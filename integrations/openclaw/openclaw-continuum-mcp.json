@@ -1,0 +1,17 @@
+{
+  "mcp": {
+    "servers": {
+      "continuum": {
+        "command": "python",
+        "args": [
+          "-m",
+          "continuum.mcp_server"
+        ],
+        "env": {
+          "CONTINUUM_ROOT": "/path/to/continuum-root",
+          "PYTHONPATH": "/path/to/epic-continuum/src"
+        }
+      }
+    }
+  }
+}

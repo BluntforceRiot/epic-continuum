@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/operation_event.schema.json",
+  "title": "Epic Continuum Operation Event",
+  "type": "object",
+  "required": ["schema", "event_id", "operation_id", "event_type", "created_at", "previous_event_hash", "payload", "event_hash"],
+  "properties": {
+    "schema": {"const": "epic_continuum.operation_event.v1"},
+    "event_id": {"type": "string", "pattern": "^opevt_"},
+    "operation_id": {"type": "string", "pattern": "^op_"},
+    "event_type": {"type": "string"},
+    "created_at": {"type": "string"},
+    "previous_event_hash": {"type": ["string", "null"]},
+    "payload": {"type": "object"},
+    "event_hash": {"type": "string"}
+  },
+  "additionalProperties": true
+}

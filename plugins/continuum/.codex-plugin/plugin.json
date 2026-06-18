@@ -1,0 +1,31 @@
+{
+  "name": "continuum",
+  "version": "0.1.0+codex.20260618073500",
+  "description": "Epic Continuum local persistent memory, context continuity, and crash recovery for Codex-compatible agents.",
+  "author": {
+    "name": "Bluntforce / Epic Continuum"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Epic Continuum",
+    "shortDescription": "Persistent memory and thread recovery.",
+    "longDescription": "Epic Continuum exposes a local Scroll, Library, Card catalog, context compiler, operation ledger, and recovery packet generator to Codex-compatible agents.",
+    "developerName": "Bluntforce / Epic Continuum",
+    "category": "Productivity",
+    "capabilities": [
+      "MCP",
+      "Memory",
+      "Recovery"
+    ],
+    "defaultPrompt": [
+      "Recover this thread with Epic Continuum.",
+      "Append this session to Epic Continuum.",
+      "Compile Epic Continuum context for this task.",
+      "List Epic Continuum operation receipts.",
+      "Recover interrupted Epic Continuum operations.",
+      "Run an Epic Continuum recovery drill."
+    ],
+    "brandColor": "#2563EB"
+  },
+  "mcpServers": "./.mcp.json"
+}

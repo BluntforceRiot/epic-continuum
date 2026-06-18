@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Epic Continuum logo</title>
+  <desc id="desc">A luminous scroll-shaped continuum loop over a durable archive grid.</desc>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="65%">
+      <stop offset="0%" stop-color="#12314a"/>
+      <stop offset="45%" stop-color="#081827"/>
+      <stop offset="100%" stop-color="#05070d"/>
+    </radialGradient>
+    <linearGradient id="loop" x1="160" y1="512" x2="864" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f4c76a"/>
+      <stop offset="45%" stop-color="#79f0ff"/>
+      <stop offset="55%" stop-color="#f8fbff"/>
+      <stop offset="100%" stop-color="#7a8cff"/>
+    </linearGradient>
+    <linearGradient id="card" x1="270" y1="328" x2="754" y2="696" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fff1b5"/>
+      <stop offset="48%" stop-color="#8df3ff"/>
+      <stop offset="100%" stop-color="#99a7ff"/>
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.31 0 0 0 0 0.85 0 0 0 0 1 0 0 0 0.75 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="goldGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 1 0 0 0 0 0.68 0 0 0 0 0.24 0 0 0 0.55 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="168" fill="url(#bg)"/>
+  <circle cx="512" cy="440" r="292" fill="none" stroke="#123b5a" stroke-width="2" opacity="0.65"/>
+  <circle cx="512" cy="440" r="218" fill="none" stroke="#1b5879" stroke-width="2" opacity="0.35"/>
+
+  <g opacity="0.58">
+    <path d="M245 735h534" stroke="#35506d" stroke-width="4" stroke-linecap="round"/>
+    <path d="M284 780h456" stroke="#263d59" stroke-width="4" stroke-linecap="round"/>
+    <path d="M318 690h388" stroke="#2c4666" stroke-width="4" stroke-linecap="round"/>
+    <path d="M330 665v136M420 650v151M512 632v169M604 650v151M694 665v136" stroke="#203850" stroke-width="4" stroke-linecap="round"/>
+  </g>
+
+  <g filter="url(#softGlow)">
+    <path d="M166 512c82-146 214-172 346 0 132 172 264 146 346 0" fill="none" stroke="url(#loop)" stroke-width="36" stroke-linecap="round"/>
+    <path d="M166 512c82 146 214 172 346 0 132-172 264-146 346 0" fill="none" stroke="url(#loop)" stroke-width="36" stroke-linecap="round" opacity="0.92"/>
+    <path d="M170 512c82-132 214-156 342 0 128 156 260 132 342 0" fill="none" stroke="#f8fbff" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
+    <path d="M170 512c82 132 214 156 342 0 128-156 260-132 342 0" fill="none" stroke="#f8fbff" stroke-width="7" stroke-linecap="round" opacity="0.62"/>
+  </g>
+
+  <g filter="url(#goldGlow)">
+    <path d="M512 247v530" stroke="#f4c76a" stroke-width="12" stroke-linecap="round" opacity="0.92"/>
+    <circle cx="512" cy="512" r="45" fill="#f8fbff"/>
+    <circle cx="512" cy="512" r="23" fill="#79f0ff"/>
+  </g>
+
+  <g fill="url(#card)" opacity="0.95">
+    <rect x="412" y="300" width="200" height="84" rx="16"/>
+    <rect x="360" y="632" width="304" height="86" rx="18"/>
+    <rect x="214" y="469" width="112" height="86" rx="18"/>
+    <rect x="698" y="469" width="112" height="86" rx="18"/>
+  </g>
+
+  <g fill="#f8fbff">
+    <circle cx="330" cy="282" r="5" opacity="0.7"/>
+    <circle cx="708" cy="308" r="4" opacity="0.62"/>
+    <circle cx="232" cy="650" r="4" opacity="0.58"/>
+    <circle cx="792" cy="656" r="5" opacity="0.7"/>
+    <circle cx="624" cy="223" r="3" opacity="0.58"/>
+    <circle cx="430" cy="805" r="4" opacity="0.62"/>
+    <circle cx="590" cy="798" r="3" opacity="0.52"/>
+  </g>
+</svg>

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/operation_recovery.schema.json",
+  "title": "Epic Continuum Operation Recovery Packet",
+  "type": "object",
+  "required": ["schema", "operation_id", "status", "operation_type", "title", "generated_at"],
+  "properties": {
+    "schema": {"const": "epic_continuum.operation_recovery.v1"},
+    "operation_id": {"type": "string", "pattern": "^op_"},
+    "status": {"type": "string"},
+    "operation_type": {"type": "string"},
+    "title": {"type": "string"},
+    "generated_at": {"type": "string"},
+    "cursor": {"type": ["object", "null"]},
+    "intent": {"type": "object"},
+    "progress": {"type": "array"}
+  },
+  "additionalProperties": true
+}

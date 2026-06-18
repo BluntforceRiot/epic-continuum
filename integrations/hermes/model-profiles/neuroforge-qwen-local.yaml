@@ -1,0 +1,14 @@
+# Example Hermes model route for a local OpenAI-compatible Neuroforge/Qwen endpoint.
+model:
+  default: "neuroforge-qwen"
+  provider: "custom"
+  api_key: "none"
+  base_url: "http://127.0.0.1:8000/v1"
+  context_length: 32768
+  max_tokens: 4096
+
+model_aliases:
+  neuroforge:
+    model: "neuroforge-qwen"
+    provider: "custom"
+    base_url: "http://127.0.0.1:8000/v1"

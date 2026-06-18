@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "continuum": {
+      "command": "python",
+      "args": [
+        "-m",
+        "continuum.mcp_server"
+      ],
+      "env": {
+        "CONTINUUM_ROOT": "/path/to/continuum-root",
+        "PYTHONPATH": "/path/to/continuum/src"
+      }
+    }
+  }
+}

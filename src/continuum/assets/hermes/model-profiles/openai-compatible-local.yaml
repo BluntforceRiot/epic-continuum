@@ -1,0 +1,12 @@
+# Example Hermes model route for any local OpenAI-compatible endpoint.
+model:
+  default: "local-openai-compatible"
+  provider: "custom"
+  api_key: "none"
+  base_url: "http://127.0.0.1:8000/v1"
+
+model_aliases:
+  local:
+    model: "local-openai-compatible"
+    provider: "custom"
+    base_url: "http://127.0.0.1:8000/v1"

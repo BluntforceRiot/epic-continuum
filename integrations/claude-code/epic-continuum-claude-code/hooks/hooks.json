@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-m",
+              "continuum.integrations.claude_code_adapter"
+            ],
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-m",
+              "continuum.integrations.claude_code_adapter"
+            ],
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-m",
+              "continuum.integrations.claude_code_adapter"
+            ],
+            "timeout": 30000
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "schema": "epic_continuum.adapter_index.v1",
+  "adapters": [
+    {
+      "name": "Codex",
+      "path": "plugins/continuum",
+      "surface": "Codex plugin + stdio MCP",
+      "status": "packaged"
+    },
+    {
+      "name": "Hermes Agent",
+      "path": "integrations/hermes",
+      "surface": "Hermes plugin hooks",
+      "status": "packaged"
+    },
+    {
+      "name": "Claude Code",
+      "path": "integrations/claude-code",
+      "surface": "Claude Code plugin + MCP + hooks",
+      "status": "packaged"
+    },
+    {
+      "name": "Claude Desktop",
+      "path": "integrations/mcp-generic",
+      "surface": "stdio MCP config",
+      "status": "template"
+    },
+    {
+      "name": "Cursor",
+      "path": "integrations/mcp-generic",
+      "surface": "stdio MCP config",
+      "status": "template"
+    },
+    {
+      "name": "Windsurf",
+      "path": "integrations/mcp-generic",
+      "surface": "stdio MCP config",
+      "status": "template"
+    },
+    {
+      "name": "Continue.dev",
+      "path": "integrations/openai-compatible",
+      "surface": "context gateway pattern",
+      "status": "template"
+    },
+    {
+      "name": "OpenClaw",
+      "path": "integrations/openclaw",
+      "surface": "MCP + mission card handoff",
+      "status": "packaged"
+    },
+    {
+      "name": "Ollama",
+      "path": "integrations/ollama",
+      "surface": "OpenAI-compatible wrapper + Modelfile guidance",
+      "status": "packaged"
+    },
+    {
+      "name": "OpenAI-compatible runtimes",
+      "path": "integrations/openai-compatible",
+      "surface": "request wrapper",
+      "status": "packaged"
+    },
+    {
+      "name": "LangChain",
+      "path": "integrations/langchain",
+      "surface": "retriever/memory shim",
+      "status": "template"
+    },
+    {
+      "name": "LlamaIndex",
+      "path": "integrations/llamaindex",
+      "surface": "query engine/memory shim",
+      "status": "template"
+    },
+    {
+      "name": "CrewAI",
+      "path": "integrations/crewai",
+      "surface": "tool adapter",
+      "status": "template"
+    },
+    {
+      "name": "AutoGen",
+      "path": "integrations/autogen",
+      "surface": "tool adapter",
+      "status": "template"
+    },
+    {
+      "name": "Semantic Kernel",
+      "path": "integrations/semantic-kernel",
+      "surface": "memory/plugin template",
+      "status": "template"
+    },
+    {
+      "name": "Haystack",
+      "path": "integrations/haystack",
+      "surface": "component template",
+      "status": "template"
+    },
+    {
+      "name": "Aider",
+      "path": "integrations/mcp-generic",
+      "surface": "MCP/CLI recovery pattern",
+      "status": "template"
+    }
+  ]
+}

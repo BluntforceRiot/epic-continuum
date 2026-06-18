@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/operation_receipt.schema.json",
+  "title": "Epic Continuum Operation Receipt",
+  "type": "object",
+  "required": ["schema", "operation_id", "operation_type", "title", "actor", "status", "created_at", "updated_at", "receipt_hash"],
+  "properties": {
+    "schema": {"const": "epic_continuum.operation_receipt.v1"},
+    "operation_id": {"type": "string", "pattern": "^op_"},
+    "operation_type": {"type": "string"},
+    "title": {"type": "string"},
+    "actor": {"type": "string"},
+    "status": {"type": "string", "enum": ["running", "succeeded", "failed", "interrupted"]},
+    "intent": {"type": "object"},
+    "cursor": {"type": ["object", "null"]},
+    "progress": {"type": "array"},
+    "result": {"type": ["object", "null"]},
+    "error": {"type": ["object", "null"]},
+    "run_receipt_uri": {"type": "string"},
+    "export_receipt_uri": {"type": "string"},
+    "operation_event_log_uri": {"type": "string"},
+    "operation_event_export_uri": {"type": "string"},
+    "proof_pack_uri": {"type": ["string", "null"]},
+    "receipt_hash": {"type": "string"}
+  },
+  "additionalProperties": true
+}

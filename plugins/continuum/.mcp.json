@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "continuum": {
+      "command": "python",
+      "args": [
+        "scripts/run_mcp.py"
+      ]
+    }
+  }
+}

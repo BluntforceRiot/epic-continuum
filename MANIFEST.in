@@ -1,0 +1,21 @@
+include LICENSE README.md PROJECT_CHARTER.md ROADMAP.md SECURITY.md CONTRIBUTING.md CHANGELOG.md
+include .gitattributes .gitignore
+include docs/configuration.md docs/GLOSSARY.md docs/HARDWARE_TIERS.md docs/ORIGINAL_DESIGN_COVERAGE_2026-06-17.md
+recursive-include docs/architecture *.md
+recursive-include docs/integrations *.md
+recursive-include docs/audits *.md
+recursive-include assets *
+recursive-include examples *
+recursive-include integrations *
+recursive-include plugins *
+recursive-include scripts *
+recursive-include .agents *
+recursive-include .github *
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod] .DS_Store
+prune .git
+prune .venv
+prune .pytest_cache
+prune build
+prune dist
+global-exclude BUILD_RECEIPT_*.md BUILD_CYCLE_RECEIPT_*.md AI_REVIEW_PACKET_*.md REVIEW_TRIAGE_*.md GITHUB_PUBLICATION_DRAFT.md ERIC_REVIEW_PACKET.md

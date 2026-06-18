@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/proof_pack.schema.json",
+  "title": "Epic Continuum Proof Pack",
+  "type": "object",
+  "required": ["schema", "operation_id", "operation_receipt_hash", "paths", "proof_pack_hash"],
+  "properties": {
+    "schema": {"const": "epic_continuum.proof_pack.v1"},
+    "operation_id": {"type": "string", "pattern": "^op_"},
+    "operation_receipt_hash": {"type": "string"},
+    "run_receipt_uri": {"type": "string"},
+    "export_receipt_uri": {"type": "string"},
+    "paths": {"type": "array", "items": {"type": "object"}},
+    "path_substitutions": {"type": "array", "items": {"type": "object"}},
+    "proof_pack_hash": {"type": "string"}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,20 @@
+{
+  "name": "epic-continuum",
+  "interface": {
+    "displayName": "Epic Continuum"
+  },
+  "plugins": [
+    {
+      "name": "continuum",
+      "source": {
+        "source": "local",
+        "path": "./plugins/continuum"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

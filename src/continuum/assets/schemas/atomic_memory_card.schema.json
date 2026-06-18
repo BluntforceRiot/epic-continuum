@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/atomic_memory_card.schema.json",
+  "title": "Epic Continuum Atomic Memory Card",
+  "type": "object",
+  "required": ["schema", "card_id", "card_type", "title", "summary", "created_at", "updated_at"],
+  "properties": {
+    "schema": {"const": "continuum.atomic_memory.v1"},
+    "card_id": {"type": "string", "pattern": "^card_"},
+    "card_type": {"type": "string"},
+    "title": {"type": "string"},
+    "summary": {"type": "string"},
+    "source_refs": {"type": "array"},
+    "entities": {"type": "array"},
+    "topics": {"type": "array"},
+    "decisions": {"type": "array"},
+    "open_tasks": {"type": "array"},
+    "salience": {"type": "number"},
+    "confidence": {"type": "number"}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,49 @@
+[project]
+name = "epic-continuum-memory"
+version = "0.1.0"
+description = "Epic Continuum persistent-memory substrate for agent continuity."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["agent-memory", "ai-agents", "mcp", "sqlite", "local-first"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.scripts]
+continuum = "continuum.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/BluntforceRiot/epic-continuum"
+Repository = "https://github.com/BluntforceRiot/epic-continuum"
+Issues = "https://github.com/BluntforceRiot/epic-continuum/issues"
+Documentation = "https://github.com/BluntforceRiot/epic-continuum#readme"
+Changelog = "https://github.com/BluntforceRiot/epic-continuum/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+continuum = [
+  "config.default.json",
+  "core/schema.sql",
+  "assets/hermes/epic_continuum/plugin.yaml",
+  "assets/hermes/epic_continuum/__init__.py",
+  "assets/hermes/model-profiles/*.yaml",
+  "assets/schemas/*.schema.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

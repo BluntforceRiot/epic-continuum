@@ -1,0 +1,19 @@
+{
+  "schema": "epic_continuum.openclaw_mission_card.v1",
+  "mission_id": "continuum-example",
+  "decision": "review_only_context_handoff",
+  "evidence": [
+    "Epic Continuum compiled context from durable Scroll/Card state.",
+    "No execution authority is implied by this card."
+  ],
+  "next_action": "Use the attached context to plan or stress-review the mission.",
+  "owner": "operator",
+  "gate": "operator approval",
+  "proof_boundary": "Advisory context only. Execution requires a separate receipt-backed action.",
+  "continuum": {
+    "session_id": "example",
+    "token_budget": 1800,
+    "estimated_tokens": 0,
+    "context_text": ""
+  }
+}

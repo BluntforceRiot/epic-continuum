@@ -1,0 +1,23 @@
+{
+  "name": "epic-continuum",
+  "version": "0.1.0",
+  "description": "Epic Continuum persistent memory, Looking Glass context, and recovery packets for Claude Code.",
+  "author": {
+    "name": "Bluntforce / Epic Continuum"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Epic Continuum",
+    "shortDescription": "Persistent memory and thread recovery.",
+    "longDescription": "Adds Epic Continuum MCP tools and lightweight hooks for context injection and turn capture.",
+    "developerName": "Bluntforce / Epic Continuum",
+    "category": "Productivity",
+    "capabilities": [
+      "MCP",
+      "Memory",
+      "Recovery",
+      "Hooks"
+    ]
+  }
+}

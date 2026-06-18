@@ -1,0 +1,5 @@
+name: epic_continuum
+kind: standalone
+version: 0.1.0
+description: Epic Continuum Looking Glass context and Scroll recorder for Hermes Agent.
+

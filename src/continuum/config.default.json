@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "hardware": {
+    "vram": {
+      "active_pane_budget": "8GB",
+      "notes": "Epic Continuum does not store its archive in VRAM. This is a runtime hint for model context and KV cache budgets."
+    },
+    "system_ram": {
+      "hot_cache_budget": "4GB",
+      "sqlite_cache_budget": "512MB",
+      "kv_offload_budget": "16GB"
+    },
+    "nvme": {
+      "durable_store_budget": "256GB",
+      "snapshot_budget": "64GB",
+      "segment_target_size": "16MB"
+    }
+  },
+  "context": {
+    "default_token_budget": 3000,
+    "max_token_budget": 128000,
+    "scroll_event_fetch_limit": 500,
+    "reserve_output_tokens": 1024,
+    "card_recall_scope": "session_then_global"
+  },
+  "capture": {
+    "mode": "automatic",
+    "record_user_turns": true,
+    "record_assistant_turns": true,
+    "record_tool_calls": true,
+    "record_tool_results": true,
+    "snapshot_on_task_start": true,
+    "snapshot_on_task_finish": true,
+    "roll_segments_every_events": 200,
+    "dedup_window_seconds": 30,
+    "max_tool_result_bytes": "256KB",
+    "large_result_policy": "truncate_with_notice"
+  },
+  "retention": {
+    "raw_scroll_hot_days": 30,
+    "raw_scroll_warm_days": 180,
+    "keep_cards_forever": true,
+    "max_root_size": "50GB",
+    "snapshot_retention": "last_20",
+    "proof_pack_retention": "keep_successful_90_days",
+    "prune_policy": "ask",
+    "delete_raw_evidence": false
+  },
+  "learning": {
+    "route_decay_min_interval_seconds": 3600,
+    "route_decay_weight_factor": 0.92,
+    "route_decay_floor": 0.01,
+    "route_prune_weight_threshold": 0.12
+  },
+  "storage": {
+    "default_tier": "hot",
+    "max_ingest_bytes": "50MB",
+    "keep_cards_hot": true,
+    "allow_evidence_delete": false
+  },
+  "security": {
+    "ignore_file": ".continuumignore",
+    "secret_scan_enabled": true,
+    "secret_scan_action": "block",
+    "secret_audit_max_file_bytes": "20MB",
+    "secret_audit_max_findings": 200,
+    "entropy_secret_scan_enabled": false,
+    "entropy_min_length": 32,
+    "entropy_min_bits_per_char": 4.5,
+    "secret_allowlist_file": "security/secret_allowlist.jsonl",
+    "redaction_profile": "portable"
+  },
+  "atomic_memory": {
+    "write_card_sidecars": true,
+    "card_sidecar_dir": "catalog/cards",
+    "schema": "continuum.atomic_memory.v1"
+  },
+  "epic_continuity": {
+    "operation_receipts": true,
+    "principle": "No one said we could not back it up while building it.",
+    "run_dir": "run/operations",
+    "export_dir": "exports/operation_receipts",
+    "proof_pack_dir": "exports/proof_packs",
+    "operation_recovery_dir": "exports/operation_recovery",
+    "recovery_drill_dir": "exports/recovery_drills",
+    "stale_after_seconds": 300,
+    "mutating_tool_guard": true
+  },
+  "queues": {
+    "worker_lease_seconds": 3600,
+    "live_request_priority": 10,
+    "request_blocking_card_priority": 20,
+    "scribe_event_priority": 100,
+    "librarian_review_priority": 75,
+    "archivist_verify_priority": 80
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "continuum": {
+      "command": "python",
+      "args": [
+        "-m",
+        "continuum.mcp_server"
+      ],
+      "env": {
+        "CONTINUUM_ROOT": "${CONTINUUM_ROOT}",
+        "PYTHONPATH": "${CONTINUUM_PYTHONPATH}"
+      },
+      "timeout": 600000
+    }
+  }
+}

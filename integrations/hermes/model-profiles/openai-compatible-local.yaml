@@ -1,0 +1,17 @@
+# Hermes model route template for any OpenAI-compatible endpoint.
+# Use this for vLLM, llama.cpp, LM Studio, Ollama gateways, and compatible
+# cloud proxies. The Epic Continuum adapter does not depend on this model.
+model:
+  default: "your-local-model"
+  provider: "custom"
+  api_key: "none"
+  base_url: "http://127.0.0.1:8000/v1"
+  context_length: 16384
+  max_tokens: 2048
+
+model_aliases:
+  local-openai:
+    model: "your-local-model"
+    provider: custom
+    base_url: "http://127.0.0.1:8000/v1"
+

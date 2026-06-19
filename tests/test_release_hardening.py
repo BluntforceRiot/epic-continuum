@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -79,6 +80,19 @@ def _create_minimal_mempalace(palace: Path) -> None:
 
 
 class ReleaseHardeningTest(unittest.TestCase):
+    def test_static_release_metadata_matches_pyproject_version(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+
+        self.assertIn(f"release-{version}", (repo_root / "README.md").read_text(encoding="utf-8"))
+        self.assertIn(f"## {version} -", (repo_root / "CHANGELOG.md").read_text(encoding="utf-8"))
+        for path in (
+            repo_root / "integrations" / "hermes" / "epic_continuum" / "plugin.yaml",
+            repo_root / "src" / "continuum" / "assets" / "hermes" / "epic_continuum" / "plugin.yaml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f"version: {version}", path.read_text(encoding="utf-8"))
+
     def test_pack_root_does_not_chmod_existing_external_export_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             if os.name != "posix" or not posix_permissions_supported(Path(tmp)):

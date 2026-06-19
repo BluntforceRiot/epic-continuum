@@ -12,7 +12,8 @@ The release gate focused on:
 - root bundle canonicality, portability, and semantic verification;
 - secret scanning and legacy redaction;
 - Codex/Hermes adapter installation behavior;
-- Debian/Ubuntu/Windows portability.
+- Debian/Ubuntu/Windows portability;
+- release package reproducibility and installer wrapper safety.
 
 ## Current Gate
 
@@ -24,11 +25,22 @@ Review hardening after the final private review pass added:
 
 - private directory/file modes and a `repair-permissions` command;
 - Hermes secret-key handling that avoids subprocess argv;
+- direct Hermes CLI rejection for secret-looking `--api-key` values;
 - hard `max_tool_result_bytes` enforcement;
 - healthy-degraded FTS5 fallback reporting;
 - the unique Codex marketplace namespace `epic-continuum`;
 - explicit MCP tool annotations;
 - curated source/release package contents.
+- bundle Zip64 threshold and central/local header canonicality hardening;
+- portable bundle refusal for link-like catalog databases;
+- manifest member mode binding;
+- release builder refusal for tracked dirty-tree builds;
+- safe Codex plugin staging under a generated child directory;
+- BOM-less generated Codex `.mcp.json` files;
+- Codex plugin cachebuster versions for generated local stages.
+
+See `MAINTAINABILITY_HOTSPOTS.md` for the non-blocking large-function
+refactor map identified during release review.
 
 ## Remaining Security Boundary
 

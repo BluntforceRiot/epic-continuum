@@ -95,7 +95,7 @@ redacted before storage and findings are stored in event metadata.
   eligible to move between hot, warm, and cold tiers. `tier-storage` updates the
   catalog and moves internal archived originals/reader editions into the
   matching tier directories.
-- `keep_cards_forever` keeps compact memory cards searchable even when raw
+- `keep_cards_forever` keeps compact memory cards recallable even when raw
   evidence moves to colder storage.
 - `max_root_size` is the operator's preferred storage ceiling surfaced by
   `memory-health`.

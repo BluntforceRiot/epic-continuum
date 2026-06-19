@@ -28,7 +28,7 @@
 > [!IMPORTANT]
 > Epic Continuum does not make a model's native context window literally
 > infinite. It gives agents a durable continuity layer around finite context:
-> ordered events, compact Cards, searchable evidence, operation receipts, and
+> ordered events, searchable Library evidence, compact Cards, operation receipts, and
 > recovery packets.
 
 > [!NOTE]
@@ -84,7 +84,7 @@ The system may compact context and prune routes. It must not destroy evidence.
 ```text
 raw event stays
 book stays
-card stays hot/searchable
+card stays hot/recallable
 atomic YAML sidecar stays portable
 route may reinforce, decay, or tombstone
 location may move hot -> warm -> cold -> vault
@@ -301,9 +301,9 @@ python -m continuum.mcp_server
 ```
 
 The MCP surface mirrors the CLI: initialize/status/config, append Scroll events,
-roll segments into Cards, ingest files, compile/search context, recover a
-thread, audit, doctor, verify proof packs, snapshot, run recovery/restore
-drills, import MemPalace, and optimize hardware budgets.
+roll segments into Cards, ingest files, compile context, search Library chunks,
+recover a thread, audit, doctor, verify proof packs, snapshot, run
+recovery/restore drills, import MemPalace, and optimize hardware budgets.
 
 The server currently supports and advertises MCP protocol `2025-11-25`.
 Tool responses include JSON text, `structuredContent`, generic `outputSchema`,

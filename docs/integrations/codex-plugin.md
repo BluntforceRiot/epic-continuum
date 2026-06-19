@@ -77,10 +77,27 @@ If you want the plugin wrapper too, install it with:
 
 The portable repo includes `.agents/plugins/marketplace.json`. The installer
 stages that marketplace before registration so generated local paths do not
-modify the source checkout. Manual registration uses the staged or repo root:
+modify the source checkout. The staged marketplace path is stable:
+
+```text
+<stage-base>/epic-continuum
+```
+
+Only the generated plugin version changes when the Continuum root, Python path,
+or plugin content changes. That keeps Codex's marketplace source stable while
+still forcing its plugin cache to refresh. Manual registration should therefore
+use the staged path printed by the installer or helper, not the tracked repo
+root:
 
 ```powershell
-codex plugin marketplace add "$env:REPO_ROOT"
+$stage = python .\scripts\stage_codex_plugin.py --repo-root "$PWD" --root "$env:CONTINUUM_ROOT" --python python --stage-base "$HOME\.cache\epic-continuum\codex-marketplace"
+codex plugin marketplace add $stage
+codex plugin add continuum@epic-continuum
+```
+
+```bash
+stage="$(python3 ./scripts/stage_codex_plugin.py --repo-root "$PWD" --root "$CONTINUUM_ROOT" --python python3 --stage-base "$HOME/.cache/epic-continuum/codex-marketplace")"
+codex plugin marketplace add "$stage"
 codex plugin add continuum@epic-continuum
 ```
 

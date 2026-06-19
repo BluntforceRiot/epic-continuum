@@ -36,7 +36,7 @@ reader editions.
 ## Card
 
 A structured compact memory object. A card can summarize a scroll span, describe
-a book, or represent a decision/open task. Cards remain hot and searchable.
+a book, or represent a decision/open task. Cards remain hot and recallable.
 
 ## Atomic YAML Memory
 

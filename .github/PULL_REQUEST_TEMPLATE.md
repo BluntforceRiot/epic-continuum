@@ -10,4 +10,4 @@
 
 - [ ] No evidence deletion caused by recall/decay logic
 - [ ] Any compaction preserves source pointers
-- [ ] Any storage move keeps cards searchable
+- [ ] Any storage move keeps cards recallable

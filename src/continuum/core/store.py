@@ -29,6 +29,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/\\-]{1,}")
 INDEX_DDL_MARKER = "\nCREATE INDEX"
+_INIT_DB_CACHE: set[str] = set()
 
 
 def utc_now() -> str:
@@ -291,6 +292,11 @@ def extract_terms(text: str, limit: int = 16) -> list[str]:
     return [term for term, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
 
 
+def fts_phrase(term: str) -> str:
+    escaped = term.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def chunk_text(text: str, max_chars: int = 5000, overlap: int = 400) -> list[str]:
     if len(text) <= max_chars:
         return [text]
@@ -437,6 +443,9 @@ def apply_schema_migrations(conn: sqlite3.Connection) -> list[str]:
 
 
 def init_db(root: Path) -> None:
+    cache_key = str(root.resolve(strict=False))
+    if cache_key in _INIT_DB_CACHE and is_initialized(root) and config_path(root).exists():
+        return
     init_layout(root)
     write_default_config(root)
     conn = connect(root)
@@ -451,6 +460,7 @@ def init_db(root: Path) -> None:
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('created_at', ?)", (utc_now(),))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('fts5_available', ?)", ("1" if ensure_fts(conn) else "0",))
         conn.commit()
+        _INIT_DB_CACHE.add(cache_key)
     finally:
         conn.close()
 
@@ -2275,7 +2285,7 @@ def search_memory(
             ).fetchone()
         )
         if has_fts and terms:
-            fts_query = " OR ".join(terms)
+            fts_query = " OR ".join(fts_phrase(term) for term in terms)
             try:
                 rows = conn.execute(
                     """
@@ -2440,7 +2450,7 @@ def recover_thread(
             "",
             f"- Recovery id: `{recovery_id}`",
             f"- Generated: `{now}`",
-            f"- Epic Continuum root: `{root}`",
+            "- Epic Continuum root: `<continuum-root>`",
             "",
             "## Resume Instruction",
             "",

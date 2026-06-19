@@ -74,6 +74,27 @@ def secure_mkdir(path: Path) -> None:
     _chmod(path, PRIVATE_DIR_MODE)
 
 
+def fsync_parent(path: Path) -> None:
+    """Best-effort fsync for the containing directory after atomic renames."""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = -1
+    try:
+        fd = os.open(str(path.parent), flags)
+        os.fsync(fd)
+    except OSError:
+        return
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     secure_mkdir(path.parent)
     data = text.encode(encoding)
@@ -88,6 +109,7 @@ def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
         _chmod(path, PRIVATE_FILE_MODE)
+        fsync_parent(path)
     except Exception:
         try:
             os.close(fd)
@@ -106,6 +128,21 @@ def secure_copy_file(source: Path, destination: Path) -> None:
     secure_mkdir(destination.parent)
     shutil.copyfile(source, destination)
     secure_file(destination)
+    fsync_parent(destination)
+
+
+def secure_move_file(source: Path, destination: Path) -> None:
+    secure_mkdir(destination.parent)
+    try:
+        if source.resolve(strict=False) == destination.resolve(strict=False):
+            secure_file(destination)
+            return
+    except OSError:
+        pass
+    os.replace(source, destination)
+    secure_file(destination)
+    fsync_parent(destination)
+    fsync_parent(source)
 
 
 def secure_tree(path: Path) -> None:

@@ -997,6 +997,45 @@ class OperationLedgerTest(unittest.TestCase):
             verification = verify_proof_pack(proof_path, root=root)
             self.assertTrue(verification["ok"], verification["errors"])
 
+    def test_operation_guard_does_not_mask_original_error_when_proof_pack_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+
+            with self.assertRaisesRegex(ValueError, "original failure"):
+                with patch("continuum.core.operations.create_proof_pack", side_effect=RuntimeError("proof exploded")):
+                    with OperationGuard(root, operation_type="proof_mask", title="Proof mask"):
+                        raise ValueError("original failure")
+
+    def test_operation_guard_records_proof_failure_without_losing_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+
+            with patch("continuum.core.operations.create_proof_pack", side_effect=RuntimeError("proof exploded")):
+                with OperationGuard(root, operation_type="proof_success", title="Proof success") as operation:
+                    receipt = operation.succeed({"ok": True})
+
+            self.assertEqual(receipt["status"], "succeeded")
+            phases = [item["phase"] for item in receipt.get("progress", [])]
+            self.assertIn("proof_pack_failed", phases)
+
+    def test_cli_top_level_error_redacts_paths_and_secret_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            missing = Path(tmp) / "private" / "api_key=supersecretvalue123.txt"
+            stdout = io.StringIO()
+
+            with redirect_stdout(stdout):
+                code = cli_main(["ingest-file", "--root", str(root), "--path", str(missing)])
+
+            payload = json.loads(stdout.getvalue())
+            rendered = json.dumps(payload, ensure_ascii=True)
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertIn("<redacted-path:", payload["error"])
+            self.assertNotIn(str(missing), rendered)
+            self.assertNotIn("supersecretvalue123", rendered)
 
     def test_directory_proof_manifests_redact_secret_bearing_child_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

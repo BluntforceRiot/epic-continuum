@@ -92,22 +92,25 @@ redacted before storage and findings are stored in event metadata.
 `retention` describes storage pressure behavior separately from capture:
 
 - `raw_scroll_hot_days` and `raw_scroll_warm_days` describe when evidence is
-  eligible to move between hot, warm, and cold tiers.
+  eligible to move between hot, warm, and cold tiers. `tier-storage` updates the
+  catalog and moves internal archived originals/reader editions into the
+  matching tier directories.
 - `keep_cards_forever` keeps compact memory cards searchable even when raw
   evidence moves to colder storage.
 - `max_root_size` is the operator's preferred storage ceiling surfaced by
   `memory-health`.
-- `snapshot_retention` and `proof_pack_retention` describe cleanup targets for
-  generated proof artifacts.
+- `snapshot_retention` accepts `last_20` or `keep_all`.
+- `proof_pack_retention` accepts `keep_successful_90_days` or `keep_all`.
 - `prune_policy` defaults to `ask`, so destructive pruning requires operator
   review.
 - `delete_raw_evidence` defaults to `false`. Setting it to `true` is rejected
   unless the prune policy remains `ask` or `manual`.
 
-`tier-storage` applies the current Archivist tiering policy. `prune-memory`
-archives, marks summary-only, or prunes Cards by topic. These commands update
-catalog state and write audit events; they do not delete raw evidence unless a
-future destructive policy explicitly allows it.
+`tier-storage` applies the current Archivist tiering policy. It relocates
+internal archive files and leaves any legacy external URI untouched. `prune-memory`
+archives, marks summary-only, or prunes Cards by topic. These commands write
+audit events; they do not delete raw evidence unless a future destructive policy
+explicitly allows it.
 
 `prune-memory --action forget` prunes Card projections from active recall. It
 does not erase Scroll rows, Library originals, reader editions, or proof

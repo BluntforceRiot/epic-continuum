@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -50,7 +51,24 @@ from .core.workers import (
     run_worker_pass,
     serve_workers,
 )
+from .core.safety import redact_text_secrets
 from .integrations.hermes_adapter import install_hermes_adapter
+
+
+ABSOLUTE_PATH_RE = re.compile(r"(?i)(?:[A-Z]:[\\/][^\s\"'<>|]+|/[^\s\"'<>]+)")
+
+
+def redact_cli_error_message(message: str) -> str:
+    redacted = redact_text_secrets(str(message))
+
+    def replace_path(match: re.Match[str]) -> str:
+        raw = match.group(0).rstrip(".,;:)")
+        suffix = match.group(0)[len(raw):]
+        name = re.split(r"[\\/]", raw)[-1] or "path"
+        safe_name = redact_text_secrets(name)
+        return f"<redacted-path:{safe_name}>{suffix}"
+
+    return ABSOLUTE_PATH_RE.sub(replace_path, redacted)
 
 
 def emit(value: object) -> None:
@@ -989,5 +1007,5 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _main(argv)
     except Exception as exc:
-        emit({"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+        emit({"ok": False, "error": redact_cli_error_message(str(exc)), "error_type": type(exc).__name__})
         return 1

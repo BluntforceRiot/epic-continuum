@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,11 @@ def yaml_scalar(value: Any) -> str:
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("atomic YAML cannot encode NaN or infinite floats")
         return str(value)
     return json.dumps(str(value), ensure_ascii=True)
 
@@ -51,6 +56,99 @@ def dump_yaml(value: Any, indent: int = 0) -> str:
                 lines.append(f"{prefix}- {yaml_scalar(item)}")
         return "\n".join(lines)
     return f"{prefix}{yaml_scalar(value)}"
+
+
+def _parse_scalar(raw: str) -> Any:
+    text = raw.strip()
+    if text == "null":
+        return None
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    if text == "{}":
+        return {}
+    if text == "[]":
+        return []
+    if text.startswith('"') or text.startswith("'"):
+        return json.loads(text)
+    try:
+        if any(char in text for char in ".eE"):
+            number = float(text)
+            if not math.isfinite(number):
+                raise ValueError("atomic YAML cannot decode NaN or infinite floats")
+            return number
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _parse_key(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith('"') or text.startswith("'"):
+        return str(json.loads(text))
+    return text
+
+
+def _yaml_lines(text: str) -> list[tuple[int, str]]:
+    lines: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        lines.append((indent, line.strip()))
+    return lines
+
+
+def _parse_block(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[Any, int]:
+    if index >= len(lines):
+        return {}, index
+    current_indent, current = lines[index]
+    if current_indent < indent:
+        return {}, index
+    if current.startswith("-"):
+        items: list[Any] = []
+        while index < len(lines):
+            line_indent, content = lines[index]
+            if line_indent != indent or not content.startswith("-"):
+                break
+            item_text = content[1:].strip()
+            index += 1
+            if item_text:
+                items.append(_parse_scalar(item_text))
+            else:
+                item, index = _parse_block(lines, index, indent + 2)
+                items.append(item)
+        return items, index
+
+    mapping: dict[str, Any] = {}
+    while index < len(lines):
+        line_indent, content = lines[index]
+        if line_indent != indent or content.startswith("-"):
+            break
+        if ":" not in content:
+            raise ValueError(f"invalid atomic YAML line: {content!r}")
+        key_text, value_text = content.split(":", 1)
+        key = _parse_key(key_text)
+        value_text = value_text.strip()
+        index += 1
+        if value_text:
+            mapping[key] = _parse_scalar(value_text)
+        else:
+            value, index = _parse_block(lines, index, indent + 2)
+            mapping[key] = value
+    return mapping, index
+
+
+def load_atomic_yaml(text: str) -> Any:
+    """Parse the small deterministic YAML subset emitted by ``dump_yaml``."""
+    lines = _yaml_lines(text)
+    if not lines:
+        return {}
+    result, index = _parse_block(lines, 0, lines[0][0])
+    if index != len(lines):
+        raise ValueError("invalid trailing atomic YAML content")
+    return result
 
 
 def write_atomic_yaml(path: Path, payload: dict[str, Any]) -> None:

@@ -292,11 +292,8 @@ def emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) ->
 
 def sqlite_backup(source: Path, dest: Path) -> None:
     secure_mkdir(dest.parent)
-    if platform.system().lower() == "windows":
-        src = sqlite3.connect(str(source), timeout=2)
-    else:
-        source_uri = f"file:{source}?mode=ro"
-        src = sqlite3.connect(source_uri, uri=True, timeout=2)
+    source_uri = f"{source.resolve(strict=False).as_uri()}?mode=ro"
+    src = sqlite3.connect(source_uri, uri=True, timeout=2)
     try:
         dst = sqlite3.connect(str(dest))
         try:

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.config import load_config, write_config
-from continuum.core.mempalace_import import import_mempalace, stop_mempalace_processes
+from continuum.core.mempalace_import import import_mempalace, sqlite_backup, stop_mempalace_processes
 from continuum.core.operations import doctor, verify_proof_pack
 from continuum.core.store import audit_search_index, init_db, rebuild_search_index, resolve_stored_uri, search_memory
 
@@ -95,6 +95,14 @@ def create_fake_chroma(
         conn.close()
 
 
+class _FakeSqliteConnection:
+    def backup(self, _destination: object) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 def create_fake_kg(
     path: Path,
     *,
@@ -172,6 +180,23 @@ def root_contains_bytes(root: Path, needle: bytes) -> bool:
 
 
 class MemPalaceImportTest(unittest.TestCase):
+    def test_sqlite_backup_opens_source_read_only_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.sqlite3"
+            dest = Path(tmp) / "dest.sqlite3"
+            source.write_bytes(b"not used by fake connection")
+            calls: list[tuple[object, dict[str, object]]] = []
+
+            def fake_connect(target: object, *args: object, **kwargs: object) -> _FakeSqliteConnection:
+                calls.append((target, dict(kwargs)))
+                return _FakeSqliteConnection()
+
+            with patch("continuum.core.mempalace_import.sqlite3.connect", side_effect=fake_connect):
+                sqlite_backup(source, dest)
+
+            self.assertIn("mode=ro", str(calls[0][0]))
+            self.assertTrue(calls[0][1].get("uri"))
+
     def test_stop_mempalace_processes_does_not_record_command_lines(self) -> None:
         class Completed:
             def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:

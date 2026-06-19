@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, retention_policy
+from .permissions import secure_move_file
 from .store import (
     add_graph_edge,
     audit_event,
     connect,
     connect_existing,
     content_hash,
+    continuum_uri,
     estimate_tokens,
     extract_terms,
     file_sha256,
@@ -65,7 +67,8 @@ def _parse_utc_timestamp(value: str) -> dt.datetime:
 
 
 def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
-    params: list[Any] = [utc_now()]
+    now = utc_now()
+    params: list[Any] = [now]
     role_clause = ""
     if roles:
         placeholders = ",".join("?" for _ in roles)
@@ -81,9 +84,28 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= ?{role_clause}
         """,
-        [PENDING_JOB_STATUS, utc_now(), json_dumps({"reclaimed": True, "reason": "worker_lease_expired"}), ACTIVE_JOB_STATUS, *params],
+        [PENDING_JOB_STATUS, now, json_dumps({"reclaimed": True, "reason": "worker_lease_expired"}), ACTIVE_JOB_STATUS, *params],
     )
-    return int(cursor.rowcount or 0)
+    reclaimed = int(cursor.rowcount or 0)
+    failed_cursor = conn.execute(
+        f"""
+        UPDATE queue_jobs
+        SET status = 'failed', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+            heartbeat_at = NULL, updated_at = ?, error_json = ?
+        WHERE status = ?
+          AND preemptible = 0
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= ?{role_clause}
+        """,
+        [
+            now,
+            now,
+            json_dumps({"error": "non_preemptible_worker_lease_expired", "reclaimed": False}),
+            ACTIVE_JOB_STATUS,
+            *params,
+        ],
+    )
+    return reclaimed + int(failed_cursor.rowcount or 0)
 
 
 def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_seconds: int) -> dict[str, Any] | None:
@@ -486,7 +508,7 @@ def apply_storage_tiering(root: Path, *, dry_run: bool = False, limit: int = 100
     try:
         rows = conn.execute(
             """
-            SELECT id, title, storage_tier, original_uri, reader_uri, updated_at, metadata_json
+            SELECT id, title, storage_tier, original_uri, reader_uri, location_uri, updated_at, metadata_json
             FROM books
             WHERE status = 'active'
             ORDER BY updated_at ASC
@@ -512,18 +534,62 @@ def apply_storage_tiering(root: Path, *, dry_run: bool = False, limit: int = 100
             if target == tier:
                 continue
             action = {"book_id": row["id"], "from": tier, "to": target, "age_days": age_days}
+            original_uri = row["original_uri"]
+            reader_uri = row["reader_uri"]
+            moved_files: list[dict[str, Any]] = []
+            for field, base, uri, target_tier in (
+                ("original_uri", root / "archive" / "originals", original_uri, target),
+                ("reader_uri", root / "archive" / "reader_editions", reader_uri, "cold" if target == "vault" else target),
+            ):
+                if not uri:
+                    continue
+                source_path = resolve_stored_uri(root, uri)
+                destination = base / target_tier / source_path.name
+                target_uri = continuum_uri(root, destination)
+                move_detail = {
+                    "field": field,
+                    "from_uri": str(uri),
+                    "to_uri": target_uri,
+                    "moved": False,
+                }
+                try:
+                    same_path = source_path.resolve(strict=False) == destination.resolve(strict=False)
+                    inside_root = source_path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
+                except OSError:
+                    same_path = False
+                    inside_root = False
+                if same_path:
+                    move_detail["reason"] = "already_in_target_tier"
+                elif not inside_root:
+                    move_detail["reason"] = "external_uri_not_moved"
+                elif not source_path.exists():
+                    move_detail["reason"] = "source_missing"
+                else:
+                    if not dry_run:
+                        secure_move_file(source_path, destination)
+                    move_detail["moved"] = True
+                if field == "original_uri" and (move_detail["moved"] or same_path):
+                    original_uri = target_uri
+                if field == "reader_uri" and (move_detail["moved"] or same_path):
+                    reader_uri = target_uri
+                moved_files.append(move_detail)
+            action["files"] = moved_files
             actions.append(action)
             if dry_run:
                 continue
             metadata = json_loads(row["metadata_json"], {})
-            metadata.setdefault("tier_history", []).append({"from": tier, "to": target, "at": now, "reason": "retention_age"})
+            metadata.setdefault("tier_history", []).append(
+                {"from": tier, "to": target, "at": now, "reason": "retention_age", "files": moved_files}
+            )
+            location_uri = original_uri if row["location_uri"] == row["original_uri"] else row["location_uri"]
             conn.execute(
                 """
                 UPDATE books
-                SET storage_tier = ?, last_tiered_at = ?, metadata_json = ?, updated_at = ?
+                SET storage_tier = ?, original_uri = ?, reader_uri = ?, location_uri = ?,
+                    last_tiered_at = ?, metadata_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (target, now, json_dumps(metadata), now, row["id"]),
+                (target, original_uri, reader_uri, location_uri, now, json_dumps(metadata), now, row["id"]),
             )
         if not dry_run:
             audit_event(conn, action="archivist_apply_storage_tiering", target_type="books", target_id=None, payload={"actions": actions})

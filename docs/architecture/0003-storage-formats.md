@@ -64,7 +64,9 @@ Hermes and other agent shells can use this as an interchange format:
 - Hermes can emit atomic YAML; Epic Continuum can ingest and index it.
 - Epic Continuum can emit atomic YAML; Hermes can read it for handoff or recovery.
 - The Archivist can rebuild catalog rows from sidecars if the SQLite catalog is
-  damaged.
+  damaged. The core package includes a minimal reader for the deterministic YAML
+  subset it emits, so this rebuild path does not depend on a separate YAML
+  runtime.
 
 ## Thread Recovery Packets
 

@@ -55,6 +55,7 @@ RECOVERY_DRILL_SCHEMA = "epic_continuum.recovery_drill.v1"
 RESTORE_DRILL_SCHEMA = "epic_continuum.restore_drill.v1"
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
 ACTIVE_STATUSES = {"running"}
+_OPERATION_EVENT_HEAD_CACHE: dict[str, tuple[int, int, str | None]] = {}
 
 
 def safe_slug(value: str, limit: int = 96) -> str:
@@ -223,6 +224,30 @@ def _last_operation_event_hash(path: Path) -> str | None:
     return payload.get("event_hash")
 
 
+def _cached_last_operation_event_hash(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return _last_operation_event_hash(path)
+    key = str(path.resolve(strict=False))
+    cached = _OPERATION_EVENT_HEAD_CACHE.get(key)
+    if cached and cached[0] == stat.st_size and cached[1] == stat.st_mtime_ns:
+        return cached[2]
+    head = _last_operation_event_hash(path)
+    _OPERATION_EVENT_HEAD_CACHE[key] = (stat.st_size, stat.st_mtime_ns, head)
+    return head
+
+
+def _remember_operation_event_hash(path: Path, event_hash: str | None) -> None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    _OPERATION_EVENT_HEAD_CACHE[str(path.resolve(strict=False))] = (stat.st_size, stat.st_mtime_ns, event_hash)
+
+
 def append_operation_event(
     root: Path,
     operation_id: str,
@@ -231,7 +256,7 @@ def append_operation_event(
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     paths = operation_event_paths(root, operation_id)
-    previous_hash = _last_operation_event_hash(paths["run"])
+    previous_hash = _cached_last_operation_event_hash(paths["run"])
     event = {
         "schema": OPERATION_EVENT_SCHEMA,
         "event_id": unique_id("opevt"),
@@ -246,6 +271,7 @@ def append_operation_event(
     event["event_hash"] = _operation_event_hash(event)
     for path in paths.values():
         append_jsonl(path, event)
+        _remember_operation_event_hash(path, str(event["event_hash"]))
     return event
 
 
@@ -1856,7 +1882,19 @@ class OperationGuard:
             }
             self.final_receipt = finish_operation(self.root, self.operation_id, status="failed", error=error)
             if self.proof:
-                create_proof_pack(self.root, self.operation_id, touched_paths=self.touched_paths)
+                try:
+                    create_proof_pack(self.root, self.operation_id, touched_paths=self.touched_paths)
+                except Exception as proof_exc:
+                    try:
+                        record_operation_progress(
+                            self.root,
+                            self.operation_id,
+                            phase="proof_pack_failed",
+                            message=str(proof_exc),
+                            detail={"error_type": type(proof_exc).__name__},
+                        )
+                    except Exception:
+                        pass
             self.finished = True
             return False
         self.succeed({})
@@ -1896,7 +1934,19 @@ class OperationGuard:
         self.final_receipt = finish_operation(self.root, self.operation_id, status="succeeded", result=result)
         if self.proof:
             proof_paths = [*self.touched_paths, *(touched_paths or [])]
-            create_proof_pack(self.root, self.operation_id, touched_paths=proof_paths, extra=proof_extra)
+            try:
+                create_proof_pack(self.root, self.operation_id, touched_paths=proof_paths, extra=proof_extra)
+            except Exception as proof_exc:
+                try:
+                    record_operation_progress(
+                        self.root,
+                        self.operation_id,
+                        phase="proof_pack_failed",
+                        message=str(proof_exc),
+                        detail={"error_type": type(proof_exc).__name__},
+                    )
+                except Exception:
+                    pass
             self.final_receipt = read_operation(self.root, self.operation_id)
         self.finished = True
         return self.final_receipt

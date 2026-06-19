@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 import tempfile
@@ -326,6 +327,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             from continuum.core.store import ingest_file
 
             book = ingest_file(root, path=source, storage_tier="hot")
+            old_original = Path(book["original_uri"])
+            old_reader = Path(book["reader_uri"])
             tiered = apply_storage_tiering(root)
             health = memory_health(root)
             evals = run_memory_quality_evals(root)
@@ -336,10 +339,52 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertTrue(evals["ok"], evals["scores"])
             conn = connect_existing(root)
             try:
-                tier = conn.execute("SELECT storage_tier FROM books WHERE id = ?", (book["book_id"],)).fetchone()["storage_tier"]
+                row = conn.execute("SELECT storage_tier, original_uri, reader_uri FROM books WHERE id = ?", (book["book_id"],)).fetchone()
             finally:
                 conn.close()
-            self.assertEqual(tier, "warm")
+            self.assertEqual(row["storage_tier"], "warm")
+            self.assertIn("archive/originals/warm/", row["original_uri"])
+            self.assertIn("archive/reader_editions/warm/", row["reader_uri"])
+            self.assertFalse(old_original.exists())
+            self.assertFalse(old_reader.exists())
+            self.assertTrue((root / row["original_uri"]).exists())
+            self.assertTrue((root / row["reader_uri"]).exists())
+
+    def test_non_preemptible_expired_worker_lease_is_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            expired = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=30)).replace(microsecond=0).isoformat()
+            conn = sqlite3.connect(root / "catalog" / "catalog.sqlite3")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible, attempt_count,
+                        lease_owner, lease_expires_at, heartbeat_at, related_card_ids_json,
+                        payload_json, created_at, updated_at, started_at
+                    )
+                    VALUES(
+                        'job_stale_nonpreemptible', 'archivist', 'verify_book_integrity', 10,
+                        'running', 0, 1, 'dead-worker', ?, ?, '[]', '{}', ?, ?, ?
+                    )
+                    """,
+                    (expired, expired, expired, expired, expired),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = run_worker_pass(root, roles=["archivist"], limit=1, maintenance=False)
+
+            self.assertEqual(result["reclaimed_expired_jobs"], 1)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute("SELECT status, error_json FROM queue_jobs WHERE id = 'job_stale_nonpreemptible'").fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row["status"], "failed")
+            self.assertIn("non_preemptible_worker_lease_expired", row["error_json"])
 
     def test_conflict_detection_marks_related_cards(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,6 +22,8 @@ CAPTURE_FLAG_BY_KIND = {
 # `summarize_and_link` is accepted only as a legacy alias for older configs.
 LARGE_RESULT_POLICIES = {"truncate_with_notice", "summarize_and_link", "truncate", "skip"}
 PRUNE_POLICIES = {"ask", "manual", "auto_tier_only", "auto_prune"}
+SNAPSHOT_RETENTION_POLICIES = {"last_20", "keep_all"}
+PROOF_PACK_RETENTION_POLICIES = {"keep_successful_90_days", "keep_all"}
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +223,10 @@ def validate_config(config: dict[str, Any]) -> None:
         parse_size(retention["max_root_size"])
     if retention.get("prune_policy", "ask") not in PRUNE_POLICIES:
         raise ValueError("retention.prune_policy must be ask, manual, auto_tier_only, or auto_prune")
+    if retention.get("snapshot_retention", "last_20") not in SNAPSHOT_RETENTION_POLICIES:
+        raise ValueError("retention.snapshot_retention must be last_20 or keep_all")
+    if retention.get("proof_pack_retention", "keep_successful_90_days") not in PROOF_PACK_RETENTION_POLICIES:
+        raise ValueError("retention.proof_pack_retention must be keep_successful_90_days or keep_all")
     if retention.get("delete_raw_evidence") and retention.get("prune_policy") not in {"ask", "manual"}:
         raise ValueError("retention.delete_raw_evidence requires ask or manual prune_policy")
     learning = config.get("learning", {})

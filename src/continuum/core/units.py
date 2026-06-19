@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+from decimal import Decimal, InvalidOperation
 
 
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?B)?\s*$", re.IGNORECASE)
@@ -16,14 +18,23 @@ UNITS = {
 
 def parse_size(value: str | int | float) -> int:
     """Parse byte sizes such as 512MB, 4GB, or 1024."""
-    if isinstance(value, (int, float)):
+    if isinstance(value, bool):
+        raise ValueError("size must be numeric, not boolean")
+    if isinstance(value, int):
         if value < 0:
             raise ValueError("size must be non-negative")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("size must be a finite non-negative value")
         return int(value)
-    match = SIZE_RE.match(value)
+    match = SIZE_RE.match(str(value))
     if not match:
         raise ValueError(f"invalid size: {value!r}")
-    number = float(match.group(1))
+    try:
+        number = Decimal(match.group(1))
+    except InvalidOperation as exc:
+        raise ValueError(f"invalid size: {value!r}") from exc
     unit = match.group(2).upper() if match.group(2) else None
     if unit not in UNITS:
         raise ValueError(f"unsupported size unit: {unit}")

@@ -19,7 +19,10 @@ class EpicContinuumConfigTest(unittest.TestCase):
         self.assertEqual(parse_size("128MB"), 128 * 1024**2)
         self.assertEqual(parse_size("4GB"), 4 * 1024**3)
         self.assertEqual(parse_size("1TB"), 1024**4)
+        self.assertEqual(parse_size("1.1TB"), int(1.1 * 1024**4))
         self.assertEqual(parse_size("1048576"), 1024**2)
+        with self.assertRaises(ValueError):
+            parse_size(float("nan"))
 
     def test_format_size_round_trips_for_status_display(self) -> None:
         self.assertEqual(format_size(parse_size("512MB")), "512.00MB")
@@ -653,6 +656,16 @@ class EpicContinuumConfigTest(unittest.TestCase):
         config = default_config()
         config["retention"]["raw_scroll_hot_days"] = 100
         config["retention"]["raw_scroll_warm_days"] = 30
+        with self.assertRaises(ValueError):
+            validate_config(config)
+
+        config = default_config()
+        config["retention"]["snapshot_retention"] = "last-twenty"
+        with self.assertRaises(ValueError):
+            validate_config(config)
+
+        config = default_config()
+        config["retention"]["proof_pack_retention"] = "ninety-days"
         with self.assertRaises(ValueError):
             validate_config(config)
 

@@ -4,6 +4,7 @@ import copy
 import ctypes
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -114,11 +115,23 @@ def detect_system_ram_bytes() -> tuple[int | None, str]:
     return None, "unknown"
 
 
-def detect_vram_bytes() -> tuple[int | None, str]:
-    override = os.getenv("CONTINUUM_VRAM")
-    if override:
-        return parse_size(override), "CONTINUUM_VRAM"
+def _parse_memory_tokens(text: str) -> list[int]:
+    values: list[int] = []
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([KMGT]i?B|B)\b", text, flags=re.IGNORECASE):
+        normalized = unit.upper().replace("IB", "B")
+        try:
+            values.append(parse_size(f"{number}{normalized}"))
+        except ValueError:
+            continue
+    for number in re.findall(r"\b(?:VRAM|MEMORY)[^:\n]*\((?:B|BYTES)\)\s*:\s*(\d+)\b", text, flags=re.IGNORECASE):
+        try:
+            values.append(int(number))
+        except ValueError:
+            continue
+    return values
 
+
+def _detect_nvidia_vram_bytes() -> tuple[int | None, str]:
     try:
         proc = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
@@ -141,6 +154,63 @@ def detect_vram_bytes() -> tuple[int | None, str]:
     if values:
         return max(values), "nvidia-smi max_gpu_memory"
     return None, "nvidia-smi empty"
+
+
+def _detect_amd_vram_bytes() -> tuple[int | None, str]:
+    for command in (
+        ["rocm-smi", "--showmeminfo", "vram"],
+        ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+    ):
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            continue
+        if proc.returncode != 0:
+            continue
+        values = _parse_memory_tokens(f"{proc.stdout}\n{proc.stderr}")
+        if values:
+            return max(values), "rocm-smi max_gpu_memory"
+    return None, "rocm-smi unavailable"
+
+
+def _detect_macos_vram_bytes() -> tuple[int | None, str]:
+    if platform.system().lower() != "darwin":
+        return None, "not macOS"
+    try:
+        proc = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        vram_lines = "\n".join(line for line in proc.stdout.splitlines() if "VRAM" in line.upper())
+        values = _parse_memory_tokens(vram_lines)
+        if values:
+            return max(values), "system_profiler display_vram"
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        ram, source = detect_system_ram_bytes()
+        if ram is not None:
+            return ram, f"apple_unified_memory:{source}"
+    return None, "macOS VRAM unavailable"
+
+
+def detect_vram_bytes() -> tuple[int | None, str]:
+    override = os.getenv("CONTINUUM_VRAM")
+    if override:
+        return parse_size(override), "CONTINUUM_VRAM"
+
+    reasons: list[str] = []
+    for probe in (_detect_nvidia_vram_bytes, _detect_amd_vram_bytes, _detect_macos_vram_bytes):
+        value, source = probe()
+        if value is not None:
+            return value, source
+        reasons.append(source)
+    return None, "; ".join(reasons)
 
 
 def detect_hardware(root: Path) -> dict[str, Any]:

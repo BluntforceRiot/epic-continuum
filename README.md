@@ -393,7 +393,8 @@ that backup instead of the live WAL database.
 Epic Continuum uses SQLite for indexed memory and atomic YAML sidecars for portable
 memory units. Card sidecars live under `catalog/cards/*.yaml` by default. They
 are meant for human review, git diffs, Hermes handoff, and rebuild/recovery
-workflows.
+workflows. The bundled atomic YAML reader handles the deterministic subset Epic
+Continuum writes, keeping sidecar rebuilds dependency-light.
 
 ## Storage Layout
 

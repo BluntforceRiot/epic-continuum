@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +279,15 @@ def _redacted_key_name(key: Any) -> Any:
     return f"redacted_key_{digest}"
 
 
+def _secret_hash_payload(secret: str, *, allow_low_entropy_hash: bool = True) -> dict[str, Any]:
+    payload = {"secret_hash": hashlib.sha256(secret.encode("utf-8", errors="replace")).hexdigest()}
+    if allow_low_entropy_hash or len(secret) >= 20 or _shannon_entropy(secret) >= 3.5:
+        return payload
+    payload["secret_hash_risk"] = "low_entropy_secret_value"
+    payload["secret_hash_note"] = "Stable unsalted hash retained for allowlist compatibility; avoid sharing raw audit output."
+    return payload
+
+
 def redact_value_secrets(value: Any) -> Any:
     """Recursively redact obvious secrets from JSON-like metadata values and keys."""
     if isinstance(value, dict):
@@ -311,7 +321,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                         "type": name,
                         "line": line_number,
                         "snippet": _redact_line(line, match),
-                        "secret_hash": hashlib.sha256(match.group(0).encode("utf-8", errors="replace")).hexdigest(),
+                        **_secret_hash_payload(match.group(0)),
                     }
                 )
                 line_had_finding = True
@@ -326,7 +336,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                         "type": "sensitive_key_assignment",
                         "line": line_number,
                         "snippet": _redact_sensitive_assignment_line(line).strip()[:240],
-                        "secret_hash": hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest(),
+                        **_secret_hash_payload(value, allow_low_entropy_hash=False),
                         "metadata_path": f"$.{_safe_metadata_path_part(key)}",
                     }
                 )
@@ -340,7 +350,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                         "type": "sensitive_key_assignment",
                         "line": line_number,
                         "snippet": _redact_embedded_sensitive_assignments(line).strip()[:240],
-                        "secret_hash": hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest(),
+                        **_secret_hash_payload(value, allow_low_entropy_hash=False),
                         "metadata_path": f"$.{_safe_metadata_path_part(key)}",
                     }
                 )
@@ -352,7 +362,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
 def _shannon_entropy(value: str) -> float:
     if not value:
         return 0.0
-    counts = {char: value.count(char) for char in set(value)}
+    counts = Counter(value)
     length = len(value)
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
@@ -381,7 +391,7 @@ def scan_text_for_entropy_secrets(
                     "type": "high_entropy_token",
                     "line": line_number,
                     "snippet": snippet,
-                    "secret_hash": hashlib.sha256(token.encode("utf-8", errors="replace")).hexdigest(),
+                    **_secret_hash_payload(token),
                     "entropy": round(entropy, 3),
                     "length": len(token),
                 }
@@ -419,7 +429,7 @@ def _scan_sensitive_key_findings(
                         "type": "sensitive_metadata_key",
                         "line": 1,
                         "snippet": f"{key_part}=[REDACTED]",
-                        "secret_hash": hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest(),
+                        **_secret_hash_payload(material, allow_low_entropy_hash=False),
                         "scope": scope,
                         "metadata_path": nested_path,
                     }

@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import continuum
-from continuum.core.atomic import atomic_memory_card, dump_yaml
+from continuum.core.atomic import atomic_memory_card, dump_yaml, load_atomic_yaml
 from continuum.core.config import load_config, write_config
 from continuum.core.store import (
     append_scroll_event,
@@ -78,6 +78,11 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             self.assertIn(key, card)
         self.assertEqual(card["card_id"], card["id"])
         self.assertIn("metadata: {}", dump_yaml(card))
+        self.assertEqual(load_atomic_yaml(dump_yaml(card)), card)
+
+    def test_atomic_yaml_rejects_non_finite_floats(self) -> None:
+        with self.assertRaises(ValueError):
+            dump_yaml({"salience": float("nan")})
 
     def test_status_can_read_missing_root_without_initializing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -193,6 +198,8 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             )
             self.assertTrue(Path(recovery["packet_uri"]).exists())
             self.assertIn("Epic Continuum Thread Recovery: core-flow", recovery["packet_text"])
+            self.assertIn("Epic Continuum root: `<continuum-root>`", recovery["packet_text"])
+            self.assertNotIn(str(root), recovery["packet_text"])
             self.assertIn("Decision: keep Aurora engine notes hot", recovery["packet_text"])
             self.assertGreaterEqual(recovery["recent_event_count"], 2)
             self.assertGreaterEqual(recovery["card_count"], 1)
@@ -297,6 +304,18 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             self.assertIn(search["backend"], {"fts5", "like"})
             self.assertGreaterEqual(search["result_count"], 1)
             self.assertIn("Helios Source Notes", search["results"][0]["title"])
+
+    def test_search_memory_quotes_structured_tokens_for_fts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            source = Path(tmp) / "structured-token.txt"
+            source.write_text("Document DOW-UAP-D077 and file:C:/uap/drop-03 are indexed.\n", encoding="utf-8")
+            ingest_file(root, path=source, title="Structured Token Source")
+
+            result = search_memory(root, query="DOW-UAP-D077 file:C:/uap/drop-03")
+
+            self.assertEqual(result["backend"], "fts5", result)
+            self.assertGreaterEqual(result["result_count"], 1)
 
     def test_snapshots_do_not_collide_in_bursts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

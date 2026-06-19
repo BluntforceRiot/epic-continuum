@@ -101,11 +101,36 @@ class RootBundleTest(unittest.TestCase):
         self.assertFalse(_is_transient(Path("archive/evidence-wal.txt")))
         self.assertTrue(_is_transient(Path("build/release.tmp")))
         self.assertTrue(_is_transient(Path("run/work/__pycache__/worker.pyc")))
+        self.assertTrue(_is_transient(Path("run/recovery_drills/drill_1/exports/proof_packs/op.json")))
+        self.assertTrue(_is_transient(Path("run/restore_drills/restore_1/exports/restore_drills/result.json")))
         self.assertFalse(_is_transient(Path("archive/originals/hot/project/build/evidence.txt")))
         self.assertFalse(_is_transient(Path("archive/originals/hot/package.egg-info")))
         self.assertFalse(_is_transient(Path("archive/originals/hot/evidence.db-wal")))
         self.assertFalse(_is_transient(Path("archive/originals/hot/.evidence.tmp")))
         self.assertFalse(_is_transient(Path("archive/originals/hot/evidence.pyc")))
+
+    def test_pack_root_after_verify_root_restore_drill_skips_transient_run_drills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "continuum-shareable.zip"
+            init_db(root)
+
+            verified = verify_root(root, strict=True, run_restore_drill=True, verify_recent_proof_packs=0)
+            self.assertTrue(verified["ok"], verified)
+            self.assertTrue((root / "run" / "restore_drills").exists())
+            self.assertTrue(audit_portable_metadata(root)["ok"])
+
+            result = pack_root(root, out_path=output)
+            self.assertTrue(result["ok"], result)
+            with zipfile.ZipFile(output) as archive:
+                members = archive.namelist()
+            self.assertFalse(
+                any(member.startswith(f"{BUNDLE_ROOT_NAME}/run/restore_drills/") for member in members)
+            )
+            self.assertFalse(
+                any(member.startswith(f"{BUNDLE_ROOT_NAME}/run/recovery_drills/") for member in members)
+            )
 
     def test_shareable_bundle_preserves_nested_generic_evidence_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

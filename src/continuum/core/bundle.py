@@ -46,6 +46,8 @@ SUPPORTED_SYMLINK_POLICIES = {"fail", "skip"}
 _TRANSIENT_PROCESS_PARTS = {".git", ".venv", "__pycache__", ".pytest_cache", "build"}
 _TRANSIENT_PREFIXES = (
     PurePosixPath("run/locks"),
+    PurePosixPath("run/recovery_drills"),
+    PurePosixPath("run/restore_drills"),
 )
 _TRANSIENT_NAMES = {
     "catalog/catalog.sqlite3-wal",
@@ -736,6 +738,8 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
         if _is_link_like(file_path) or not file_path.is_file():
             continue
         rel = file_path.relative_to(root)
+        if _is_transient(rel):
+            continue
         if not _is_metadata_file(rel):
             continue
         json_files_scanned += 1

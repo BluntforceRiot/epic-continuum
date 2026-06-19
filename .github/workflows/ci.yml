@@ -107,7 +107,7 @@ jobs:
             --python python \
             --stage-only
           test -f "${RUNNER_TEMP}/codex-stage-sh/keep.txt"
-          test -f "${RUNNER_TEMP}/codex-stage-sh"/continuum-*/plugins/continuum/.mcp.json
+          test -f "${RUNNER_TEMP}/codex-stage-sh"/epic-continuum/plugins/continuum/.mcp.json
 
           bash scripts/install_hermes_adapter.sh \
             --root "${RUNNER_TEMP}/continuum-hermes-sh" \
@@ -123,7 +123,7 @@ jobs:
               -Python python \
               -StageOnly
             test -f "${RUNNER_TEMP}/codex-stage-ps/keep.txt"
-            test -f "${RUNNER_TEMP}/codex-stage-ps"/continuum-*/plugins/continuum/.mcp.json
+            test -f "${RUNNER_TEMP}/codex-stage-ps"/epic-continuum/plugins/continuum/.mcp.json
 
             pwsh -NoProfile -File scripts/install_hermes_adapter.ps1 \
               -Root "${RUNNER_TEMP}/continuum-hermes-ps" \

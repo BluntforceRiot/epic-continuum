@@ -20,6 +20,7 @@
   <a href="#the-problem">The Problem</a>
   &middot; <a href="#how-memory-works">Memory</a>
   &middot; <a href="#how-the-context-window-works">Context Window</a>
+  &middot; <a href="#what-this-looks-like-in-codex">Codex Flow</a>
   &middot; <a href="#how-continuum-keeps-work-from-being-lost">Recovery</a>
   &middot; <a href="#quick-start">Quick Start</a>
   &middot; <a href="#mcp-and-agent-integrations">Integrations</a>
@@ -135,6 +136,31 @@ The model's native context remains finite. Epic Continuum works around that limi
 
 The Looking Glass is not the entire memory store. It is a bounded view over durable memory.
 
+Think of the model context as the agent's current working set. It is fast, but it has a hard size limit and disappears when the session is gone. Continuum is the durable state beside it: Scroll entries, Cards, Library evidence, operations, receipts, and snapshots. The Looking Glass is the selected slice of that durable state that gets brought back into the model for the next turn.
+
+That means Continuum does not make a 16K, 64K, or 200K model internally larger. Instead, it gives the agent a fast external memory loop:
+
+```text
+conversation/tool activity
+        |
+        v
+capture to durable Scroll and operations
+        |
+        v
+compact into Cards and searchable Library evidence
+        |
+        v
+retrieve the relevant subset
+        |
+        v
+compile a token-bounded Looking Glass packet
+        |
+        v
+agent receives only what it needs right now
+```
+
+The context window still has a budget. Continuum makes that budget repeatable, inspectable, and recoverable.
+
 ### Current context-compilation flow
 
 When `compile-context` runs, Continuum:
@@ -185,6 +211,38 @@ An ever-growing prompt eventually forces silent truncation, aggressive summariza
 - compressed conclusions survive while their evidence vanishes.
 
 Continuum keeps the durable record outside the prompt. Context can be rebuilt repeatedly without deleting the source history.
+
+## What This Looks Like In Codex
+
+When the Codex plugin is installed, Epic Continuum becomes part of the agent's toolbelt through MCP. Codex can call Continuum tools during a normal conversation to record what just happened, check memory health, compile context, or recover a previous thread.
+
+In practice, the loop feels simple:
+
+```text
+You: Remember that the release blocker is the Windows reparse-point health bug.
+Codex: writes that event into the Scroll through Continuum.
+
+You: What were we doing before the restart?
+Codex: asks Continuum for status and recovery context.
+Continuum: returns recent events, Cards, open tasks, and operation receipts.
+Codex: answers with the current state instead of starting cold.
+```
+
+The memory is not stored inside one Codex chat. It is stored in the configured Continuum root. A restarted Codex thread, another Codex session, or another MCP-compatible agent can point at that same root and recover the same project state.
+
+This is why a useful memory can appear "a few seconds later": the agent is not waiting for a model to retrain or for a giant transcript to be pasted back in. It writes a small structured event locally, then retrieves or compiles that local state when it is needed.
+
+Typical Codex commands are conversational:
+
+```text
+"Remember this decision."
+"Recover the thread from yesterday."
+"Check Continuum status before we continue."
+"Compile the current release context."
+"Write a recovery packet before we switch tasks."
+```
+
+Under the hood those requests map to tools such as `continuum_append_event`, `continuum_status`, `continuum_compile_context`, `continuum_recover_thread`, and `continuum_snapshot`.
 
 ## How Continuum Keeps Work From Being Lost
 

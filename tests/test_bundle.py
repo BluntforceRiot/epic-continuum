@@ -22,6 +22,7 @@ from continuum.core.bundle import (
     _is_transient,
     _manifest_hash,
     _write_zip_member,
+    _zip_envelope_errors,
     _zip_member_is_safe,
     audit_portable_metadata,
     pack_root,
@@ -78,7 +79,12 @@ def _write_canonical_bundle_from_root(
     ) as archive:
         for path in paths:
             rel = path.relative_to(embedded_root).as_posix()
-            _write_zip_member(archive, path, arcname=f"{BUNDLE_ROOT_NAME}/{rel}")
+            _write_zip_member(
+                archive,
+                path,
+                arcname=f"{BUNDLE_ROOT_NAME}/{rel}",
+                mode_override=0o644 if rel == BUNDLE_MANIFEST_NAME else None,
+            )
 
 
 class RootBundleTest(unittest.TestCase):
@@ -440,6 +446,37 @@ class RootBundleTest(unittest.TestCase):
                     profile="shareable",
                     run_restore_drill=False,
                 )
+
+    def test_portable_skip_never_follows_symlinked_catalog_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            external = base / "external"
+            init_db(external)
+
+            for link_parent in (False, True):
+                with self.subTest(link_parent=link_parent):
+                    root = base / ("root-parent-link" if link_parent else "root-db-link")
+                    init_db(root)
+                    try:
+                        if link_parent:
+                            shutil.rmtree(root / "catalog")
+                            (root / "catalog").symlink_to(external / "catalog", target_is_directory=True)
+                        else:
+                            (root / "catalog" / "catalog.sqlite3").unlink()
+                            (root / "catalog" / "catalog.sqlite3").symlink_to(
+                                external / "catalog" / "catalog.sqlite3"
+                            )
+                    except (OSError, NotImplementedError) as exc:
+                        self.skipTest(f"symlink creation unavailable: {exc}")
+
+                    with self.assertRaisesRegex(ValueError, "regular in-root file"):
+                        pack_root(
+                            root,
+                            out_path=base / f"should-not-exist-{link_parent}.zip",
+                            profile="portable",
+                            symlink_policy="skip",
+                            run_restore_drill=False,
+                        )
 
     def test_verify_root_bundle_rejects_tampered_member(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -855,6 +892,142 @@ class RootBundleTest(unittest.TestCase):
             result = verify_root_bundle(mutated)
             self.assertFalse(result["ok"], result)
             self.assertIn("zip64_not_required", json.dumps(result["errors"]))
+
+    def test_zip64_canonicality_tracks_python_writer_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(zipfile, "ZIP64_LIMIT", 1024):
+            base = Path(tmp)
+
+            local_only_source = base / "local-only.bin"
+            local_only_source.write_bytes(b"A" * 1000)
+            local_only_zip = base / "local-only.zip"
+            with zipfile.ZipFile(local_only_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                _write_zip_member(archive, local_only_source, arcname=local_only_source.name)
+            with zipfile.ZipFile(local_only_zip) as archive:
+                infos = archive.infolist()
+                self.assertEqual(infos[0].extract_version, 45)
+                self.assertEqual(infos[0].extra, b"")
+                self.assertEqual(_zip_envelope_errors(local_only_zip, infos), [])
+
+            member_source = base / "member.bin"
+            member_source.write_bytes(b"B" * 1100)
+            member_zip = base / "member.zip"
+            with zipfile.ZipFile(member_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                _write_zip_member(archive, member_source, arcname=member_source.name)
+            with zipfile.ZipFile(member_zip) as archive:
+                infos = archive.infolist()
+                self.assertEqual(infos[0].extract_version, 45)
+                self.assertTrue(infos[0].extra)
+                self.assertEqual(_zip_envelope_errors(member_zip, infos), [])
+
+            offset_zip = base / "offset.zip"
+            sources: list[Path] = []
+            for index in range(20):
+                source = base / f"offset-{index:02d}.bin"
+                source.write_bytes(bytes((index * 37 + value * 13) % 256 for value in range(100)))
+                sources.append(source)
+            with zipfile.ZipFile(offset_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for source in sources:
+                    _write_zip_member(archive, source, arcname=source.name)
+            with zipfile.ZipFile(offset_zip) as archive:
+                infos = archive.infolist()
+                later = next(info for info in infos if info.header_offset > zipfile.ZIP64_LIMIT)
+                self.assertEqual(later.extract_version, 45)
+                with offset_zip.open("rb") as handle:
+                    handle.seek(later.header_offset + 4)
+                    local_needed = struct.unpack("<H", handle.read(2))[0]
+                self.assertEqual(local_needed, 20)
+                self.assertEqual(_zip_envelope_errors(offset_zip, infos), [])
+
+    def test_zip64_count_boundary_tracks_python_writer_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 3):
+            base = Path(tmp)
+            archive_path = base / "count-boundary.zip"
+            sources: list[Path] = []
+            for index in range(5):
+                source = base / f"count-{index}.txt"
+                source.write_text(str(index), encoding="utf-8")
+                sources.append(source)
+
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for source in sources:
+                    _write_zip_member(archive, source, arcname=source.name)
+
+            with zipfile.ZipFile(archive_path) as archive:
+                infos = archive.infolist()
+                self.assertEqual(len(infos), 5)
+                self.assertEqual(_zip_envelope_errors(archive_path, infos), [])
+
+    def test_bundle_packer_self_verifies_across_reduced_zip64_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(zipfile, "ZIP64_LIMIT", 4096):
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "continuum.zip"
+            init_db(root)
+
+            result = pack_root(root, out_path=output, run_restore_drill=False)
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(verify_root_bundle(output)["ok"])
+
+    def test_bundle_verifier_rejects_unnecessary_member_zip64_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            archive_path = base / "unnecessary-member-zip64.zip"
+            info = zipfile.ZipInfo("tiny.txt", date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.file_size = 4
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                with archive.open(info, "w", force_zip64=True) as destination:
+                    destination.write(b"tiny")
+
+            with zipfile.ZipFile(archive_path) as archive:
+                errors = _zip_envelope_errors(archive_path, archive.infolist())
+
+            rendered = json.dumps(errors)
+            self.assertIn("zip_local_zip64_layout_noncanonical", rendered)
+
+    def test_bundle_verifier_binds_manifest_member_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            clean = base / "clean.zip"
+            mutated = base / "manifest-mode.zip"
+            init_db(root)
+            pack_root(root, out_path=clean, run_restore_drill=False)
+
+            data = bytearray(clean.read_bytes())
+            manifest_member = f"{BUNDLE_ROOT_NAME}/{BUNDLE_MANIFEST_NAME}"
+            with zipfile.ZipFile(clean) as archive:
+                target = archive.getinfo(manifest_member)
+
+            eocd_offset = data.rfind(b"PK\x05\x06")
+            self.assertGreaterEqual(eocd_offset, 0)
+            central_offset = struct.unpack_from("<I", data, eocd_offset + 16)[0]
+            cursor = central_offset
+            found = False
+            while cursor < eocd_offset:
+                self.assertEqual(data[cursor : cursor + 4], b"PK\x01\x02")
+                values = struct.unpack_from("<IHHHHHHIIIHHHHHII", data, cursor)
+                name_length = values[10]
+                extra_length = values[11]
+                comment_length = values[12]
+                name = bytes(data[cursor + 46 : cursor + 46 + name_length]).decode("utf-8")
+                if name == target.filename:
+                    external_attr = struct.unpack_from("<I", data, cursor + 38)[0]
+                    raw_mode = external_attr >> 16
+                    changed_mode = (stat.S_IFMT(raw_mode) | 0o773) << 16
+                    struct.pack_into("<I", data, cursor + 38, changed_mode)
+                    found = True
+                    break
+                cursor += 46 + name_length + extra_length + comment_length
+            self.assertTrue(found)
+            mutated.write_bytes(data)
+
+            result = verify_root_bundle(mutated, verify_embedded_root=False)
+            self.assertFalse(result["ok"], result)
+            self.assertIn("manifest_member_mode_noncanonical", json.dumps(result["errors"]))
 
     def test_bundle_verifier_fails_closed_on_unsupported_central_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

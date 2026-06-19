@@ -71,6 +71,29 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
+def _is_link_like(path: Path) -> bool:
+    """Treat POSIX symlinks and Windows reparse-point links as references."""
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        pass
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            if is_junction():
+                return True
+        except OSError:
+            pass
+    try:
+        stat_result = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(stat_result, "st_file_attributes", 0)
+    return bool(reparse_flag and (file_attributes & reparse_flag))
+
+
 def _safe_rel_text(rel: Path) -> dict[str, Any]:
     raw = rel.as_posix()
     findings = scan_text_for_secrets(raw, max_findings=1)
@@ -112,6 +135,14 @@ def _is_transient(rel: Path) -> bool:
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:
+    if _is_link_like(source):
+        raise ValueError(
+            "refusing to back up a symlink, junction, or reparse-point "
+            f"database: {source}"
+        )
+    source_stat = source.stat(follow_symlinks=False)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError(f"refusing to back up a non-regular database: {source}")
     secure_mkdir(destination.parent)
     source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     destination_conn = sqlite3.connect(str(destination))
@@ -122,6 +153,24 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
         destination_conn.close()
         source_conn.close()
     secure_sqlite_files(destination)
+
+
+def _catalog_database_for_bundle(root: Path) -> Path:
+    """Return the live catalog only when its in-root path is a regular file."""
+    catalog_dir = root / "catalog"
+    source_db = catalog_dir / "catalog.sqlite3"
+    if _is_link_like(catalog_dir) or _is_link_like(source_db):
+        raise ValueError(
+            "bundle catalog/catalog.sqlite3 must be a regular in-root file; "
+            "symlinks, junctions, and reparse points are not supported"
+        )
+    try:
+        source_stat = source_db.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        raise FileNotFoundError(str(source_db)) from None
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError(f"bundle catalog database is not a regular file: {source_db}")
+    return source_db
 
 
 def _artifact_row_count(root: Path) -> int:
@@ -338,7 +387,7 @@ def _sqlite_database_paths(root: Path) -> list[Path]:
     """
     databases: list[Path] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_symlink() or not path.is_file() or path.suffix.casefold() not in _SQLITE_SUFFIXES:
+        if _is_link_like(path) or not path.is_file() or path.suffix.casefold() not in _SQLITE_SUFFIXES:
             continue
         try:
             rel = path.relative_to(root)
@@ -639,7 +688,7 @@ def _audit_yaml_portable_metadata(
     ):
         if len(findings) >= max_findings:
             break
-        if file_path.is_symlink() or not file_path.is_file():
+        if _is_link_like(file_path) or not file_path.is_file():
             continue
         rel = file_path.relative_to(root).as_posix()
         try:
@@ -684,7 +733,7 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
     for file_path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         if len(findings) >= max_findings:
             break
-        if file_path.is_symlink() or not file_path.is_file():
+        if _is_link_like(file_path) or not file_path.is_file():
             continue
         rel = file_path.relative_to(root)
         if not _is_metadata_file(rel):
@@ -774,7 +823,7 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
 def _symlink_inventory(root: Path) -> list[dict[str, Any]]:
     inventory: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if not path.is_symlink():
+        if not _is_link_like(path):
             continue
         rel = path.relative_to(root)
         item = _safe_rel_text(rel)
@@ -809,9 +858,7 @@ def _copy_root_to_stage(
     skipped: list[dict[str, Any]] = []
     copied_files = 0
     copied_bytes = 0
-    source_db = root / "catalog" / "catalog.sqlite3"
-    if not source_db.exists():
-        raise FileNotFoundError(str(source_db))
+    source_db = _catalog_database_for_bundle(root)
 
     symlinks = _symlink_inventory(root)
     if symlinks and symlink_policy == "fail":
@@ -825,7 +872,7 @@ def _copy_root_to_stage(
         if _is_transient(rel):
             skipped.append({**_safe_rel_text(rel), "reason": "transient_excluded"})
             continue
-        if path.is_symlink():
+        if _is_link_like(path):
             skipped.append({**_safe_rel_text(rel), "reason": "symlink_skipped"})
             continue
         if path.is_dir():
@@ -856,8 +903,8 @@ def _file_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
     entries: list[dict[str, Any]] = []
     total_bytes = 0
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_symlink():
-            raise ValueError(f"staged bundle unexpectedly contains symlink: {path}")
+        if _is_link_like(path):
+            raise ValueError(f"staged bundle unexpectedly contains symlink or junction: {path}")
         if not path.is_file() or path.name == BUNDLE_MANIFEST_NAME:
             continue
         rel_path = path.relative_to(root)
@@ -1166,16 +1213,22 @@ def _strict_json_loads(text: str) -> Any:
     return json.loads(text, object_pairs_hook=reject_duplicate_keys, parse_constant=reject_nonfinite)
 
 
-def _write_zip_member(archive: zipfile.ZipFile, path: Path, *, arcname: str) -> None:
+def _write_zip_member(
+    archive: zipfile.ZipFile,
+    path: Path,
+    *,
+    arcname: str,
+    mode_override: int | None = None,
+) -> None:
     """Write one regular file with normalized timestamp and explicit POSIX mode."""
     stat_result = path.stat()
-    mode = stat.S_IMODE(stat_result.st_mode)
+    mode = stat.S_IMODE(stat_result.st_mode) if mode_override is None else stat.S_IMODE(mode_override)
     info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
     info.create_system = 3
     info.compress_type = zipfile.ZIP_DEFLATED
     info.external_attr = (stat.S_IFREG | mode) << 16
     info.file_size = stat_result.st_size
-    force_zip64 = stat_result.st_size >= _ZIP_UINT32_MAX
+    force_zip64 = _zip64_local_layout_required(stat_result.st_size, 0)
     with path.open("rb") as source, archive.open(info, "w", force_zip64=force_zip64) as destination:
         shutil.copyfileobj(source, destination, length=1024 * 1024)
 
@@ -1282,6 +1335,19 @@ _ZIP64_LOCATOR_SIGNATURE = 0x07064B50
 _ZIP64_EXTRA_ID = 0x0001
 _ZIP_UINT16_MAX = 0xFFFF
 _ZIP_UINT32_MAX = 0xFFFFFFFF
+
+
+def _zip64_local_layout_required(uncompressed_size: int, compressed_size: int) -> bool:
+    """Return the layout decision used by Python's seekable ZIP writer."""
+    return (
+        int(uncompressed_size) * 1.05 > zipfile.ZIP64_LIMIT
+        or int(compressed_size) > zipfile.ZIP64_LIMIT
+    )
+
+
+def _zip64_central_value_required(value: int) -> bool:
+    """Return whether Python's central-directory writer emits a Zip64 value."""
+    return int(value) > zipfile.ZIP64_LIMIT
 
 
 def _zip_extra_fields(extra: bytes) -> tuple[list[tuple[int, bytes]], str | None]:
@@ -1431,11 +1497,6 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
         central_size = central_size_32
         central_offset = central_offset_32
         central_boundary = eocd_offset
-        legacy_zip64_marker = (
-            total_entries == _ZIP_UINT16_MAX
-            or central_size_32 == _ZIP_UINT32_MAX
-            or central_offset_32 == _ZIP_UINT32_MAX
-        )
         locator_offset = eocd_offset - 20
         try:
             locator = _read_exact_at(handle, locator_offset, 20) if locator_offset >= 0 else b""
@@ -1446,12 +1507,11 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
             and struct.unpack_from("<I", locator)[0] == _ZIP64_LOCATOR_SIGNATURE
         )
 
-        # The maximum legacy values are also legitimate literal values, so do
-        # not require ZIP64 merely because an EOCD field equals its maximum.
-        # A canonical ZIP64 archive is identified by its adjacent locator.
+        # Python's writer begins using Zip64 end records at zipfile.ZIP64_LIMIT,
+        # while legacy EOCD fields can still contain literal values below the
+        # raw 0xffffffff boundary. Locator presence is therefore modeled
+        # against Python's writer contract, not only saturated legacy fields.
         if locator_present:
-            if not legacy_zip64_marker:
-                errors.append({"error": "zip64_locator_unexpected"})
             _locator_sig, zip64_disk, zip64_offset, zip64_disks = struct.unpack("<IIQI", locator)
             if zip64_disk != 0 or zip64_disks != 1:
                 errors.append({"error": "multi_disk_zip64_not_allowed"})
@@ -1499,9 +1559,9 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
             ):
                 errors.append({"error": "multi_disk_zip64_not_allowed"})
             zip64_required = (
-                zip64_entries_total > _ZIP_UINT16_MAX
-                or central_size > _ZIP_UINT32_MAX
-                or central_offset > _ZIP_UINT32_MAX
+                zip64_entries_total > zipfile.ZIP_FILECOUNT_LIMIT
+                or central_size > zipfile.ZIP64_LIMIT
+                or central_offset > zipfile.ZIP64_LIMIT
             )
             if not zip64_required:
                 errors.append({"error": "zip64_not_required"})
@@ -1514,6 +1574,12 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
                 errors.append({"error": "zip64_legacy_directory_fields_noncanonical"})
             total_entries = zip64_entries_total
             central_boundary = zip64_offset
+        elif (
+            total_entries > zipfile.ZIP_FILECOUNT_LIMIT
+            or central_size > zipfile.ZIP64_LIMIT
+            or central_offset > zipfile.ZIP64_LIMIT
+        ):
+            errors.append({"error": "zip64_eocd_required"})
 
         if total_entries != len(infos):
             errors.append(
@@ -1531,6 +1597,7 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
 
         cursor = central_offset
         central_index = 0
+        central_zip64_by_offset: dict[int, bool] = {}
         while cursor < min(central_end, file_size):
             try:
                 header = _read_exact_at(handle, cursor, 46)
@@ -1610,7 +1677,7 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
                         "member": name,
                     }
                 )
-            if disk_start not in {0, _ZIP_UINT16_MAX}:
+            if disk_start != 0:
                 errors.append(
                     {
                         "error": "zip_member_disk_start_invalid",
@@ -1618,13 +1685,23 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
                         "actual": disk_start,
                     }
                 )
-            central_uses_zip64 = (
-                uncompressed_32 == _ZIP_UINT32_MAX
-                or compressed_32 == _ZIP_UINT32_MAX
-                or local_offset_32 == _ZIP_UINT32_MAX
-                or disk_start == _ZIP_UINT16_MAX
+            expected_sizes_zip64 = (
+                _zip64_central_value_required(actual_uncompressed)
+                or _zip64_central_value_required(actual_compressed)
             )
-            expected_member_version = 45 if central_uses_zip64 else 20
+            expected_offset_zip64 = _zip64_central_value_required(actual_offset)
+            central_uses_zip64 = expected_sizes_zip64 or expected_offset_zip64
+            central_zip64_by_offset[actual_offset] = central_uses_zip64
+            expected_uncompressed_32 = _ZIP_UINT32_MAX if expected_sizes_zip64 else actual_uncompressed
+            expected_compressed_32 = _ZIP_UINT32_MAX if expected_sizes_zip64 else actual_compressed
+            expected_offset_32 = _ZIP_UINT32_MAX if expected_offset_zip64 else actual_offset
+            if (
+                uncompressed_32 != expected_uncompressed_32
+                or compressed_32 != expected_compressed_32
+                or local_offset_32 != expected_offset_32
+                or disk_start != 0
+            ):
+                errors.append({"error": "zip_central_zip64_layout_noncanonical", "member": name})
             extra_error = _zip64_extra_error(
                 extra,
                 raw_uncompressed=uncompressed_32,
@@ -1659,16 +1736,8 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
                     or _external_attr != info.external_attr
                 ):
                     errors.append({"error": "zip_central_metadata_mismatch", "member": name})
-                if uncompressed_32 not in {int(info.file_size), _ZIP_UINT32_MAX}:
-                    errors.append({"error": "zip_central_size_mismatch", "member": name})
-                if compressed_32 not in {int(info.compress_size), _ZIP_UINT32_MAX}:
-                    errors.append({"error": "zip_central_size_mismatch", "member": name})
-                if local_offset_32 not in {int(info.header_offset), _ZIP_UINT32_MAX}:
-                    errors.append({"error": "zip_central_offset_mismatch", "member": name})
                 if (
                     info.create_system != 3
-                    or info.create_version != expected_member_version
-                    or info.extract_version != expected_member_version
                     or info.date_time != (1980, 1, 1, 0, 0, 0)
                     or info.volume != 0
                     or info.internal_attr != 0
@@ -1738,19 +1807,26 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
             if (
                 flags != info.flag_bits
                 or compression != info.compress_type
-                or needed != info.extract_version
                 or crc != info.CRC
             ):
                 errors.append({"error": "zip_local_central_metadata_mismatch", "member": info.filename})
             local_uses_zip64 = compressed_32 == _ZIP_UINT32_MAX or uncompressed_32 == _ZIP_UINT32_MAX
-            expected_local_version = 45 if local_uses_zip64 else 20
+            expected_local_zip64 = _zip64_local_layout_required(int(info.file_size), int(info.compress_size))
+            expected_local_version = 45 if expected_local_zip64 else 20
+            expected_member_version = 45 if (
+                expected_local_zip64 or central_zip64_by_offset.get(offset, False)
+            ) else 20
             if needed != expected_local_version or mtime != 0 or mdate != 33:
                 errors.append({"error": "zip_local_metadata_noncanonical", "member": info.filename})
-            if local_uses_zip64:
+            if local_uses_zip64 != expected_local_zip64:
+                errors.append({"error": "zip_local_zip64_layout_noncanonical", "member": info.filename})
+            elif expected_local_zip64:
                 if compressed_32 != _ZIP_UINT32_MAX or uncompressed_32 != _ZIP_UINT32_MAX:
                     errors.append({"error": "zip_local_zip64_layout_noncanonical", "member": info.filename})
             elif compressed_32 != int(info.compress_size) or uncompressed_32 != int(info.file_size):
                 errors.append({"error": "zip_local_size_mismatch", "member": info.filename})
+            if info.create_version != expected_member_version or info.extract_version != expected_member_version:
+                errors.append({"error": "zip_member_metadata_noncanonical", "member": info.filename})
             if flags & 0x8:
                 errors.append({"error": "zip_data_descriptors_not_allowed", "member": info.filename})
             extra_error = _zip64_extra_error(
@@ -2120,6 +2196,16 @@ def verify_root_bundle(
             )
         else:
             info = archive.getinfo(manifest_member)
+            if info.create_system == 3:
+                manifest_mode = stat.S_IMODE(info.external_attr >> 16)
+                if manifest_mode != 0o644:
+                    errors.append(
+                        {
+                            "error": "manifest_member_mode_noncanonical",
+                            "expected": 0o644,
+                            "actual": manifest_mode,
+                        }
+                    )
             if info.file_size > 16 * 1024 * 1024:
                 errors.append({"error": "manifest_too_large", "size_bytes": info.file_size})
             else:
@@ -2354,7 +2440,7 @@ def _backup_existing_regular_file(path: Path) -> Path | None:
     """Create a same-directory rollback copy/link without disturbing the published path."""
     if not _path_lexists(path):
         return None
-    if path.is_symlink() or not path.is_file():
+    if _is_link_like(path) or not path.is_file():
         raise ValueError(f"refusing to replace non-regular output path: {path}")
     fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.rollback.", suffix=".bak", dir=path.parent)
     os.close(fd)
@@ -2426,6 +2512,7 @@ def pack_root(
         raise ValueError("shareable bundles require symlink_policy='fail' so no evidence is silently omitted")
     if not is_initialized(root):
         raise ValueError(f"Continuum root is not initialized: {root}")
+    _catalog_database_for_bundle(root)
     if out_path.suffix.casefold() != ".zip":
         raise ValueError("root bundles currently use .zip output; choose an output path ending in .zip")
     if _is_relative_to(out_path, root):
@@ -2435,7 +2522,7 @@ def pack_root(
     if existing_outputs and not force:
         raise FileExistsError(str(existing_outputs[0]))
     for existing in existing_outputs:
-        if existing.is_symlink() or not existing.is_file():
+        if _is_link_like(existing) or not existing.is_file():
             raise ValueError(f"refusing to replace non-regular output path: {existing}")
 
     symlinks = _symlink_inventory(root)
@@ -2595,7 +2682,12 @@ def pack_root(
                 archive_paths.append(manifest_path)
                 for path in sorted(archive_paths, key=lambda item: item.relative_to(stage_root).as_posix()):
                     rel = path.relative_to(stage_root).as_posix()
-                    _write_zip_member(archive, path, arcname=f"{BUNDLE_ROOT_NAME}/{rel}")
+                    _write_zip_member(
+                        archive,
+                        path,
+                        arcname=f"{BUNDLE_ROOT_NAME}/{rel}",
+                        mode_override=0o644 if path == manifest_path else None,
+                    )
 
             bundle_verification = verify_root_bundle(temp_zip, verify_embedded_root=False)
             if not bundle_verification.get("ok"):

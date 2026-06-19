@@ -110,7 +110,8 @@ class ReleaseHardeningTest(unittest.TestCase):
 
     def test_read_only_sqlite_access_supports_uri_reserved_path_characters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "continuum#query?fragment"
+            name = "continuum#query&fragment=value" if os.name == "nt" else "continuum#query?fragment"
+            root = Path(tmp) / name
             init_db(root)
 
             search_audit = audit_search_index(root)

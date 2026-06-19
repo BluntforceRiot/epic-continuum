@@ -225,7 +225,7 @@ version = "9.9.9"
             self.assertTrue(sentinel.exists())
             stage_root = Path(proc.stdout.strip())
             self.assertEqual(stage_root.parent.resolve(), stage_base.resolve())
-            self.assertTrue(stage_root.name.startswith("continuum-"))
+            self.assertEqual(stage_root.name, "epic-continuum")
 
             mcp_bytes = (stage_root / "plugins" / "continuum" / ".mcp.json").read_bytes()
             self.assertFalse(mcp_bytes.startswith(b"\xef\xbb\xbf"))
@@ -234,6 +234,35 @@ version = "9.9.9"
             manifest = json.loads((stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text())
             self.assertIn(".local.", manifest["version"])
             self.assertLessEqual(len(manifest["interface"]["defaultPrompt"]), 3)
+
+            first_stage_root = stage_root
+            first_manifest_version = manifest["version"]
+            second_root = Path(tmp) / "other-continuum-root"
+            second = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo_root),
+                    "--root",
+                    str(second_root),
+                    "--python",
+                    sys.executable,
+                    "--stage-base",
+                    str(stage_base),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertTrue(sentinel.exists())
+            second_stage_root = Path(second.stdout.strip())
+            self.assertEqual(first_stage_root.resolve(), second_stage_root.resolve())
+            second_manifest = json.loads(
+                (second_stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text()
+            )
+            self.assertNotEqual(first_manifest_version, second_manifest["version"])
 
     def test_private_root_files_are_created_private_and_repairable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0 - 2026-06-18
+## 0.1.0 - 2026-06-19
 
-Initial public release candidate.
+Initial public release.
 
 - Added the Scroll, Card, Library, graph, queue, and snapshot storage substrate.
 - Added CLI and MCP tools for capture, recall, recovery, verification, bundle

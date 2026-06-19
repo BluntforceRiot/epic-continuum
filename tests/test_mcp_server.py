@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.operations import _proof_pack_hash
-from continuum.mcp_server import dispatch
+from continuum.mcp_server import TOOLS, dispatch
 
 
 def call_tool(name: str, arguments: dict) -> dict:
@@ -26,6 +26,19 @@ def call_tool(name: str, arguments: dict) -> dict:
     parsed = json.loads(result["content"][0]["text"])
     assert result["structuredContent"] == parsed
     return parsed
+
+
+def call_tool_raw(name: str, arguments: dict) -> dict:
+    response = dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+    )
+    assert response is not None
+    return response["result"]
 
 
 class EpicContinuumMcpServerTest(unittest.TestCase):
@@ -149,6 +162,107 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 )
                 self.assertTrue(Path(recovery["packet_uri"]).exists())
                 self.assertIn("Epic Continuum Thread Recovery: mcp-flow", recovery["packet_text"])
+
+    def test_repair_permissions_mcp_tool_dispatches_successfully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = str(Path(tmp) / "continuum")
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                call_tool("continuum_init", {"root": root})
+                repaired = call_tool("continuum_repair_permissions", {"root": root})
+
+            self.assertTrue(repaired["ok"], repaired)
+            self.assertEqual(repaired["_operation"]["status"], "succeeded")
+
+    def test_every_advertised_mcp_tool_dispatches_without_runtime_handler_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = str(base / "continuum")
+            source = base / "source.txt"
+            source.write_text("MCP smoke content for Epic Continuum.\n", encoding="utf-8")
+            prebundle = str(base / "prebundle.zip")
+            smoke_bundle = str(base / "smoke-bundle.zip")
+            missing_palace = str(base / "missing-mempalace")
+
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                call_tool("continuum_init", {"root": root})
+                event = call_tool(
+                    "continuum_append_event",
+                    {"root": root, "session_id": "mcp-smoke", "content": "smoke event"},
+                )
+                operation_id = event["_operation"]["operation_id"]
+                proof_path = event["_operation"]["proof_pack_uri"]
+                event_log = str(Path(root) / "exports" / "operation_events" / f"{operation_id}.jsonl")
+                call_tool(
+                    "continuum_pack_root",
+                    {"root": root, "out_path": prebundle, "profile": "portable", "run_restore_drill": False},
+                )
+
+                smoke_args: dict[str, dict] = {
+                    name: {"root": root}
+                    for name, (_description, schema, _handler) in TOOLS.items()
+                    if "root" in schema.get("properties", {})
+                }
+                smoke_args.update(
+                    {
+                        "continuum_append_event": {
+                            "root": root,
+                            "session_id": "mcp-smoke",
+                            "content": "second smoke event",
+                        },
+                        "continuum_roll_segment": {
+                            "root": root,
+                            "session_id": "mcp-smoke",
+                            "start_seq": 1,
+                            "end_seq": 1,
+                        },
+                        "continuum_ingest_file": {"root": root, "path": str(source)},
+                        "continuum_compile_context": {"root": root, "session_id": "mcp-smoke"},
+                        "continuum_recover_thread": {"root": root, "session_id": "mcp-smoke"},
+                        "continuum_search": {"root": root, "query": "smoke"},
+                        "continuum_doctor": {"root": root, "verify_recent_proof_packs": 0, "scan_secrets": False},
+                        "continuum_tier_storage": {"root": root, "dry_run": True},
+                        "continuum_prune_memory": {"root": root, "dry_run": True, "all": True},
+                        "continuum_verify_proof_pack": {"root": root, "path": proof_path},
+                        "continuum_verify_root": {
+                            "root": root,
+                            "verify_recent_proof_packs": 0,
+                            "run_restore_drill": False,
+                            "scan_secrets": False,
+                        },
+                        "continuum_pack_root": {
+                            "root": root,
+                            "out_path": smoke_bundle,
+                            "profile": "portable",
+                            "run_restore_drill": False,
+                        },
+                        "continuum_verify_bundle": {"path": prebundle, "verify_embedded_root": False},
+                        "continuum_replay_operation_log": {"path": event_log, "operation_id": operation_id},
+                        "continuum_redact_legacy_secrets": {"root": root, "limit": 1},
+                        "continuum_import_mempalace": {"root": root, "palace_path": missing_palace},
+                        "continuum_operation_summary": {"root": root, "operation_id": operation_id},
+                        "continuum_recover_operations": {"root": root, "dry_run": True},
+                        "continuum_recovery_drill": {"root": root, "name": "mcp-smoke-recovery"},
+                        "continuum_restore_drill": {
+                            "root": root,
+                            "name": "mcp-smoke-restore",
+                            "verify_recent_proof_packs": 0,
+                        },
+                    }
+                )
+
+                missing = set(TOOLS) - set(smoke_args)
+                self.assertFalse(missing, f"missing MCP smoke args for: {sorted(missing)}")
+
+                with patch("continuum.mcp_server.traceback.print_exc"):
+                    for name in sorted(TOOLS):
+                        with self.subTest(tool=name):
+                            result = call_tool_raw(name, smoke_args[name])
+                            payload = json.loads(result["content"][0]["text"])
+                            if result["isError"]:
+                                error = str(payload.get("error", ""))
+                                self.assertNotIn("not defined", error)
+                                self.assertNotIn("NameError", error)
+                                self.assertNotIn("AttributeError", error)
 
     def test_read_only_status_does_not_initialize_missing_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

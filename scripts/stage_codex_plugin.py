@@ -86,9 +86,9 @@ def stage_codex_plugin(
     )
     cache = _cachebuster(plugin_source=plugin_source, mcp_payload=mcp_payload)
     stage_base.mkdir(parents=True, exist_ok=True)
-    stage_root = stage_base / f"continuum-{cache}"
+    stage_root = stage_base / "epic-continuum"
     if stage_root.exists():
-        if not _is_direct_child(stage_root, stage_base) or not stage_root.name.startswith("continuum-"):
+        if not _is_direct_child(stage_root, stage_base) or stage_root.name != "epic-continuum":
             raise ValueError(f"refusing to remove unsafe stage path: {stage_root}")
         shutil.rmtree(stage_root)
 

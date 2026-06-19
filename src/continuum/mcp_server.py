@@ -475,7 +475,7 @@ def tool_repair_permissions(args: JSON) -> Any:
         )
         return result
 
-    return guarded_tool_result(
+    return guarded_tool(
         root,
         operation_type="mcp_repair_permissions",
         title="Repair Epic Continuum private root permissions",

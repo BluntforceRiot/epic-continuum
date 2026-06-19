@@ -55,12 +55,21 @@ def posix_permissions_supported(path: Path | None = None) -> bool:
 
 
 def _chmod(path: Path, mode: int) -> None:
-    if not posix_permissions_supported(path):
+    target = path
+    if path.is_symlink():
+        try:
+            target = path.resolve(strict=True)
+        except OSError:
+            return
+    if not posix_permissions_supported(target):
         return
-    os.chmod(path, mode, follow_symlinks=False)
+    try:
+        os.chmod(target, mode, follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        return
 
 
-def secure_mkdir(path: Path) -> None:
+def secure_mkdir(path: Path, *, secure_existing: bool = False) -> None:
     missing: list[Path] = []
     candidate = path
     while not candidate.exists():
@@ -71,7 +80,8 @@ def secure_mkdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     for created in reversed(missing):
         _chmod(created, PRIVATE_DIR_MODE)
-    _chmod(path, PRIVATE_DIR_MODE)
+    if secure_existing and path.exists():
+        _chmod(path, PRIVATE_DIR_MODE)
 
 
 def fsync_parent(path: Path) -> None:
@@ -180,6 +190,18 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[str, Any]:
+    if root.is_symlink():
+        try:
+            root = root.resolve(strict=True)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "supported": posix_permissions_supported(root),
+                "reason": "root_symlink_unresolved",
+                "checked": 0,
+                "unsafe_count": 1,
+                "findings": [{"path": str(root), "reason": "root_symlink_unresolved", "error": str(exc)}],
+            }
     if not posix_permissions_supported(root):
         return {
             "ok": True,
@@ -249,6 +271,8 @@ def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[st
 
 
 def repair_private_permissions(root: Path) -> dict[str, Any]:
+    if root.is_symlink():
+        root = root.resolve(strict=True)
     if not posix_permissions_supported(root):
         return {"ok": True, "supported": False, "reason": "posix_permissions_unavailable", "changed": 0}
     if not root.exists():

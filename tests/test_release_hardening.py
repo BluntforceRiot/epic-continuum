@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from continuum.core.bundle import pack_root
 from continuum.core.mempalace_import import import_mempalace
 from continuum.core.operations import create_proof_pack, doctor, finish_operation, repair_permissions, start_operation
 from continuum.core.permissions import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, audit_private_permissions, posix_permissions_supported
@@ -75,6 +79,134 @@ def _create_minimal_mempalace(palace: Path) -> None:
 
 
 class ReleaseHardeningTest(unittest.TestCase):
+    def test_pack_root_does_not_chmod_existing_external_export_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            if os.name != "posix" or not posix_permissions_supported(Path(tmp)):
+                self.skipTest("POSIX mode checks require chmod-style permissions")
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            export_parent = base / "downloads"
+            export_parent.mkdir()
+            export_parent.chmod(0o755)
+
+            init_db(root)
+            result = pack_root(root, out_path=export_parent / "continuum.zip", run_restore_drill=False)
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_mode(export_parent), 0o755)
+
+    def test_symlinked_memory_root_does_not_break_permission_handling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            if os.name != "posix" or not posix_permissions_supported(Path(tmp)):
+                self.skipTest("POSIX mode checks require chmod-style permissions")
+            base = Path(tmp)
+            target = base / "actual-root"
+            link = base / "linked-root"
+            target.mkdir()
+            try:
+                link.symlink_to(target, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            init_db(link)
+            audited = audit_private_permissions(link)
+
+            self.assertTrue((target / "catalog" / "catalog.sqlite3").exists())
+            self.assertTrue(audited["ok"], audited)
+
+    def test_release_builder_refuses_dirty_tracked_tree_unless_explicitly_allowed(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for dirty-tree release builder smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "epic-continuum-memory"
+version = "9.9.9"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "add", "pyproject.toml", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            (repo / "README.md").write_text("dirty sentinel\n", encoding="utf-8")
+
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+            blocked = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+            self.assertIn("tracked working-tree changes", blocked.stderr)
+
+            allowed = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out), "--allow-dirty"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+            self.assertTrue((out / "epic-continuum-9.9.9.zip").exists())
+
+    def test_codex_stage_helper_preserves_base_and_writes_bomless_cachebusted_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(__file__).resolve().parents[1]
+            stage_base = Path(tmp) / "stage-base"
+            stage_base.mkdir()
+            sentinel = stage_base / "keep.txt"
+            sentinel.write_text("keep\n", encoding="utf-8")
+            script = repo_root / "scripts" / "stage_codex_plugin.py"
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo_root),
+                    "--root",
+                    str(Path(tmp) / "continuum-root"),
+                    "--python",
+                    sys.executable,
+                    "--stage-base",
+                    str(stage_base),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(sentinel.exists())
+            stage_root = Path(proc.stdout.strip())
+            self.assertEqual(stage_root.parent.resolve(), stage_base.resolve())
+            self.assertTrue(stage_root.name.startswith("continuum-"))
+
+            mcp_bytes = (stage_root / "plugins" / "continuum" / ".mcp.json").read_bytes()
+            self.assertFalse(mcp_bytes.startswith(b"\xef\xbb\xbf"))
+            json.loads(mcp_bytes.decode("utf-8"))
+
+            manifest = json.loads((stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text())
+            self.assertIn(".local.", manifest["version"])
+            self.assertLessEqual(len(manifest["interface"]["defaultPrompt"]), 3)
+
     def test_private_root_files_are_created_private_and_repairable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             if os.name != "posix" or not posix_permissions_supported(Path(tmp)):

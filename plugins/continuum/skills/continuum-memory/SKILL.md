@@ -28,6 +28,16 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_snapshot` before risky changes or after important milestones.
 - `continuum_optimize_config` when hardware budgets should be detected or tuned.
 - `continuum_import_mempalace` to migrate MemPalace drawers, closets, and KG records.
+- `continuum_run_workers` to run one Scribe/Librarian/Archivist worker pass.
+- `continuum_memory_health` to inspect capture, queue, storage, and learning health.
+- `continuum_tier_storage` to apply Archivist storage movement.
+- `continuum_prune_memory` to archive, summarize-only, or forget cards by topic.
+- `continuum_detect_conflicts` to find likely conflicting Cards.
+- `continuum_decay_routes` to apply Librarian route decay and synaptic pruning.
+- `continuum_run_evals` to run deterministic memory-quality evals.
+- `continuum_verify_root` to run strict root invariants.
+- `continuum_pack_root` and `continuum_verify_bundle` to create and verify portable root bundles.
+- `continuum_audit_secrets` and `continuum_redact_legacy_secrets` to inspect or clean secret-like legacy catalog text.
 - `continuum_list_operations` to inspect work receipts written during long operations.
 - `continuum_operation_summary` to read one operation receipt.
 - `continuum_recover_operations` to mark stale running work interrupted and write recovery packets.

@@ -331,8 +331,8 @@ def truncate_to_token_budget(text: str, token_budget: int) -> tuple[str, bool]:
 
 def connect(root: Path) -> sqlite3.Connection:
     db_path = root / "catalog" / "catalog.sqlite3"
-    secure_mkdir(root)
-    secure_mkdir(db_path.parent)
+    secure_mkdir(root, secure_existing=True)
+    secure_mkdir(db_path.parent, secure_existing=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -371,7 +371,7 @@ def card_sidecar_path(root: Path, card_id: str) -> Path | None:
 
 
 def init_layout(root: Path) -> None:
-    secure_mkdir(root)
+    secure_mkdir(root, secure_existing=True)
     dirs = [
         "archive/originals/hot",
         "archive/originals/warm",
@@ -390,7 +390,7 @@ def init_layout(root: Path) -> None:
         "run",
     ]
     for rel in dirs:
-        secure_mkdir(root / rel)
+        secure_mkdir(root / rel, secure_existing=True)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

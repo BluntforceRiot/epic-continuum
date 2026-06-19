@@ -85,6 +85,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("continuum_doctor", names)
         self.assertIn("continuum_verify_proof_pack", names)
         self.assertIn("continuum_verify_root", names)
+        self.assertIn("continuum_pack_root", names)
+        self.assertIn("continuum_verify_bundle", names)
         self.assertIn("continuum_replay_operation_log", names)
         self.assertIn("continuum_redact_legacy_secrets", names)
         self.assertIn("continuum_search", names)
@@ -93,6 +95,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         first_tool = listed["result"]["tools"][0]
         self.assertIn("outputSchema", first_tool)
         self.assertIn("title", first_tool)
+        self.assertTrue(tools["continuum_pack_root"]["annotations"]["openWorldHint"])
+        self.assertTrue(tools["continuum_verify_bundle"]["annotations"]["openWorldHint"])
 
     def test_tool_calls_append_status_and_recovery_packet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

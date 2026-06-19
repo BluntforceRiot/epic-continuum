@@ -20,10 +20,7 @@
     "defaultPrompt": [
       "Recover this thread with Epic Continuum.",
       "Append this session to Epic Continuum.",
-      "Compile Epic Continuum context for this task.",
-      "List Epic Continuum operation receipts.",
-      "Recover interrupted Epic Continuum operations.",
-      "Run an Epic Continuum recovery drill."
+      "Compile Epic Continuum context for this task."
     ],
     "brandColor": "#2563EB"
   },

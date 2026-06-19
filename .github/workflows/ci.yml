@@ -94,26 +94,69 @@ jobs:
             git ls-files --eol | grep 'w/mixed'
             exit 1
           fi
+      - name: Smoke installer wrappers
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/codex-stage-sh" "${RUNNER_TEMP}/codex-stage-ps"
+          echo keep > "${RUNNER_TEMP}/codex-stage-sh/keep.txt"
+          echo keep > "${RUNNER_TEMP}/codex-stage-ps/keep.txt"
+
+          bash scripts/install_codex_plugin.sh \
+            --stage-root "${RUNNER_TEMP}/codex-stage-sh" \
+            --root "${RUNNER_TEMP}/continuum-codex-sh" \
+            --python python \
+            --stage-only
+          test -f "${RUNNER_TEMP}/codex-stage-sh/keep.txt"
+          test -f "${RUNNER_TEMP}/codex-stage-sh"/continuum-*/plugins/continuum/.mcp.json
+
+          bash scripts/install_hermes_adapter.sh \
+            --root "${RUNNER_TEMP}/continuum-hermes-sh" \
+            --hermes-home "${RUNNER_TEMP}/hermes-sh" \
+            --python python \
+            --dry-run \
+            --skip-enable
+
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoProfile -File scripts/install_codex_plugin.ps1 \
+              -StageRoot "${RUNNER_TEMP}/codex-stage-ps" \
+              -Root "${RUNNER_TEMP}/continuum-codex-ps" \
+              -Python python \
+              -StageOnly
+            test -f "${RUNNER_TEMP}/codex-stage-ps/keep.txt"
+            test -f "${RUNNER_TEMP}/codex-stage-ps"/continuum-*/plugins/continuum/.mcp.json
+
+            pwsh -NoProfile -File scripts/install_hermes_adapter.ps1 \
+              -Root "${RUNNER_TEMP}/continuum-hermes-ps" \
+              -HermesHome "${RUNNER_TEMP}/hermes-ps" \
+              -Python python \
+              -DryRun \
+              -SkipEnable
+          else
+            echo "pwsh not available; PowerShell wrapper smoke skipped"
+          fi
       - name: Build public release archive
         shell: bash
         run: |
           python scripts/build_release_package.py --out-dir dist
           python - <<'PY'
+          import tomllib
           import zipfile
           from pathlib import Path
 
-          archive = Path("dist/epic-continuum-0.1.0.zip")
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          prefix = f"epic-continuum-{version}/"
+          archive = Path(f"dist/epic-continuum-{version}.zip")
           with zipfile.ZipFile(archive) as zf:
               names = zf.namelist()
-              assert all(name.startswith("epic-continuum-0.1.0/") for name in names)
-              assert "epic-continuum-0.1.0/docs/GITHUB_PUBLICATION_DRAFT.md" not in names
+              assert all(name.startswith(prefix) for name in names)
+              assert f"{prefix}docs/GITHUB_PUBLICATION_DRAFT.md" not in names
               for name in (
-                  "epic-continuum-0.1.0/scripts/install_codex_plugin.sh",
-                  "epic-continuum-0.1.0/scripts/install_hermes_adapter.sh",
+                  f"{prefix}scripts/install_codex_plugin.sh",
+                  f"{prefix}scripts/install_hermes_adapter.sh",
               ):
                   mode = (zf.getinfo(name).external_attr >> 16) & 0o777
                   assert mode == 0o755, (name, oct(mode))
-              name = "epic-continuum-0.1.0/scripts/build_release_package.py"
+              name = f"{prefix}scripts/build_release_package.py"
               mode = (zf.getinfo(name).external_attr >> 16) & 0o777
               assert mode == 0o644, (name, oct(mode))
           PY

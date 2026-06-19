@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import fnmatch
 import hashlib
 import os
 import subprocess
+import tomllib
 import zipfile
 from pathlib import Path
 
 
-DEFAULT_VERSION = "0.1.0"
-FIXED_ZIP_DT = (2026, 6, 18, 0, 0, 0)
+DEFAULT_ZIP_DT = (1980, 1, 1, 0, 0, 0)
 
 EXCLUDED_PARTS = {
     ".git",
@@ -67,6 +68,39 @@ INCLUDE_TOP_LEVEL = {
 }
 
 
+def project_version(repo_root: Path) -> str:
+    pyproject = repo_root / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    return str(data["project"]["version"])
+
+
+def _git_tracked_tree_is_clean(repo_root: Path) -> bool | None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=no"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() == ""
+
+
+def reproducible_zip_dt() -> tuple[int, int, int, int, int, int]:
+    raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if not raw_epoch:
+        return DEFAULT_ZIP_DT
+    timestamp = dt.datetime.fromtimestamp(int(raw_epoch), tz=dt.UTC)
+    return (
+        max(timestamp.year, 1980),
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second,
+    )
+
+
 def should_include(path: Path, repo_root: Path) -> bool:
     rel = path.relative_to(repo_root)
     parts = rel.parts
@@ -108,7 +142,7 @@ def zip_mode(path: Path) -> int:
 
 
 def write_member(zf: zipfile.ZipFile, source: Path, arcname: str, *, mode: int | None = None) -> None:
-    info = zipfile.ZipInfo(arcname, FIXED_ZIP_DT)
+    info = zipfile.ZipInfo(arcname, reproducible_zip_dt())
     info.create_system = 3
     info.external_attr = (mode if mode is not None else zip_mode(source)) << 16
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -185,7 +219,7 @@ def _walk_members(repo_root: Path, package_name: str) -> list[tuple[Path, str, i
     return sorted(members, key=lambda item: item[1])
 
 
-def build_release(repo_root: Path, out_dir: Path, version: str) -> dict[str, object]:
+def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean: bool = True) -> dict[str, object]:
     package_name = f"epic-continuum-{version}"
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"{package_name}.zip"
@@ -195,6 +229,15 @@ def build_release(repo_root: Path, out_dir: Path, version: str) -> dict[str, obj
     if members is None:
         source = "walk"
         members = _walk_members(repo_root, package_name)
+    elif require_clean:
+        clean = _git_tracked_tree_is_clean(repo_root)
+        if clean is False:
+            raise RuntimeError(
+                "refusing to build a git-sourced release archive from tracked working-tree changes; "
+                "commit or stash changes first, or pass --allow-dirty for a development archive"
+            )
+        if clean is None:
+            raise RuntimeError("unable to verify git working-tree cleanliness before release archive build")
 
     if zip_path.exists():
         zip_path.unlink()
@@ -202,7 +245,7 @@ def build_release(repo_root: Path, out_dir: Path, version: str) -> dict[str, obj
         checksum_path.unlink()
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        root_info = zipfile.ZipInfo(f"{package_name}/", FIXED_ZIP_DT)
+        root_info = zipfile.ZipInfo(f"{package_name}/", reproducible_zip_dt())
         root_info.create_system = 3
         root_info.external_attr = 0o40755 << 16
         root_info.compress_type = zipfile.ZIP_STORED
@@ -225,12 +268,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build the Epic Continuum public release ZIP.")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--version", default=DEFAULT_VERSION)
+    parser.add_argument("--version", default=None)
+    parser.add_argument("--allow-dirty", action="store_true", help="Allow tracked working-tree changes in a development archive.")
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
     out_dir = (args.out_dir or (repo_root / "dist")).resolve()
-    result = build_release(repo_root, out_dir, args.version)
+    result = build_release(repo_root, out_dir, args.version or project_version(repo_root), require_clean=not args.allow_dirty)
     for key, value in result.items():
         print(f"{key}: {value}")
     return 0

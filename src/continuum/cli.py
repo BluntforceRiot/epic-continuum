@@ -75,6 +75,13 @@ def emit(value: object) -> None:
     print(json.dumps(value, ensure_ascii=True, sort_keys=True))
 
 
+def emit_result(result: Any) -> int:
+    emit(result)
+    if isinstance(result, dict) and result.get("ok") is False:
+        return 1
+    return 0
+
+
 def guarded_result(
     root: Path,
     *,
@@ -559,7 +566,7 @@ def _main(argv: list[str] | None = None) -> int:
             )
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_rebuild_search_index",
@@ -571,7 +578,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "run-workers":
         assert root is not None
@@ -581,7 +587,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "workers_ran", "processed_count": result.get("processed_count"), "ok": result.get("ok")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_run_workers",
@@ -593,30 +599,26 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "serve":
         assert root is not None
-        emit(serve_workers(root, roles=args.role, limit=args.passes, interval_seconds=args.interval_seconds))
-        return 0
+        return emit_result(serve_workers(root, roles=args.role, limit=args.passes, interval_seconds=args.interval_seconds))
 
     if args.command == "memory-health":
         assert root is not None
-        emit(memory_health(root))
-        return 0
+        return emit_result(memory_health(root))
 
     if args.command == "tier-storage":
         assert root is not None
         if args.dry_run:
-            emit(apply_storage_tiering(root, dry_run=True, limit=args.limit))
-            return 0
+            return emit_result(apply_storage_tiering(root, dry_run=True, limit=args.limit))
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = apply_storage_tiering(root, dry_run=False, limit=args.limit)
             operation.cursor({"phase": "storage_tiering_applied", "action_count": result.get("action_count")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_tier_storage",
@@ -628,20 +630,18 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "prune-memory":
         assert root is not None
         if args.dry_run:
-            emit(prune_memory(root, topic=args.topic, action=args.action, dry_run=True, limit=args.limit, allow_global=args.all))
-            return 0
+            return emit_result(prune_memory(root, topic=args.topic, action=args.action, dry_run=True, limit=args.limit, allow_global=args.all))
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = prune_memory(root, topic=args.topic, action=args.action, dry_run=False, limit=args.limit, allow_global=args.all)
             operation.cursor({"phase": "memory_pruned", "action": result.get("action"), "card_count": result.get("card_count")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_prune_memory",
@@ -653,7 +653,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "detect-conflicts":
         assert root is not None
@@ -663,7 +662,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "conflicts_detected", "conflict_count": result.get("conflict_count")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_detect_conflicts",
@@ -675,7 +674,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "decay-routes":
         assert root is not None
@@ -685,7 +683,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "routes_decayed", "decayed": result.get("decayed"), "pruned": result.get("pruned")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_decay_routes",
@@ -697,7 +695,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "run-evals":
         assert root is not None
@@ -707,7 +704,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "evals_ran", "eval_id": result.get("eval_id"), "ok": result.get("ok")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_run_evals",
@@ -720,7 +717,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "audit":
         assert root is not None
@@ -747,7 +743,7 @@ def _main(argv: list[str] | None = None) -> int:
             )
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_repair_permissions",
@@ -759,7 +755,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "verify-root":
         assert root is not None
@@ -805,15 +800,14 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "redact-legacy-secrets":
         assert root is not None
         if not args.apply:
-            emit(redact_legacy_secrets(root, dry_run=True, limit=args.limit))
-            return 0
+            return emit_result(redact_legacy_secrets(root, dry_run=True, limit=args.limit))
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = redact_legacy_secrets(root, dry_run=False, limit=args.limit)
             operation.cursor({"phase": "legacy_secrets_redacted", "redaction_count": result.get("redaction_count")})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_redact_legacy_secrets",
@@ -825,7 +819,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "verify-proof-pack":
         result = verify_proof_pack(Path(args.path), root=root, strict=True)
@@ -844,7 +837,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "snapshot_created", "snapshot_uri": result["snapshot_uri"]})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_snapshot",
@@ -859,11 +852,10 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "import-mempalace":
         assert root is not None
-        emit(
+        return emit_result(
             import_mempalace(
                 root,
                 palace_path=Path(args.palace_path),
@@ -873,7 +865,6 @@ def _main(argv: list[str] | None = None) -> int:
                 progress=None if args.no_progress else progress_bar,
             )
         )
-        return 0
 
     if args.command == "operations":
         assert root is not None
@@ -885,7 +876,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "recover-operations":
         assert root is not None
-        emit(
+        return emit_result(
             recover_stale_operations(
                 root,
                 older_than_seconds=args.older_than_seconds,
@@ -893,7 +884,6 @@ def _main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
             )
         )
-        return 0
 
     if args.command == "recovery-drill":
         assert root is not None
@@ -902,7 +892,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "drill_complete", "drill_id": result["drill_id"], "ok": result["ok"]})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_recovery_drill",
@@ -914,7 +904,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "restore-drill":
         assert root is not None
@@ -928,7 +917,7 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "restore_drill_complete", "drill_id": result["drill_id"], "ok": result["ok"]})
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_restore_drill",
@@ -944,10 +933,14 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     if args.command == "install-hermes-adapter":
         assert root is not None
+        if args.api_key and args.api_key not in {"none", "null", "false"}:
+            raise ValueError(
+                "Refusing --api-key with a secret-looking value; use --api-key-env NAME or Hermes protected secrets instead."
+            )
+
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = install_hermes_adapter(
                 hermes_home=Path(args.hermes_home) if args.hermes_home else None,
@@ -977,7 +970,7 @@ def _main(argv: list[str] | None = None) -> int:
             )
             return result
 
-        emit(
+        return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_install_hermes_adapter",
@@ -997,7 +990,6 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
-        return 0
 
     parser.error(f"unknown command: {args.command}")
     return 2

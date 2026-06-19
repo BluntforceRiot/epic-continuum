@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
+from .core.bundle import pack_root, verify_root_bundle
 from .core.config import config_path, load_config, optimize_config, write_default_config
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
@@ -662,6 +663,29 @@ def tool_verify_root(args: JSON) -> Any:
     )
 
 
+def tool_pack_root(args: JSON) -> Any:
+    root = root_arg(args)
+    out_path = validate_allowed_path(Path(require_str(args, "out_path")), purpose="bundle output")
+    profile = optional_str(args, "profile") or "portable"
+    symlink_policy = optional_str(args, "symlink_policy") or "fail"
+    return pack_root(
+        root,
+        out_path=out_path,
+        profile=profile,
+        symlink_policy=symlink_policy,
+        run_restore_drill=optional_bool(args, "run_restore_drill", True),
+        force=optional_bool(args, "force", False),
+    )
+
+
+def tool_verify_bundle(args: JSON) -> Any:
+    bundle_path = validate_allowed_path(Path(require_str(args, "path")), purpose="bundle")
+    return verify_root_bundle(
+        bundle_path,
+        verify_embedded_root=optional_bool(args, "verify_embedded_root", True),
+    )
+
+
 def tool_replay_operation_log(args: JSON) -> Any:
     log_path = validate_allowed_path(Path(require_str(args, "path")), purpose="operation event log")
     return replay_operation_event_log(log_path, operation_id=optional_str(args, "operation_id"))
@@ -1081,6 +1105,36 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "additionalProperties": False,
         },
         tool_verify_root,
+    ),
+    "continuum_pack_root": (
+        "Create a policy-checked portable ZIP bundle from a Continuum root.",
+        {
+            "type": "object",
+            "required": ["out_path"],
+            "properties": {
+                "root": {"type": "string"},
+                "out_path": {"type": "string"},
+                "profile": {"type": "string", "enum": ["portable", "shareable"]},
+                "symlink_policy": {"type": "string", "enum": ["fail", "skip"]},
+                "run_restore_drill": {"type": "boolean"},
+                "force": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        tool_pack_root,
+    ),
+    "continuum_verify_bundle": (
+        "Verify a packed Continuum ZIP manifest and every member hash.",
+        {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string"},
+                "verify_embedded_root": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        tool_verify_bundle,
     ),
     "continuum_replay_operation_log": (
         "Replay a hash-chained operation event JSONL log into reconstructed operation state.",

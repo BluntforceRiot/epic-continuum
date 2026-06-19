@@ -11,6 +11,7 @@ from continuum.integrations.adapter_manifest import adapter_index
 from continuum.integrations.claude_code_adapter import handle_hook
 from continuum.integrations.openai_context_adapter import prepare_chat_request, record_chat_response
 from continuum.integrations.openclaw_adapter import build_openclaw_mission_card
+from continuum.mcp_server import TOOLS
 
 
 class AdapterKitTest(unittest.TestCase):
@@ -48,6 +49,25 @@ class AdapterKitTest(unittest.TestCase):
         self.assertIn("continuum", entries)
         self.assertEqual(entries["continuum"]["source"]["path"], "./plugins/continuum")
         self.assertEqual(entries["continuum"]["policy"]["installation"], "AVAILABLE")
+
+    def test_codex_docs_list_the_complete_mcp_tool_surface(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        docs = (repo_root / "docs" / "integrations" / "codex-plugin.md").read_text(encoding="utf-8")
+        skill = (repo_root / "plugins" / "continuum" / "skills" / "continuum-memory" / "SKILL.md").read_text(encoding="utf-8")
+
+        for tool_name in TOOLS:
+            with self.subTest(tool_name=tool_name):
+                self.assertIn(f"`{tool_name}`", docs)
+        for expected in (
+            "continuum_run_workers",
+            "continuum_memory_health",
+            "continuum_pack_root",
+            "continuum_verify_bundle",
+            "continuum_audit_secrets",
+            "continuum_redact_legacy_secrets",
+        ):
+            with self.subTest(skill_tool=expected):
+                self.assertIn(expected, skill)
 
     def test_openai_compatible_adapter_records_and_injects_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

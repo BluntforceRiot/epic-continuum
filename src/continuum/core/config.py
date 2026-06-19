@@ -57,8 +57,8 @@ def write_config(root: Path, config: dict[str, Any]) -> Path:
 
 def write_default_config(root: Path) -> Path:
     config_dir = root / "config"
-    secure_mkdir(root)
-    secure_mkdir(config_dir)
+    secure_mkdir(root, secure_existing=True)
+    secure_mkdir(config_dir, secure_existing=True)
     path = config_path(root)
     if not path.exists():
         secure_write_text(

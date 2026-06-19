@@ -282,6 +282,28 @@ class HermesAdapterTest(unittest.TestCase):
             self.assertNotIn(str(hermes_exe), generated_text)
             self.assertIn("external:Sensitive_Hermes_Home", generated_text)
 
+    def test_cli_hermes_install_rejects_secret_api_key_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    [
+                        "install-hermes-adapter",
+                        "--root",
+                        str(Path(tmp) / "continuum"),
+                        "--hermes-home",
+                        str(Path(tmp) / "hermes"),
+                        "--api-key",
+                        "sk-test-secret-value-1234567890",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            rendered = output.getvalue()
+            self.assertIn("Refusing --api-key", rendered)
+            self.assertNotIn("sk-test-secret-value", rendered)
+
     def test_hermes_plugin_source_is_packaged_asset(self) -> None:
         source = default_plugin_source()
 

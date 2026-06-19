@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -349,6 +350,29 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertFalse(old_reader.exists())
             self.assertTrue((root / row["original_uri"]).exists())
             self.assertTrue((root / row["reader_uri"]).exists())
+
+    def test_memory_health_skips_inaccessible_reparse_like_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            exports = root / "exports"
+            readable = exports / "readable"
+            blocked = exports / "blocked-reparse-point"
+            readable.mkdir(parents=True)
+            blocked.mkdir(parents=True)
+            (readable / "note.txt").write_text("healthy bytes\n", encoding="utf-8")
+            real_scandir = os.scandir
+
+            def guarded_scandir(path):
+                if Path(path) == blocked:
+                    raise OSError("simulated inaccessible Windows reparse point")
+                return real_scandir(path)
+
+            with patch("continuum.core.workers.os.scandir", side_effect=guarded_scandir):
+                health = memory_health(root)
+
+            self.assertTrue(health["initialized"])
+            self.assertIn("root_size_bytes", health)
 
     def test_non_preemptible_expired_worker_lease_is_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

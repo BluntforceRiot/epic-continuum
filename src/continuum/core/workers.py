@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -45,14 +46,23 @@ def _root_size_bytes(root: Path) -> int:
     total = 0
     if not root.exists():
         return 0
-    for path in root.rglob("*"):
-        if path.is_symlink():
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
             continue
-        if path.is_file():
-            try:
-                total += path.stat().st_size
-            except OSError:
-                continue
     return total
 
 

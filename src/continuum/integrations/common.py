@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from continuum.core.config import load_config, should_capture, trim_tool_result_for_capture
+from continuum.core.permissions import secure_append_text
 from continuum.core.safety import redact_text_secrets, redact_value_secrets, scan_text_for_secrets, scan_value_for_secrets
 from continuum.core.store import append_scroll_event, compile_context, estimate_tokens
 from continuum.core.workers import maybe_maintain_after_capture
@@ -13,6 +14,13 @@ from continuum.core.workers import maybe_maintain_after_capture
 
 DEFAULT_TOKEN_BUDGET = 1800
 DEFAULT_CONTEXT_HEADER = "Epic Continuum Looking Glass"
+
+
+def append_adapter_log(path: Path, payload: dict[str, Any]) -> None:
+    """Append one redacted, private JSONL adapter diagnostic record."""
+    safe_payload = redact_value_secrets(payload)
+    line = json.dumps(safe_payload, ensure_ascii=True, sort_keys=True) + "\n"
+    secure_append_text(path, line)
 
 
 def default_continuum_root() -> Path:
@@ -182,11 +190,11 @@ def record_tool_event(
     text, event_metadata = capture_ready
     if result:
         text, capture_meta = trim_tool_result_for_capture(resolved_root, text)
+        event_metadata["capture"] = capture_meta
+        if capture_meta.get("skipped"):
+            return None
         if not text:
-            event_metadata["capture"] = capture_meta
-            text = "[Continuum capture notice: tool result skipped by capture.large_result_policy.]"
-        else:
-            event_metadata["capture"] = capture_meta
+            return None
     result = append_scroll_event(
         resolved_root,
         session_id=session_id,

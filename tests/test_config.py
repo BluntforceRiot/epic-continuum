@@ -164,6 +164,55 @@ class EpicContinuumConfigTest(unittest.TestCase):
             self.assertNotIn("supersecretvalue123", context["context_text"])
             self.assertNotIn("test_tool_result", context["context_text"])
 
+    def test_tool_result_skip_policy_writes_no_scroll_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["capture"]["max_tool_result_bytes"] = "8B"
+            config["capture"]["large_result_policy"] = "skip"
+            write_config(root, config)
+
+            result = record_tool_event(
+                root,
+                session_id="tool-skip",
+                tool_name="huge_tool",
+                payload="x" * 512,
+                source="test",
+                result=True,
+            )
+
+            self.assertIsNone(result)
+            self.assertFalse((root / "catalog" / "catalog.sqlite3").exists())
+
+    def test_tiny_tool_result_cap_is_an_absolute_byte_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["capture"]["max_tool_result_bytes"] = "1B"
+            config["capture"]["large_result_policy"] = "truncate_with_notice"
+            write_config(root, config)
+
+            result = record_tool_event(
+                root,
+                session_id="tool-one-byte",
+                tool_name="tiny_cap",
+                payload="é" * 32,
+                source="test",
+                result=True,
+            )
+
+            self.assertIsNotNone(result)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT content, metadata_json FROM scroll_events WHERE id = ?",
+                    (result["event_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertLessEqual(len(row["content"].encode("utf-8")), 1)
+            self.assertLessEqual(json.loads(row["metadata_json"])["capture"]["stored_bytes"], 1)
+
     def test_capture_blocks_secret_bearing_turns_and_tool_results_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -684,6 +733,45 @@ class EpicContinuumConfigTest(unittest.TestCase):
         config["queues"]["worker_lease_seconds"] = 0
         with self.assertRaises(ValueError):
             validate_config(config)
+
+    def test_root_relative_config_paths_reject_cross_platform_escapes(self) -> None:
+        cases = (
+            (("atomic_memory", "card_sidecar_dir"), "../../escaped-cards"),
+            (("atomic_memory", "card_sidecar_dir"), r"C:\escaped-cards"),
+            (("security", "ignore_file"), "/tmp/continuum.ignore"),
+            (("security", "ignore_file"), r"\\server\share\continuum.ignore"),
+            (("security", "secret_allowlist_file"), "security/../outside.jsonl"),
+        )
+        for keys, value in cases:
+            with self.subTest(keys=keys, value=value):
+                config = default_config()
+                config[keys[0]][keys[1]] = value
+                with self.assertRaises(ValueError):
+                    validate_config(config)
+
+        config = default_config()
+        config["capture"]["max_tool_result_bytes"] = "0B"
+        with self.assertRaisesRegex(ValueError, "max_tool_result_bytes must be positive"):
+            validate_config(config)
+
+    def test_configured_internal_paths_reject_existing_symlink_escapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside-cards"
+            outside.mkdir()
+            (root / "catalog").mkdir(parents=True)
+            link = root / "catalog" / "linked-cards"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            config = default_config()
+            config["atomic_memory"]["card_sidecar_dir"] = "catalog/linked-cards"
+            with self.assertRaisesRegex(ValueError, "resolves outside"):
+                write_config(root, config)
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_optimize_config_can_preview_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

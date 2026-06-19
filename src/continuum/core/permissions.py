@@ -129,6 +129,45 @@ def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
         raise
 
 
+def secure_append_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Append text to a private regular file without following symlinks.
+
+    Adapter diagnostics are durable local state too.  Creating them with the
+    process umask can leave secrets or tracebacks world-readable, while normal
+    ``open(..., 'a')`` will follow a substituted symlink.  Use one append-only
+    descriptor, request ``0600`` at creation, and tighten existing files.
+    """
+    secure_mkdir(path.parent)
+    try:
+        if path.is_symlink():
+            raise ValueError(f"refusing to append through symlink: {path}")
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            raise ValueError(f"refusing to append through junction: {path}")
+    except OSError as exc:
+        raise ValueError(f"unable to validate append target: {path}") from exc
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    fd = os.open(str(path), flags, PRIVATE_FILE_MODE)
+    try:
+        if posix_permissions_supported(path):
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        data = text.encode(encoding)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while appending private text")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _chmod(path, PRIVATE_FILE_MODE)
+
+
 def secure_file(path: Path) -> None:
     if path.exists() and path.is_file():
         _chmod(path, PRIVATE_FILE_MODE)
@@ -189,7 +228,12 @@ def _relative(path: Path, root: Path) -> str:
         return str(path)
 
 
-def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[str, Any]:
+def audit_private_permissions(
+    root: Path,
+    *,
+    max_findings: int = 100,
+    allow_symlinks: bool = False,
+) -> dict[str, Any]:
     if root.is_symlink():
         try:
             root = root.resolve(strict=True)
@@ -223,15 +267,24 @@ def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[st
 
     checked = 0
     unsafe_count = 0
+    symlink_count = 0
     findings: list[dict[str, Any]] = []
 
     def inspect(path: Path) -> None:
-        nonlocal checked, unsafe_count
+        nonlocal checked, unsafe_count, symlink_count
         try:
-            mode = stat.S_IMODE(os.lstat(path).st_mode)
-            is_dir = path.is_dir()
-            is_file = path.is_file()
-            is_link = path.is_symlink()
+            stat_result = os.lstat(path)
+            mode = stat.S_IMODE(stat_result.st_mode)
+            is_link = stat.S_ISLNK(stat_result.st_mode)
+            is_junction = getattr(path, "is_junction", None)
+            if callable(is_junction):
+                try:
+                    is_link = is_link or bool(is_junction())
+                except OSError:
+                    pass
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            attributes = getattr(stat_result, "st_file_attributes", 0)
+            is_link = is_link or bool(reparse_flag and attributes & reparse_flag)
         except OSError as exc:
             unsafe_count += 1
             if len(findings) < max_findings:
@@ -239,10 +292,14 @@ def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[st
             return
         checked += 1
         if is_link:
-            unsafe_count += 1
-            if len(findings) < max_findings:
-                findings.append({"path": _relative(path, root), "mode": oct(mode), "reason": "symlink_in_private_root"})
+            symlink_count += 1
+            if not allow_symlinks:
+                unsafe_count += 1
+                if len(findings) < max_findings:
+                    findings.append({"path": _relative(path, root), "mode": oct(mode), "reason": "symlink_in_private_root"})
             return
+        is_dir = stat.S_ISDIR(stat_result.st_mode)
+        is_file = stat.S_ISREG(stat_result.st_mode)
         if not (is_dir or is_file):
             return
         if mode & 0o077:
@@ -265,6 +322,8 @@ def audit_private_permissions(root: Path, *, max_findings: int = 100) -> dict[st
         "supported": True,
         "checked": checked,
         "unsafe_count": unsafe_count,
+        "symlink_count": symlink_count,
+        "symlinks_allowed": allow_symlinks,
         "findings": findings,
         "repair_hint": "Run `continuum repair-permissions --root <root>` to set directories to 0700 and files to 0600.",
     }

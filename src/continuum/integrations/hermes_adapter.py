@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from continuum.core.config import capture_policy, should_capture
+from continuum.core.permissions import secure_write_text
 from continuum.core.store import (
     compile_context,
     connect_existing,
@@ -20,7 +22,7 @@ from continuum.core.store import (
     source_file_reference,
     utc_now,
 )
-from continuum.integrations.common import record_tool_event, record_turn
+from continuum.integrations.common import append_adapter_log, record_tool_event, record_turn
 
 
 PLUGIN_NAME = "epic_continuum"
@@ -28,6 +30,24 @@ DEFAULT_TOKEN_BUDGET = 1800
 DEFAULT_CONTEXT_HEADER = "Epic Continuum Looking Glass"
 REDACTED_SECRET = "[REDACTED]"
 _CONFIG_PATH: Path | None = None
+_MODEL_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+_WINDOWS_RESERVED_STEMS = {
+    "con", "prn", "aux", "nul", "clock$", "conin$", "conout$",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+
+def _validated_model_alias(value: str) -> str:
+    alias = str(value)
+    if not _MODEL_ALIAS_RE.fullmatch(alias) or alias.endswith((".", " ")):
+        raise ValueError(
+            "model_alias must be 1-96 filesystem-safe ASCII characters and may contain only "
+            "letters, digits, underscore, hyphen, or dot"
+        )
+    if alias.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_STEMS:
+        raise ValueError("model_alias uses a Windows-reserved filename")
+    return alias
 
 
 def configure(*, config_path: Path | str | None = None) -> None:
@@ -306,7 +326,6 @@ def _log_warning(config: dict[str, Any], phase: str, message: str, detail: dict[
     root = Path(config.get("continuum_root") or default_continuum_root())
     log_path = Path(config.get("log_path") or root / "run" / "integrations" / "hermes_adapter.log")
     try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "created_at": utc_now(),
             "level": "warning",
@@ -314,9 +333,8 @@ def _log_warning(config: dict[str, Any], phase: str, message: str, detail: dict[
             "message": message,
             "detail": detail or {},
         }
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
-    except OSError:
+        append_adapter_log(log_path, payload)
+    except (OSError, ValueError):
         return
 
 
@@ -324,16 +342,14 @@ def _log_error(config: dict[str, Any], phase: str, exc: BaseException) -> None:
     root = Path(config.get("continuum_root") or default_continuum_root())
     log_path = Path(config.get("log_path") or root / "run" / "integrations" / "hermes_adapter.log")
     try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "created_at": utc_now(),
             "phase": phase,
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(limit=8),
         }
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
-    except OSError:
+        append_adapter_log(log_path, payload)
+    except (OSError, ValueError):
         return
 
 
@@ -685,7 +701,8 @@ def install_hermes_adapter(
             raise FileNotFoundError(f"Hermes plugin source not found: {plugin_source}")
         plugin_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(plugin_source, plugin_target, dirs_exist_ok=True)
-        local_config_path.write_text(
+        secure_write_text(
+            local_config_path,
             json.dumps(
                 {
                     "continuum_root": str(root),
@@ -708,6 +725,7 @@ def install_hermes_adapter(
     profile_snippet = None
     profile_snippet_for_return = None
     if model_alias and model_name and base_url:
+        model_alias = _validated_model_alias(model_alias)
         profile_snippet = openai_compatible_model_profile(
             alias=model_alias,
             model_name=model_name,
@@ -729,7 +747,7 @@ def install_hermes_adapter(
         profile_path = snippets_dir / f"{model_alias}.yaml"
         touched_paths.append(str(profile_path))
         if not dry_run:
-            profile_path.write_text(profile_snippet, encoding="utf-8")
+            secure_write_text(profile_path, profile_snippet, encoding="utf-8")
 
     commands: list[dict[str, Any]] = []
     exe = Path(hermes_exe) if hermes_exe else _find_hermes_exe(home)

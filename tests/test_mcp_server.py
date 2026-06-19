@@ -264,6 +264,28 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                                 self.assertNotIn("NameError", error)
                                 self.assertNotIn("AttributeError", error)
 
+    def test_mcp_operation_summary_rejects_path_traversal_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                call_tool("continuum_init", {"root": str(root)})
+                response = dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 9,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "continuum_operation_summary",
+                            "arguments": {"root": str(root), "operation_id": "../../../outside"},
+                        },
+                    }
+                )
+
+            assert response is not None
+            self.assertTrue(response["result"]["isError"])
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertIn("safe portable filename component", payload["error"])
+
     def test_read_only_status_does_not_initialize_missing_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "missing-continuum"

@@ -16,3 +16,9 @@ Initial public release.
 - Hardened public-release behavior for POSIX file modes, Hermes secret handling,
   FTS fallback health, hard tool-result byte caps, plugin namespace isolation,
   and clean release packaging.
+- Added root-confined configurable paths, portable operation identifiers,
+  cross-process operation-receipt locking, URI-safe read-only SQLite access,
+  private redacted adapter logs, and link-safe public release assembly.
+- Finalized release boundaries with proofed-ledger immutability, portable recovery
+  packets, bounded recovery filenames, strict tool-result skip/byte-cap semantics,
+  portable symlink-skip export, and secret-safe packaged adapter diagnostics.

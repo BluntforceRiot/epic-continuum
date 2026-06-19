@@ -18,6 +18,7 @@ from continuum.core.mempalace_import import import_mempalace
 from continuum.core.operations import create_proof_pack, doctor, finish_operation, repair_permissions, start_operation
 from continuum.core.permissions import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, audit_private_permissions, posix_permissions_supported
 from continuum.core.store import audit_search_index, ingest_file, init_db, snapshot
+from continuum.integrations import claude_code_adapter, hermes_adapter
 from continuum.integrations.hermes_adapter import REDACTED_SECRET, install_hermes_adapter
 from continuum.mcp_server import dispatch
 
@@ -107,6 +108,36 @@ class ReleaseHardeningTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(f"version: {version}", path.read_text(encoding="utf-8"))
 
+    def test_read_only_sqlite_access_supports_uri_reserved_path_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum#query?fragment"
+            init_db(root)
+
+            search_audit = audit_search_index(root)
+            health = doctor(root, verify_recent_proof_packs=0)
+
+            self.assertTrue(search_audit["ok"], search_audit)
+            self.assertTrue(health["ok"], health)
+
+    def test_adapter_error_logs_are_private_and_secret_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            secret = "client_secret=supersecretvalue123"
+            with patch.dict(os.environ, {"CONTINUUM_ROOT": str(root)}):
+                claude_code_adapter._log_error(RuntimeError(secret), phase="test")
+            hermes_adapter._log_error({"continuum_root": str(root)}, "test", RuntimeError(secret))
+
+            for log_path in (
+                root / "run" / "integrations" / "claude_code_adapter.log",
+                root / "run" / "integrations" / "hermes_adapter.log",
+            ):
+                with self.subTest(log_path=log_path):
+                    rendered = log_path.read_text(encoding="utf-8")
+                    self.assertNotIn("supersecretvalue123", rendered)
+                    self.assertIn("[REDACTED]", rendered)
+                    if os.name == "posix" and posix_permissions_supported(log_path.parent):
+                        self.assertEqual(_mode(log_path), PRIVATE_FILE_MODE)
+
     def test_pack_root_does_not_chmod_existing_external_export_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             if os.name != "posix" or not posix_permissions_supported(Path(tmp)):
@@ -194,6 +225,53 @@ version = "9.9.9"
             )
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
             self.assertTrue((out / "epic-continuum-9.9.9.zip").exists())
+
+    def test_release_builder_walk_fallback_rejects_source_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            source_dir = repo / "src" / "continuum"
+            source_dir.mkdir(parents=True)
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            outside = base / "outside-secret.txt"
+            outside.write_text("external target bytes", encoding="utf-8")
+            link = source_dir / "linked.py"
+            try:
+                link.symlink_to(outside)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+            result = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("refusing to package link-like", result.stderr)
+            self.assertFalse((out / "epic-continuum-9.9.9.zip").exists())
+
+            link.unlink()
+            shutil.rmtree(source_dir.parent)
+            outside_source = base / "outside-src"
+            (outside_source / "continuum").mkdir(parents=True)
+            (outside_source / "continuum" / "external.py").write_text("external = True\n", encoding="utf-8")
+            try:
+                (repo / "src").symlink_to(outside_source, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlink creation unavailable: {exc}")
+            directory_result = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(directory_result.returncode, 0, directory_result.stdout + directory_result.stderr)
+            self.assertIn("refusing to package link-like", directory_result.stderr)
 
     def test_codex_stage_helper_preserves_base_and_writes_bomless_cachebusted_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -410,6 +488,47 @@ version = "9.9.9"
         self.assertFalse(tools["continuum_repair_permissions"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_import_mempalace"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_prune_memory"]["annotations"]["destructiveHint"])
+
+    def test_hermes_bootstrap_import_error_log_is_private_and_does_not_store_exception_text(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        for source in (
+            repo_root / "integrations" / "hermes" / "epic_continuum" / "__init__.py",
+            repo_root / "src" / "continuum" / "assets" / "hermes" / "epic_continuum" / "__init__.py",
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "__init__.py"
+                shutil.copyfile(source, target)
+                spec = importlib.util.spec_from_file_location("continuum_bootstrap_probe", target)
+                assert spec is not None and spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module._log_import_error(RuntimeError("api_key=supersecretvalue123"))
+
+                log_path = target.with_name("continuum_adapter.error.log")
+                text = log_path.read_text(encoding="utf-8")
+                self.assertNotIn("supersecretvalue123", text)
+                self.assertNotIn("api_key", text)
+                self.assertIn("error_type=RuntimeError", text)
+                self.assertIn("error_hash=", text)
+                if os.name == "posix" and posix_permissions_supported(Path(tmp)):
+                    self.assertEqual(_mode(log_path), PRIVATE_FILE_MODE)
+
+    def test_hermes_model_alias_cannot_escape_profile_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            hermes_home = base / "hermes"
+            with self.assertRaisesRegex(ValueError, "model_alias"):
+                install_hermes_adapter(
+                    hermes_home=hermes_home,
+                    continuum_root=base / "continuum",
+                    continuum_src=Path(__file__).resolve().parents[1] / "src",
+                    enable=False,
+                    dry_run=True,
+                    model_alias="../../../escaped",
+                    model_name="model",
+                    base_url="http://127.0.0.1:9999/v1",
+                )
+            self.assertFalse((base / "escaped.yaml").exists())
 
 
 if __name__ == "__main__":

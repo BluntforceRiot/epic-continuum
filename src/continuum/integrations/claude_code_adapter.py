@@ -11,6 +11,7 @@ from continuum.core.store import utc_now
 from continuum.integrations.common import (
     DEFAULT_TOKEN_BUDGET,
     adapter_metadata,
+    append_adapter_log,
     as_text,
     compile_context_packet,
     default_continuum_root,
@@ -36,16 +37,14 @@ def _root() -> Path:
 def _log_error(exc: BaseException, *, phase: str) -> None:
     try:
         log_path = _root() / "run" / "integrations" / "claude_code_adapter.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "created_at": utc_now(),
             "phase": phase,
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(limit=8),
         }
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
-    except OSError:
+        append_adapter_log(log_path, payload)
+    except (OSError, ValueError):
         return
 
 

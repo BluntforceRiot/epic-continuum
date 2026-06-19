@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-import traceback
+import hashlib
 from pathlib import Path
 
 
@@ -21,12 +21,38 @@ def _local_config() -> dict:
 
 
 def _log_import_error(exc: BaseException) -> None:
+    """Record a private, non-sensitive import failure marker.
+
+    This bootstrap module runs precisely when importing Continuum may have
+    failed, so it cannot rely on the main redaction helpers.  Never persist the
+    exception message or traceback here: both can contain API keys, paths, or
+    user content.  A deterministic digest still allows repeated failures to be
+    correlated without storing the raw material.
+    """
     try:
         log_path = Path(__file__).with_name("continuum_adapter.error.log")
-        log_path.write_text(
-            f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc(limit=8)}",
-            encoding="utf-8",
-        )
+        if log_path.is_symlink():
+            return
+        raw = f"{type(exc).__name__}: {exc}".encode("utf-8", errors="replace")
+        message = (
+            "Continuum adapter import failed.\n"
+            f"error_type={type(exc).__name__}\n"
+            f"error_hash={hashlib.sha256(raw).hexdigest()}\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(log_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600) if hasattr(os, "fchmod") else None
+            os.write(fd, message)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
     except OSError:
         return
 

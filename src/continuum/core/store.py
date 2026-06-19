@@ -9,9 +9,10 @@ import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from .atomic import atomic_memory_card, write_atomic_yaml
-from .config import config_path, default_config, load_config, write_default_config
+from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
 from .permissions import secure_copy_file, secure_copytree, secure_mkdir, secure_sqlite_files, secure_write_text
 from .safety import (
     is_ignored_path,
@@ -30,6 +31,19 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/\\-]{1,}")
 INDEX_DDL_MARKER = "\nCREATE INDEX"
 _INIT_DB_CACHE: set[str] = set()
+
+
+def sqlite_file_uri(path: Path, **query: str | int | bool) -> str:
+    """Return a properly escaped SQLite file URI for an absolute filesystem path."""
+    resolved = path.resolve(strict=False)
+    uri = resolved.as_uri()
+    if query:
+        uri = f"{uri}?{urlencode({key: str(value).lower() if isinstance(value, bool) else value for key, value in query.items()})}"
+    return uri
+
+
+def sqlite_readonly_uri(path: Path) -> str:
+    return sqlite_file_uri(path, mode="ro")
 
 
 def utc_now() -> str:
@@ -347,7 +361,7 @@ def connect_existing(root: Path) -> sqlite3.Connection:
     db_path = root / "catalog" / "catalog.sqlite3"
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -367,7 +381,12 @@ def card_sidecar_path(root: Path, card_id: str) -> Path | None:
     atomic_config = config.get("atomic_memory", {})
     if not atomic_config.get("write_card_sidecars", True):
         return None
-    return root / atomic_config.get("card_sidecar_dir", "catalog/cards") / f"{card_id}.yaml"
+    sidecar_dir = resolve_root_config_path(
+        root,
+        atomic_config.get("card_sidecar_dir", "catalog/cards"),
+        field="atomic_memory.card_sidecar_dir",
+    )
+    return sidecar_dir / f"{card_id}.yaml"
 
 
 def init_layout(root: Path) -> None:
@@ -672,8 +691,7 @@ LEGACY_SECRET_REDACTION_COLUMNS: dict[str, set[str]] = {
 
 def _secret_allowlist_path(root: Path, security: dict[str, Any]) -> Path:
     configured = str(security.get("secret_allowlist_file") or "security/secret_allowlist.jsonl")
-    candidate = Path(configured)
-    return candidate if candidate.is_absolute() else root / candidate
+    return resolve_root_config_path(root, configured, field="security.secret_allowlist_file")
 
 
 def _load_secret_allowlist_hashes(root: Path, security: dict[str, Any]) -> set[str]:
@@ -849,7 +867,7 @@ def _scan_sqlite_text_for_secrets(path: Path, *, max_findings: int) -> list[dict
         return []
     findings: list[dict[str, Any]] = []
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        conn = sqlite3.connect(sqlite_readonly_uri(path), uri=True, timeout=2)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error:
         return []
@@ -1472,7 +1490,11 @@ def create_card(
         config = load_config(root)
         atomic_config = config.get("atomic_memory", {})
         if atomic_config.get("write_card_sidecars", True):
-            sidecar_dir = root / atomic_config.get("card_sidecar_dir", "catalog/cards")
+            sidecar_dir = resolve_root_config_path(
+                root,
+                atomic_config.get("card_sidecar_dir", "catalog/cards"),
+                field="atomic_memory.card_sidecar_dir",
+            )
             sidecar_path = sidecar_dir / f"{card_id}.yaml"
             write_atomic_yaml(
                 sidecar_path,
@@ -2500,7 +2522,7 @@ def recover_thread(
         packet_text = "\n".join(lines).rstrip() + "\n"
 
         safe_session_source = display_session_id if display_session_id != session_id else session_id
-        safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", safe_session_source).strip("_") or "thread"
+        safe_session = safe_external_name(safe_session_source, limit=80)
         packet_path = root / "exports" / "thread_recovery" / f"{safe_session}_{recovery_id}.md"
         secure_mkdir(packet_path.parent)
         atomic_write_text_file(packet_path, packet_text)

@@ -38,6 +38,13 @@ Review hardening after the final private review pass added:
 - safe Codex plugin staging under a generated child directory;
 - BOM-less generated Codex `.mcp.json` files;
 - Codex plugin cachebuster versions for generated local stages.
+- root-confined configurable paths and portable operation identifiers;
+- cross-thread and cross-process operation-ledger serialization;
+- immutable public ledger APIs after proof publication;
+- private secret-redacted adapter and bootstrap diagnostic logs;
+- absolute tool-result byte caps and true no-event skip semantics;
+- portable recovery packets and bounded recovery filenames;
+- link-safe release assembly and coherent portable symlink-skip behavior.
 
 See `MAINTAINABILITY_HOTSPOTS.md` for the non-blocking large-function
 refactor map identified during release review.

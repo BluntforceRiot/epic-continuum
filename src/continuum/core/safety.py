@@ -9,6 +9,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .config import resolve_root_config_path
+
 
 DEFAULT_IGNORE_PATTERNS = [
     ".env",
@@ -51,7 +53,7 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 def load_ignore_patterns(root: Path, *, ignore_file_name: str = ".continuumignore") -> list[str]:
     patterns = list(DEFAULT_IGNORE_PATTERNS)
-    ignore_path = root / ignore_file_name
+    ignore_path = resolve_root_config_path(root, ignore_file_name, field="security.ignore_file")
     if ignore_path.exists():
         for line in ignore_path.read_text(encoding="utf-8", errors="replace").splitlines():
             stripped = line.strip()

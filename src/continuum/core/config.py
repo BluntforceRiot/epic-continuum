@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .hardware import apply_inventory_overrides, detect_hardware, recommend_config
@@ -26,6 +26,61 @@ SNAPSHOT_RETENTION_POLICIES = {"last_20", "keep_all"}
 PROOF_PACK_RETENTION_POLICIES = {"keep_successful_90_days", "keep_all"}
 
 
+def normalize_root_relative_config_path(value: Any, *, field: str) -> str:
+    """Validate and normalize a configurable path that must remain under a root.
+
+    Config files are portable between POSIX and Windows.  Treat both slash styles
+    as separators and reject drive-qualified, UNC, absolute, empty, and parent-
+    traversing paths on every platform rather than only on the host that happens
+    to load the config.
+    """
+    text = str(value or "").strip()
+    if not text or "\x00" in text:
+        raise ValueError(f"{field} must be a non-empty root-relative path")
+    windows = PureWindowsPath(text)
+    normalized = text.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    if windows.is_absolute() or bool(windows.drive) or posix.is_absolute():
+        raise ValueError(f"{field} must be root-relative")
+    parts = posix.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{field} must not contain empty, current, or parent path components")
+    return posix.as_posix()
+
+
+def resolve_root_config_path(root: Path, value: Any, *, field: str) -> Path:
+    """Resolve one validated config path and reject existing symlink escapes."""
+    normalized = normalize_root_relative_config_path(value, field=field)
+    candidate = root.joinpath(*PurePosixPath(normalized).parts)
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except (OSError, ValueError):
+        raise ValueError(f"{field} resolves outside the Continuum root") from None
+    return candidate
+
+
+
+def validate_config_root_paths(root: Path, config: dict[str, Any]) -> None:
+    """Validate configured internal files against one concrete Continuum root."""
+    atomic_memory = config.get("atomic_memory", {})
+    resolve_root_config_path(
+        root,
+        atomic_memory.get("card_sidecar_dir", "catalog/cards"),
+        field="atomic_memory.card_sidecar_dir",
+    )
+    security = config.get("security", {})
+    resolve_root_config_path(
+        root,
+        security.get("ignore_file", ".continuumignore"),
+        field="security.ignore_file",
+    )
+    resolve_root_config_path(
+        root,
+        security.get("secret_allowlist_file", "security/secret_allowlist.jsonl"),
+        field="security.secret_allowlist_file",
+    )
+
+
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(base)
     for key, value in overlay.items():
@@ -46,6 +101,7 @@ def config_path(root: Path) -> Path:
 
 def write_config(root: Path, config: dict[str, Any]) -> Path:
     validate_config(config)
+    validate_config_root_paths(root, config)
     path = config_path(root)
     secure_write_text(
         path,
@@ -74,6 +130,7 @@ def load_config(root: Path) -> dict[str, Any]:
     user_config = json.loads(path.read_text(encoding="utf-8"))
     config = deep_merge(default_config(), user_config)
     validate_config(config)
+    validate_config_root_paths(root, config)
     return config
 
 
@@ -207,7 +264,8 @@ def validate_config(config: dict[str, Any]) -> None:
     if int(capture.get("dedup_window_seconds", 0)) < 0:
         raise ValueError("capture.dedup_window_seconds must be non-negative")
     if "max_tool_result_bytes" in capture:
-        parse_size(capture["max_tool_result_bytes"])
+        if parse_size(capture["max_tool_result_bytes"]) <= 0:
+            raise ValueError("capture.max_tool_result_bytes must be positive")
     if capture.get("large_result_policy", "truncate_with_notice") not in LARGE_RESULT_POLICIES:
         raise ValueError("capture.large_result_policy must be truncate_with_notice, truncate, or skip")
     retention = config.get("retention", {})
@@ -240,6 +298,13 @@ def validate_config(config: dict[str, Any]) -> None:
     storage = config.get("storage", {})
     if "max_ingest_bytes" in storage:
         parse_size(storage["max_ingest_bytes"])
+    atomic_memory = config.get("atomic_memory", {})
+    if "write_card_sidecars" in atomic_memory and not isinstance(atomic_memory["write_card_sidecars"], bool):
+        raise ValueError("atomic_memory.write_card_sidecars must be true or false")
+    normalize_root_relative_config_path(
+        atomic_memory.get("card_sidecar_dir", "catalog/cards"),
+        field="atomic_memory.card_sidecar_dir",
+    )
     security = config.get("security", {})
     if security.get("secret_scan_action", "block") not in {"warn", "block", "off"}:
         raise ValueError("security.secret_scan_action must be warn, block, or off")
@@ -253,6 +318,14 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("security.entropy_min_bits_per_char must be positive")
     if security.get("redaction_profile", "portable") not in {"private", "portable", "shareable"}:
         raise ValueError("security.redaction_profile must be private, portable, or shareable")
+    normalize_root_relative_config_path(
+        security.get("ignore_file", ".continuumignore"),
+        field="security.ignore_file",
+    )
+    normalize_root_relative_config_path(
+        security.get("secret_allowlist_file", "security/secret_allowlist.jsonl"),
+        field="security.secret_allowlist_file",
+    )
     queues = config.get("queues", {})
     if int(queues.get("worker_lease_seconds", 300)) <= 0:
         raise ValueError("queues.worker_lease_seconds must be positive")

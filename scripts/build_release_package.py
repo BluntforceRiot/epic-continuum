@@ -5,6 +5,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import os
+import stat
 import subprocess
 import tomllib
 import zipfile
@@ -66,6 +67,36 @@ INCLUDE_TOP_LEVEL = {
     "SECURITY.md",
     "pyproject.toml",
 }
+
+
+
+def _is_link_like(path: Path) -> bool:
+    """Return true for symlinks and Windows junction/reparse-point entries."""
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(reparse_flag and attributes & reparse_flag)
+    except OSError:
+        return False
+
+
+def _assert_confined_source(path: Path, repo_root: Path) -> None:
+    """Reject source members that escape through a link-like path component."""
+    rel = path.relative_to(repo_root)
+    current = repo_root
+    for part in rel.parts:
+        current = current / part
+        if _is_link_like(current):
+            raise RuntimeError(f"refusing to package link-like source path: {rel.as_posix()}")
+    try:
+        path.resolve(strict=True).relative_to(repo_root.resolve(strict=True))
+    except (OSError, ValueError):
+        raise RuntimeError(f"refusing to package source outside repository root: {rel.as_posix()}") from None
 
 
 def project_version(repo_root: Path) -> str:
@@ -145,6 +176,8 @@ def zip_mode(path: Path) -> int:
 
 
 def write_member(zf: zipfile.ZipFile, source: Path, arcname: str, *, mode: int | None = None) -> None:
+    if _is_link_like(source):
+        raise RuntimeError(f"refusing to package symlink, junction, or reparse point: {source}")
     info = zipfile.ZipInfo(arcname, reproducible_zip_dt())
     info.create_system = 3
     info.external_attr = (mode if mode is not None else zip_mode(source)) << 16
@@ -176,11 +209,14 @@ def _git_tracked_members(repo_root: Path, package_name: str) -> list[tuple[Path,
             raise RuntimeError(f"unable to parse git ls-files record: {raw_record!r}") from None
         path = repo_root / rel
         if mode == 0o120000:
+            if should_include(path, repo_root):
+                raise RuntimeError(f"refusing to package tracked symlink: {rel.as_posix()}")
             continue
-        if not path.exists() or not path.is_file():
-            raise FileNotFoundError(str(path))
         if not should_include(path, repo_root):
             continue
+        _assert_confined_source(path, repo_root)
+        if not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
+            raise FileNotFoundError(str(path))
         rel_posix = rel.as_posix()
         members_by_arcname[f"{package_name}/{rel_posix}"] = (path, f"{package_name}/{rel_posix}", mode)
         parent = rel.parent
@@ -199,30 +235,55 @@ def _git_tracked_members(repo_root: Path, package_name: str) -> list[tuple[Path,
 
 def _walk_members(repo_root: Path, package_name: str) -> list[tuple[Path, str, int]]:
     members: list[tuple[Path, str, int]] = []
-    for current_root, dir_names, file_names in os.walk(repo_root):
+    for current_root, dir_names, file_names in os.walk(repo_root, followlinks=False):
         current = Path(current_root)
         rel_current = current.relative_to(repo_root)
-        dir_names[:] = sorted(
-            name
-            for name in dir_names
-            if name not in EXCLUDED_PARTS
-            and not any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_BASENAME_PATTERNS)
-            and (rel_current.parts or name in INCLUDE_TOP_LEVEL)
-        )
+
+        retained_dirs: list[str] = []
+        for name in sorted(dir_names):
+            path = current / name
+            if name in EXCLUDED_PARTS or any(
+                fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_BASENAME_PATTERNS
+            ):
+                continue
+            if not rel_current.parts and name not in INCLUDE_TOP_LEVEL:
+                continue
+            if _is_link_like(path):
+                if should_include(path, repo_root):
+                    raise RuntimeError(
+                        f"refusing to package link-like path from filesystem walk: "
+                        f"{path.relative_to(repo_root).as_posix()}"
+                    )
+                continue
+            _assert_confined_source(path, repo_root)
+            retained_dirs.append(name)
+        dir_names[:] = retained_dirs
+
         for dir_name in dir_names:
             path = current / dir_name
             if should_include(path, repo_root):
                 rel = path.relative_to(repo_root).as_posix()
                 members.append((path, f"{package_name}/{rel}/", zip_mode(path)))
+
         for file_name in sorted(file_names):
             path = current / file_name
+            if _is_link_like(path):
+                if should_include(path, repo_root):
+                    raise RuntimeError(
+                        f"refusing to package link-like path from filesystem walk: "
+                        f"{path.relative_to(repo_root).as_posix()}"
+                    )
+                continue
             if should_include(path, repo_root):
+                _assert_confined_source(path, repo_root)
                 rel = path.relative_to(repo_root).as_posix()
                 members.append((path, f"{package_name}/{rel}", zip_mode(path)))
     return sorted(members, key=lambda item: item[1])
 
 
 def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean: bool = True) -> dict[str, object]:
+    if _is_link_like(repo_root):
+        raise RuntimeError(f"refusing to package a linked repository root: {repo_root}")
     package_name = f"epic-continuum-{version}"
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"{package_name}.zip"

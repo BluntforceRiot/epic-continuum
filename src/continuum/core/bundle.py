@@ -27,6 +27,7 @@ from .store import (
     content_hash,
     file_sha256,
     is_initialized,
+    sqlite_readonly_uri,
     unique_id,
     utc_now,
 )
@@ -146,7 +147,7 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
     if not stat.S_ISREG(source_stat.st_mode):
         raise ValueError(f"refusing to back up a non-regular database: {source}")
     secure_mkdir(destination.parent)
-    source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    source_conn = sqlite3.connect(sqlite_readonly_uri(source), uri=True)
     destination_conn = sqlite3.connect(str(destination))
     try:
         source_conn.backup(destination_conn)
@@ -272,6 +273,16 @@ _SQLITE_VALUE_COLUMNS = {
     "uri_value",
 }
 _SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
+_EMBEDDED_TRACEBACK_PATH_RE = re.compile(
+    r"(?i)\bFile\s+[\"\'](?P<path>(?:[A-Z]:[\\\\/]|/|~[/\\\\])[^\"\'\r\n]+)[\"\']"
+)
+_EMBEDDED_QUOTED_PATH_RE = re.compile(
+    r"(?P<quote>[\"\'])(?P<path>(?:file:(?://)?|[A-Za-z]:[\\\\/]|~[/\\\\]|/(?:Users|home|root|tmp|private|var|opt|mnt|Volumes|srv|data|workspace|workspaces|app)(?:/|$))[^\"\'\r\n]*)(?P=quote)",
+    re.IGNORECASE,
+)
+_EMBEDDED_WINDOWS_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?P<path>[A-Z]:[\\\\/][^\s\"\'<>|\r\n]+)"
+)
 
 
 def _normalized_key_text(value: str) -> str:
@@ -296,7 +307,11 @@ def _is_json_like_column(value: str) -> bool:
 
 def _is_metadata_file(rel: Path) -> bool:
     pure = PurePosixPath(rel.as_posix())
-    if rel.suffix.casefold() not in {".json", ".jsonl"}:
+    suffix = rel.suffix.casefold()
+    if suffix == ".log":
+        integration_logs = PurePosixPath("run/integrations")
+        return pure == integration_logs or integration_logs in pure.parents
+    if suffix not in {".json", ".jsonl"}:
         return False
     return any(pure == prefix or prefix in pure.parents for prefix in _METADATA_PATHS)
 
@@ -326,6 +341,21 @@ def _looks_nonportable_local_path(value: str) -> bool:
     return Path(text).is_absolute() or bool(_WINDOWS_ABSOLUTE_RE.match(text))
 
 
+def _embedded_nonportable_paths(value: str) -> list[str]:
+    """Extract clear local filesystem references embedded in diagnostic text."""
+    found: list[str] = []
+    for pattern in (
+        _EMBEDDED_TRACEBACK_PATH_RE,
+        _EMBEDDED_QUOTED_PATH_RE,
+        _EMBEDDED_WINDOWS_PATH_RE,
+    ):
+        for match in pattern.finditer(value):
+            candidate = match.group("path").strip().rstrip(".,;:)")
+            if candidate and _looks_nonportable_local_path(candidate) and candidate not in found:
+                found.append(candidate)
+    return found
+
+
 def _external_path_reference(value: str) -> str:
     text = value.strip().rstrip("/\\")
     lowered = text.casefold()
@@ -340,7 +370,13 @@ def _external_path_reference(value: str) -> str:
     return f"external:{safe_name}"
 
 
-def _portable_metadata_findings(value: Any, *, path: str = "$", key_hint: str | None = None) -> list[dict[str, Any]]:
+def _portable_metadata_findings(
+    value: Any,
+    *,
+    path: str = "$",
+    key_hint: str | None = None,
+    scan_embedded_paths: bool = False,
+) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if isinstance(value, dict):
         for key, nested in value.items():
@@ -359,19 +395,47 @@ def _portable_metadata_findings(value: Any, *, path: str = "$", key_hint: str | 
                 safe_key_text = redact_text_secrets(key_text)
                 nested_path = f"{path}.{safe_key_text}"
             findings.extend(
-                _portable_metadata_findings(nested, path=nested_path, key_hint=key_text)
+                _portable_metadata_findings(
+                    nested,
+                    path=nested_path,
+                    key_hint=key_text,
+                    scan_embedded_paths=scan_embedded_paths,
+                )
             )
     elif isinstance(value, list):
         for index, nested in enumerate(value):
-            findings.extend(_portable_metadata_findings(nested, path=f"{path}[{index}]", key_hint=key_hint))
-    elif isinstance(value, str) and key_hint and _is_path_like_key(key_hint) and _looks_nonportable_local_path(value):
-        findings.append(
-            {
-                "metadata_path": path,
-                "value": _external_path_reference(value),
-                "value_hash": content_hash(value),
-            }
-        )
+            findings.extend(
+                _portable_metadata_findings(
+                    nested,
+                    path=f"{path}[{index}]",
+                    key_hint=key_hint,
+                    scan_embedded_paths=scan_embedded_paths,
+                )
+            )
+    elif isinstance(value, str):
+        if key_hint and _is_path_like_key(key_hint) and _looks_nonportable_local_path(value):
+            findings.append(
+                {
+                    "metadata_path": path,
+                    "value": _external_path_reference(value),
+                    "value_hash": content_hash(value),
+                }
+            )
+        if scan_embedded_paths:
+            seen_hashes = {str(item.get("value_hash")) for item in findings}
+            for embedded in _embedded_nonportable_paths(value):
+                embedded_hash = content_hash(embedded)
+                if embedded_hash in seen_hashes:
+                    continue
+                findings.append(
+                    {
+                        "metadata_path": path,
+                        "value": _external_path_reference(embedded),
+                        "value_hash": embedded_hash,
+                        "embedded": True,
+                    }
+                )
+                seen_hashes.add(embedded_hash)
     return findings
 
 
@@ -429,7 +493,7 @@ def _audit_sqlite_portable_metadata(
         rel_raw = database.relative_to(root)
         rel = str(_safe_rel_text(rel_raw)["path"])
         try:
-            conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+            conn = sqlite3.connect(sqlite_readonly_uri(database), uri=True, timeout=2)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error as exc:
             errors.append(
@@ -749,7 +813,8 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
             errors.append({"source": "json", "file": rel.as_posix(), "error": "metadata_read_failed", "detail": str(exc)})
             continue
         values: list[tuple[int | None, Any]] = []
-        if rel.suffix.casefold() == ".jsonl":
+        line_oriented = rel.suffix.casefold() in {".jsonl", ".log"}
+        if line_oriented:
             for line_number, line in enumerate(text.splitlines(), start=1):
                 if not line.strip():
                     continue
@@ -784,7 +849,10 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
             remaining = max_findings - len(findings)
             if remaining <= 0:
                 break
-            for item in _portable_metadata_findings(parsed)[:remaining]:
+            for item in _portable_metadata_findings(
+                parsed,
+                scan_embedded_paths=rel.suffix.casefold() == ".log",
+            )[:remaining]:
                 item["source"] = "jsonl" if line_number is not None else "json"
                 item["file"] = rel.as_posix()
                 if line_number is not None:
@@ -2551,6 +2619,7 @@ def pack_root(
         verify_recent_proof_packs=proof_count,
         run_restore_drill=run_restore_drill,
         scan_secrets=True,
+        allow_symlinks=symlink_policy == "skip",
     )
     if not root_verification.get("ok"):
         raise ValueError(f"root verification failed: {_verification_failure_message(root_verification)}")
@@ -2606,6 +2675,7 @@ def pack_root(
             verify_recent_proof_packs=staged_proof_count,
             run_restore_drill=False,
             scan_secrets=True,
+            allow_symlinks=False,
         )
         if not staged_verification.get("ok"):
             raise ValueError(f"staged root verification failed: {_verification_failure_message(staged_verification)}")

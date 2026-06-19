@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -19,11 +23,13 @@ from continuum.core.operations import (
     SNAPSHOT_COUNT_TABLES,
     _proof_pack_hash,
     _stable_json_hash,
+    append_operation_event,
     create_proof_pack,
     doctor,
     finish_operation,
     list_operations,
     operation_summary,
+    read_operation,
     record_operation_progress,
     recover_stale_operations,
     recovery_drill,
@@ -34,6 +40,7 @@ from continuum.core.operations import (
     verify_operation_event_log,
     verify_root,
     verify_proof_pack,
+    write_operation,
 )
 
 
@@ -48,6 +55,90 @@ def root_uri(root: Path, path: str | Path) -> str:
 
 
 class OperationLedgerTest(unittest.TestCase):
+    def test_operation_id_cannot_escape_receipt_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            start_operation(root, operation_type="seed", title="Create operation directories")
+            outside = base / "outside.json"
+            outside.write_text(json.dumps({"operation_id": "outside", "title": "loot"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "safe portable filename component"):
+                operation_summary(root, "../../../outside")
+            for reserved in ("CON", "nul", "LPT1.backup"):
+                with self.subTest(reserved=reserved):
+                    with self.assertRaisesRegex(ValueError, "safe portable filename component"):
+                        operation_summary(root, reserved)
+
+    def test_concurrent_progress_updates_are_lossless_and_hash_chained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            started = start_operation(root, operation_type="concurrency", title="Concurrent progress")
+            operation_id = started["operation_id"]
+
+            def record(index: int) -> None:
+                record_operation_progress(
+                    root,
+                    operation_id,
+                    phase="parallel",
+                    message=f"progress-{index}",
+                    current=index,
+                    total=40,
+                )
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                list(executor.map(record, range(40)))
+
+            summary = operation_summary(root, operation_id)
+            self.assertEqual(summary["progress_events"], 40)
+            for path in (
+                root / "run" / "operation_events" / f"{operation_id}.jsonl",
+                root / "exports" / "operation_events" / f"{operation_id}.jsonl",
+            ):
+                verification = verify_operation_event_log(path, operation_id=operation_id)
+                self.assertTrue(verification["ok"], verification["errors"])
+                self.assertEqual(verification["event_count"], 41)
+
+    def test_cross_process_progress_updates_are_lossless_and_hash_chained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            started = start_operation(root, operation_type="multiprocess", title="Cross-process progress")
+            operation_id = started["operation_id"]
+            code = (
+                "from pathlib import Path; import sys; "
+                "from continuum.core.operations import record_operation_progress; "
+                "record_operation_progress(Path(sys.argv[1]), sys.argv[2], "
+                "phase='parallel-process', message='progress-' + sys.argv[3], "
+                "current=int(sys.argv[3]), total=8)"
+            )
+            environment = dict(os.environ)
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-c", code, str(root), operation_id, str(index)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                )
+                for index in range(8)
+            ]
+            failures: list[str] = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=60)
+                if process.returncode != 0:
+                    failures.append(f"returncode={process.returncode} stdout={stdout!r} stderr={stderr!r}")
+            self.assertEqual(failures, [])
+
+            summary = operation_summary(root, operation_id)
+            self.assertEqual(summary["progress_events"], 8)
+            for path in (
+                root / "run" / "operation_events" / f"{operation_id}.jsonl",
+                root / "exports" / "operation_events" / f"{operation_id}.jsonl",
+            ):
+                verification = verify_operation_event_log(path, operation_id=operation_id)
+                self.assertTrue(verification["ok"], verification["errors"])
+                self.assertEqual(verification["event_count"], 9)
+
     def test_operation_ids_do_not_collide_in_bursts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -263,6 +354,28 @@ class OperationLedgerTest(unittest.TestCase):
             verification = verify_proof_pack(Path(proof["proof_pack_uri"]))
             self.assertTrue(verification["ok"])
             self.assertEqual(verification["operation_id"], started["operation_id"])
+
+    def test_published_proof_makes_public_operation_ledger_writers_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            started = start_operation(root, operation_type="proof_immutable", title="Proof immutability")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            proof = create_proof_pack(root, started["operation_id"])
+
+            receipt = read_operation(root, started["operation_id"])
+            receipt["title"] = "mutated after proof"
+            with self.assertRaisesRegex(ValueError, "proof pack already exists"):
+                write_operation(root, receipt)
+            with self.assertRaisesRegex(ValueError, "proof pack already exists"):
+                append_operation_event(
+                    root,
+                    started["operation_id"],
+                    event_type="late_mutation",
+                    payload={"unexpected": True},
+                )
+
+            verification = verify_proof_pack(Path(proof["proof_pack_uri"]), root=root)
+            self.assertTrue(verification["ok"], verification["errors"])
 
     def test_proof_pack_freezes_live_catalog_and_records_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1198,6 +1311,50 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(verification["ok"], verification["errors"])
             policy_verification = verify_proof_pack(proof_path, root=root, allowed_roots=[root])
             self.assertTrue(policy_verification["ok"], policy_verification["errors"])
+
+    def test_strict_proof_verification_rejects_invalid_operation_identifier_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            proof_path = root / "exports" / "proof_packs" / "forged.json"
+            proof_path.parent.mkdir(parents=True, exist_ok=True)
+            proof = {
+                "schema": "epic_continuum.proof_pack.v1",
+                "operation_id": "../../../outside/loot",
+                "paths": [{"uri": "run/operations/forged.json", "kind": "missing", "exists": False}],
+            }
+            proof["proof_pack_hash"] = _proof_pack_hash(proof)
+            proof_path.write_text(json.dumps(proof), encoding="utf-8")
+
+            result = verify_proof_pack(proof_path, root=root, strict=True)
+            self.assertFalse(result["ok"], result)
+            self.assertIn("operation_id_valid", {item.get("check") for item in result["errors"]})
+
+    def test_terminal_operation_cannot_be_mutated_after_proof_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            started = start_operation(root, operation_type="immutable_terminal", title="Immutable terminal receipt")
+            with self.assertRaisesRegex(ValueError, "terminal operations"):
+                create_proof_pack(root, started["operation_id"])
+
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            proof = create_proof_pack(root, started["operation_id"])
+            proof_path = Path(proof["proof_pack_uri"])
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+
+            with self.assertRaisesRegex(ValueError, "terminal status"):
+                record_operation_progress(
+                    root,
+                    started["operation_id"],
+                    phase="late",
+                    message="must not rot the proof",
+                )
+            with self.assertRaisesRegex(ValueError, "terminal status"):
+                update_operation_cursor(root, started["operation_id"], {"late": True})
+            with self.assertRaisesRegex(ValueError, "terminal status"):
+                finish_operation(root, started["operation_id"], status="failed", error={"late": True})
+
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
 
 
 

@@ -29,7 +29,7 @@ from continuum.core.bundle import (
     verify_root_bundle,
 )
 from continuum.core.config import load_config, write_config
-from continuum.core.operations import verify_root
+from continuum.core.operations import recover_stale_operations, start_operation, verify_root
 from continuum.core.permissions import secure_file, secure_mkdir, secure_sqlite_files, secure_tree, secure_write_text
 from continuum.core.store import audit_secrets, file_sha256, init_db
 
@@ -641,6 +641,64 @@ class RootBundleTest(unittest.TestCase):
                     run_restore_drill=False,
                 )
 
+
+    def test_portable_metadata_audit_scans_json_lines_in_adapter_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            log_path = root / "run" / "integrations" / "adapter.log"
+            raw_path = str(Path(tmp) / "private" / "workspace.txt")
+            secure_write_text(
+                log_path,
+                json.dumps(
+                    {
+                        "source_path": raw_path,
+                        "traceback": f'Traceback (most recent call last):\n  File "{raw_path}", line 1',
+                    }
+                )
+                + "\n",
+            )
+
+            audit = audit_portable_metadata(root)
+
+            self.assertFalse(audit["ok"], audit)
+            log_findings = [item for item in audit["findings"] if item["file"] == "run/integrations/adapter.log"]
+            self.assertGreaterEqual(len(log_findings), 2, audit)
+            self.assertTrue(any(item.get("embedded") for item in log_findings), audit)
+            self.assertNotIn(raw_path, json.dumps(audit))
+            with self.assertRaisesRegex(ValueError, "portable metadata"):
+                pack_root(
+                    root,
+                    out_path=Path(tmp) / "should-not-exist.zip",
+                    profile="shareable",
+                    run_restore_drill=False,
+                )
+
+    def test_portable_bundle_can_explicitly_skip_non_catalog_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            output = Path(tmp) / "portable.zip"
+            target = Path(tmp) / "external-evidence.txt"
+            target.write_text("external evidence", encoding="utf-8")
+            init_db(root)
+            link = root / "archive" / "external-link.txt"
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            result = pack_root(
+                root,
+                out_path=output,
+                profile="portable",
+                symlink_policy="skip",
+                run_restore_drill=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(output.exists())
+            with zipfile.ZipFile(output) as archive:
+                self.assertNotIn(f"{BUNDLE_ROOT_NAME}/archive/external-link.txt", archive.namelist())
 
     def test_shareable_pack_rejects_allowlisted_secret_like_findings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1307,6 +1365,59 @@ class RootBundleTest(unittest.TestCase):
                     pack_root(root, out_path=output, run_restore_drill=False)
             self.assertFalse(output.exists())
             self.assertFalse(Path(str(output) + ".sha256").exists())
+
+    def test_portable_skip_omits_symlinks_without_failing_private_permission_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "portable.zip"
+            external = base / "external.txt"
+            external.write_text("external bytes must not enter the bundle", encoding="utf-8")
+            init_db(root)
+            link = root / "archive" / "external-link.txt"
+            try:
+                link.symlink_to(external)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            result = pack_root(
+                root,
+                out_path=output,
+                profile="portable",
+                symlink_policy="skip",
+                run_restore_drill=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(verify_root_bundle(output)["ok"])
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+                self.assertFalse(any("external-link.txt" in name for name in names), names)
+                manifest = json.loads(archive.read(f"{BUNDLE_ROOT_NAME}/{BUNDLE_MANIFEST_NAME}"))
+            self.assertEqual(manifest["symlink_policy"], "skip")
+            self.assertGreaterEqual(manifest["copy"]["symlink_count"], 1)
+
+    def test_recovered_operation_packets_remain_portable_and_bundleable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "continuum-shareable.zip"
+            init_db(root)
+            started = start_operation(root, operation_type="stale", title="Recover me")
+
+            recovered = recover_stale_operations(root, older_than_seconds=0, mark=True)
+
+            self.assertEqual(recovered["recovered"][0]["operation_id"], started["operation_id"])
+            packet_json = Path(recovered["recovered"][0]["recovery_packet_json_uri"])
+            packet_md = Path(recovered["recovered"][0]["recovery_packet_uri"])
+            self.assertNotIn(str(root), packet_json.read_text(encoding="utf-8"))
+            self.assertNotIn(str(root), packet_md.read_text(encoding="utf-8"))
+            portability = audit_portable_metadata(root)
+            self.assertTrue(portability["ok"], portability)
+            packed = pack_root(root, out_path=output, run_restore_drill=False)
+            self.assertTrue(packed["ok"], packed)
+            self.assertTrue(verify_root_bundle(output)["ok"])
+
 
 
 

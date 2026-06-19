@@ -445,6 +445,19 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
 
             self.assertEqual(state["orphan_card_sidecars"], 1)
 
+    def test_recover_thread_bounds_user_controlled_filename_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+
+            result = recover_thread(root, session_id="A" * 5000)
+
+            packet = Path(result["packet_uri"])
+            self.assertTrue(packet.exists())
+            self.assertLessEqual(len(packet.name.encode("utf-8")), 255)
+            self.assertIn("A" * 80, packet.name)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -145,6 +145,12 @@ agent-facing folders that may contain logs, databases, or binary files.
 
 ## Safety
 
+Filesystem locations configured by `atomic_memory.card_sidecar_dir`,
+`security.ignore_file`, and `security.secret_allowlist_file` must be portable,
+root-relative paths. Absolute, drive-qualified, UNC, and parent-traversing paths
+are rejected, and existing link-like components may not resolve outside the
+Continuum root.
+
 `security.ignore_file` defaults to `.continuumignore`. `ingest_file` combines
 built-in ignore rules with patterns from that file and refuses ignored paths such
 as `.env`, private keys, virtual environments, `node_modules`, and `.git`.

@@ -47,6 +47,7 @@ from .store import (
     json_dumps,
     json_loads,
     record_artifact,
+    sqlite_readonly_uri,
     stable_id,
     unique_id,
     summarize_text,
@@ -292,8 +293,7 @@ def emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) ->
 
 def sqlite_backup(source: Path, dest: Path) -> None:
     secure_mkdir(dest.parent)
-    source_uri = f"{source.resolve(strict=False).as_uri()}?mode=ro"
-    src = sqlite3.connect(source_uri, uri=True, timeout=2)
+    src = sqlite3.connect(sqlite_readonly_uri(source), uri=True, timeout=2)
     try:
         dst = sqlite3.connect(str(dest))
         try:

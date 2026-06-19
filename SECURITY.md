@@ -42,3 +42,9 @@ private keys, or cloud tokens through prompts, tool results, or adapter config.
 
 Hermes integration does not pass real API keys to subprocess argv. Prefer
 environment-variable or protected secret-store flows for any model provider key.
+Adapter diagnostic logs are written with private permissions where the platform
+supports POSIX modes, and structured exception details are secret-redacted before
+persistence.
+Packaged adapter bootstrap failures also omit raw exception messages and tracebacks.
+Internal configurable paths are root-confined, and operation-derived filenames are
+validated as portable single components before filesystem access.

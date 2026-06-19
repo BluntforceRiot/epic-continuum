@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import errno
 import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
+import threading
+import time
 import traceback
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import config_path, load_config, write_default_config
 from .permissions import (
@@ -18,6 +24,7 @@ from .permissions import (
     secure_copy_file,
     secure_copytree,
     secure_file,
+    secure_append_text,
     secure_mkdir,
     secure_sqlite_files,
     secure_write_text,
@@ -40,6 +47,7 @@ from .store import (
     record_artifact,
     resolve_stored_uri,
     snapshot,
+    sqlite_readonly_uri,
     status,
     unique_id,
     utc_now,
@@ -47,6 +55,142 @@ from .store import (
 
 
 EPIC_PRINCIPLE = "No one said we could not back it up while building it."
+_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_OPERATION_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+_OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCK_STATE = threading.local()
+_WINDOWS_RESERVED_OPERATION_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def validate_operation_id(operation_id: str) -> str:
+    """Return one portable filename component for operation-derived paths."""
+    value = str(operation_id)
+    portable_stem = value.split(".", 1)[0].upper()
+    if (
+        not _OPERATION_ID_RE.fullmatch(value)
+        or value in {".", ".."}
+        or value.endswith(".")
+        or portable_stem in _WINDOWS_RESERVED_OPERATION_NAMES
+    ):
+        raise ValueError("operation_id must be a safe portable filename component")
+    return value
+
+
+def _thread_operation_lock(key: str) -> threading.RLock:
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault(key, threading.RLock())
+
+
+def _lock_file_handle(handle: Any, *, timeout_seconds: float) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for operation lock") from None
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for operation lock") from None
+                time.sleep(0.05)
+
+
+def _unlock_file_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _open_operation_lock_file(path: Path) -> Any:
+    """Open one private regular lock file without following a final link."""
+    try:
+        if path.is_symlink():
+            raise ValueError(f"refusing operation lock symlink: {path}")
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            raise ValueError(f"refusing operation lock junction: {path}")
+    except OSError as exc:
+        raise ValueError(f"unable to validate operation lock path: {path}") from exc
+
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"operation lock must be a regular file: {path}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "r+b", buffering=0)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60.0) -> Iterator[None]:
+    """Serialize receipt and hash-chain updates across threads and processes."""
+    safe_id = validate_operation_id(operation_id)
+    lock_path = root / "run" / "locks" / "operations" / f"{safe_id}.lock"
+    key = str(lock_path.resolve(strict=False))
+    thread_lock = _thread_operation_lock(key)
+    held: dict[str, int] = getattr(_OPERATION_LOCK_STATE, "held", {})
+    _OPERATION_LOCK_STATE.held = held
+    with thread_lock:
+        if held.get(key, 0):
+            held[key] += 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+            return
+        secure_mkdir(lock_path.parent)
+        handle = _open_operation_lock_file(lock_path)
+        secure_file(lock_path)
+        try:
+            _lock_file_handle(handle, timeout_seconds=timeout_seconds)
+            held[key] = 1
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+                _unlock_file_handle(handle)
+        finally:
+            handle.close()
 OPERATION_SCHEMA = "epic_continuum.operation_receipt.v1"
 OPERATION_EVENT_SCHEMA = "epic_continuum.operation_event.v1"
 PROOF_PACK_SCHEMA = "epic_continuum.proof_pack.v1"
@@ -78,15 +222,12 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    secure_mkdir(path.parent)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    secure_file(path)
+    line = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+    secure_append_text(path, line)
 
 
 def operation_paths(root: Path, operation_id: str) -> dict[str, Path]:
+    operation_id = validate_operation_id(operation_id)
     return {
         "run": root / "run" / "operations" / f"{operation_id}.json",
         "export": root / "exports" / "operation_receipts" / f"{operation_id}.json",
@@ -94,6 +235,7 @@ def operation_paths(root: Path, operation_id: str) -> dict[str, Path]:
 
 
 def operation_event_paths(root: Path, operation_id: str) -> dict[str, Path]:
+    operation_id = validate_operation_id(operation_id)
     return {
         "run": root / "run" / "operation_events" / f"{operation_id}.jsonl",
         "export": root / "exports" / "operation_events" / f"{operation_id}.jsonl",
@@ -101,18 +243,22 @@ def operation_event_paths(root: Path, operation_id: str) -> dict[str, Path]:
 
 
 def proof_pack_path(root: Path, operation_id: str) -> Path:
+    operation_id = validate_operation_id(operation_id)
     return root / "exports" / "proof_packs" / f"{operation_id}.json"
 
 
 def proof_artifact_dir(root: Path, operation_id: str) -> Path:
+    operation_id = validate_operation_id(operation_id)
     return root / "exports" / "proof_artifacts" / operation_id
 
 
 def operation_recovery_path(root: Path, operation_id: str) -> Path:
+    operation_id = validate_operation_id(operation_id)
     return root / "exports" / "operation_recovery" / f"{operation_id}.md"
 
 
 def operation_recovery_json_path(root: Path, operation_id: str) -> Path:
+    operation_id = validate_operation_id(operation_id)
     return root / "exports" / "operation_recovery" / f"{operation_id}.recovery.json"
 
 
@@ -248,7 +394,7 @@ def _remember_operation_event_hash(path: Path, event_hash: str | None) -> None:
     _OPERATION_EVENT_HEAD_CACHE[str(path.resolve(strict=False))] = (stat.st_size, stat.st_mtime_ns, event_hash)
 
 
-def append_operation_event(
+def _append_operation_event_unlocked(
     root: Path,
     operation_id: str,
     *,
@@ -273,6 +419,31 @@ def append_operation_event(
         append_jsonl(path, event)
         _remember_operation_event_hash(path, str(event["event_hash"]))
     return event
+
+
+def _require_unproofed_operation(root: Path, operation_id: str, *, action: str) -> None:
+    """Reject public ledger mutation after a proof pack has been published."""
+    proof_path = proof_pack_path(root, operation_id)
+    if proof_path.exists() or proof_path.is_symlink():
+        raise ValueError(f"cannot {action} proofed operation; proof pack already exists")
+
+
+def append_operation_event(
+    root: Path,
+    operation_id: str,
+    *,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        _require_unproofed_operation(root, operation_id, action="append an event to")
+        return _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type=event_type,
+            payload=payload,
+        )
 
 
 def _apply_persistent_secret_policy(root: Path, payload: dict[str, Any], *, scope: str) -> dict[str, Any]:
@@ -362,7 +533,7 @@ def _display_receipt_uris(root: Path, receipt: dict[str, Any]) -> dict[str, Any]
     return displayed
 
 
-def write_operation(root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
+def _write_operation_unlocked(root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
     init_layout(root)
     operation_id = str(receipt["operation_id"])
     paths = operation_paths(root, operation_id)
@@ -379,6 +550,13 @@ def write_operation(root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
     for path in paths.values():
         atomic_write_json(path, receipt)
     return _display_receipt_uris(root, receipt)
+
+
+def write_operation(root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
+    operation_id = validate_operation_id(str(receipt["operation_id"]))
+    with operation_lock(root, operation_id):
+        _require_unproofed_operation(root, operation_id, action="rewrite")
+        return _write_operation_unlocked(root, receipt)
 
 
 def _load_receipt(path: Path) -> dict[str, Any]:
@@ -416,19 +594,26 @@ def start_operation(
         "result": None,
         "error": None,
     }
-    written = write_operation(root, receipt)
-    append_operation_event(
-        root,
-        operation_id,
-        event_type="started",
-        payload={"operation_type": operation_type, "title": title, "actor": actor, "intent": intent or {}},
-    )
-    return written
+    with operation_lock(root, operation_id):
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type="started",
+            payload={"operation_type": operation_type, "title": title, "actor": actor, "intent": intent or {}},
+        )
+        return written
 
 
 def read_operation(root: Path, operation_id: str) -> dict[str, Any]:
     path = operation_paths(root, operation_id)["run"]
     return _load_receipt(path)
+
+
+def _require_active_operation(receipt: dict[str, Any], *, action: str) -> None:
+    status = str(receipt.get("status") or "unknown")
+    if status not in ACTIVE_STATUSES:
+        raise ValueError(f"cannot {action} operation in terminal status {status!r}")
 
 
 def record_operation_progress(
@@ -441,38 +626,66 @@ def record_operation_progress(
     total: int | None = None,
     detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    receipt = read_operation(root, operation_id)
-    event: dict[str, Any] = {
-        "at": utc_now(),
-        "phase": phase,
-        "message": message,
-    }
-    if current is not None:
-        event["current"] = current
-    if total is not None:
-        event["total"] = total
-    if detail:
-        event["detail"] = detail
-    receipt.setdefault("progress", []).append(event)
-    written = write_operation(root, receipt)
-    append_operation_event(root, operation_id, event_type="progress", payload=event)
-    return written
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        _require_active_operation(receipt, action="record progress for")
+        event: dict[str, Any] = {
+            "at": utc_now(),
+            "phase": phase,
+            "message": message,
+        }
+        if current is not None:
+            event["current"] = current
+        if total is not None:
+            event["total"] = total
+        if detail:
+            event["detail"] = detail
+        receipt.setdefault("progress", []).append(event)
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(root, operation_id, event_type="progress", payload=event)
+        return written
+
+
+def _record_proof_pack_failure(root: Path, operation_id: str, exc: BaseException) -> dict[str, Any]:
+    """Record a terminal proof failure without leaving a stale proof binding."""
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        proof_pack_path(root, operation_id).unlink(missing_ok=True)
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        receipt["proof_pack_uri"] = None
+        event = {
+            "at": utc_now(),
+            "phase": "proof_pack_failed",
+            "message": str(exc),
+            "detail": {"error_type": type(exc).__name__},
+        }
+        receipt.setdefault("progress", []).append(event)
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(root, operation_id, event_type="proof_pack_failed", payload=event)
+        return written
 
 
 def update_operation_cursor(root: Path, operation_id: str, cursor: dict[str, Any] | None) -> dict[str, Any]:
-    receipt = read_operation(root, operation_id)
-    receipt["cursor"] = cursor
-    written = write_operation(root, receipt)
-    append_operation_event(root, operation_id, event_type="cursor", payload={"cursor": cursor})
-    return written
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        _require_active_operation(receipt, action="update cursor for")
+        receipt["cursor"] = cursor
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(root, operation_id, event_type="cursor", payload={"cursor": cursor})
+        return written
 
 
 def attach_preflight_snapshot(root: Path, operation_id: str, snapshot_result: dict[str, Any]) -> dict[str, Any]:
-    receipt = read_operation(root, operation_id)
-    receipt.setdefault("preflight_snapshots", []).append(snapshot_result)
-    written = write_operation(root, receipt)
-    append_operation_event(root, operation_id, event_type="preflight_snapshot", payload=snapshot_result)
-    return written
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        _require_active_operation(receipt, action="attach a preflight snapshot to")
+        receipt.setdefault("preflight_snapshots", []).append(snapshot_result)
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(root, operation_id, event_type="preflight_snapshot", payload=snapshot_result)
+        return written
 
 
 def create_preflight_snapshot(root: Path, operation_id: str, *, reason: str) -> dict[str, Any]:
@@ -491,14 +704,22 @@ def finish_operation(
 ) -> dict[str, Any]:
     if status not in TERMINAL_STATUSES:
         raise ValueError("status must be succeeded, failed, or interrupted")
-    receipt = read_operation(root, operation_id)
-    receipt["status"] = status
-    receipt["finished_at"] = utc_now()
-    receipt["result"] = result
-    receipt["error"] = error
-    written = write_operation(root, receipt)
-    append_operation_event(root, operation_id, event_type=status, payload={"result": result, "error": error})
-    return written
+    operation_id = validate_operation_id(operation_id)
+    with operation_lock(root, operation_id):
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        _require_active_operation(receipt, action="finish")
+        receipt["status"] = status
+        receipt["finished_at"] = utc_now()
+        receipt["result"] = result
+        receipt["error"] = error
+        written = _write_operation_unlocked(root, receipt)
+        _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type=status,
+            payload={"result": result, "error": error},
+        )
+        return written
 
 
 def _sha256_file(path: Path) -> str:
@@ -712,7 +933,7 @@ def _proof_item_within_allowed_root(item_path: Path, item: dict[str, Any], allow
 
 def _backup_sqlite(source: Path, dest: Path) -> None:
     secure_mkdir(dest.parent)
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=5)
+    src = sqlite3.connect(sqlite_readonly_uri(source), uri=True, timeout=5)
     try:
         dst = sqlite3.connect(str(dest))
         try:
@@ -925,7 +1146,7 @@ def _record_proof_artifacts(
         conn.close()
 
 
-def create_proof_pack(
+def _create_proof_pack_unlocked(
     root: Path,
     operation_id: str,
     *,
@@ -935,6 +1156,8 @@ def create_proof_pack(
     write_default_config(root)
     init_db(root)
     receipt = read_operation(root, operation_id)
+    if receipt.get("status") not in TERMINAL_STATUSES:
+        raise ValueError("proof packs may only be created for terminal operations")
     paths = operation_paths(root, operation_id)
     proof_path = proof_pack_path(root, operation_id)
     receipt["proof_pack_uri"] = str(proof_path)
@@ -1010,6 +1233,22 @@ def create_proof_pack(
     return display_proof
 
 
+def create_proof_pack(
+    root: Path,
+    operation_id: str,
+    *,
+    touched_paths: list[Path | str] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with operation_lock(root, operation_id):
+        return _create_proof_pack_unlocked(
+            root,
+            operation_id,
+            touched_paths=touched_paths,
+            extra=extra,
+        )
+
+
 def _proof_pack_hash(payload: dict[str, Any]) -> str:
     material = {key: value for key, value in payload.items() if key != "proof_pack_hash"}
     return content_hash(json.dumps(material, ensure_ascii=True, sort_keys=True, default=str))
@@ -1060,11 +1299,17 @@ def _semantic_receipt_checks(
     operation_id = proof.get("operation_id")
     if not operation_id:
         return
+    try:
+        operation_id = validate_operation_id(str(operation_id))
+    except ValueError as exc:
+        _add_check(checks, errors, "operation_id_valid", False, error=str(exc))
+        return
+    _add_check(checks, errors, "operation_id_valid", True, operation_id=operation_id)
     if root is None:
         _add_check(checks, errors, "semantic_root_available", False, error="strict proof verification requires a root")
         return
 
-    paths = operation_paths(root, str(operation_id))
+    paths = operation_paths(root, operation_id)
     proof_uris = _proof_path_uris(proof)
     loaded: dict[str, dict[str, Any]] = {}
     for label, receipt_path in (("run", paths["run"]), ("export", paths["export"])):
@@ -1108,7 +1353,7 @@ def _semantic_receipt_checks(
         )
 
     event_log_results: dict[str, dict[str, Any]] = {}
-    for label, event_path in (("run", operation_event_paths(root, str(operation_id))["run"]), ("export", operation_event_paths(root, str(operation_id))["export"])):
+    for label, event_path in (("run", operation_event_paths(root, operation_id)["run"]), ("export", operation_event_paths(root, operation_id)["export"])):
         rel_uri = _stored_root_uri(root, event_path).replace("\\", "/")
         _add_check(
             checks,
@@ -1117,7 +1362,7 @@ def _semantic_receipt_checks(
             rel_uri in proof_uris,
             uri=rel_uri,
         )
-        result = verify_operation_event_log(event_path, operation_id=str(operation_id))
+        result = verify_operation_event_log(event_path, operation_id=operation_id)
         event_log_results[label] = result
         _add_check(
             checks,
@@ -1424,6 +1669,7 @@ def doctor(
     verify_recent_proof_packs: int = 1,
     scan_secrets: bool = False,
     allowed_roots: list[Path] | None = None,
+    allow_symlinks: bool = False,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
@@ -1433,13 +1679,15 @@ def doctor(
     add("package_config_default", (SCHEMA_PATH.parents[1] / "config.default.json").exists())
     add("package_schema_sql", SCHEMA_PATH.exists(), path=str(SCHEMA_PATH))
     try:
-        permissions = audit_private_permissions(root)
+        permissions = audit_private_permissions(root, allow_symlinks=allow_symlinks)
         add(
             "private_permissions",
             bool(permissions.get("ok")),
             supported=permissions.get("supported"),
             checked=permissions.get("checked"),
             unsafe_count=permissions.get("unsafe_count"),
+            symlink_count=permissions.get("symlink_count", 0),
+            symlinks_allowed=permissions.get("symlinks_allowed", False),
             reason=permissions.get("reason"),
             repair_hint=permissions.get("repair_hint"),
             findings=permissions.get("findings", [])[:10],
@@ -1644,11 +1892,25 @@ def _write_operation_recovery_packet(
     *,
     reason: str,
 ) -> dict[str, Any]:
-    operation_id = str(receipt["operation_id"])
+    operation_id = validate_operation_id(str(receipt["operation_id"]))
     last_progress = (receipt.get("progress") or [None])[-1]
     generated_at = utc_now()
     packet_path = operation_recovery_path(root, operation_id)
     packet_json_path = operation_recovery_json_path(root, operation_id)
+
+    def portable_uri(value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        candidate = Path(str(value))
+        if not candidate.is_absolute():
+            return candidate.as_posix()
+        return _stored_root_uri(root, candidate)
+
+    run_receipt_uri = portable_uri(receipt.get("run_receipt_uri"))
+    export_receipt_uri = portable_uri(receipt.get("export_receipt_uri"))
+    proof_pack_uri = portable_uri(receipt.get("proof_pack_uri"))
+    packet_uri = _stored_root_uri(root, packet_path)
+    packet_json_uri = _stored_root_uri(root, packet_json_path)
     machine_packet = {
         "schema": OPERATION_RECOVERY_SCHEMA,
         "operation_id": operation_id,
@@ -1657,10 +1919,10 @@ def _write_operation_recovery_packet(
         "status": receipt.get("status"),
         "operation_type": receipt.get("operation_type"),
         "title": receipt.get("title"),
-        "root": str(root),
-        "run_receipt_uri": receipt.get("run_receipt_uri"),
-        "export_receipt_uri": receipt.get("export_receipt_uri"),
-        "proof_pack_uri": receipt.get("proof_pack_uri"),
+        "root": "continuum_root",
+        "run_receipt_uri": run_receipt_uri,
+        "export_receipt_uri": export_receipt_uri,
+        "proof_pack_uri": proof_pack_uri,
         "cursor": receipt.get("cursor"),
         "last_progress": last_progress,
         "intent": receipt.get("intent") or {},
@@ -1669,9 +1931,11 @@ def _write_operation_recovery_packet(
             "Inspect cursor and last_progress first. Resume from the last durable cursor when "
             "the tool supports resume; otherwise rerun against preserved receipts and proof pack."
         ),
-        "packet_uri": str(packet_path),
-        "packet_json_uri": str(packet_json_path),
+        "packet_uri": packet_uri,
+        "packet_json_uri": packet_json_uri,
     }
+    machine_packet = _root_relative_payload(root, machine_packet)
+    machine_packet = _apply_persistent_secret_policy(root, machine_packet, scope="operation_recovery")
     lines = [
         f"# Epic Continuum Operation Recovery: {operation_id}",
         "",
@@ -1681,27 +1945,27 @@ def _write_operation_recovery_packet(
         f"- Status: `{receipt.get('status')}`",
         f"- Operation type: `{receipt.get('operation_type')}`",
         f"- Title: {receipt.get('title')}",
-        f"- Root: `{root}`",
-        f"- Run receipt: `{receipt.get('run_receipt_uri')}`",
-        f"- Export receipt: `{receipt.get('export_receipt_uri')}`",
-        f"- Proof pack: `{receipt.get('proof_pack_uri')}`",
+        "- Root: `<continuum-root>`",
+        f"- Run receipt: `{run_receipt_uri}`",
+        f"- Export receipt: `{export_receipt_uri}`",
+        f"- Proof pack: `{proof_pack_uri}`",
         "",
         "## Resume Cursor",
         "",
         "```json",
-        json.dumps(receipt.get("cursor"), ensure_ascii=True, indent=2, sort_keys=True),
+        json.dumps(machine_packet.get("cursor"), ensure_ascii=True, indent=2, sort_keys=True),
         "```",
         "",
         "## Last Progress",
         "",
         "```json",
-        json.dumps(last_progress, ensure_ascii=True, indent=2, sort_keys=True),
+        json.dumps(machine_packet.get("last_progress"), ensure_ascii=True, indent=2, sort_keys=True),
         "```",
         "",
         "## Intent",
         "",
         "```json",
-        json.dumps(receipt.get("intent") or {}, ensure_ascii=True, indent=2, sort_keys=True),
+        json.dumps(machine_packet.get("intent") or {}, ensure_ascii=True, indent=2, sort_keys=True),
         "```",
         "",
         "## Recovery Instruction",
@@ -1713,10 +1977,10 @@ def _write_operation_recovery_packet(
     machine_packet["packet_hash"] = content_hash(packet_text)
     atomic_write_json(packet_json_path, machine_packet)
 
-    receipt = read_operation(root, operation_id)
-    receipt["recovery_packet_uri"] = str(packet_path)
-    receipt["recovery_packet_json_uri"] = str(packet_json_path)
-    write_operation(root, receipt)
+    stored_receipt = read_operation(root, operation_id)
+    stored_receipt["recovery_packet_uri"] = packet_uri
+    stored_receipt["recovery_packet_json_uri"] = packet_json_uri
+    write_operation(root, stored_receipt)
     return {
         "operation_id": operation_id,
         "packet_uri": str(packet_path),
@@ -1886,13 +2150,7 @@ class OperationGuard:
                     create_proof_pack(self.root, self.operation_id, touched_paths=self.touched_paths)
                 except Exception as proof_exc:
                     try:
-                        record_operation_progress(
-                            self.root,
-                            self.operation_id,
-                            phase="proof_pack_failed",
-                            message=str(proof_exc),
-                            detail={"error_type": type(proof_exc).__name__},
-                        )
+                        _record_proof_pack_failure(self.root, self.operation_id, proof_exc)
                     except Exception:
                         pass
             self.finished = True
@@ -1938,13 +2196,7 @@ class OperationGuard:
                 create_proof_pack(self.root, self.operation_id, touched_paths=proof_paths, extra=proof_extra)
             except Exception as proof_exc:
                 try:
-                    record_operation_progress(
-                        self.root,
-                        self.operation_id,
-                        phase="proof_pack_failed",
-                        message=str(proof_exc),
-                        detail={"error_type": type(proof_exc).__name__},
-                    )
+                    _record_proof_pack_failure(self.root, self.operation_id, proof_exc)
                 except Exception:
                     pass
             self.final_receipt = read_operation(self.root, self.operation_id)
@@ -2070,7 +2322,7 @@ SNAPSHOT_COUNT_TABLES = (
 
 
 def _catalog_counts_from_db(db_path: Path) -> dict[str, int]:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         existing_tables = {
@@ -2196,6 +2448,7 @@ def verify_root(
     run_restore_drill: bool = True,
     scan_secrets: bool = True,
     allowed_roots: list[Path] | None = None,
+    allow_symlinks: bool = False,
 ) -> dict[str, Any]:
     """Run the high-level root invariant suite for reviewer and recovery handoffs."""
     checks: list[dict[str, Any]] = []
@@ -2209,6 +2462,7 @@ def verify_root(
         verify_recent_proof_packs=verify_recent_proof_packs,
         scan_secrets=scan_secrets,
         allowed_roots=allowed_roots,
+        allow_symlinks=allow_symlinks,
     )
     sections["doctor"] = doctor_result
     add("doctor", bool(doctor_result.get("ok")), check_count=doctor_result.get("check_count"))
@@ -2224,7 +2478,7 @@ def verify_root(
         orphan_fts_rows=search_result.get("orphan_fts_rows"),
     )
 
-    permissions_result = audit_private_permissions(root)
+    permissions_result = audit_private_permissions(root, allow_symlinks=allow_symlinks)
     sections["private_permissions"] = permissions_result
     add(
         "private_permissions",
@@ -2232,6 +2486,8 @@ def verify_root(
         supported=permissions_result.get("supported"),
         checked=permissions_result.get("checked"),
         unsafe_count=permissions_result.get("unsafe_count"),
+        symlink_count=permissions_result.get("symlink_count", 0),
+        symlinks_allowed=permissions_result.get("symlinks_allowed", False),
         reason=permissions_result.get("reason"),
     )
 

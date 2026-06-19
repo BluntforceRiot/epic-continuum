@@ -90,7 +90,10 @@ def reproducible_zip_dt() -> tuple[int, int, int, int, int, int]:
     raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if not raw_epoch:
         return DEFAULT_ZIP_DT
-    timestamp = dt.datetime.fromtimestamp(int(raw_epoch), tz=dt.UTC)
+    try:
+        timestamp = dt.datetime.fromtimestamp(int(raw_epoch), tz=dt.UTC)
+    except (OSError, OverflowError, ValueError):
+        return DEFAULT_ZIP_DT
     return (
         max(timestamp.year, 1980),
         timestamp.month,

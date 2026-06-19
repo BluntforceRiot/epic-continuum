@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -80,6 +81,19 @@ def _create_minimal_mempalace(palace: Path) -> None:
 
 
 class ReleaseHardeningTest(unittest.TestCase):
+    def test_release_builder_ignores_malformed_source_date_epoch(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location("build_release_package_under_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "not-an-integer"}):
+            self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
+        with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "999999999999999999999999999"}):
+            self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
+
     def test_static_release_metadata_matches_pyproject_version(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]

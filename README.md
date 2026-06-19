@@ -20,7 +20,7 @@
   <a href="#the-problem">The Problem</a>
   &middot; <a href="#how-memory-works">Memory</a>
   &middot; <a href="#how-the-context-window-works">Context Window</a>
-  &middot; <a href="#what-this-looks-like-in-codex">Codex Flow</a>
+  &middot; <a href="#what-this-looks-like-in-agents">Agent Flow</a>
   &middot; <a href="#how-continuum-keeps-work-from-being-lost">Recovery</a>
   &middot; <a href="#quick-start">Quick Start</a>
   &middot; <a href="#mcp-and-agent-integrations">Integrations</a>
@@ -212,27 +212,49 @@ An ever-growing prompt eventually forces silent truncation, aggressive summariza
 
 Continuum keeps the durable record outside the prompt. Context can be rebuilt repeatedly without deleting the source history.
 
-## What This Looks Like In Codex
+## What This Looks Like In Agents
 
-When the Codex plugin is installed, Epic Continuum becomes part of the agent's toolbelt through MCP. Codex can call Continuum tools during a normal conversation to record what just happened, check memory health, compile context, or recover a previous thread.
+Epic Continuum is useful because the memory is not trapped inside one chat application, one model, or one agent runtime.
+
+Codex can use it through the local Codex plugin and MCP server. Claude Code and other MCP-capable tools can use the same server pattern. Hermes Agent and local LLM setups can use the Hermes adapter or the generic CLI/OpenAI-compatible adapter pattern. The model can be a hosted model, a local Qwen/vLLM route, another OpenAI-compatible endpoint, or a smaller model running on local hardware.
+
+The important part is that they can point at the same Continuum root.
+
+```text
+Codex thread
+        |
+Claude Code session ----> shared Epic Continuum root
+        |
+Hermes/local LLM
+```
+
+Each agent can write events, read recovery packets, search Library evidence, and compile a bounded Looking Glass from the same durable state. That makes Continuum a shared memory layer rather than a per-client transcript.
 
 In practice, the loop feels simple:
 
 ```text
 You: Remember that the release blocker is the Windows reparse-point health bug.
-Codex: writes that event into the Scroll through Continuum.
+Agent: writes that event into the Scroll through Continuum.
 
 You: What were we doing before the restart?
-Codex: asks Continuum for status and recovery context.
+Agent: asks Continuum for status and recovery context.
 Continuum: returns recent events, Cards, open tasks, and operation receipts.
-Codex: answers with the current state instead of starting cold.
+Agent: answers with the current state instead of starting cold.
 ```
 
-The memory is not stored inside one Codex chat. It is stored in the configured Continuum root. A restarted Codex thread, another Codex session, or another MCP-compatible agent can point at that same root and recover the same project state.
+The memory is stored in the configured Continuum root. A restarted Codex thread, a Claude Code session, Hermes, or another MCP-compatible agent can point at that same root and recover the same project state.
 
 This is why a useful memory can appear "a few seconds later": the agent is not waiting for a model to retrain or for a giant transcript to be pasted back in. It writes a small structured event locally, then retrieves or compiles that local state when it is needed.
 
-Typical Codex commands are conversational:
+This helps in a few concrete ways:
+
+- **Cross-agent handoff:** Codex can do implementation work, Claude Code can review it later, and both can see the same recovery packets and operation receipts.
+- **Local model continuity:** a local LLM with a smaller native context can still use durable project memory by receiving only the relevant Looking Glass packet for the current turn.
+- **Fair model comparison:** different models can be tested against the same saved context instead of relying on whatever one chat happened to remember.
+- **Crash recovery:** if a desktop client, terminal, or model server dies, the next agent can recover from disk-backed Scroll events, Cards, and receipts.
+- **Less prompt stuffing:** large evidence stays in the Library and only selected summaries or search results enter the model context.
+
+Typical agent commands are conversational:
 
 ```text
 "Remember this decision."
@@ -242,7 +264,7 @@ Typical Codex commands are conversational:
 "Write a recovery packet before we switch tasks."
 ```
 
-Under the hood those requests map to tools such as `continuum_append_event`, `continuum_status`, `continuum_compile_context`, `continuum_recover_thread`, and `continuum_snapshot`.
+Under the hood those requests map to tools such as `continuum_append_event`, `continuum_status`, `continuum_compile_context`, `continuum_recover_thread`, and `continuum_snapshot`. For local LLMs, Continuum does not increase the model server's native context length; it improves the effective working memory around that limit by retrieving and compressing the right durable context before inference.
 
 ## How Continuum Keeps Work From Being Lost
 

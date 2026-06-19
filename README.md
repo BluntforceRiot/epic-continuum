@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/BluntforceRiot/epic-continuum/main/assets/epic-continuum-logo.svg" alt="Epic Continuum logo" width="220" />
+  <img src="https://raw.githubusercontent.com/BluntforceRiot/epic-continuum/main/assets/epic-continuum-logo.png" alt="Epic Continuum logo" width="320" />
 </p>
 
 <h1 align="center">Epic Continuum</h1>

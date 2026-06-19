@@ -244,9 +244,12 @@ CI without separately parsing `ok`.
 
 ## Search
 
-`continuum search` and the `continuum_search` MCP tool use SQLite FTS5 when the
-local SQLite build supports it. If FTS5 is unavailable, Epic Continuum falls back
-to simple `LIKE` search so the package remains dependency-light and portable.
+`continuum search` and the `continuum_search` MCP tool query Library
+chunks/books created by `ingest-file` or import workflows. They use SQLite FTS5
+when the local SQLite build supports it. If FTS5 is unavailable, Epic Continuum
+falls back to simple `LIKE` search so the package remains dependency-light and
+portable. Use `compile-context` or `recover-thread` when you want Card, Scroll,
+and recent-work recall.
 
 ## MemPalace Import
 

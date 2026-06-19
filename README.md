@@ -97,7 +97,8 @@ location may move hot -> warm -> cold -> vault
 2. **Compact**
    Roll older spans into structured Cards without deleting raw evidence.
 3. **Recall**
-   Search Cards, events, graph routes, reader editions, and recent work.
+   Compile context from Cards, Scroll events, recent work, and Library state;
+   search currently queries Library chunks/books.
 4. **Recover**
    Generate crash/thread recovery packets for Codex, Hermes, and other agents.
 5. **Verify**
@@ -130,7 +131,7 @@ For Hermes integration, see [docs/integrations/hermes-adapter.md](docs/integrati
 | Looking Glass context | Implemented | Strict estimated-token budget, truncation metadata, read-only compile mode, and configurable card visibility scopes. |
 | Card recall | Implemented | Defaults to `session_then_global`; callers can request `session`, `global`, or `project` recall. |
 | Graph memory | Implemented heuristic | Nodes/edges are written, recalled Cards reinforce routes, and Librarian decay is interval-gated before pruning stale unpinned routes. |
-| Library search | Partial | SQLite FTS5 is used when available, with LIKE fallback. |
+| Library search | Implemented for ingested books/chunks | `continuum search` and MCP `continuum_search` query Library chunks/books with SQLite FTS5 when available and LIKE fallback. Use `compile-context`/`recover-thread` for Card and Scroll recall. |
 | Import safety | Implemented | `.continuumignore`-style blocking and lightweight secret blocking are enabled by default for file ingest and MemPalace import; warning mode is configurable. |
 | Proof packs | Implemented foundation | Manifest hashes frozen touched files, operation event logs, and receipt files after proof URI is written; live catalog DB paths are backed up before hashing. |
 | Snapshots | Implemented | Catalog and card sidecars are copied with collision-resistant IDs. |
@@ -164,7 +165,9 @@ python -m continuum optimize-config --root $env:CONTINUUM_ROOT --profile balance
 python -m continuum run-workers --root $env:CONTINUUM_ROOT
 python -m continuum memory-health --root $env:CONTINUUM_ROOT
 python -m continuum recover-thread --root $env:CONTINUUM_ROOT --session-id design
-python -m continuum search --root $env:CONTINUUM_ROOT --query "design"
+Set-Content -Path .\continuum-note.txt -Value "Design note: Epic Continuum library search works over ingested files."
+python -m continuum ingest-file --root $env:CONTINUUM_ROOT --path .\continuum-note.txt --title "Continuum design note"
+python -m continuum search --root $env:CONTINUUM_ROOT --query "library search"
 ```
 
 Bash:
@@ -181,6 +184,9 @@ python -m continuum optimize-config --root "$CONTINUUM_ROOT" --profile balanced
 python -m continuum run-workers --root "$CONTINUUM_ROOT"
 python -m continuum memory-health --root "$CONTINUUM_ROOT"
 python -m continuum recover-thread --root "$CONTINUUM_ROOT" --session-id design
+printf 'Design note: Epic Continuum library search works over ingested files.\n' > ./continuum-note.txt
+python -m continuum ingest-file --root "$CONTINUUM_ROOT" --path ./continuum-note.txt --title "Continuum design note"
+python -m continuum search --root "$CONTINUUM_ROOT" --query "library search"
 ```
 
 Editable install:

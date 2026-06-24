@@ -57,16 +57,22 @@ The physical layout maps to hardware tiers:
 Atomic YAML is the portable memory unit format. SQLite remains the fast catalog,
 but every Card can also be written as a small `.yaml` sidecar with the card id,
 type, title, summary, source references, topics, decisions, open tasks, hashes,
+visibility scope, session/project ownership, lifecycle status, placement, tier,
 and timestamps.
 
 Hermes and other agent shells can use this as an interchange format:
 
 - Hermes can emit atomic YAML; Epic Continuum can ingest and index it.
 - Epic Continuum can emit atomic YAML; Hermes can read it for handoff or recovery.
-- The Archivist can rebuild catalog rows from sidecars if the SQLite catalog is
-  damaged. The core package includes a minimal reader for the deterministic YAML
-  subset it emits, so this rebuild path does not depend on a separate YAML
-  runtime.
+- The core package includes a minimal reader for the deterministic YAML subset
+  it emits, so sidecars can be audited, diffed, and used as portable evidence
+  without a separate YAML runtime.
+- Lifecycle workers rewrite sidecars after committed placement, recall, and
+  pruning changes so the sidecar reflects current durable Card state rather than
+  only creation state.
+- A damaged SQLite catalog is recovered from snapshots and bundles today.
+  Sidecar-driven catalog rebuild/import is an explicit tool boundary, not an
+  implied automatic recovery path.
 
 ## Thread Recovery Packets
 

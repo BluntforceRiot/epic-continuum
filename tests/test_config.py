@@ -8,7 +8,7 @@ from pathlib import Path
 
 from continuum.core.config import default_config, load_config, optimize_config, should_capture, validate_config, write_config
 from continuum.core.safety import redact_text_secrets, redact_value_secrets, scan_text_for_secrets, scan_value_for_secrets
-from continuum.core.store import audit_event, audit_secrets, audit_secrets_sarif, append_scroll_event, compile_context, connect, connect_existing, enqueue_job, ingest_file, init_db, recover_thread, redact_legacy_secrets, snapshot
+from continuum.core.store import audit, audit_event, audit_secrets, audit_secrets_sarif, append_scroll_event, compile_context, connect, connect_existing, enqueue_job, ingest_file, init_db, recover_thread, redact_legacy_secrets, roll_scroll_segment, snapshot
 from continuum.core.units import format_size, parse_size
 from continuum.integrations.common import record_tool_event, record_turn
 
@@ -369,7 +369,7 @@ class EpicContinuumConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
 
-            with self.assertRaisesRegex(ValueError, "secret scan blocked Scroll event"):
+            with self.assertRaisesRegex(ValueError, "secret scan blocked session_id before partition lookup"):
                 append_scroll_event(
                     root,
                     session_id="api_key=supersecretvalue123",
@@ -401,14 +401,18 @@ class EpicContinuumConfigTest(unittest.TestCase):
                 metadata={"token": "supersecretvalue123"},
             )
 
-            self.assertTrue(result["session_id"].startswith("redacted_session_"))
+            self.assertTrue(result["session_id"].startswith("ec_session_"))
             conn = connect_existing(root)
             try:
                 row = conn.execute("SELECT session_id, metadata_json FROM scroll_events").fetchone()
+                alias_count = conn.execute(
+                    "SELECT count(*) AS n FROM partition_aliases WHERE kind = 'session'"
+                ).fetchone()["n"]
             finally:
                 conn.close()
             serialized = f"{row['session_id']} {row['metadata_json']}"
-            self.assertIn("redacted_session_", serialized)
+            self.assertIn("ec_session_", serialized)
+            self.assertEqual(alias_count, 1)
             self.assertIn("[REDACTED]", serialized)
             self.assertNotIn("supersecretvalue123", serialized)
 
@@ -685,15 +689,14 @@ class EpicContinuumConfigTest(unittest.TestCase):
             self.assertFalse(any(action["table"] == "scroll_events" for action in applied["actions"]))
             self.assertFalse(audit_secrets(root)["ok"])
 
-    def test_recover_thread_blocks_secret_session_id_by_default(self) -> None:
+    def test_recover_thread_pseudonymizes_secret_session_id_lookup_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
 
-            with self.assertRaisesRegex(ValueError, "secret scan blocked recovery session_id"):
-                recover_thread(root, session_id="api_key=supersecretvalue123")
+            recovery = recover_thread(root, session_id="api_key=supersecretvalue123")
 
-            packets = list((root / "exports" / "thread_recovery").glob("*.md")) if (root / "exports" / "thread_recovery").exists() else []
-            self.assertEqual(packets, [])
+            self.assertTrue(recovery["session_id"].startswith("redacted_session_"))
+            self.assertNotIn("api_key=supersecretvalue123", recovery["packet_text"])
             self.assertTrue(audit_secrets(root)["ok"])
 
     def test_invalid_capture_and_retention_policies_are_rejected(self) -> None:
@@ -772,6 +775,22 @@ class EpicContinuumConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "resolves outside"):
                 write_config(root, config)
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_card_sidecar_audit_uses_configured_sidecar_directory_for_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = load_config(root)
+            config["atomic_memory"]["card_sidecar_dir"] = "catalog/custom-cards"
+            write_config(root, config)
+            append_scroll_event(root, session_id="custom-orphan", event_type="message", role="user", content="custom sidecar orphan")
+            roll_scroll_segment(root, session_id="custom-orphan", start_seq=1, end_seq=1)
+            orphan = root / "catalog" / "custom-cards" / "card_custom_orphan.yaml"
+            orphan.write_text("schema: test\n", encoding="utf-8")
+
+            state = audit(root)
+
+            self.assertEqual(state["orphan_card_sidecars"], 1)
 
     def test_optimize_config_can_preview_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

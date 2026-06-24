@@ -1,0 +1,290 @@
+{
+  "name": "ContinuityBench",
+  "version": "0.2.0",
+  "seed": 1337,
+  "cases": [
+    {
+      "id": "cb-001-readme-release",
+      "interruption": "fresh_model_session",
+      "query": "resume README release work and current blocker",
+      "events": [
+        "Decision EVID:001-current-readme use the memory-focused README as the public landing page.",
+        "Superseded EVID:001-old-readme the older capability inventory README is no longer the landing-page narrative.",
+        "Next action EVID:001-next-action verify links and keep benchmark claims conservative."
+      ],
+      "cards": [
+        "Current README release state EVID:001-current-readme EVID:001-next-action"
+      ],
+      "library": [
+        "README review notes: public copy should lead with memory, context, recovery, and evidence. EVID:001-current-readme"
+      ],
+      "required_evidence": ["EVID:001-current-readme", "EVID:001-next-action"],
+      "forbidden_evidence": ["EVID:001-old-readme"]
+    },
+    {
+      "id": "cb-002-windows-health",
+      "interruption": "application_restart",
+      "query": "what Windows health bug was fixed",
+      "events": [
+        "Bug EVID:002-reparse Windows memory-health failed on inaccessible reparse-like directories.",
+        "Fix EVID:002-fix replace root size rglob traversal with safe scandir skipping inaccessible entries.",
+        "Distractor EVID:002-distractor icon asset changed during README polish."
+      ],
+      "cards": ["Windows health traversal fix EVID:002-reparse EVID:002-fix"],
+      "library": ["Regression test notes mention simulated inaccessible Windows reparse point. EVID:002-fix"],
+      "required_evidence": ["EVID:002-reparse", "EVID:002-fix"],
+      "forbidden_evidence": ["EVID:002-distractor"]
+    },
+    {
+      "id": "cb-003-plugin-cache",
+      "interruption": "agent_handoff",
+      "query": "Codex plugin staging cache problem and solution",
+      "events": [
+        "Issue EVID:003-cache Codex can keep stale plugin cache when local plugin contents change.",
+        "Decision EVID:003-stable-stage use a stable marketplace path and change plugin cachebuster version.",
+        "Old idea EVID:003-old-stage digest-named marketplace roots should not accumulate."
+      ],
+      "cards": ["Codex staging policy EVID:003-cache EVID:003-stable-stage"],
+      "library": ["Installer notes: stable stage path plus generated cachebuster avoids stale plugin content. EVID:003-stable-stage"],
+      "required_evidence": ["EVID:003-cache", "EVID:003-stable-stage"],
+      "forbidden_evidence": ["EVID:003-old-stage"]
+    },
+    {
+      "id": "cb-004-local-llm",
+      "interruption": "active_context_cleared",
+      "query": "local LLM context window reality",
+      "events": [
+        "Fact EVID:004-native-limit Continuum does not increase native model context length.",
+        "Benefit EVID:004-working-memory it improves effective working memory by retrieving relevant durable context.",
+        "Superseded EVID:004-infinite avoid claiming infinite context."
+      ],
+      "cards": ["Local LLM context reality EVID:004-native-limit EVID:004-working-memory"],
+      "library": ["Context docs explain native model limit remains finite. EVID:004-native-limit"],
+      "required_evidence": ["EVID:004-native-limit", "EVID:004-working-memory"],
+      "forbidden_evidence": ["EVID:004-infinite"]
+    },
+    {
+      "id": "cb-005-artifact-path",
+      "interruption": "fresh_model_session",
+      "query": "current artifact path and next action",
+      "events": [
+        "Artifact EVID:005-current-artifact build output lives at exports/release_assets.",
+        "Old artifact EVID:005-old-artifact earlier review zip is superseded.",
+        "Next action EVID:005-next-action update documentation links before release."
+      ],
+      "cards": ["Artifact handoff EVID:005-current-artifact EVID:005-next-action"],
+      "library": ["Release notes identify exports/release_assets as the current artifact location. EVID:005-current-artifact"],
+      "required_evidence": ["EVID:005-current-artifact", "EVID:005-next-action"],
+      "forbidden_evidence": ["EVID:005-old-artifact"]
+    },
+    {
+      "id": "cb-006-proof-pack",
+      "interruption": "interrupted_operation",
+      "query": "proof pack validation and tamper detection",
+      "events": [
+        "Requirement EVID:006-proof proof packs hash frozen touched files and receipts.",
+        "Fault EVID:006-tamper modified proof artifact must be detected.",
+        "Distractor EVID:006-theme header image was updated."
+      ],
+      "cards": ["Proof evidence rule EVID:006-proof EVID:006-tamper"],
+      "library": ["Evidence docs explain proof packs and frozen inputs. EVID:006-proof"],
+      "required_evidence": ["EVID:006-proof", "EVID:006-tamper"],
+      "forbidden_evidence": ["EVID:006-theme"]
+    },
+    {
+      "id": "cb-007-secret-policy",
+      "interruption": "agent_handoff",
+      "query": "secret scanning policy before sharing",
+      "events": [
+        "Policy EVID:007-heuristic secret scanning is heuristic and not a guarantee.",
+        "Action EVID:007-audit run audit-secrets before sharing a root.",
+        "Unsupported EVID:007-guarantee do not claim perfect secret detection."
+      ],
+      "cards": ["Secret policy EVID:007-heuristic EVID:007-audit"],
+      "library": ["Privacy docs: use encryption and audit-secrets before sharing. EVID:007-audit"],
+      "required_evidence": ["EVID:007-heuristic", "EVID:007-audit"],
+      "forbidden_evidence": ["EVID:007-guarantee"]
+    },
+    {
+      "id": "cb-008-bundle",
+      "interruption": "root_copied",
+      "query": "verified bundle handoff steps",
+      "events": [
+        "Step EVID:008-pack use pack-root to create a portable bundle.",
+        "Step EVID:008-verify use verify-bundle before handoff.",
+        "Bad shortcut EVID:008-copy-only do not treat blind folder copy as verified handoff."
+      ],
+      "cards": ["Bundle handoff EVID:008-pack EVID:008-verify"],
+      "library": ["Bundle docs: pack-root then verify-bundle is the handoff path. EVID:008-verify"],
+      "required_evidence": ["EVID:008-pack", "EVID:008-verify"],
+      "forbidden_evidence": ["EVID:008-copy-only"]
+    },
+    {
+      "id": "cb-009-worker-roles",
+      "interruption": "fresh_model_session",
+      "query": "scribe librarian archivist responsibilities",
+      "events": [
+        "Role EVID:009-scribe Scribe records and compacts events.",
+        "Role EVID:009-librarian Librarian handles recall placement and route maintenance.",
+        "Role EVID:009-archivist Archivist verifies integrity and storage movement."
+      ],
+      "cards": ["Worker role summary EVID:009-scribe EVID:009-librarian EVID:009-archivist"],
+      "library": ["Architecture notes list Scribe Librarian and Archivist responsibilities. EVID:009-archivist"],
+      "required_evidence": ["EVID:009-scribe", "EVID:009-librarian", "EVID:009-archivist"],
+      "forbidden_evidence": []
+    },
+    {
+      "id": "cb-010-supersession",
+      "interruption": "active_context_cleared",
+      "query": "which decision is current after supersession",
+      "events": [
+        "Old decision EVID:010-old use digest-specific stage roots.",
+        "Current decision EVID:010-current use stable stage root and cachebuster version.",
+        "Reason EVID:010-reason avoid marketplace source mismatch."
+      ],
+      "cards": ["Current staging decision EVID:010-current EVID:010-reason"],
+      "library": ["Review notes mark digest-specific stage roots superseded. EVID:010-current"],
+      "required_evidence": ["EVID:010-current", "EVID:010-reason"],
+      "forbidden_evidence": ["EVID:010-old"]
+    },
+    {
+      "id": "cb-011-cross-session",
+      "interruption": "agent_handoff",
+      "query": "facts separated across sessions",
+      "events": [
+        "Session one EVID:011-constraint do not push without explicit approval.",
+        "Session two EVID:011-task produce local patch zip and notes.",
+        "Distractor EVID:011-publish publish the release immediately."
+      ],
+      "cards": ["Cross-session local-only work EVID:011-constraint EVID:011-task"],
+      "library": ["Release control notes require no remote operation. EVID:011-constraint"],
+      "required_evidence": ["EVID:011-constraint", "EVID:011-task"],
+      "forbidden_evidence": ["EVID:011-publish"]
+    },
+    {
+      "id": "cb-012-library-only",
+      "interruption": "fresh_model_session",
+      "query": "necessary evidence lives in ingested file",
+      "events": [
+        "Pointer EVID:012-pointer the answer is in the ingested design note.",
+        "Distractor EVID:012-chat-only chat does not contain the full setting."
+      ],
+      "cards": ["Library pointer EVID:012-pointer"],
+      "library": ["Ingested design note: the required setting is storage.max_ingest_bytes. EVID:012-library-setting"],
+      "required_evidence": ["EVID:012-library-setting"],
+      "forbidden_evidence": ["EVID:012-chat-only"]
+    },
+    {
+      "id": "cb-013-old-current",
+      "interruption": "application_restart",
+      "query": "old decision remains current",
+      "events": [
+        "Early decision EVID:013-current keep raw evidence when routes decay.",
+        "Later note EVID:013-later no replacement decision was made.",
+        "Distractor EVID:013-delete delete raw events after carding."
+      ],
+      "cards": ["Raw evidence preservation EVID:013-current EVID:013-later"],
+      "library": ["Memory docs: route pruning does not delete raw evidence. EVID:013-current"],
+      "required_evidence": ["EVID:013-current", "EVID:013-later"],
+      "forbidden_evidence": ["EVID:013-delete"]
+    },
+    {
+      "id": "cb-014-operation-cursor",
+      "interruption": "process_termination",
+      "query": "operation cursor and recovery after interruption",
+      "events": [
+        "Operation EVID:014-start import started with row cursor.",
+        "Progress EVID:014-cursor last completed row was 120.",
+        "Next EVID:014-resume resume from cursor rather than restarting blindly."
+      ],
+      "cards": ["Operation cursor recovery EVID:014-cursor EVID:014-resume"],
+      "library": ["Operation receipt mirror includes cursor state. EVID:014-cursor"],
+      "required_evidence": ["EVID:014-cursor", "EVID:014-resume"],
+      "forbidden_evidence": []
+    },
+    {
+      "id": "cb-015-ui-docs",
+      "interruption": "fresh_model_session",
+      "query": "what should public README avoid",
+      "events": [
+        "Guidance EVID:015-avoid avoid massive capability inventory on landing page.",
+        "Guidance EVID:015-link link deeper docs instead.",
+        "Bad EVID:015-huge-table keep every implementation table in README."
+      ],
+      "cards": ["README focus EVID:015-avoid EVID:015-link"],
+      "library": ["Documentation plan: landing page concise, detailed docs linked. EVID:015-link"],
+      "required_evidence": ["EVID:015-avoid", "EVID:015-link"],
+      "forbidden_evidence": ["EVID:015-huge-table"]
+    },
+    {
+      "id": "cb-016-context-budget",
+      "interruption": "active_context_cleared",
+      "query": "strict context budget rule",
+      "events": [
+        "Rule EVID:016-budget context compilation must not silently exceed requested budget.",
+        "Rule EVID:016-truncate truncation must be explicit in metadata.",
+        "Bad EVID:016-overflow silently overflow model window."
+      ],
+      "cards": ["Context budget rule EVID:016-budget EVID:016-truncate"],
+      "library": ["Context docs define strict budget behavior. EVID:016-budget"],
+      "required_evidence": ["EVID:016-budget", "EVID:016-truncate"],
+      "forbidden_evidence": ["EVID:016-overflow"]
+    },
+    {
+      "id": "cb-017-agent-share",
+      "interruption": "agent_handoff",
+      "query": "shared root between different agents",
+      "events": [
+        "Benefit EVID:017-shared Codex and another agent can share the same Continuum root.",
+        "Benefit EVID:017-handoff handoff uses durable recovery packets and receipts.",
+        "Bad EVID:017-isolated every agent should keep isolated hidden memory."
+      ],
+      "cards": ["Shared agent memory EVID:017-shared EVID:017-handoff"],
+      "library": ["Adapter docs describe shared CLI Python MCP core. EVID:017-shared"],
+      "required_evidence": ["EVID:017-shared", "EVID:017-handoff"],
+      "forbidden_evidence": ["EVID:017-isolated"]
+    },
+    {
+      "id": "cb-018-benchmark-policy",
+      "interruption": "fresh_model_session",
+      "query": "benchmark publication rules",
+      "events": [
+        "Policy EVID:018-no-claim no public benchmark claim without methodology and per-case results.",
+        "Policy EVID:018-no-paid do not run paid API benchmark without approval.",
+        "Bad EVID:018-invent invent values for README benchmark table."
+      ],
+      "cards": ["Benchmark policy EVID:018-no-claim EVID:018-no-paid"],
+      "library": ["Benchmark docs require commands environment and cases. EVID:018-no-claim"],
+      "required_evidence": ["EVID:018-no-claim", "EVID:018-no-paid"],
+      "forbidden_evidence": ["EVID:018-invent"]
+    },
+    {
+      "id": "cb-019-copied-root",
+      "interruption": "root_copied_to_another_location",
+      "query": "copied root recovery expectation",
+      "events": [
+        "Expectation EVID:019-copy copied root should be verified before trust.",
+        "Tool EVID:019-doctor run doctor or verify-root after copy.",
+        "Bad EVID:019-assume assume copied root is valid without checks."
+      ],
+      "cards": ["Copied root verification EVID:019-copy EVID:019-doctor"],
+      "library": ["Recovery docs explain copied-root verification. EVID:019-doctor"],
+      "required_evidence": ["EVID:019-copy", "EVID:019-doctor"],
+      "forbidden_evidence": ["EVID:019-assume"]
+    },
+    {
+      "id": "cb-020-conflict",
+      "interruption": "full_transcript_unavailable",
+      "query": "resolve conflicting facts about deployment",
+      "events": [
+        "Old fact EVID:020-old deployment is blocked by missing README.",
+        "Current fact EVID:020-current README exists and deployment blocker is cleared.",
+        "Next EVID:020-next run final local tests before asking for push approval."
+      ],
+      "cards": ["Current deployment state EVID:020-current EVID:020-next"],
+      "library": ["Status note: README exists, blocker cleared, final local tests remain. EVID:020-current"],
+      "required_evidence": ["EVID:020-current", "EVID:020-next"],
+      "forbidden_evidence": ["EVID:020-old"]
+    }
+  ]
+}

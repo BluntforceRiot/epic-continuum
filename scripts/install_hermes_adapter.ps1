@@ -1,4 +1,6 @@
+[CmdletBinding()]
 param(
+    [Alias("ContinuumRoot")]
     [string]$Root = $(if ($env:CONTINUUM_ROOT) { $env:CONTINUUM_ROOT } else { Join-Path $HOME ".continuum" }),
     [string]$HermesHome = "$env:LOCALAPPDATA\hermes",
     [string]$Python = $(if ($env:CONTINUUM_PYTHON) { $env:CONTINUUM_PYTHON } else { "python" }),

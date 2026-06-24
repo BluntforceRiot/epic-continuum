@@ -9,30 +9,217 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from continuum.core.atomic import load_atomic_yaml
 from continuum.core.config import default_config, write_config
 from continuum.core.evals import run_memory_quality_evals
 from continuum.core.store import (
     append_scroll_event,
+    add_graph_edge,
+    audit,
     compile_context,
+    connect,
     connect_existing,
     create_card,
     init_db,
     ingest_file,
+    resolve_stored_uri,
     roll_scroll_segment,
+    sync_card_sidecars_after_commit,
+    upsert_graph_node,
 )
 from continuum.core.workers import (
     apply_storage_tiering,
     decay_graph_routes,
     detect_conflicts,
+    drain_card_sidecar_outbox,
     memory_health,
     prune_memory,
     run_worker_pass,
     verify_book_integrity,
     verify_segment_integrity,
 )
+from continuum.integrations.common import record_turn
 
 
 class EpicContinuumWorkerDesignTest(unittest.TestCase):
+    def test_conflict_detection_respects_project_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                alpha = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Copper Routing",
+                    summary="Use copper routing for the alpha project.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="shared-session",
+                    project_id="alpha",
+                )
+                beta = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Copper Routing",
+                    summary="Do not use copper routing for the beta project.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="shared-session",
+                    project_id="beta",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = detect_conflicts(root, card_id=alpha)
+
+            self.assertEqual(result["conflict_count"], 0)
+            conn = connect(root)
+            try:
+                rows = conn.execute(
+                    "SELECT id, conflict_group FROM cards WHERE id IN (?, ?) ORDER BY id",
+                    (alpha, beta),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual([row["conflict_group"] for row in rows], [None, None])
+
+    def test_conflict_detection_finds_same_project_conflicts_across_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                alpha = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Lantern Routing",
+                    summary="Use lantern routing for the alpha project.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="agent-a-session",
+                    project_id="alpha",
+                )
+                beta = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Lantern Routing",
+                    summary="Do not use lantern routing for the alpha project.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="agent-b-session",
+                    project_id="alpha",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = detect_conflicts(root, card_id=alpha)
+
+            self.assertEqual(result["conflict_count"], 1)
+            conn = connect(root)
+            try:
+                groups = {
+                    row["id"]: row["conflict_group"]
+                    for row in conn.execute("SELECT id, conflict_group FROM cards WHERE id IN (?, ?)", (alpha, beta))
+                }
+            finally:
+                conn.close()
+            self.assertTrue(groups[alpha])
+            self.assertEqual(groups[alpha], groups[beta])
+
+    def test_conflict_detection_syncs_sidecars_after_committed_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                alpha = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Lantern Plan",
+                    summary="Use lantern staging for the shared session.",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="conflict-session",
+                )
+                beta = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Lantern Plan",
+                    summary="Do not use lantern staging for the shared session.",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="conflict-session",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, [alpha, beta])
+
+            result = detect_conflicts(root, card_id=alpha)
+
+            self.assertEqual(result["conflict_count"], 1)
+            self.assertEqual(audit(root)["stale_card_sidecars"], 0)
+            conn = connect_existing(root)
+            try:
+                rows = conn.execute(
+                    "SELECT id, conflict_group, location_uri FROM cards WHERE id IN (?, ?)",
+                    (alpha, beta),
+                ).fetchall()
+            finally:
+                conn.close()
+            groups = {row["id"]: row["conflict_group"] for row in rows}
+            self.assertTrue(groups[alpha])
+            self.assertEqual(groups[alpha], groups[beta])
+            for row in rows:
+                sidecar = load_atomic_yaml(resolve_stored_uri(root, row["location_uri"]).read_text(encoding="utf-8"))
+                self.assertEqual(sidecar["conflict_group"], row["conflict_group"])
+
+    def test_sidecar_outbox_survives_commit_until_worker_drains_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Crash Window Sidecar",
+                    summary="Sidecar should sync after a crash-window commit.",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="sidecar-crash-window",
+                )
+                conn.commit()
+                outbox_count = conn.execute("SELECT count(*) AS n FROM card_sidecar_outbox WHERE card_id = ?", (card_id,)).fetchone()["n"]
+                location_uri = conn.execute("SELECT location_uri FROM cards WHERE id = ?", (card_id,)).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertEqual(outbox_count, 1)
+            self.assertFalse(resolve_stored_uri(root, location_uri).exists())
+
+            drained = drain_card_sidecar_outbox(root)
+
+            self.assertTrue(drained["ok"], drained)
+            self.assertEqual(drained["synced"], 1)
+            conn = connect(root)
+            try:
+                remaining = conn.execute("SELECT count(*) AS n FROM card_sidecar_outbox WHERE card_id = ?", (card_id,)).fetchone()["n"]
+                location_uri = conn.execute("SELECT location_uri FROM cards WHERE id = ?", (card_id,)).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertEqual(remaining, 0)
+            self.assertTrue(resolve_stored_uri(root, location_uri).exists())
+
     def test_worker_pass_reviews_cards_and_verifies_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -45,13 +232,64 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertGreaterEqual(result["processed_count"], 3)
             conn = connect_existing(root)
             try:
-                card = conn.execute("SELECT status, shelf FROM cards WHERE id = ?", (segment["card_id"],)).fetchone()
+                card = conn.execute("SELECT status, shelf, visibility_scope, session_id, project_id, location_uri FROM cards WHERE id = ?", (segment["card_id"],)).fetchone()
                 jobs = conn.execute("SELECT status, count(*) AS n FROM queue_jobs GROUP BY status").fetchall()
             finally:
                 conn.close()
             self.assertEqual(card["status"], "active")
             self.assertTrue(card["shelf"])
+            sidecar = load_atomic_yaml(resolve_stored_uri(root, card["location_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["schema"], "continuum.atomic_memory.v2")
+            self.assertEqual(sidecar["status"], "active")
+            self.assertEqual(sidecar["shelf"], card["shelf"])
+            self.assertEqual(sidecar["visibility_scope"], card["visibility_scope"])
+            self.assertEqual(sidecar["session_id"], card["session_id"])
+            self.assertEqual(sidecar["project_id"], card["project_id"])
             self.assertTrue(any(row["status"] == "succeeded" for row in jobs))
+
+    def test_automatic_capture_rolls_mixed_project_windows_by_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 2
+            write_config(root, config)
+
+            alpha = record_turn(
+                root,
+                session_id="shared-capture-session",
+                role="user",
+                content="Alpha scoped automatic capture segment.",
+                source="codex",
+                project_id="alpha",
+            )
+            beta = record_turn(
+                root,
+                session_id="shared-capture-session",
+                role="user",
+                content="Beta scoped automatic capture segment.",
+                source="codex",
+                project_id="beta",
+            )
+
+            self.assertIsNotNone(alpha)
+            self.assertIsNotNone(beta)
+            conn = connect_existing(root)
+            try:
+                cards = conn.execute(
+                    """
+                    SELECT visibility_scope, project_id, summary
+                    FROM cards
+                    WHERE card_type = 'scroll_segment'
+                    ORDER BY project_id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(cards), 2)
+            self.assertEqual([card["project_id"] for card in cards], ["alpha", "beta"])
+            self.assertTrue(all(card["visibility_scope"] == "project" for card in cards))
+            self.assertIn("Alpha scoped", cards[0]["summary"])
+            self.assertIn("Beta scoped", cards[1]["summary"])
 
     def test_scoped_recall_and_reinforcement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +519,225 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.close()
             self.assertEqual(card["recall_count"], 0)
             self.assertIsNotNone(edge)
+
+    def test_hidden_project_activity_does_not_reset_other_project_decay_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            alpha_session = "alpha-session"
+            beta_session = "beta-session"
+            content = "local-agent lattice route calibration marker"
+            append_scroll_event(
+                root,
+                session_id=alpha_session,
+                event_type="message",
+                role="user",
+                content=content,
+                metadata={"project_id": "alpha", "visibility_scope": "project"},
+            )
+            old_time = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=4)).replace(microsecond=0).isoformat()
+            now_time = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE graph_edge_sources SET last_decay_at = ?, decay_count = 0 WHERE source_ref_json LIKE ?",
+                    (old_time, f"%{alpha_session}%"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            append_scroll_event(
+                root,
+                session_id=beta_session,
+                event_type="message",
+                role="user",
+                content=content,
+                metadata={"project_id": "beta", "visibility_scope": "project"},
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE graph_edge_sources SET last_decay_at = ?, decay_count = 0 WHERE source_ref_json LIKE ?",
+                    (now_time, f"%{beta_session}%"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = decay_graph_routes(root, limit=100, prune_threshold=99)
+
+            self.assertGreater(result["decayed"], 0)
+            conn = connect_existing(root)
+            try:
+                alpha_decay = conn.execute(
+                    "SELECT max(decay_count) AS n FROM graph_edge_sources WHERE source_ref_json LIKE ?",
+                    (f"%{alpha_session}%",),
+                ).fetchone()["n"]
+                beta_decay = conn.execute(
+                    "SELECT max(decay_count) AS n FROM graph_edge_sources WHERE source_ref_json LIKE ?",
+                    (f"%{beta_session}%",),
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertGreaterEqual(int(alpha_decay or 0), 1)
+            self.assertEqual(int(beta_decay or 0), 0)
+
+    def test_route_decay_uses_fair_per_domain_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            old_time = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=4)).replace(microsecond=0).isoformat()
+            for index in range(5):
+                append_scroll_event(
+                    root,
+                    session_id=f"beta-backlog-{index}",
+                    event_type="message",
+                    role="user",
+                    content=f"shared fairness term beta backlog {index}",
+                    metadata={"project_id": "beta", "visibility_scope": "project"},
+                )
+            append_scroll_event(
+                root,
+                session_id="alpha-fairness",
+                event_type="message",
+                role="user",
+                content="shared fairness term alpha should progress",
+                metadata={"project_id": "alpha", "visibility_scope": "project"},
+            )
+            conn = connect(root)
+            try:
+                conn.execute("UPDATE graph_edge_sources SET last_decay_at = ?, decay_count = 0", (old_time,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = decay_graph_routes(root, limit=2, prune_threshold=99)
+
+            self.assertGreaterEqual(result["domains"], 2)
+            self.assertLessEqual(result["processed"], 2)
+            self.assertEqual(result["processed"], 2)
+            conn = connect_existing(root)
+            try:
+                alpha_decay = conn.execute(
+                    "SELECT max(decay_count) AS n FROM graph_edge_sources WHERE source_ref_json LIKE '%\"project_id\":\"alpha\"%'"
+                ).fetchone()["n"]
+                beta_decay = conn.execute(
+                    "SELECT max(decay_count) AS n FROM graph_edge_sources WHERE source_ref_json LIKE '%\"project_id\":\"beta\"%'"
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertGreaterEqual(int(alpha_decay or 0), 1)
+            self.assertGreaterEqual(int(beta_decay or 0), 1)
+
+    def test_route_decay_resolves_card_source_refs_to_project_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            old_time = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=4)).replace(microsecond=0).isoformat()
+            conn = connect(root)
+            try:
+                shared_term = upsert_graph_node(conn, kind="term", label="card-origin-fairness")
+                for index in range(20):
+                    beta_card = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"Beta card source {index}",
+                        summary=f"Beta card source backlog {index}",
+                        source_refs=[],
+                        visibility_scope="project",
+                        session_id="beta-card-session",
+                        project_id="beta-card-project",
+                    )
+                    beta_node = upsert_graph_node(conn, kind="card", label=f"Beta card source {index}", card_id=beta_card)
+                    add_graph_edge(
+                        conn,
+                        source_node_id=shared_term,
+                        relation="mentions",
+                        target_node_id=beta_node,
+                        weight=0.4,
+                        confidence=0.8,
+                        source_refs=[{"card_id": beta_card}],
+                    )
+                alpha_card = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Alpha card source",
+                    summary="Alpha card source must still decay under card-only provenance.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="alpha-card-session",
+                    project_id="alpha-card-project",
+                )
+                alpha_node = upsert_graph_node(conn, kind="card", label="Alpha card source", card_id=alpha_card)
+                add_graph_edge(
+                    conn,
+                    source_node_id=shared_term,
+                    relation="mentions",
+                    target_node_id=alpha_node,
+                    weight=0.4,
+                    confidence=0.8,
+                    source_refs=[{"card_id": alpha_card}],
+                )
+                conn.execute("UPDATE graph_edge_sources SET last_decay_at = ?, decay_count = 0", (old_time,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = decay_graph_routes(root, limit=2, prune_threshold=99)
+
+            self.assertGreaterEqual(result["domains"], 2)
+            self.assertLessEqual(result["processed"], 2)
+            conn = connect_existing(root)
+            try:
+                alpha_decay = conn.execute(
+                    """
+                    SELECT max(ges.decay_count) AS n
+                    FROM graph_edge_sources ges
+                    JOIN cards c ON ges.source_ref_json LIKE '%' || c.id || '%'
+                    WHERE c.project_id = 'alpha-card-project'
+                    """
+                ).fetchone()["n"]
+                beta_decay = conn.execute(
+                    """
+                    SELECT max(ges.decay_count) AS n
+                    FROM graph_edge_sources ges
+                    JOIN cards c ON ges.source_ref_json LIKE '%' || c.id || '%'
+                    WHERE c.project_id = 'beta-card-project'
+                    """
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertGreaterEqual(int(alpha_decay or 0), 1)
+            self.assertGreaterEqual(int(beta_decay or 0), 1)
+
+    def test_route_decay_limit_is_global_not_per_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            old_time = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=4)).replace(microsecond=0).isoformat()
+            for index in range(7):
+                append_scroll_event(
+                    root,
+                    session_id=f"global-cap-{index}",
+                    event_type="message",
+                    role="user",
+                    content=f"global decay cap evidence {index}",
+                    metadata={"project_id": f"project-{index}", "visibility_scope": "project"},
+                )
+            conn = connect(root)
+            try:
+                conn.execute("UPDATE graph_edge_sources SET last_decay_at = ?, decay_count = 0", (old_time,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = decay_graph_routes(root, limit=1, prune_threshold=99)
+
+            self.assertGreaterEqual(result["domains"], 7)
+            self.assertEqual(result["processed"], 1)
 
     def test_decay_and_prune_memory_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

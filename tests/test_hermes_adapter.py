@@ -206,12 +206,12 @@ class HermesAdapterTest(unittest.TestCase):
                 model_alias="secret-model",
                 model_name="secret-model",
                 base_url="http://127.0.0.1:9999/v1",
-                api_key="sk-secretvalue12345678901234567890",
+                api_key="sk-" + "secretvalue12345678901234567890",
                 set_default_model=True,
             )
             serialized = json.dumps(result, ensure_ascii=True)
 
-            self.assertNotIn("sk-secretvalue12345678901234567890", serialized)
+            self.assertNotIn("sk-" + "secretvalue12345678901234567890", serialized)
             self.assertNotIn(str(hermes_home), serialized)
             self.assertNotIn(str(continuum_src), serialized)
             self.assertIn("[REDACTED]", serialized)
@@ -294,7 +294,7 @@ class HermesAdapterTest(unittest.TestCase):
                         "--hermes-home",
                         str(Path(tmp) / "hermes"),
                         "--api-key",
-                        "sk-test-secret-value-1234567890",
+                        "sk-" + "test-secret-value-1234567890",
                         "--dry-run",
                     ]
                 )
@@ -302,7 +302,7 @@ class HermesAdapterTest(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             rendered = output.getvalue()
             self.assertIn("Refusing --api-key", rendered)
-            self.assertNotIn("sk-test-secret-value", rendered)
+            self.assertNotIn("sk-" + "test-secret-value", rendered)
 
     def test_hermes_plugin_source_is_packaged_asset(self) -> None:
         source = default_plugin_source()

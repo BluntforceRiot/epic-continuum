@@ -22,6 +22,14 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
+For WSL or Linux release checks, keep temporary SQLite-heavy test roots on the
+Linux filesystem instead of a mounted Windows drive:
+
+```bash
+TMPDIR=/tmp PYTHONPATH=src python -m compileall -q src tests
+TMPDIR=/tmp PYTHONPATH=src python -m unittest discover -s tests
+```
+
 ## Pull Request Checklist
 
 - Keep durable memory and source code paths configurable.

@@ -9,7 +9,7 @@ Status: accepted
 Epic Continuum is a new standalone repository and memory substrate. It does not use
 MemPalace internally.
 
-MemPalace and the MemGalaxy plugin provided useful lessons, but Epic Continuum is
+Palace-style memory tools provided useful lessons, but Epic Continuum is
 designed around:
 
 - a Scroll: append-only ordered event log

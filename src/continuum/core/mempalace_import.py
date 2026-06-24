@@ -49,6 +49,7 @@ from .store import (
     record_artifact,
     sqlite_readonly_uri,
     stable_id,
+    sync_card_sidecars_after_commit,
     unique_id,
     summarize_text,
     upsert_graph_node,
@@ -293,7 +294,7 @@ def emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) ->
 
 def sqlite_backup(source: Path, dest: Path) -> None:
     secure_mkdir(dest.parent)
-    src = sqlite3.connect(sqlite_readonly_uri(source), uri=True, timeout=2)
+    src = sqlite3.connect(sqlite_readonly_uri(source, immutable=False), uri=True, timeout=2)
     try:
         dst = sqlite3.connect(str(dest))
         try:
@@ -1466,6 +1467,10 @@ def _import_mempalace_locked(
             },
         )
         target.commit()
+        sync_card_sidecars_after_commit(
+            root,
+            [str(item["card_id"]) for item in imported_items if item.get("card_id")],
+        )
 
         import_dir = root / "exports" / "imports" / safe_filename(import_id)
         receipt_path = import_dir / "receipt.final.json"

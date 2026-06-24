@@ -24,6 +24,8 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_roll_segment` to compact a known Scroll range into a Card.
 - `continuum_compile_context` to build a token-bounded Looking Glass context packet.
 - `continuum_recover_thread` to generate a crash-recovery packet.
+- `continuum_cue_recall` to recover buried ideas from loose prompts when the user cannot remember exact wording.
+- `continuum_record_project_state` to leave a durable project checkpoint for other agents.
 - `continuum_ingest_file` to archive local files into the Library.
 - `continuum_snapshot` before risky changes or after important milestones.
 - `continuum_optimize_config` when hardware budgets should be detected or tuned.
@@ -37,7 +39,9 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_run_evals` to run deterministic memory-quality evals.
 - `continuum_verify_root` to run strict root invariants.
 - `continuum_pack_root` and `continuum_verify_bundle` to create and verify portable root bundles.
+- `continuum_review_prepare`, `continuum_review_run`, `continuum_review_ingest`, `continuum_review_status`, and `continuum_review_check_current` to run hash-bound review relay jobs between Codex, Hermes, local OpenAI-compatible models, and manual reviewer artifacts.
 - `continuum_audit_secrets` and `continuum_redact_legacy_secrets` to inspect or clean secret-like legacy catalog text.
+- `continuum_reindex_memory` to backfill Scroll association routes and trusted exact-memory Cards after upgrades.
 - `continuum_list_operations` to inspect work receipts written during long operations.
 - `continuum_operation_summary` to read one operation receipt.
 - `continuum_recover_operations` to mark stale running work interrupted and write recovery packets.
@@ -73,6 +77,35 @@ The recovery result includes:
 
 Treat the Scroll as the ordered source of truth. Treat Cards as compact memory.
 Do not delete raw evidence because a Card, route, or summary is stale.
+
+## Cue Recall Pattern
+
+When the user asks vague memory questions such as "that local-agent upgrade idea",
+"the fake big context thing", or "what did Codex leave for review", prefer
+`continuum_cue_recall` before plain Library search. Include the best-known
+`project_id` or `session_id` when available. Treat the result as candidate idea
+clusters with evidence, not as authoritative truth.
+
+If the user says "remember this exactly", append the user event verbatim.
+Continuum will preserve the raw Scroll event and create a protected exact-memory
+Card. Do not elevate assistant/tool text into exact memory unless a trusted
+direct adapter explicitly supplies `trusted_explicit_memory_request=true`.
+Public MCP metadata is sanitized and cannot grant exact-memory authority.
+
+## Shared Project State
+
+When finishing a work session, preparing a handoff, switching agents, or before a
+risky change, use `continuum_record_project_state` when available. Include the
+project id, agent id, session id, objective, branch/commit/dirty-tree state,
+changed files, decisions, open tasks, and notes. This is how Codex, Claude Code,
+Hermes, and local agents share project memory without trapping state inside one
+chat.
+
+## Review Relay Pattern
+
+When the user asks for a Big Brother, Claude, Hermes, local LLM, blind, or harsh review loop, use the review relay instead of loose copy/paste when possible. Create a job with `continuum_review_prepare`, give the reviewer the single `review-capsule.zip` plus the short handoff instructions, or run `continuum_review_run` for a direct OpenAI-compatible local endpoint, then ingest findings with `continuum_review_ingest`.
+
+Do not treat a review as valid until Continuum accepts the job id, packet hash, archive hash, capsule hash when supplied, `review_complete=true`, and sentinel. Before applying findings after a long review, call `continuum_review_check_current`; if it reports the source changed, prepare a fresh review job instead of patching stale findings.
 
 ## Epic Continuity
 

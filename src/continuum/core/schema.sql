@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS scroll_events (
     content TEXT NOT NULL,
     token_estimate INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT NOT NULL,
+    visibility_scope TEXT NOT NULL DEFAULT 'session',
+    project_id TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     UNIQUE(session_id, seq)
@@ -142,6 +144,41 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     UNIQUE(source_node_id, relation, target_node_id)
 );
 
+CREATE TABLE IF NOT EXISTS graph_edge_sources (
+    edge_id TEXT NOT NULL REFERENCES graph_edges(id) ON DELETE CASCADE,
+    source_ref_key TEXT NOT NULL,
+    source_ref_json TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 0.0,
+    confidence REAL NOT NULL DEFAULT 0.7,
+    status TEXT NOT NULL DEFAULT 'active',
+    decay_count INTEGER NOT NULL DEFAULT 0,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    last_decay_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(edge_id, source_ref_key)
+);
+
+CREATE TABLE IF NOT EXISTS partition_aliases (
+    kind TEXT NOT NULL,
+    external_digest TEXT NOT NULL,
+    internal_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(kind, external_digest),
+    UNIQUE(kind, internal_id)
+);
+
+CREATE TABLE IF NOT EXISTS card_sidecar_outbox (
+    card_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -157,6 +194,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_uri TEXT NOT NULL,
     reason TEXT NOT NULL,
     source_db_uri TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL DEFAULT '',
+    manifest_uri TEXT,
+    manifest_hash TEXT NOT NULL DEFAULT '',
+    partition_alias_key_hash TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -176,12 +217,16 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scroll_events_session_seq ON scroll_events(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status, salience DESC);
 CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC);
 CREATE INDEX IF NOT EXISTS idx_books_tier ON books(storage_tier, status);
 CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, status, weight DESC);
+CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_edge ON graph_edge_sources(edge_id);
+CREATE INDEX IF NOT EXISTS idx_partition_aliases_internal ON partition_aliases(kind, internal_id);
+CREATE INDEX IF NOT EXISTS idx_card_sidecar_outbox_updated ON card_sidecar_outbox(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_operation ON artifacts(operation_id);

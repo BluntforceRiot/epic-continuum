@@ -147,7 +147,7 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
     if not stat.S_ISREG(source_stat.st_mode):
         raise ValueError(f"refusing to back up a non-regular database: {source}")
     secure_mkdir(destination.parent)
-    source_conn = sqlite3.connect(sqlite_readonly_uri(source), uri=True)
+    source_conn = sqlite3.connect(sqlite_readonly_uri(source, immutable=False), uri=True)
     destination_conn = sqlite3.connect(str(destination))
     try:
         source_conn.backup(destination_conn)
@@ -1067,7 +1067,7 @@ def _manifest_structure_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]
     allowed_keys = {
         "schema", "bundle_id", "created_at", "profile", "symlink_policy",
         "redaction_profile", "root_identity_hash", "file_count", "total_size_bytes",
-        "files", "copy", "preflight", "manifest_hash",
+        "files", "copy", "preflight", "alias_key_policy", "manifest_hash",
     }
     unexpected = sorted(set(manifest) - allowed_keys)
     if unexpected:
@@ -1106,6 +1106,14 @@ def _manifest_structure_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]
     ]
     if ordered_paths != sorted(ordered_paths):
         errors.append({"error": "manifest_file_order_noncanonical"})
+    if manifest.get("profile") == "shareable":
+        alias_key_paths = [
+            path for path in ordered_paths
+            if path == "catalog/partition_alias.key"
+            or (path.startswith("snapshots/continuum_partition_alias_") and path.endswith(".key"))
+        ]
+        if alias_key_paths:
+            errors.append({"error": "manifest_shareable_alias_key_included", "paths": alias_key_paths[:20]})
     allowed_entry_keys = {"path", "sha256", "size_bytes", "mode"}
     for index, entry in enumerate(files):
         if not isinstance(entry, dict):
@@ -1179,7 +1187,7 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         if _is_nonnegative_int(copy_payload.get("copied_bytes")) and _is_nonnegative_int(manifest.get("total_size_bytes")):
             if copy_payload.get("copied_bytes") != manifest.get("total_size_bytes"):
                 errors.append({"error": "manifest_copy_size_mismatch"})
-        valid_skip_reasons = {"transient_excluded", "symlink_skipped", "unsupported_file_type"}
+        valid_skip_reasons = {"transient_excluded", "symlink_skipped", "unsupported_file_type", "shareable_alias_key_omitted"}
         invalid_skipped = [
             index for index, item in enumerate(skipped)
             if not isinstance(item, dict)
@@ -1209,6 +1217,8 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             "proof_packs_ok", "artifact_count", "artifact_ledger_ok",
             "portable_metadata_files_scanned", "portable_metadata_sqlite_values_scanned",
             "portable_metadata_complete", "portable_metadata_ok", "restore_drill_ran",
+            "alias_key_included", "alias_key_policy", "alias_key_files_omitted",
+            "snapshot_manifests_rewritten_for_shareable",
         }
         unexpected = sorted(set(preflight) - allowed_preflight_keys)
         if unexpected:
@@ -1224,7 +1234,8 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         for key in (
             "secret_finding_count", "secret_allowlisted_finding_count", "proof_pack_count",
             "artifact_count", "portable_metadata_files_scanned",
-            "portable_metadata_sqlite_values_scanned",
+            "portable_metadata_sqlite_values_scanned", "alias_key_files_omitted",
+            "snapshot_manifests_rewritten_for_shareable",
         ):
             if not _is_nonnegative_int(preflight.get(key)):
                 errors.append({"error": "manifest_preflight_nonnegative_integer_required", "field": key})
@@ -2049,6 +2060,7 @@ def _embedded_root_semantic_errors(
                 run_restore_drill=False,
                 scan_secrets=False,
                 allowed_roots=[embedded_root],
+                allow_missing_alias_key=str(manifest.get("profile") or "") == "shareable",
             )
         except (OSError, ValueError, RuntimeError, sqlite3.Error, json.JSONDecodeError) as exc:
             return [
@@ -2532,6 +2544,93 @@ def _restore_or_remove(path: Path, backup: Path | None) -> None:
         path.unlink(missing_ok=True)
 
 
+def _relative_stage_path(stage_root: Path, path: Path) -> str:
+    return path.relative_to(stage_root).as_posix()
+
+
+def _remove_staged_file(stage_root: Path, path: Path, copy_result: dict[str, Any], *, reason: str) -> bool:
+    if not path.exists():
+        return False
+    rel = _relative_stage_path(stage_root, path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    path.unlink()
+    copy_result["copied_files"] = max(0, int(copy_result.get("copied_files") or 0) - 1)
+    copy_result["copied_bytes"] = max(0, int(copy_result.get("copied_bytes") or 0) - int(size))
+    copy_result.setdefault("skipped", []).append({"path": rel, "reason": reason})
+    return True
+
+
+def _rewrite_shareable_snapshot_manifests(stage_root: Path, copy_result: dict[str, Any]) -> int:
+    snapshots_dir = stage_root / "snapshots"
+    if not snapshots_dir.exists():
+        return 0
+    rewritten = 0
+    conn: sqlite3.Connection | None = None
+    db_path = stage_root / "catalog" / "catalog.sqlite3"
+    if db_path.exists():
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+    try:
+        for manifest_path in sorted(snapshots_dir.glob("continuum_snapshot_*.manifest.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not manifest.get("partition_alias_key"):
+                continue
+            old_size = manifest_path.stat().st_size
+            manifest["partition_alias_key"] = None
+            manifest["partition_alias_key_fingerprint"] = None
+            manifest["partition_alias_key_policy"] = "shareable_omitted_hmac_key"
+            atomic_write_text_file(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            )
+            new_size = manifest_path.stat().st_size
+            copy_result["copied_bytes"] = max(
+                0,
+                int(copy_result.get("copied_bytes") or 0) + int(new_size) - int(old_size),
+            )
+            rewritten += 1
+            if conn is not None:
+                rel = _relative_stage_path(stage_root, manifest_path)
+                conn.execute(
+                    """
+                    UPDATE snapshots
+                    SET manifest_hash = ?, partition_alias_key_hash = NULL
+                    WHERE manifest_uri = ?
+                    """,
+                    (file_sha256(manifest_path), rel),
+                )
+        if conn is not None:
+            conn.commit()
+    finally:
+        if conn is not None:
+            conn.close()
+    return rewritten
+
+
+def _strip_shareable_alias_keys(stage_root: Path, copy_result: dict[str, Any]) -> dict[str, Any]:
+    removed = 0
+    if _remove_staged_file(
+        stage_root,
+        stage_root / "catalog" / "partition_alias.key",
+        copy_result,
+        reason="shareable_alias_key_omitted",
+    ):
+        removed += 1
+    snapshots_dir = stage_root / "snapshots"
+    if snapshots_dir.exists():
+        for path in sorted(snapshots_dir.glob("continuum_partition_alias_*.key")):
+            if _remove_staged_file(stage_root, path, copy_result, reason="shareable_alias_key_omitted"):
+                removed += 1
+    rewritten_manifests = _rewrite_shareable_snapshot_manifests(stage_root, copy_result)
+    return {"removed_alias_key_files": removed, "rewritten_snapshot_manifests": rewritten_manifests}
+
+
 def _publish_without_overwrite(source: Path, destination: Path) -> None:
     """Publish one complete file without replacing a concurrently created path.
 
@@ -2609,6 +2708,14 @@ def pack_root(
             "use portable/shareable metadata or create a redacted copy first"
         )
 
+    preflight_portability_audit = audit_portable_metadata(root)
+    if not preflight_portability_audit.get("ok"):
+        raise ValueError(
+            f"portable metadata audit found {preflight_portability_audit.get('finding_count', 0)} raw absolute local path(s)"
+        )
+    if not preflight_portability_audit.get("complete", True):
+        raise ValueError("portable metadata audit was incomplete")
+
     # The root preflight verifies every currently present proof pack, not only a
     # small recent sample. Restore-drill writes happen before the final audit and
     # stage copy so the bundle captures the tested state.
@@ -2659,6 +2766,12 @@ def pack_root(
     with tempfile.TemporaryDirectory(prefix="continuum-bundle-") as tmp:
         stage_root = Path(tmp) / BUNDLE_ROOT_NAME
         copy_result = _copy_root_to_stage(root, stage_root, symlink_policy=symlink_policy)
+        staged_alias_key = stage_root / "catalog" / "partition_alias.key"
+        alias_key_was_present = staged_alias_key.exists()
+        alias_key_policy = "portable_included_for_disaster_recovery" if profile == "portable" else "shareable_omitted_hmac_key"
+        alias_key_stage_policy: dict[str, Any] = {"removed_alias_key_files": 0, "rewritten_snapshot_manifests": 0}
+        if profile == "shareable":
+            alias_key_stage_policy = _strip_shareable_alias_keys(stage_root, copy_result)
         unsupported = [
             item for item in copy_result["skipped"]
             if item.get("reason") == "unsupported_file_type"
@@ -2676,6 +2789,7 @@ def pack_root(
             run_restore_drill=False,
             scan_secrets=True,
             allow_symlinks=False,
+            allow_missing_alias_key=profile == "shareable",
         )
         if not staged_verification.get("ok"):
             raise ValueError(f"staged root verification failed: {_verification_failure_message(staged_verification)}")
@@ -2703,6 +2817,7 @@ def pack_root(
             "profile": profile,
             "symlink_policy": symlink_policy,
             "redaction_profile": redaction_profile,
+            "alias_key_policy": alias_key_policy,
             "file_count": len(file_entries),
             "total_size_bytes": total_size,
             "files": file_entries,
@@ -2729,6 +2844,12 @@ def pack_root(
                 "portable_metadata_complete": bool(portability_audit.get("complete", True)),
                 "portable_metadata_ok": bool(portability_audit.get("ok")),
                 "restore_drill_ran": bool(run_restore_drill),
+                "alias_key_included": bool(profile == "portable" and alias_key_was_present),
+                "alias_key_policy": alias_key_policy,
+                "alias_key_files_omitted": int(alias_key_stage_policy.get("removed_alias_key_files") or 0),
+                "snapshot_manifests_rewritten_for_shareable": int(
+                    alias_key_stage_policy.get("rewritten_snapshot_manifests") or 0
+                ),
             },
         }
         manifest["manifest_hash"] = _manifest_hash(manifest)

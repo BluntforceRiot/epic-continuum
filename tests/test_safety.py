@@ -14,7 +14,7 @@ from continuum.core.safety import (
 class EpicContinuumSafetyTest(unittest.TestCase):
     def test_known_secret_patterns_are_detected_and_redacted(self) -> None:
         samples = {
-            "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "private_key": "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
             "openai_key": "sk-" + "A" * 24,
             "github_token": "ghp_" + "A" * 36,
             "gitlab_token": "glpat-" + "A" * 24,

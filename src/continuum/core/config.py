@@ -240,7 +240,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("context token budgets must be positive")
     if scroll_event_fetch_limit <= 0:
         raise ValueError("context.scroll_event_fetch_limit must be positive")
-    if context.get("card_recall_scope", "session_then_global") not in {"session", "global", "session_then_global", "project"}:
+    if context.get("card_recall_scope", "session") not in {"session", "global", "session_then_global", "project"}:
         raise ValueError("context.card_recall_scope must be session, global, session_then_global, or project")
     if default_budget > max_budget:
         raise ValueError("default_token_budget cannot exceed max_token_budget")

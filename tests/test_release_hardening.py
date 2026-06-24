@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,18 +96,43 @@ class ReleaseHardeningTest(unittest.TestCase):
         with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "999999999999999999999999999"}):
             self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
 
+    def test_release_builder_includes_readme_linked_review_relay_doc(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location("build_release_package_under_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertTrue(module.should_include(repo_root / "docs" / "review-relay.md", repo_root))
+
     def test_static_release_metadata_matches_pyproject_version(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
+        changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn(f"release-{version}", (repo_root / "README.md").read_text(encoding="utf-8"))
-        self.assertIn(f"## {version} -", (repo_root / "CHANGELOG.md").read_text(encoding="utf-8"))
+        self.assertIn(f"## {version} -", changelog)
+        current_section = changelog.split(f"## {version} -", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("Unreleased", current_section)
         for path in (
             repo_root / "integrations" / "hermes" / "epic_continuum" / "plugin.yaml",
             repo_root / "src" / "continuum" / "assets" / "hermes" / "epic_continuum" / "plugin.yaml",
         ):
             with self.subTest(path=path):
                 self.assertIn(f"version: {version}", path.read_text(encoding="utf-8"))
+
+    def test_powershell_installers_accept_continuum_root_alias_and_strict_binding(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        for path in (
+            repo_root / "scripts" / "install_codex_plugin.ps1",
+            repo_root / "scripts" / "install_hermes_adapter.ps1",
+        ):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("[CmdletBinding()]", text)
+                self.assertRegex(text, r'\[Alias\("ContinuumRoot"\)\]\s*\n\s*\[string\]\$Root')
 
     def test_read_only_sqlite_access_supports_uri_reserved_path_characters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,7 +251,119 @@ version = "9.9.9"
                 capture_output=True,
             )
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
-            self.assertTrue((out / "epic-continuum-9.9.9.zip").exists())
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
+                provenance = json.loads(zf.read("epic-continuum-9.9.9/RELEASE_PROVENANCE.json"))
+            self.assertTrue(provenance["allow_dirty"])
+            self.assertTrue(provenance["git_dirty"])
+            self.assertGreater(provenance["git_status_short_count"], 0)
+            self.assertIn("git_status_short_sha256", provenance)
+            self.assertNotIn("git_status_short", provenance)
+            self.assertIn("member_manifest_sha256", provenance)
+
+    def test_release_builder_dirty_archive_skips_deleted_tracked_paths(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for deleted-path release builder smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "epic-continuum-memory"
+version = "9.9.9"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text("tracked then deleted\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "add", "pyproject.toml", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            (repo / "README.md").unlink()
+
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+            blocked = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+            self.assertIn("tracked working-tree changes", blocked.stderr)
+            self.assertNotIn("FileNotFoundError", blocked.stderr)
+
+            allowed = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out), "--allow-dirty"],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
+                self.assertNotIn("epic-continuum-9.9.9/README.md", set(zf.namelist()))
+
+    def test_release_builder_dirty_archive_includes_intended_untracked_paths(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for untracked-path release builder smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "epic-continuum-memory"
+version = "9.9.9"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text("tracked\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "add", "pyproject.toml", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            untracked_doc = repo / "docs" / "cue-recall.md"
+            untracked_doc.parent.mkdir()
+            untracked_doc.write_text("# Cue Recall\n", encoding="utf-8")
+
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+            allowed = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out), "--allow-dirty"],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
+                self.assertIn("epic-continuum-9.9.9/docs/cue-recall.md", set(zf.namelist()))
 
     def test_release_builder_walk_fallback_rejects_source_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -437,7 +575,7 @@ version = "9.9.9"
             self.assertFalse(search_check["fts_available"], checked)
 
     def test_hermes_secret_api_key_is_never_placed_in_recorded_or_executed_argv(self) -> None:
-        secret = "sk-secretvalue12345678901234567890"
+        secret = "sk-" + "secretvalue12345678901234567890"
         with tempfile.TemporaryDirectory() as tmp:
             hermes_home = Path(tmp) / "hermes"
             root = Path(tmp) / "continuum"

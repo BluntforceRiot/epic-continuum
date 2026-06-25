@@ -349,6 +349,38 @@ class ReviewBridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
                 ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
 
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual", max_packet_bytes=220)
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            payload["verdict"] = "pass"
+            payload["findings"] = []
+            payload["review_surface"] = "unknown"
+            payload["subject_inspected"] = False
+
+            with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
+                ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+    def test_ingest_rejects_contradictory_review_surface_flags(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            for surface, inspected in (("full_capsule", False), ("local_files", False), ("packet_excerpt_only", True)):
+                with self.subTest(surface=surface, inspected=inspected):
+                    job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+                    request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+                    status = review_job_status(root, job_id=job["job_id"])
+                    payload = valid_review_payload({**request, **status})
+                    payload["review_surface"] = surface
+                    payload["subject_inspected"] = inspected
+
+                    with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
+                        ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
     def test_ingest_requires_review_surface_contract(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
@@ -452,6 +484,16 @@ class ReviewBridgeTest(unittest.TestCase):
                     transport="manual",
                     secret_allowlist_patterns=[r".*"],
                 )
+
+            for pattern in (r"^.*:.*", r"^.*:.*:.*", r"^config\.py:.*:.*"):
+                with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, "allowlist"):
+                    create_review_job(
+                        root,
+                        subject_path=subject,
+                        prompt="Review hard.",
+                        transport="manual",
+                        secret_allowlist_patterns=[pattern],
+                    )
 
     def test_review_secret_scan_blocks_raw_secret_in_tests(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

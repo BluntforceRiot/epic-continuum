@@ -374,11 +374,18 @@ def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[re.Patt
         text = str(pattern or "").strip()
         if not text:
             continue
-        if not text.startswith("^") or ":" not in text:
+        if not text.startswith("^") or text.count(":") < 2:
             raise ReviewBridgeError(
                 "review secret allowlist patterns must be anchored to 'source:line:text' "
                 "(example: ^tests/test_fixture\\.py:12:.*synthetic_token)"
             )
+        prefix = text[1:].split(":", 2)
+        source_part = prefix[0]
+        line_part = prefix[1]
+        if not source_part or any(token in source_part for token in ("*", ".*", "[", "]", "(", ")", "|", "?")):
+            raise ReviewBridgeError("review secret allowlist source must be an explicit file path, not a wildcard pattern")
+        if not re.fullmatch(r"\d+", line_part):
+            raise ReviewBridgeError("review secret allowlist line must be an explicit positive integer")
         try:
             pattern_re = re.compile(text)
         except re.error as exc:
@@ -1621,9 +1628,7 @@ def _apply_coverage_guard(job: dict[str, Any], result: dict[str, Any]) -> dict[s
         return result
     surface = str(result.get("review_surface") or "unknown")
     subject_inspected = result.get("subject_inspected") is True
-    if surface == "full_capsule" and subject_inspected:
-        return result
-    if str(job.get("transport") or "") not in {"direct-openai"} and surface not in {"packet_excerpt_only", "packet_only"}:
+    if surface in {"full_capsule", "local_files"} and subject_inspected:
         return result
     verdict = str(result.get("verdict") or "").casefold()
     if verdict not in {"pass", "passed", "ok", "clean", "approved"}:
@@ -1685,6 +1690,15 @@ def _validate_review_schema_payload(payload: dict[str, Any]) -> None:
             errors.append("review_surface is invalid")
     if "subject_inspected" in payload and not isinstance(payload.get("subject_inspected"), bool):
         errors.append("subject_inspected must be a boolean")
+    if isinstance(payload.get("review_surface"), str) and isinstance(payload.get("subject_inspected"), bool):
+        surface = str(payload["review_surface"])
+        inspected = bool(payload["subject_inspected"])
+        if surface in {"full_capsule", "local_files"} and not inspected:
+            errors.append(f"{surface} reviews require subject_inspected=true")
+        if surface in {"packet_excerpt_only", "packet_only"} and inspected:
+            errors.append(f"{surface} reviews require subject_inspected=false")
+        if surface == "unknown" and str(payload.get("verdict") or "").casefold() in {"pass", "passed", "ok", "clean", "approved"}:
+            errors.append("unknown review_surface cannot return a clean pass")
     findings = payload.get("findings")
     if "findings" in payload and not isinstance(findings, list):
         errors.append("findings must be an array")

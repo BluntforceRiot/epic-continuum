@@ -575,7 +575,8 @@ def _scan_review_text_for_secrets(
     allowed_secret_hashes: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    limit = max(1, int(max_findings))
+    raw_limit = int(max_findings)
+    limit = raw_limit if raw_limit > 0 else None
     for finding in scan_text_for_secrets(text, max_findings=0):
         line = _line_for_finding(text, finding)
         allow_reason = _allowlisted_review_secret_finding(
@@ -592,7 +593,7 @@ def _scan_review_text_for_secrets(
         scoped = dict(finding)
         scoped["source"] = source
         findings.append(scoped)
-        if len(findings) >= limit:
+        if limit is not None and len(findings) >= limit:
             break
     return findings
 

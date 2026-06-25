@@ -633,6 +633,16 @@ class ReviewBridgeTest(unittest.TestCase):
                 leftovers = list(bridge_root.glob("**/config.py")) + list(bridge_root.glob("**/subject.zip"))
                 self.assertEqual(leftovers, [])
 
+    def test_review_secret_scan_zero_limit_means_uncapped(self) -> None:
+        text = (
+            'OPENAI_API_KEY="sk-' + ("A" * 32) + '"\n'
+            'GITHUB_TOKEN="ghp_' + ("B" * 36) + '"\n'
+        )
+
+        findings = review_bridge_module._scan_review_text_for_secrets(text, source="fixture.py", max_findings=0)
+
+        self.assertGreaterEqual(len(findings), 2)
+
     def test_review_secret_scan_reads_beyond_large_file_sample(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)

@@ -73,8 +73,9 @@ is truncated or critical files are omitted, Continuum downgrades a clean packet-
 `review_surface: "full_capsule"` and `subject_inspected: true`; that full-capsule signal is not downgraded
 only because the packet excerpts were limited.
 
-Review preparation scans every decodable snapshot file, every decodable member of a ZIP subject, and the
-packet text for obvious secret-like material before writing the capsule. Use
+Review preparation scans every decodable snapshot file, UTF-8/UTF-16 text, ZIP member contents, ZIP metadata,
+generated request/instruction text, and the completed capsule boundary for obvious secret-like material before
+publishing a capsule hash. Use
 `--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. Patterns
 must be anchored to Continuum's `source:line:text` target, such as
 `^tests/test_fixture.py:12:.*synthetic_token`. The source path and line number are treated as exact targets;
@@ -84,8 +85,10 @@ into the public capsule; only the count is recorded. Suppressed findings are wri
 Continuum removes the temporary preparation directory and does not leave an uploadable capsule or subject
 archive behind.
 
-Directory subjects must fit under `--max-files`. If the file limit is reached, `review-prepare` fails rather
-than silently omitting files. For large release reviews, pass the already-built release ZIP as the subject.
+Directory subjects must fit under `--max-files`. If the file limit is reached, a custom `.continuumignore`
+rule excludes subject files, the subject is inside the Continuum root, or a non-empty subject produces an
+empty snapshot, `review-prepare` fails rather than silently claiming full coverage. For large release reviews,
+pass the already-built release ZIP as the subject.
 
 ## Validation
 
@@ -129,15 +132,23 @@ continuum review-prepare \
   --secret-allowlist-pattern "^tests/test_fixture.py:12:.*example_fixture_token"
 ```
 
-Upload `review-capsule.zip` to the reviewer and paste the exact short prompt from `browser-handoff.md`.
-Save the reviewer JSON and ingest it:
+For a browser-only reviewer, reserve a response path before each attempt. Upload `review-capsule.zip` to the
+reviewer, paste the exact short prompt from `browser-handoff.md`, save the reviewer JSON to the reserved path,
+and ingest that exact file:
 
 ```bash
+continuum review-browser-attempt-start \
+  --root ./.continuum-demo \
+  --job-id review_20260624T000000Z_example
+
 continuum review-ingest \
   --root ./.continuum-demo \
   --job-id review_20260624T000000Z_example \
-  --result-path ./review-result.json
+  --result-path ./.continuum-demo/exports/review_bridge/jobs/review_20260624T000000Z_example/responses/response-001.raw.txt
 ```
+
+If the reviewer returns malformed JSON, keep that raw response, run `review-browser-attempt-start` again, and
+use the newly reserved `response-002.raw.txt` path. Do not overwrite an earlier response file.
 
 Check status:
 
@@ -200,11 +211,12 @@ transport. The deterministic Python code owns snapshots, hashes, schemas, state,
 private Codex skill or future Computer Use tool should own only the narrow browser steps:
 
 1. run `review-prepare`;
-2. upload the single `review-capsule.zip` to the dedicated signed-in review thread;
-3. paste the handoff prompt;
-4. capture the final JSON response;
-5. run `review-ingest`;
-6. run `review-check-current` before applying findings.
+2. run `review-browser-attempt-start` to reserve an append-only response path;
+3. upload the single `review-capsule.zip` to the dedicated signed-in review thread;
+4. paste the handoff prompt;
+5. capture the final JSON response to the reserved path;
+6. run `review-ingest`;
+7. run `review-check-current` before applying findings.
 
 When no browser automation tool is available, this remains a manual capsule upload. The package should not
 claim a fully unattended ChatGPT Pro relay unless the caller can actually control the signed-in browser.
@@ -218,6 +230,7 @@ MCP-capable agents can use the same workflow without shelling out:
 - `continuum_review_ingest`
 - `continuum_review_status`
 - `continuum_review_check_current`
+- `continuum_review_browser_attempt_start`
 
 `continuum_review_prepare` and `continuum_review_run` are marked open-world because they can package paths
 outside the memory root and call external or local model endpoints. Configure `CONTINUUM_ALLOWED_ROOTS` so

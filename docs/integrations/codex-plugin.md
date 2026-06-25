@@ -168,6 +168,7 @@ same packet is written to:
 - `continuum_review_ingest`
 - `continuum_review_status`
 - `continuum_review_check_current`
+- `continuum_review_browser_attempt_start`
 
 ## MemPalace Import
 

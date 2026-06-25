@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from continuum.core.review_bridge import create_review_job, ingest_review_result, review_job_status
+from continuum.core.review_bridge import create_review_job, ingest_review_result, review_browser_attempt_start, review_job_status
 from continuum.core import review_bridge as review_bridge_module
 from continuum.mcp_server import TOOLS, dispatch
 
@@ -183,7 +183,7 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertTrue(job["ok"])
             self.assertEqual(Path(job["subject_archive_uri"]).name, "release.zip")
 
-    def test_source_release_zip_allows_synthetic_fixture_assignments(self) -> None:
+    def test_source_release_zip_requires_explicit_fixture_assignment_allowlist(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
             root = base / "continuum"
@@ -193,7 +193,18 @@ class ReviewBridgeTest(unittest.TestCase):
                 zf.writestr("pkg/docs/example.md", 'api_key: "none"\n')
                 zf.writestr("pkg/tests/test_fixture.py", 'self.assertTrue(scan_text_for_secrets("api_key=supersecretvalue123"))\n')
 
-            job = create_review_job(root, subject_path=release_zip, prompt="Review source release.", transport="manual")
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=release_zip, prompt="Review source release.", transport="manual")
+
+            job = create_review_job(
+                root,
+                subject_path=release_zip,
+                prompt="Review source release.",
+                transport="manual",
+                secret_allowlist_patterns=[
+                    r"^source-release\.zip!/pkg/tests/test_fixture\.py:1:.*scan_text_for_secrets"
+                ],
+            )
             report = json.loads(Path(job["secret_allowlist_report_uri"]).read_text(encoding="utf-8"))
 
             self.assertTrue(job["ok"])
@@ -447,7 +458,7 @@ class ReviewBridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
                 ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
 
-    def test_browser_handoff_contains_actual_capsule_hash(self) -> None:
+    def test_browser_handoff_contains_actual_capsule_hash_and_trusted_objective(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
             root = base / "continuum"
@@ -455,7 +466,7 @@ class ReviewBridgeTest(unittest.TestCase):
             subject.mkdir()
             (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
 
-            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            job = create_review_job(root, subject_path=subject, prompt="Review the release boundary carefully.", transport="manual")
             request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
             prompt = Path(job["prompt_uri"]).read_text(encoding="utf-8")
             handoff = Path(job["browser_handoff_uri"]).read_text(encoding="utf-8")
@@ -464,13 +475,46 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertIn(job["review_capsule_sha256"], prompt)
             self.assertIn(job["review_capsule_sha256"], handoff)
             self.assertIn("GPT-5.5 Pro", handoff)
-            self.assertIn("Local response destination", handoff)
+            self.assertIn("Reserve next attempt command", handoff)
+            self.assertNotIn("response-001.raw.txt", handoff)
+            self.assertIn("Review the release boundary carefully.", handoff)
+            self.assertIn("Review the release boundary carefully.", prompt)
             schema = json.loads(Path(job["schema_uri"]).read_text(encoding="utf-8"))
             self.assertIn("review_capsule_sha256", schema["required"])
             with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
                 public_request = json.loads(zf.read("request.json").decode("utf-8"))
+                instructions = zf.read("REVIEW_INSTRUCTIONS.md").decode("utf-8")
             self.assertIsNone(public_request["review_capsule_sha256"])
             self.assertEqual(public_request["review_capsule_sha256_source"], "browser-handoff.md")
+            self.assertEqual(public_request["review_objective"], "Review the release boundary carefully.")
+            self.assertIn("Review the release boundary carefully.", instructions)
+
+    def test_browser_attempt_reservation_uses_unique_response_paths(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            first = review_browser_attempt_start(root, job_id=job["job_id"])
+            first_path = Path(first["response_uri"])
+            self.assertEqual(first_path.name, "response-001.raw.txt")
+            first_path.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
+                ingest_review_result(root, job_id=job["job_id"], result_path=first_path)
+            self.assertEqual(first_path.read_text(encoding="utf-8"), "not json")
+
+            second = review_browser_attempt_start(root, job_id=job["job_id"])
+            second_path = Path(second["response_uri"])
+            status = review_job_status(root, job_id=job["job_id"])
+            handoff = Path(status["browser_handoff_uri"]).read_text(encoding="utf-8")
+
+            self.assertEqual(second_path.name, "response-002.raw.txt")
+            self.assertNotEqual(first_path, second_path)
+            self.assertIn(str(second_path), handoff)
+            self.assertEqual(Path(status["browser_response_uri"]), second_path)
 
     def test_full_capsule_review_is_not_downgraded_for_packet_limits(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -608,6 +652,124 @@ class ReviewBridgeTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_scan_blocks_underscore_identifier_value(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "config.py").write_text(
+                'client_secret = "prod_live_db_password_9F3E7A6B5C4D2E1F"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_scan_blocks_generic_assignment_in_tests_directory(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            tests_dir = subject / "tests"
+            tests_dir.mkdir(parents=True)
+            (tests_dir / "test_config.py").write_text(
+                'client_secret = "realish_test_password_9F3E7A6B5C4D2E1F"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_scan_continues_after_suppressed_budget(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            lines = [f"api_key = 'fixture_token_{index:02d}_abcdefghijklmnop'\n" for index in range(20)]
+            lines.append('OPENAI_API_KEY="sk-' + ("Q" * 32) + '"\n')
+            (subject / "fixture.py").write_text("".join(lines), encoding="utf-8")
+            allowlist = [
+                rf"^fixture\.py:{index}:.*fixture_token_{index - 1:02d}_abcdefghijklmnop"
+                for index in range(1, 21)
+            ]
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    secret_allowlist_patterns=allowlist,
+                )
+
+    def test_review_secret_scan_decodes_utf16le_files(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "windows-config.txt").write_bytes(('OPENAI_API_KEY="sk-' + ("U" * 32) + '"\n').encode("utf-16le"))
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_scan_reads_zip_archive_comment(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            release_zip = base / "release.zip"
+            with zipfile.ZipFile(release_zip, "w") as zf:
+                zf.writestr("README.md", "# Release\n")
+                zf.comment = ('sk-' + ("C" * 32)).encode("utf-8")
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=release_zip, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_scan_blocks_generated_request_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    model="sk-" + ("M" * 32),
+                )
+            self.assertEqual(list((root / "exports" / "review_bridge").glob("jobs/*")), [])
+
+    def test_review_prepare_rejects_subject_inside_continuum_root(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = root / "subject"
+            subject.mkdir(parents=True)
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "subject must not be inside the Continuum root"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_prepare_rejects_custom_continuumignore_omissions(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            root.mkdir()
+            (root / ".continuumignore").write_text("critical.py\n", encoding="utf-8")
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            (subject / "critical.py").write_text("print('important')\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "custom \\.continuumignore exclusions"):
                 create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
 
     def test_review_prepare_fails_loudly_when_file_limit_is_reached(self) -> None:
@@ -758,6 +920,7 @@ class ReviewBridgeTest(unittest.TestCase):
         self.assertIn("continuum_review_prepare", TOOLS)
         self.assertIn("continuum_review_ingest", TOOLS)
         self.assertIn("continuum_review_status", TOOLS)
+        self.assertIn("continuum_review_browser_attempt_start", TOOLS)
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)

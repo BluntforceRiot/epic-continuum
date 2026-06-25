@@ -34,6 +34,7 @@ from .core.review_bridge import (
     SUPPORTED_TRANSPORTS,
     create_review_job,
     ingest_review_result,
+    review_browser_attempt_start,
     review_check_current,
     review_job_status,
     run_review_job,
@@ -1174,6 +1175,30 @@ def tool_review_check_current(args: JSON) -> Any:
     return review_check_current(root_arg(args), job_id=require_str(args, "job_id"))
 
 
+def tool_review_browser_attempt_start(args: JSON) -> Any:
+    root = root_arg(args)
+
+    def action(operation: OperationGuard) -> JSON:
+        result = review_browser_attempt_start(root, job_id=require_str(args, "job_id"))
+        operation.cursor({"phase": "review_browser_attempt_reserved", "job_id": args.get("job_id"), "attempt": result.get("attempt")})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_review_browser_attempt_start",
+        title=f"Reserve browser review response path {args.get('job_id')}",
+        intent={"job_id": args.get("job_id")},
+        snapshot_policy="none",
+        snapshot_reason="browser attempt reservation writes review export artifacts only",
+        result_touched_paths=lambda result: [
+            path
+            for path in [result.get("response_uri"), result.get("attempt_uri"), result.get("browser_handoff_uri")]
+            if path
+        ],
+        action=action,
+    )
+
+
 TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
     "continuum_init": (
         "Initialize an Epic Continuum root and database.",
@@ -1725,6 +1750,16 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "additionalProperties": False,
         },
         tool_review_check_current,
+    ),
+    "continuum_review_browser_attempt_start": (
+        "Reserve a unique append-only response path before a browser-only Pro review attempt.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        tool_review_browser_attempt_start,
     ),
 }
 

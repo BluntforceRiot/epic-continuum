@@ -148,8 +148,6 @@ def _is_nonsecret_assignment_value(value: str) -> bool:
         return True
     if CODE_REFERENCE_VALUE_RE.fullmatch(value.strip()):
         return True
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw) and "_" in raw:
-        return True
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*['\"]?(?:none|null|false|true)['\"]?", raw, re.IGNORECASE):
         return True
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\[\], ]*(?:\s*\|\s*[A-Za-z_][A-Za-z0-9_\[\], ]*)+\s*=\s*(?:None|null|False|True|0|1)", raw):
@@ -387,7 +385,8 @@ def redact_value_secrets(value: Any) -> Any:
     return value
 
 
-def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str, Any]]:
+def scan_text_for_secrets(text: str, *, max_findings: int | None = 20) -> list[dict[str, Any]]:
+    limit = int(max_findings) if max_findings and int(max_findings) > 0 else None
     findings: list[dict[str, Any]] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         line_had_finding = False
@@ -404,7 +403,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                     }
                 )
                 line_had_finding = True
-                if len(findings) >= max_findings:
+                if limit is not None and len(findings) >= limit:
                     return findings
         if not line_had_finding:
             assignment = _sensitive_assignment_line(line)
@@ -419,7 +418,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                         "metadata_path": f"$.{_safe_metadata_path_part(key)}",
                     }
                 )
-                if len(findings) >= max_findings:
+                if limit is not None and len(findings) >= limit:
                     return findings
                 line_had_finding = True
         if not line_had_finding:
@@ -433,7 +432,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                         "metadata_path": f"$.{_safe_metadata_path_part(key)}",
                     }
                 )
-                if len(findings) >= max_findings:
+                if limit is not None and len(findings) >= limit:
                     return findings
     return findings
 

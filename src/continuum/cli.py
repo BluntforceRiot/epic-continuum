@@ -33,6 +33,7 @@ from .core.review_bridge import (
     SUPPORTED_TRANSPORTS,
     create_review_job,
     ingest_review_result,
+    review_browser_attempt_start,
     review_check_current,
     review_job_status,
     run_review_job,
@@ -437,6 +438,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_review_check_current = sub.add_parser("review-check-current", help="Check whether the reviewed subject still matches the frozen review snapshot")
     p_review_check_current.add_argument("--root", required=True)
     p_review_check_current.add_argument("--job-id", required=True)
+
+    p_review_browser_attempt = sub.add_parser("review-browser-attempt-start", help="Reserve a unique browser-review response path")
+    p_review_browser_attempt.add_argument("--root", required=True)
+    p_review_browser_attempt.add_argument("--job-id", required=True)
 
     p_hermes = sub.add_parser("install-hermes-adapter", help="Install the Epic Continuum Hermes plugin adapter")
     p_hermes.add_argument("--root", required=True)
@@ -1369,6 +1374,10 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "review-check-current":
         assert root is not None
         return emit_result(review_check_current(root, job_id=args.job_id))
+
+    if args.command == "review-browser-attempt-start":
+        assert root is not None
+        return emit_result(review_browser_attempt_start(root, job_id=args.job_id))
 
     if args.command == "install-hermes-adapter":
         assert root is not None

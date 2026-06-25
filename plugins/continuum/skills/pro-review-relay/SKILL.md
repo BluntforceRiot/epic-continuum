@@ -15,6 +15,7 @@ The deterministic part must:
 
 - create the frozen review job;
 - produce one `review-capsule.zip`;
+- generate `browser-handoff.md` after the capsule exists, with the actual capsule hash and exact browser prompt;
 - preserve `request.json`, `status.json`, schema, packet, manifest, source hash, capsule hash, and sentinel;
 - ingest only schema-valid JSON;
 - run `review-check-current` before applying findings.
@@ -33,11 +34,12 @@ python -m continuum review-prepare \
   --transport manual
 ```
 
-2. Read the `review_capsule_uri`, `review_capsule_sha256`, and `manual_handoff_uri` from the JSON output or `review-status`.
-3. If a reliable Computer Use or browser tool is available, open the dedicated signed-in review browser/thread, upload the single capsule, paste the short handoff prompt, and wait for the final JSON object.
-4. If no browser-control tool is available, tell the user the capsule path and ask them to upload it manually. Do not claim the Pro relay is automated.
-5. Save the returned JSON to the job directory or another local file.
-6. Ingest it:
+2. Read `browser_handoff_uri` from the JSON output or `review-status`. Treat that generated file as the source of truth for the capsule path, capsule SHA-256, job ID, packet SHA-256, subject SHA-256, sentinel, exact prompt, and local response destination.
+3. If `@Chrome`, `@Computer`, Playwright, or another reliable browser-control tool is available, open `https://chatgpt.com/` in the user's signed-in browser, select/verify GPT-5.5 Pro or the user's named Pro reviewer, upload only `review-capsule.zip`, paste the exact prompt from `browser-handoff.md`, wait for the final JSON object, and save it exactly to the local response destination.
+4. Record browser attempt state in the job notes or operation receipt when automation fails: browser unavailable, not signed in, model unavailable, upload failed, response timed out, invalid JSON, or capture failed. Do not silently fall back to a different artifact.
+5. If no browser-control tool is available, stop at `handoff_ready` and report that the Pro relay is prepared but not automated in this environment. Do not claim the browser review ran.
+6. Save the returned JSON to the generated response destination or another local file.
+7. Ingest it:
 
 ```bash
 python -m continuum review-ingest \
@@ -46,7 +48,7 @@ python -m continuum review-ingest \
   --result-path "$RESULT_JSON"
 ```
 
-7. Check freshness before patching:
+8. Check freshness before patching:
 
 ```bash
 python -m continuum review-check-current \
@@ -60,9 +62,10 @@ If `current` is false, stop and prepare a fresh review job. Do not apply stale f
 
 - Use one dedicated review thread per job unless the user explicitly asks otherwise.
 - Upload only `review-capsule.zip` unless troubleshooting requires separate files.
-- Paste the handoff prompt without adding extra instructions that weaken the schema or hash binding.
+- Paste the exact prompt from `browser-handoff.md` without adding extra instructions that weaken the schema or hash binding.
 - Capture the final JSON exactly. If the model returns prose around JSON, save the raw output and let `review-ingest` extract or reject it.
 - Preserve browser, upload, timeout, and copy failures as resumable work state instead of silently retrying with a different artifact.
+- Full browser capsule reviews must return `review_surface: "full_capsule"` and `subject_inspected: true`. Packet-only relays must say `review_surface: "packet_excerpt_only"` and `subject_inspected: false`.
 
 ## Acceptance
 

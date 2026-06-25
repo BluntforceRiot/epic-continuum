@@ -245,6 +245,10 @@ continuum compile-context --root ./.continuum-demo --session-id demo --query "de
 continuum recover-thread --root ./.continuum-demo --session-id demo --query "resume the demo task"
 ```
 
+For offline or `--no-index` installs, use a built wheel or preinstall the build
+backend requirements from `pyproject.toml` such as `setuptools>=77`; otherwise
+pip build isolation may fail before Epic Continuum itself is installed.
+
 Trimmed output from the tested flow:
 
 ```json

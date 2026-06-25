@@ -32,6 +32,11 @@ exports/review_bridge/jobs/review_.../
   subject.zip
   review-capsule.zip
   manual-handoff.md
+  browser-handoff.md
+  secret-allowlist-report.json
+  responses/
+  findings/
+  receipts/
   snapshot/
     subject/...
 ```
@@ -52,8 +57,9 @@ review-capsule.zip
 ```
 
 The capsule cannot contain its own final SHA-256 because that would change the ZIP. The final capsule hash is
-reported in `status.json`, `manual-handoff.md`, `review-status`, and `review-prepare` output. The reviewer
-must echo that hash in `review_capsule_sha256`.
+reported in `status.json`, `manual-handoff.md`, `browser-handoff.md`, `review-status`, and `review-prepare`
+output. The reviewer must echo that hash in `review_capsule_sha256`. `browser-handoff.md` is generated only
+after the capsule exists, so it is the source of truth for browser-only Pro relays.
 
 Only `review-capsule.zip` is intended to be uploaded or shared with the reviewer. The local job files
 (`request.json`, `status.json`, and `manual-handoff.md`) may contain local paths so Codex can resume,
@@ -62,13 +68,23 @@ manifest use path-neutral `subject/` references instead.
 
 The packet contains the review objective, Git snapshot, file manifest, selected text excerpts, coverage
 metadata, and optional diff material. Direct OpenAI-compatible review is a packet-only review. If the packet
-is truncated or critical files are omitted, Continuum downgrades a clean pass to `coverage_limited` during
-ingest.
+is truncated or critical files are omitted, Continuum downgrades a clean packet-only pass to
+`coverage_limited` during ingest. A browser/manual reviewer that inspected the uploaded capsule should return
+`review_surface: "full_capsule"` and `subject_inspected: true`; that full-capsule signal is not downgraded
+only because the packet excerpts were limited.
 
 Review preparation scans every decodable snapshot file, every decodable member of a ZIP subject, and the
 packet text for obvious secret-like material before writing the capsule. Use
-`--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. The
-patterns are not written into the public capsule; only the count is recorded.
+`--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. Patterns
+must be anchored to Continuum's `source:line:text` target, such as
+`^tests/test_fixture\\.py:12:.*synthetic_token`; broad patterns such as `.*` are rejected. The patterns are
+not written into the public capsule; only the count is recorded. Suppressed findings are written to the local
+`secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan blocks,
+Continuum removes the temporary preparation directory and does not leave an uploadable capsule or subject
+archive behind.
+
+Directory subjects must fit under `--max-files`. If the file limit is reached, `review-prepare` fails rather
+than silently omitting files. For large release reviews, pass the already-built release ZIP as the subject.
 
 ## Validation
 
@@ -109,10 +125,10 @@ continuum review-prepare \
   --subject . \
   --prompt "Do a harsh release-boundary review." \
   --transport manual \
-  --secret-allowlist-pattern "example_fixture_token"
+  --secret-allowlist-pattern "^tests/test_fixture\\.py:12:.*example_fixture_token"
 ```
 
-Upload `review-capsule.zip` to the reviewer and paste the short instructions from `manual-handoff.md`.
+Upload `review-capsule.zip` to the reviewer and paste the exact short prompt from `browser-handoff.md`.
 Save the reviewer JSON and ingest it:
 
 ```bash

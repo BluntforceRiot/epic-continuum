@@ -53,6 +53,9 @@ Review hardening after the final private review pass added:
   unpublished local benchmark results;
 - refreshed public documentation for context-window behavior, Cue Recall,
   recovery, evidence/proof, and shared agent state.
+- hash-bound review relay packaging with browser handoffs, schema-bound ingest,
+  append-only response/findings receipts, full-capsule versus packet-only review
+  surface checks, and fresh-source verification before applying review findings.
 - review2 boundary hardening for private project-state derivatives, mixed-scope
   Scroll segment compaction, queue-job provenance, generic MCP exact-memory
   provenance, root-wide reindex cursors, visibility-aware deduplication, and

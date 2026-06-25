@@ -76,23 +76,12 @@ ARCHIVE_SUFFIXES = {".zip"}
 REVIEW_CAPSULE_NAME = "review-capsule.zip"
 REVIEW_STATUS_NAME = "status.json"
 REVIEW_REQUEST_NAME = "request.json"
-DEFAULT_REVIEW_SECRET_ALLOWLIST = [
-    re.compile(r"(?i)\bapi[_-]?key[_-]?env\b"),
-    re.compile(r"(?i)\b_redact_api_key\b"),
-    re.compile(r"(?i)\bapi_key_(?:source|applied_to_default_model)\b"),
-    re.compile(r"(?i)\bargs\.[A-Za-z0-9_]*(?:api[_-]?key|token|secret)\b"),
-    re.compile(r"(?i)\b(?:api_key|api[_-]?key_source|secret_api_key)\b.*\b(?:yaml_string|os\.environ|get|argument|env:|_api_key_is_secret|redact)\b"),
-    re.compile(r"(?i)\b[A-Za-z0-9_]*(?:token|secret)_re\s*=\s*re\.compile\b"),
-    re.compile(r"(?i)\btoken\s*=\s*match\.group\b"),
-    re.compile(r"(?i)\b[A-Za-z0-9_]*_secret\s*=\s*(?:bool|False|True|None|scan_text_for_secrets)\b"),
-    re.compile(r"(?i)\b(?:session_id|target_id|actor|related_card_ids|payload)\s*="),
-    re.compile(r"(?i)\bsecret_session\s*="),
-    re.compile(r"(?i)\b(?:sk-test-missing|ghp_missing)[A-Za-z0-9_:-]*\b"),
-    re.compile(r"(?i)\b(?:example|sample|placeholder|dummy|fake|redacted|changeme|your[_-]|hidden|short|supersecret)\b"),
-    re.compile(r"(?i)Do not persist .* in memory"),
-    re.compile(r"(?i)\b(?:OPENAI|ANTHROPIC|GITHUB|HUGGINGFACE|HF|SLACK|STRIPE)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\b"),
-    re.compile(r"(?i)\b(?:none|null|false|true)\b"),
-]
+REVIEW_BROWSER_HANDOFF_NAME = "browser-handoff.md"
+REVIEW_ALLOWLIST_REPORT_NAME = "secret-allowlist-report.json"
+REVIEW_RESULT_DIR = "responses"
+REVIEW_FINDINGS_DIR = "findings"
+REVIEW_RECEIPTS_DIR = "receipts"
+DEFAULT_REVIEW_SECRET_ALLOWLIST: list[re.Pattern[str]] = []
 DEFAULT_EXCLUDE_BASENAME_PATTERNS = {
     "BUILD_RECEIPT_*.md",
     "BUILD_CYCLE_RECEIPT_*.md",
@@ -116,11 +105,14 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
     "required": [
         "job_id",
         "packet_sha256",
+        "review_capsule_sha256",
         "subject_archive_sha256",
         "review_complete",
         "sentinel",
         "summary",
         "verdict",
+        "review_surface",
+        "subject_inspected",
         "findings",
     ],
     "properties": {
@@ -136,6 +128,11 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "verdict": {"type": "string"},
         "confidence": {"type": "string"},
+        "review_surface": {
+            "type": "string",
+            "enum": ["full_capsule", "local_files", "packet_excerpt_only", "packet_only", "unknown"],
+        },
+        "subject_inspected": {"type": "boolean"},
         "findings": {
             "type": "array",
             "items": {
@@ -223,15 +220,16 @@ def _is_zip_subject(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in ARCHIVE_SUFFIXES
 
 
-def _iter_subject_files(root: Path, subject: Path, *, max_files: int) -> list[Path]:
+def _collect_subject_files(root: Path, subject: Path, *, max_files: int) -> tuple[list[Path], bool]:
     files: list[Path] = []
+    limit = max(1, int(max_files))
     base = subject if subject.is_dir() else subject.parent
     resolved_base = base.resolve(strict=False)
     resolved_root = Path(root).resolve(strict=False)
     if subject.is_file():
         if subject.is_symlink():
             raise ReviewBridgeError(f"refusing to review symlinked subject file: {subject}")
-        return [subject]
+        return [subject], False
     for dirpath, dirnames, filenames in os.walk(subject, topdown=True, followlinks=False):
         current_dir = Path(dirpath)
         pruned_dirs: list[str] = []
@@ -270,8 +268,13 @@ def _iter_subject_files(root: Path, subject: Path, *, max_files: int) -> list[Pa
             if ignored:
                 continue
             files.append(path)
-            if len(files) >= max_files:
-                return files
+            if len(files) > limit:
+                return files[:limit], True
+    return files, False
+
+
+def _iter_subject_files(root: Path, subject: Path, *, max_files: int) -> list[Path]:
+    files, _file_limit_reached = _collect_subject_files(root, subject, max_files=max_files)
     return files
 
 
@@ -290,23 +293,25 @@ def _copy_snapshot_files(root: Path, subject: Path, files: list[Path], snapshot_
     return copied
 
 
-def _snapshot_subject(root: Path, subject: Path, job_dir: Path, *, max_files: int) -> tuple[Path, list[Path]]:
-    files = _iter_subject_files(root, subject, max_files=max_files)
+def _snapshot_subject(root: Path, subject: Path, job_dir: Path, *, max_files: int) -> tuple[Path, list[Path], bool]:
+    files, file_limit_reached = _collect_subject_files(root, subject, max_files=max_files)
     snapshot_subject = job_dir / "snapshot" / "subject"
     copied = _copy_snapshot_files(root, subject, files, snapshot_subject)
-    return snapshot_subject, copied
+    return snapshot_subject, copied, file_limit_reached
 
 
 def _file_manifest_entry(path: Path, base: Path) -> dict[str, Any]:
-    stat = path.stat()
+    stat_result = path.stat()
+    mode = stat.S_IMODE(stat_result.st_mode)
     try:
         rel = path.relative_to(base).as_posix()
     except ValueError:
         rel = path.name
     return {
         "path": rel,
-        "size_bytes": int(stat.st_size),
+        "size_bytes": int(stat_result.st_size),
         "sha256": file_sha256(path),
+        "zip_mode": "100755" if mode & 0o111 else "100644",
         "text_candidate": _is_probably_text(path),
     }
 
@@ -369,10 +374,18 @@ def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[re.Patt
         text = str(pattern or "").strip()
         if not text:
             continue
+        if not text.startswith("^") or ":" not in text:
+            raise ReviewBridgeError(
+                "review secret allowlist patterns must be anchored to 'source:line:text' "
+                "(example: ^tests/test_fixture\\.py:12:.*synthetic_token)"
+            )
         try:
-            compiled.append(re.compile(text))
+            pattern_re = re.compile(text)
         except re.error as exc:
             raise ReviewBridgeError(f"invalid review secret allowlist pattern {text!r}: {exc}") from exc
+        if pattern_re.search(""):
+            raise ReviewBridgeError("review secret allowlist pattern must not match empty text")
+        compiled.append(pattern_re)
     return compiled
 
 
@@ -387,11 +400,58 @@ def _allowlisted_review_secret_line(
     if extra_allowlist and any(pattern.search(line) for pattern in extra_allowlist):
         return True
     if _is_review_test_source(source) and re.search(
-        r"(?i)(assert|scan_text_for_secrets|write_text|write_bytes|metadata|source\s*=|reason\s*=|secret_path|notes\.txt|safe)",
+        r"(?i)(scan_text_for_secrets|scan_value_for_secrets|redact_text_secrets|redact_value_secrets|write_text|write_bytes|patch\.dict|[\"'](?:sk-|ghp_)[\"']\s*\+|(?:api_key|token|secret)\s*=\s*[\"'](?:sk-|ghp_)[\"']\s*\+)",
         line,
     ):
         return True
     return False
+
+
+def _line_for_finding(text: str, finding: dict[str, Any]) -> str:
+    try:
+        line_number = int(finding.get("line") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if line_number < 1:
+        return ""
+    lines = text.splitlines()
+    if line_number > len(lines):
+        return ""
+    return lines[line_number - 1]
+
+
+def _allowlisted_review_secret_finding(
+    finding: dict[str, Any],
+    *,
+    line: str,
+    source: str,
+    extra_allowlist: list[re.Pattern[str]] | None = None,
+) -> str | None:
+    if extra_allowlist:
+        target = f"{source}:{finding.get('line') or ''}:{line}"
+        if any(pattern.search(target) for pattern in extra_allowlist):
+            return "explicit_secret_allowlist_pattern"
+    if _is_review_test_source(source) and finding.get("type") in {"secret_assignment", "sensitive_key_assignment"} and _allowlisted_review_secret_line(
+        line,
+        source=source,
+        extra_allowlist=None,
+    ):
+        return "review_test_source_secret_fixture"
+    if _allowlisted_review_secret_line(line, source=source, extra_allowlist=None):
+        return "built_in_narrow_allowlist"
+    return None
+
+
+def _suppressed_secret_record(finding: dict[str, Any], *, source: str, reason: str) -> dict[str, Any]:
+    return {
+        "source": source,
+        "line": finding.get("line"),
+        "type": finding.get("type"),
+        "reason": reason,
+        "snippet": finding.get("snippet"),
+        "secret_hash": finding.get("secret_hash"),
+        "secret_hash_risk": finding.get("secret_hash_risk"),
+    }
 
 
 def _scan_review_text_for_secrets(
@@ -400,13 +460,20 @@ def _scan_review_text_for_secrets(
     source: str,
     max_findings: int = 20,
     extra_allowlist: list[re.Pattern[str]] | None = None,
+    suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    filtered_lines: list[str] = []
-    for line in text.splitlines():
-        filtered_lines.append("" if _allowlisted_review_secret_line(line, source=source, extra_allowlist=extra_allowlist) else line)
     findings: list[dict[str, Any]] = []
-    for finding in scan_text_for_secrets("\n".join(filtered_lines), max_findings=max_findings):
-        if _is_review_test_source(source) and finding.get("type") in {"secret_assignment", "sensitive_key_assignment"}:
+    for finding in scan_text_for_secrets(text, max_findings=max_findings):
+        line = _line_for_finding(text, finding)
+        allow_reason = _allowlisted_review_secret_finding(
+            finding,
+            line=line,
+            source=source,
+            extra_allowlist=extra_allowlist,
+        )
+        if allow_reason:
+            if suppressed_findings is not None:
+                suppressed_findings.append(_suppressed_secret_record(finding, source=source, reason=allow_reason))
             continue
         scoped = dict(finding)
         scoped["source"] = source
@@ -420,11 +487,18 @@ def _scan_review_file_for_secrets(
     source: str,
     max_findings: int = 20,
     extra_allowlist: list[re.Pattern[str]] | None = None,
+    suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     text = _read_decodable_text(path)
     if text is None:
         return []
-    return _scan_review_text_for_secrets(text, source=source, max_findings=max_findings, extra_allowlist=extra_allowlist)
+    return _scan_review_text_for_secrets(
+        text,
+        source=source,
+        max_findings=max_findings,
+        extra_allowlist=extra_allowlist,
+        suppressed_findings=suppressed_findings,
+    )
 
 
 def _scan_zip_members_for_secrets(
@@ -432,6 +506,7 @@ def _scan_zip_members_for_secrets(
     *,
     max_findings: int = 20,
     extra_allowlist: list[re.Pattern[str]] | None = None,
+    suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     try:
@@ -455,6 +530,7 @@ def _scan_zip_members_for_secrets(
                         source=f"{path.name}!/{info.filename}",
                         max_findings=max_findings - len(findings),
                         extra_allowlist=extra_allowlist,
+                        suppressed_findings=suppressed_findings,
                     )
                 )
                 if len(findings) >= max_findings:
@@ -515,6 +591,7 @@ def _build_packet(
     max_file_bytes: int,
     subject_label: str = "subject/",
     subject_type: str | None = None,
+    file_limit_reached: bool = False,
 ) -> tuple[str, list[str], dict[str, Any]]:
     warnings: list[str] = []
     excerpted_paths: list[str] = []
@@ -594,16 +671,19 @@ def _build_packet(
         warnings.append("packet_contains_no_file_excerpts")
     if manifest and not text_candidate_count:
         warnings.append("packet_has_no_text_candidates")
+    if file_limit_reached:
+        warnings.append("subject_file_limit_reached")
     coverage = {
         "review_surface": "packet_excerpt_only",
         "manifest_file_count": len(manifest),
+        "file_limit_reached": bool(file_limit_reached),
         "text_candidate_count": text_candidate_count,
         "excerpted_file_count": len(excerpted_paths),
         "excerpted_paths": excerpted_paths,
         "omitted_text_paths": omitted_text_paths,
         "critical_present": critical_present,
         "critical_omitted": critical_omitted,
-        "coverage_limited": bool(warnings or omitted_text_paths),
+        "coverage_limited": bool(warnings or omitted_text_paths or file_limit_reached),
     }
     return "\n".join(lines).strip() + "\n", warnings, coverage
 
@@ -623,7 +703,10 @@ def _review_prompt_text(job: dict[str, Any]) -> str:
         f"- review_capsule_sha256: {job.get('review_capsule_sha256') or 'null'}\n"
         f"- subject_archive_sha256: {archive_hash or 'null'}\n"
         f"- sentinel: {sentinel}\n\n"
-        "Set review_complete to true only after the review is complete. Include the sentinel string in the "
+        "Set review_complete to true only after the review is complete. Include review_surface and subject_inspected. "
+        "Use review_surface=\"full_capsule\" and subject_inspected=true only if you inspected the uploaded capsule subject. "
+        "Use review_surface=\"packet_excerpt_only\" and subject_inspected=false when only the packet was reviewed. "
+        "Include the sentinel string in the "
         "`sentinel` field. If you cannot inspect the packet, return review_complete=false with a blocker finding.\n"
         "The review packet content is supplied by the caller. In a review capsule, read `review-packet.md`.\n"
     )
@@ -640,6 +723,8 @@ def _manual_handoff_text(job: dict[str, Any]) -> str:
         f"- Packet: `{job['packet_uri']}`\n"
         f"- Packet SHA-256: `{job['packet_sha256']}`\n"
         f"- Subject archive: `{job.get('subject_archive_uri') or 'not created'}`\n\n"
+        "For a full capsule review, upload only `review-capsule.zip`, read `REVIEW_INSTRUCTIONS.md`, inspect `subject/`, "
+        "and return `review_surface: \"full_capsule\"` with `subject_inspected: true`.\n\n"
         "Ask the reviewer to return JSON only using `expected-response.schema.json`. The returned JSON must include "
         "`job_id`, `packet_sha256`, `review_complete: true`, the matching capsule hash when supplied, and the matching archive hash when an archive exists. "
         "Then ingest it with:\n\n"
@@ -657,11 +742,56 @@ def _review_capsule_instructions(job: dict[str, Any]) -> str:
         "Required binding fields:\n\n"
         f"- job_id: `{job['job_id']}`\n"
         f"- packet_sha256: `{job['packet_sha256']}`\n"
-        f"- review_capsule_sha256: `{job.get('review_capsule_sha256') or '<provided outside after capsule build>'}`\n"
+        f"- review_capsule_sha256: `{job.get('review_capsule_sha256') or '<provided in browser-handoff.md after capsule build>'}`\n"
         f"- subject_archive_sha256: `{job.get('subject_archive_sha256') or 'null'}`\n"
         f"- sentinel: `{job['sentinel']}`\n\n"
         "Review the files under `subject/`, `source-manifest.json`, and `review-packet.md`. If coverage is limited, "
-        "say so as a finding instead of returning a clean pass.\n"
+        "say so as a finding instead of returning a clean pass. If you inspect the full capsule, set "
+        "`review_surface` to `full_capsule` and `subject_inspected` to true. If you only inspect the packet, "
+        "set `review_surface` to `packet_excerpt_only` and `subject_inspected` to false.\n"
+    )
+
+
+def _browser_handoff_short_prompt(job: dict[str, Any]) -> str:
+    return (
+        "Run a harsh Epic Continuum release-boundary review of the uploaded review-capsule.zip. "
+        "Read REVIEW_INSTRUCTIONS.md first, inspect subject/ and source-manifest.json, then return JSON only matching "
+        "expected-response.schema.json. Copy these binding values exactly: "
+        f"job_id={job['job_id']}, packet_sha256={job['packet_sha256']}, "
+        f"review_capsule_sha256={job.get('review_capsule_sha256')}, "
+        f"subject_archive_sha256={job.get('subject_archive_sha256') or 'null'}, sentinel={job['sentinel']}. "
+        "If you inspected the full capsule, set review_surface=\"full_capsule\" and subject_inspected=true."
+    )
+
+
+def _browser_handoff_text(job: dict[str, Any]) -> str:
+    response_dir = review_job_dir(Path(str(job["root"])), str(job["job_id"])) / REVIEW_RESULT_DIR
+    destination = response_dir / "response-001.raw.txt"
+    return (
+        "# ChatGPT Pro Browser Review Handoff\n\n"
+        "This file is generated after `review-capsule.zip` exists, so it contains the real capsule hash. "
+        "Use it as the source of truth for browser-only Pro review relays.\n\n"
+        "## Browser Target\n\n"
+        "- Tool target: `@Chrome` or `@Computer` when available\n"
+        "- URL: `https://chatgpt.com/`\n"
+        "- Project/thread: user's pinned review thread when available\n"
+        "- Model: GPT-5.5 Pro / Pro Thinking, verified in the UI before upload\n"
+        "- Browser attempt state: `pending_browser_upload`\n\n"
+        "## Artifacts\n\n"
+        f"- Job ID: `{job['job_id']}`\n"
+        f"- Review capsule path: `{job.get('review_capsule_uri')}`\n"
+        f"- Review capsule SHA-256: `{job.get('review_capsule_sha256')}`\n"
+        f"- Packet SHA-256: `{job.get('packet_sha256')}`\n"
+        f"- Subject archive SHA-256: `{job.get('subject_archive_sha256') or 'null'}`\n"
+        f"- Sentinel: `{job.get('sentinel')}`\n"
+        f"- Local response destination: `{destination}`\n\n"
+        "## Exact Prompt\n\n"
+        "```text\n"
+        f"{_browser_handoff_short_prompt(job)}\n"
+        "```\n\n"
+        "## Completion Gate\n\n"
+        "Save the final model output exactly to the local response destination, then run `review-ingest` and "
+        "`review-check-current`. Do not apply findings until ingestion succeeds and the source is still current.\n"
     )
 
 
@@ -692,6 +822,7 @@ def _public_review_request(job: dict[str, Any]) -> dict[str, Any]:
         "secret_allowlist_pattern_count": job.get("secret_allowlist_pattern_count"),
         "status": job.get("status"),
         "sentinel": job.get("sentinel"),
+        "review_capsule_sha256_source": "browser-handoff.md",
         "review_capsule_sha256": None,
         "artifacts": {
             "request": "request.json",
@@ -726,6 +857,7 @@ def _source_fingerprint(subject: Path, manifest: list[dict[str, Any]], git_info:
                 "path": str(entry.get("path") or ""),
                 "sha256": str(entry.get("sha256") or ""),
                 "size_bytes": int(entry.get("size_bytes") or 0),
+                "zip_mode": str(entry.get("zip_mode") or ""),
             }
             for entry in manifest
         ],
@@ -768,6 +900,32 @@ def _write_attempt(job_dir: Path, payload: dict[str, Any]) -> Path:
     path = _next_attempt_path(job_dir)
     secure_write_text(path, json_dumps(payload))
     return path
+
+
+def _next_numbered_path(directory: Path, prefix: str, suffix: str) -> Path:
+    secure_mkdir(directory)
+    existing = sorted(directory.glob(f"{prefix}-*{suffix}"))
+    return directory / f"{prefix}-{len(existing) + 1:03d}{suffix}"
+
+
+def _next_response_raw_path(job_dir: Path) -> Path:
+    return _next_numbered_path(job_dir / REVIEW_RESULT_DIR, "response", ".raw.txt")
+
+
+def _response_json_path_for_raw(raw_path: Path) -> Path:
+    return raw_path.with_suffix("").with_suffix(".json")
+
+
+def _next_findings_json_path(job_dir: Path) -> Path:
+    return _next_numbered_path(job_dir / REVIEW_FINDINGS_DIR, "findings", ".json")
+
+
+def _findings_markdown_path_for_json(findings_path: Path) -> Path:
+    return findings_path.with_suffix(".md")
+
+
+def _next_ingest_receipt_path(job_dir: Path) -> Path:
+    return _next_numbered_path(job_dir / REVIEW_RECEIPTS_DIR, "ingest", ".json")
 
 
 def _write_review_capsule(job_dir: Path, job: dict[str, Any], snapshot_subject: Path, manifest_path: Path) -> tuple[Path, str]:
@@ -813,61 +971,103 @@ def create_review_job(
 
     job_id = unique_id("review")
     job_dir = review_job_dir(root, job_id)
-    secure_mkdir(job_dir, secure_existing=True)
+    temp_job_dir = review_bridge_root(root) / "tmp" / job_id
+    secure_mkdir(temp_job_dir.parent, secure_existing=True)
+    secure_mkdir(job_dir.parent, secure_existing=True)
+    if temp_job_dir.exists():
+        shutil.rmtree(temp_job_dir, ignore_errors=True)
+    secure_mkdir(temp_job_dir)
 
-    snapshot_subject, snapshot_files = _snapshot_subject(root, subject, job_dir, max_files=max_files)
-    snapshot_base = snapshot_subject if snapshot_subject.is_dir() else snapshot_subject.parent
-    manifest = [_file_manifest_entry(path, snapshot_base) for path in snapshot_files]
-    archive_uri: str | None = None
-    archive_sha256: str | None = None
-    if subject.is_file() and snapshot_files:
-        archive_path = snapshot_files[0]
-        archive_sha256 = file_sha256(archive_path)
-        archive_uri = str(archive_path)
-    elif snapshot_files:
-        archive_path = job_dir / "subject.zip"
-        archive_sha256 = _zip_subject(snapshot_subject, snapshot_files, archive_path)
-        archive_uri = str(archive_path)
-
-    git_info = _git_capture(subject, include_diff=include_diff, max_diff_bytes=max_packet_bytes // 2)
-    packet_text, packet_warnings, packet_coverage = _build_packet(
-        subject=snapshot_subject,
-        manifest=manifest,
-        git_info=git_info,
-        prompt=prompt,
-        max_packet_bytes=max_packet_bytes,
-        max_file_bytes=max_file_bytes,
-        subject_label="subject/",
-        subject_type="directory" if subject.is_dir() else "file",
-    )
-    secret_findings: list[dict[str, Any]] = []
-    for path in snapshot_files:
-        rel = path.relative_to(snapshot_base).as_posix()
-        secret_findings.extend(
-            _scan_review_file_for_secrets(
-                path,
-                source=rel,
-                max_findings=20 - len(secret_findings),
-                extra_allowlist=secret_allowlist,
+    try:
+        git_info = _git_capture(subject, include_diff=include_diff, max_diff_bytes=max_packet_bytes // 2)
+        snapshot_subject, snapshot_files, file_limit_reached = _snapshot_subject(root, subject, temp_job_dir, max_files=max_files)
+        if file_limit_reached:
+            raise ReviewBridgeError(
+                f"review subject file limit exceeded: more than {int(max_files)} files; "
+                "review an existing release ZIP or increase --max-files for a full-capsule review"
             )
+        snapshot_base = snapshot_subject if snapshot_subject.is_dir() else snapshot_subject.parent
+        manifest = [_file_manifest_entry(path, snapshot_base) for path in snapshot_files]
+        archive_uri: str | None = None
+        archive_sha256: str | None = None
+        if subject.is_file() and snapshot_files:
+            archive_path = snapshot_files[0]
+            archive_sha256 = file_sha256(archive_path)
+            archive_uri = str(archive_path)
+        elif snapshot_files:
+            archive_path = temp_job_dir / "subject.zip"
+            archive_sha256 = _zip_subject(snapshot_subject, snapshot_files, archive_path)
+            archive_uri = str(archive_path)
+
+        packet_text, packet_warnings, packet_coverage = _build_packet(
+            subject=snapshot_subject,
+            manifest=manifest,
+            git_info=git_info,
+            prompt=prompt,
+            max_packet_bytes=max_packet_bytes,
+            max_file_bytes=max_file_bytes,
+            subject_label="subject/",
+            subject_type="directory" if subject.is_dir() else "file",
+            file_limit_reached=file_limit_reached,
         )
-        if _is_zip_subject(path):
+        secret_findings: list[dict[str, Any]] = []
+        suppressed_secret_findings: list[dict[str, Any]] = []
+        for path in snapshot_files:
+            rel = path.relative_to(snapshot_base).as_posix()
             secret_findings.extend(
-                _scan_zip_members_for_secrets(path, max_findings=20 - len(secret_findings), extra_allowlist=secret_allowlist)
+                _scan_review_file_for_secrets(
+                    path,
+                    source=rel,
+                    max_findings=20 - len(secret_findings),
+                    extra_allowlist=secret_allowlist,
+                    suppressed_findings=suppressed_secret_findings,
+                )
             )
-        if len(secret_findings) >= 20:
-            break
-    if len(secret_findings) < 20:
-        secret_findings.extend(
-            _scan_review_text_for_secrets(
+            if _is_zip_subject(path):
+                secret_findings.extend(
+                    _scan_zip_members_for_secrets(
+                        path,
+                        max_findings=20 - len(secret_findings),
+                        extra_allowlist=secret_allowlist,
+                        suppressed_findings=suppressed_secret_findings,
+                    )
+                )
+            if len(secret_findings) >= 20:
+                break
+        if len(secret_findings) < 20:
+            suppressed_hashes = {
+                str(item.get("secret_hash"))
+                for item in suppressed_secret_findings
+                if item.get("secret_hash")
+            }
+            packet_findings = _scan_review_text_for_secrets(
                 packet_text,
                 source="review-packet.md",
                 max_findings=20 - len(secret_findings),
                 extra_allowlist=secret_allowlist,
+                suppressed_findings=suppressed_secret_findings,
             )
-        )
-    if secret_findings:
-        raise ReviewBridgeError(f"secret scan blocked review artifact: {len(secret_findings)} finding(s)")
+            secret_findings.extend(
+                finding
+                for finding in packet_findings
+                if str(finding.get("secret_hash") or "") not in suppressed_hashes
+            )
+        if secret_findings:
+            raise ReviewBridgeError(f"secret scan blocked review artifact: {len(secret_findings)} finding(s)")
+        git_info_after = _git_capture(subject, include_diff=include_diff, max_diff_bytes=max_packet_bytes // 2)
+        if git_info_after != git_info:
+            raise ReviewBridgeError("subject git state changed during review preparation; retry with a stable tree")
+
+        temp_job_dir.rename(job_dir)
+        snapshot_subject = job_dir / snapshot_subject.relative_to(temp_job_dir)
+        snapshot_files = [job_dir / path.relative_to(temp_job_dir) for path in snapshot_files]
+        if archive_uri:
+            archive_uri = str(job_dir / Path(archive_uri).relative_to(temp_job_dir))
+    except Exception:
+        shutil.rmtree(temp_job_dir, ignore_errors=True)
+        if not (job_dir / REVIEW_REQUEST_NAME).exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
     packet_path = job_dir / "review-packet.md"
     prompt_path = job_dir / "review-prompt.md"
@@ -876,6 +1076,8 @@ def create_review_job(
     request_path = job_dir / REVIEW_REQUEST_NAME
     status_path = job_dir / REVIEW_STATUS_NAME
     handoff_path = job_dir / "manual-handoff.md"
+    browser_handoff_path = job_dir / REVIEW_BROWSER_HANDOFF_NAME
+    allowlist_report_path = job_dir / REVIEW_ALLOWLIST_REPORT_NAME
 
     secure_write_text(packet_path, packet_text)
     secure_write_text(schema_path, json_dumps(REVIEW_RESULT_SCHEMA))
@@ -922,12 +1124,22 @@ def create_review_job(
         "max_file_bytes": int(max_file_bytes),
         "max_files": int(max_files),
         "secret_allowlist_pattern_count": len(secret_allowlist),
+        "secret_allowlist_report_uri": str(allowlist_report_path),
+        "secret_allowlist_suppressed_count": len(suppressed_secret_findings),
         "operation_id": operation_id,
         "status": "prepared",
     }
     request["sentinel"] = review_sentinel(job_id, packet_sha256)
-    secure_write_text(prompt_path, _review_prompt_text(request))
-    request["prompt_sha256"] = file_sha256(prompt_path)
+    allowlist_report = {
+        "schema": "epic-continuum.review-secret-allowlist-report/1",
+        "job_id": job_id,
+        "created_at": utc_now(),
+        "explicit_pattern_count": len(secret_allowlist),
+        "suppressed_count": len(suppressed_secret_findings),
+        "suppressed_findings": suppressed_secret_findings,
+    }
+    secure_write_text(allowlist_report_path, json_dumps(allowlist_report))
+    request["secret_allowlist_report_sha256"] = file_sha256(allowlist_report_path)
     secure_write_text(request_path, json_dumps(request))
     capsule_path, capsule_sha256 = _write_review_capsule(job_dir, request, snapshot_subject, manifest_path)
     status = {
@@ -936,10 +1148,19 @@ def create_review_job(
         "updated_at": utc_now(),
         "review_capsule_uri": str(capsule_path),
         "review_capsule_sha256": capsule_sha256,
+        "browser_handoff_uri": str(browser_handoff_path),
         "attempt_count": 0,
     }
     _write_status(root, job_id, status)
     job_for_handoff = _merge_job_state(request, status)
+    secure_write_text(prompt_path, _review_prompt_text(job_for_handoff))
+    request["prompt_sha256"] = file_sha256(prompt_path)
+    request["review_capsule_uri"] = str(capsule_path)
+    request["review_capsule_sha256"] = capsule_sha256
+    request["browser_handoff_uri"] = str(browser_handoff_path)
+    secure_write_text(request_path, json_dumps(request))
+    job_for_handoff = _merge_job_state(request, status)
+    secure_write_text(browser_handoff_path, _browser_handoff_text(job_for_handoff))
     job_result = {
         "ok": True,
         "job_id": job_id,
@@ -955,9 +1176,12 @@ def create_review_job(
         "subject_archive_sha256": archive_sha256,
         "review_capsule_uri": str(capsule_path),
         "review_capsule_sha256": capsule_sha256,
+        "browser_handoff_uri": str(browser_handoff_path),
         "packet_sha256": request["packet_sha256"],
         "packet_warnings": packet_warnings,
         "packet_coverage": packet_coverage,
+        "secret_allowlist_report_uri": str(allowlist_report_path),
+        "secret_allowlist_suppressed_count": len(suppressed_secret_findings),
         "transport": transport,
         "model": str(model),
         "base_url": str(base_url),
@@ -975,6 +1199,8 @@ def create_review_job(
             (request_path, "review_request"),
             (capsule_path, "review_capsule"),
             (handoff_path, "review_manual_handoff"),
+            (browser_handoff_path, "review_browser_handoff"),
+            (allowlist_report_path, "review_secret_allowlist_report"),
         ):
             record_artifact(
                 conn,
@@ -1029,9 +1255,12 @@ def _write_job(root: Path, job: dict[str, Any]) -> None:
         "updated_at",
         "review_capsule_uri",
         "review_capsule_sha256",
+        "browser_handoff_uri",
         "attempt_count",
+        "accepted_ingest_count",
         "raw_response_uri",
         "reviewer_content_uri",
+        "last_response_uri",
         "findings_uri",
         "findings_markdown_uri",
         "ingest_receipt_uri",
@@ -1100,6 +1329,8 @@ def _run_hermes_oneshot(
         "summary": "One concise review summary.",
         "verdict": "pass|hold|needs_changes",
         "confidence": "low|medium|high",
+        "review_surface": "local_files",
+        "subject_inspected": True,
         "findings": [],
         "open_questions": [],
         "tests_suggested": [],
@@ -1212,7 +1443,8 @@ def run_review_job(
                 f"```json\n{schema_text}\n```\n\n"
                 "Return one JSON object with these binding fields copied exactly from the prompt/status: "
                 "job_id, packet_sha256, review_capsule_sha256, subject_archive_sha256/package_sha256, "
-                "review_complete=true, and sentinel. Use findings=[] only if you genuinely find no issues. "
+                "review_complete=true, sentinel, review_surface=\"packet_excerpt_only\", and subject_inspected=false. "
+                "Use findings=[] only if you genuinely find no issues. "
                 "This is a packet-only automated review; if packet_coverage is limited, report that limitation.\n\n"
                 f"Review capsule SHA-256: {job.get('review_capsule_sha256') or 'null'}\n"
                 f"Packet coverage:\n{json_dumps(job.get('packet_coverage') or {})}\n\n"
@@ -1291,7 +1523,7 @@ def run_review_job(
         raise
     job = _load_job(root, job_id)
     job["updated_at"] = utc_now()
-    if raw_path is not None:
+    if raw_path is not None and not job.get("raw_response_uri"):
         job["raw_response_uri"] = str(raw_path)
     if content_path is not None:
         job["reviewer_content_uri"] = str(content_path)
@@ -1314,7 +1546,7 @@ def run_review_job(
         "ok": True,
         "job_id": job_id,
         "status": job.get("status") or "ingested",
-        "raw_response_uri": str(raw_path) if raw_path else None,
+        "raw_response_uri": job.get("raw_response_uri") or (str(raw_path) if raw_path else None),
         "reviewer_content_uri": str(content_path) if content_path else None,
         "attempt_uri": str(attempt_uri),
         "ingest": ingested,
@@ -1373,6 +1605,8 @@ def _normalize_review_result(payload: dict[str, Any]) -> dict[str, Any]:
         "summary": str(payload.get("summary") or ""),
         "verdict": str(payload.get("verdict") or "needs_review"),
         "confidence": str(payload.get("confidence") or ""),
+        "review_surface": str(payload.get("review_surface") or "unknown"),
+        "subject_inspected": bool(payload.get("subject_inspected")) if "subject_inspected" in payload else False,
         "findings": [_normalize_finding(item) for item in findings],
         "open_questions": payload.get("open_questions") if isinstance(payload.get("open_questions"), list) else [],
         "tests_suggested": payload.get("tests_suggested") if isinstance(payload.get("tests_suggested"), list) else [],
@@ -1384,6 +1618,12 @@ def _normalize_review_result(payload: dict[str, Any]) -> dict[str, Any]:
 def _apply_coverage_guard(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     coverage = job.get("packet_coverage") if isinstance(job.get("packet_coverage"), dict) else {}
     if not coverage or not coverage.get("coverage_limited"):
+        return result
+    surface = str(result.get("review_surface") or "unknown")
+    subject_inspected = result.get("subject_inspected") is True
+    if surface == "full_capsule" and subject_inspected:
+        return result
+    if str(job.get("transport") or "") not in {"direct-openai"} and surface not in {"packet_excerpt_only", "packet_only"}:
         return result
     verdict = str(result.get("verdict") or "").casefold()
     if verdict not in {"pass", "passed", "ok", "clean", "approved"}:
@@ -1438,6 +1678,13 @@ def _validate_review_schema_payload(payload: dict[str, Any]) -> None:
         errors.append("summary must be a string")
     if "verdict" in payload and not isinstance(payload.get("verdict"), str):
         errors.append("verdict must be a string")
+    if "review_surface" in payload:
+        surface = payload.get("review_surface")
+        allowed = set(REVIEW_RESULT_SCHEMA["properties"]["review_surface"]["enum"])
+        if not isinstance(surface, str) or surface not in allowed:
+            errors.append("review_surface is invalid")
+    if "subject_inspected" in payload and not isinstance(payload.get("subject_inspected"), bool):
+        errors.append("subject_inspected must be a boolean")
     findings = payload.get("findings")
     if "findings" in payload and not isinstance(findings, list):
         errors.append("findings must be an array")
@@ -1580,19 +1827,52 @@ def ingest_review_result(
 ) -> dict[str, Any]:
     init_db(root)
     job = _load_job(root, job_id)
+    if str(job.get("status") or "") == "ingested" or int(job.get("accepted_ingest_count") or 0) > 0:
+        raise ReviewBridgeError("review job already has an accepted ingest; create a new review job for another response")
+    job_dir = review_job_dir(root, job_id)
     if content is None:
         if result_path is None:
             raise ReviewBridgeError("result_path or content is required")
         content = Path(result_path).read_text(encoding="utf-8", errors="replace")
-    payload = _extract_json_object(content)
-    _validate_review_schema_payload(payload)
-    _validate_review_binding(root, job, payload)
+    raw_response_path = _next_response_raw_path(job_dir)
+    secure_write_text(raw_response_path, content)
+    try:
+        payload = _extract_json_object(content)
+        _validate_review_schema_payload(payload)
+        _validate_review_binding(root, job, payload)
+    except Exception as exc:
+        error = exc if isinstance(exc, ReviewBridgeError) else ReviewBridgeError(str(exc))
+        failed_job = _load_job(root, job_id)
+        failed_job["status"] = "review_failed"
+        failed_job["updated_at"] = utc_now()
+        failed_job["raw_response_uri"] = str(raw_response_path)
+        failed_job["last_response_uri"] = str(raw_response_path)
+        failed_job["error"] = str(error)
+        failed_job["error_type"] = type(error).__name__
+        attempt_uri = _write_attempt(
+            job_dir,
+            {
+                "attempt": int(failed_job.get("attempt_count") or 0) + 1,
+                "transport": failed_job.get("transport"),
+                "started_at": utc_now(),
+                "finished_at": utc_now(),
+                "status": "review_failed",
+                "error": str(error),
+                "error_type": type(error).__name__,
+                "raw_response_uri": str(raw_response_path),
+            },
+        )
+        failed_job["attempt_count"] = int(failed_job.get("attempt_count") or 0) + 1
+        failed_job["last_attempt_uri"] = str(attempt_uri)
+        _write_job(root, failed_job)
+        raise error
     result = _normalize_review_result(payload)
     result = _apply_coverage_guard(job, result)
-    job_dir = review_job_dir(root, job_id)
-    findings_path = job_dir / "findings.json"
-    markdown_path = job_dir / "findings.md"
-    receipt_path = job_dir / "ingest-receipt.json"
+    response_json_path = _response_json_path_for_raw(raw_response_path)
+    findings_path = _next_findings_json_path(job_dir)
+    markdown_path = _findings_markdown_path_for_json(findings_path)
+    receipt_path = _next_ingest_receipt_path(job_dir)
+    secure_write_text(response_json_path, json_dumps(result))
     secure_write_text(findings_path, json_dumps(result))
     secure_write_text(markdown_path, _findings_markdown(result, job_id=job_id))
     counts: dict[str, int] = {}
@@ -1606,6 +1886,8 @@ def ingest_review_result(
         "finding_count": len(result["findings"]),
         "severity_counts": counts,
         "verdict": result["verdict"],
+        "raw_response_uri": str(raw_response_path),
+        "response_uri": str(response_json_path),
         "findings_uri": str(findings_path),
         "findings_markdown_uri": str(markdown_path),
         "ingest_receipt_uri": str(receipt_path),
@@ -1616,6 +1898,8 @@ def ingest_review_result(
 
     with connect(root) as conn:
         for path, kind in (
+            (raw_response_path, "review_raw_response"),
+            (response_json_path, "review_response_json"),
             (findings_path, "review_findings_json"),
             (markdown_path, "review_findings_markdown"),
             (receipt_path, "review_ingest_receipt"),
@@ -1636,6 +1920,9 @@ def ingest_review_result(
     job = _load_job(root, job_id)
     job["status"] = "ingested"
     job["updated_at"] = utc_now()
+    job["accepted_ingest_count"] = int(job.get("accepted_ingest_count") or 0) + 1
+    job["raw_response_uri"] = str(raw_response_path)
+    job["last_response_uri"] = str(response_json_path)
     job["findings_uri"] = str(findings_path)
     job["findings_markdown_uri"] = str(markdown_path)
     job["ingest_receipt_uri"] = str(receipt_path)
@@ -1659,9 +1946,11 @@ def review_job_status(root: Path, *, job_id: str) -> dict[str, Any]:
         "subject_archive_sha256": job.get("subject_archive_sha256"),
         "review_capsule_uri": job.get("review_capsule_uri"),
         "review_capsule_sha256": job.get("review_capsule_sha256"),
+        "browser_handoff_uri": job.get("browser_handoff_uri") or str(job_dir / REVIEW_BROWSER_HANDOFF_NAME),
         "source_fingerprint": job.get("source_fingerprint"),
         "last_attempt_uri": job.get("last_attempt_uri"),
         "manual_handoff_uri": str(job_dir / "manual-handoff.md"),
+        "last_response_uri": job.get("last_response_uri"),
         "findings_uri": job.get("findings_uri"),
         "findings_markdown_uri": job.get("findings_markdown_uri"),
         "ingest_receipt_uri": job.get("ingest_receipt_uri"),
@@ -1684,7 +1973,16 @@ def review_check_current(root: Path, *, job_id: str) -> dict[str, Any]:
             "reason": "subject_missing",
             "subject_path": str(subject),
         }
-    files = _iter_subject_files(root, subject, max_files=int(job.get("max_files") or 300))
+    files, file_limit_reached = _collect_subject_files(root, subject, max_files=int(job.get("max_files") or 300))
+    if file_limit_reached:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "subject_file_limit_reached_during_current_check",
+            "subject_path": str(subject),
+            "max_files": int(job.get("max_files") or 300),
+        }
     if subject.is_file():
         manifest = [_file_manifest_entry(subject, subject.parent)]
         subject_sha256 = file_sha256(subject)

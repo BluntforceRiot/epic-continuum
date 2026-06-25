@@ -1072,7 +1072,10 @@ def tool_review_prepare(args: JSON) -> Any:
                 result.get("schema_uri"),
                 result.get("subject_manifest_uri"),
                 result.get("subject_archive_uri"),
+                result.get("review_capsule_uri"),
                 result.get("manual_handoff_uri"),
+                result.get("browser_handoff_uri"),
+                result.get("secret_allowlist_report_uri"),
             ]
             if path
         ],
@@ -1149,7 +1152,15 @@ def tool_review_ingest(args: JSON) -> Any:
         snapshot_policy="none",
         snapshot_reason="review ingest writes export artifacts and artifact ledger rows",
         result_touched_paths=lambda result: [
-            path for path in [result.get("findings_uri"), result.get("findings_markdown_uri"), result.get("ingest_receipt_uri")] if path
+            path
+            for path in [
+                result.get("raw_response_uri"),
+                result.get("response_uri"),
+                result.get("findings_uri"),
+                result.get("findings_markdown_uri"),
+                result.get("ingest_receipt_uri"),
+            ]
+            if path
         ],
         action=action,
     )

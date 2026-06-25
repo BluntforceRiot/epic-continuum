@@ -28,6 +28,8 @@ def valid_review_payload(request: dict) -> dict:
         "summary": "Review complete.",
         "verdict": "hold",
         "confidence": "high",
+        "review_surface": "full_capsule",
+        "subject_inspected": True,
         "findings": [
             {
                 "severity": "high",
@@ -198,7 +200,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 subject_path=subject,
                 prompt="Review hard.",
                 transport="manual",
-                secret_allowlist_patterns=[r"review_fixture_token"],
+                secret_allowlist_patterns=[r"^fixture\.txt:1:.*review_fixture_token"],
             )
 
             request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
@@ -254,6 +256,8 @@ class ReviewBridgeTest(unittest.TestCase):
             payload = valid_review_payload({**request, **status})
             payload["verdict"] = "pass"
             payload["findings"] = []
+            payload["review_surface"] = "packet_excerpt_only"
+            payload["subject_inspected"] = False
             receipt = ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
             findings = json.loads(Path(receipt["findings_uri"]).read_text(encoding="utf-8"))
 
@@ -306,7 +310,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 bad["review_complete"] = False
                 ingest_review_result(root, job_id=job["job_id"], content=json.dumps(bad))
 
-            with self.assertRaisesRegex(ValueError, "review_capsule_sha256 mismatch"):
+            with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
                 bad = dict(payload)
                 del bad["review_capsule_sha256"]
                 ingest_review_result(root, job_id=job["job_id"], content=json.dumps(bad))
@@ -344,6 +348,217 @@ class ReviewBridgeTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
                 ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+    def test_ingest_requires_review_surface_contract(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual", max_packet_bytes=220)
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            payload["verdict"] = "pass"
+            payload["findings"] = []
+            del payload["review_surface"]
+
+            with self.assertRaisesRegex(ValueError, "review response schema validation failed"):
+                ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+    def test_browser_handoff_contains_actual_capsule_hash(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            prompt = Path(job["prompt_uri"]).read_text(encoding="utf-8")
+            handoff = Path(job["browser_handoff_uri"]).read_text(encoding="utf-8")
+
+            self.assertEqual(request["review_capsule_sha256"], job["review_capsule_sha256"])
+            self.assertIn(job["review_capsule_sha256"], prompt)
+            self.assertIn(job["review_capsule_sha256"], handoff)
+            self.assertIn("GPT-5.5 Pro", handoff)
+            self.assertIn("Local response destination", handoff)
+            schema = json.loads(Path(job["schema_uri"]).read_text(encoding="utf-8"))
+            self.assertIn("review_capsule_sha256", schema["required"])
+            with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
+                public_request = json.loads(zf.read("request.json").decode("utf-8"))
+            self.assertIsNone(public_request["review_capsule_sha256"])
+            self.assertEqual(public_request["review_capsule_sha256_source"], "browser-handoff.md")
+
+    def test_full_capsule_review_is_not_downgraded_for_packet_limits(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "a.py").write_text("print('a')\n", encoding="utf-8")
+            (subject / "b.py").write_text("print('b')\n", encoding="utf-8")
+
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual", max_packet_bytes=220)
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            payload["verdict"] = "pass"
+            payload["findings"] = []
+            payload["review_surface"] = "full_capsule"
+            payload["subject_inspected"] = True
+
+            receipt = ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+            self.assertEqual(receipt["verdict"], "pass")
+
+    def test_review_secret_scan_does_not_allowlist_semantic_words(self) -> None:
+        probes = [
+            'API_KEY = "sk-' + ("A" * 32) + '"  # example\n',
+            'API_KEY = "sk-' + ("B" * 32) + '" if True else ""\n',
+            'payload = {"api_key": "sk-' + ("C" * 32) + '"}\n',
+        ]
+        for text in probes:
+            with self.subTest(text=text[:20]), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                base = Path(tmp)
+                root = base / "continuum"
+                subject = base / "subject"
+                subject.mkdir()
+                (subject / "config.py").write_text(text, encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                    create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+                bridge_root = root / "exports" / "review_bridge"
+                leftovers = list(bridge_root.glob("**/config.py")) + list(bridge_root.glob("**/subject.zip"))
+                self.assertEqual(leftovers, [])
+
+    def test_review_secret_allowlist_rejects_broad_patterns(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "config.py").write_text('OPENAI_API_KEY="sk-' + ("Z" * 32) + '"\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "allowlist patterns must be anchored"):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    secret_allowlist_patterns=[r".*"],
+                )
+
+    def test_review_secret_scan_blocks_raw_secret_in_tests(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            tests_dir = subject / "tests"
+            tests_dir.mkdir(parents=True)
+            (tests_dir / "test_live_secret.py").write_text('assert token == "sk-' + ("Y" * 32) + '"\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_prepare_fails_loudly_when_file_limit_is_reached(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            for index in range(3):
+                (subject / f"file-{index}.txt").write_text(f"{index}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "file limit exceeded"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual", max_files=2)
+
+    def test_review_check_current_detects_executable_mode_changes_on_posix(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX executable mode changes are not meaningful on Windows")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            script = subject / "tool.sh"
+            script.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            script.chmod(0o644)
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            self.assertTrue(review_bridge_module.review_check_current(root, job_id=job["job_id"])["current"])
+            script.chmod(0o755)
+            current = review_bridge_module.review_check_current(root, job_id=job["job_id"])
+            self.assertFalse(current["current"])
+            self.assertEqual(current["reason"], "source_changed_since_review_preparation")
+
+    def test_invalid_manual_response_is_preserved_and_marks_failed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            with self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
+                ingest_review_result(root, job_id=job["job_id"], content="not json")
+
+            status = review_job_status(root, job_id=job["job_id"])
+            self.assertEqual(status["status"], "review_failed")
+            self.assertTrue(Path(status["raw_response_uri"]).exists())
+            self.assertIn("responses", Path(status["raw_response_uri"]).parts)
+            self.assertTrue(Path(status["last_attempt_uri"]).exists())
+
+    def test_ingest_is_append_only_and_rejects_second_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+
+            receipt = ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+            self.assertIn("responses", Path(receipt["raw_response_uri"]).parts)
+            self.assertEqual(Path(receipt["findings_uri"]).name, "findings-001.json")
+            self.assertEqual(Path(receipt["ingest_receipt_uri"]).name, "ingest-001.json")
+            with self.assertRaisesRegex(ValueError, "already has an accepted ingest"):
+                ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+    def test_git_state_change_during_snapshot_is_rejected(self) -> None:
+        if review_bridge_module.shutil.which("git") is None:
+            self.skipTest("git executable unavailable")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "repo"
+            subject.mkdir()
+            target = subject / "app.py"
+            target.write_text('VERSION = "old"\n', encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=subject, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=subject, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=subject, check=True)
+            subprocess.run(["git", "add", "app.py"], cwd=subject, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=subject, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            original_copy = review_bridge_module._copy_snapshot_files
+
+            def copy_then_mutate(root_arg: Path, subject_arg: Path, files: list[Path], snapshot_subject: Path) -> list[Path]:
+                copied = original_copy(root_arg, subject_arg, files, snapshot_subject)
+                target.write_text('VERSION = "new"\n', encoding="utf-8")
+                return copied
+
+            with patch.object(review_bridge_module, "_copy_snapshot_files", side_effect=copy_then_mutate):
+                with self.assertRaisesRegex(ValueError, "git state changed during review preparation"):
+                    create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
 
     def test_subject_packaging_skips_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

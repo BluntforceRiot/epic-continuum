@@ -30,6 +30,14 @@
   excluding generated results from release artifacts, and documenting packet-level
   metric limits.
 - Added high-entropy ScaleBench pressure coverage for graph write amplification.
+- Added the hash-bound review relay for Big Brother/Claude/Hermes/local reviewer
+  loops, including review capsules, browser handoff prompts, schema-bound ingest,
+  append-only findings receipts, freshness checks, and fail-closed secret/package
+  validation.
+- Hardened review relay boundaries for capsule hash binding, full-capsule versus
+  packet-only review surfaces, blocked-scan cleanup, file-limit refusal, malformed
+  response preservation, append-only ingest, Git snapshot stability, and source
+  mode metadata binding.
 
 ## 0.1.0 - 2026-06-19
 

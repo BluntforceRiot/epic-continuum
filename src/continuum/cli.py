@@ -411,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--secret-allowlist-pattern",
         action="append",
         default=[],
-        help="Regex for one review-specific false-positive secret line to suppress; repeat for multiple patterns.",
+        help="Anchored regex for one source:line:text review-secret false positive; repeat for multiple patterns.",
     )
 
     p_review_run = sub.add_parser("review-run", help="Run a review relay job with a direct OpenAI-compatible endpoint")
@@ -1275,6 +1275,8 @@ def _main(argv: list[str] | None = None) -> int:
                         result.get("subject_archive_uri"),
                         result.get("review_capsule_uri"),
                         result.get("manual_handoff_uri"),
+                        result.get("browser_handoff_uri"),
+                        result.get("secret_allowlist_report_uri"),
                     ]
                     if path
                 ],
@@ -1312,6 +1314,7 @@ def _main(argv: list[str] | None = None) -> int:
                     for path in [
                         result.get("raw_response_uri"),
                         result.get("reviewer_content_uri"),
+                        result.get("last_response_uri"),
                         (result.get("ingest") or {}).get("findings_uri") if isinstance(result.get("ingest"), dict) else None,
                         (result.get("ingest") or {}).get("findings_markdown_uri") if isinstance(result.get("ingest"), dict) else None,
                         (result.get("ingest") or {}).get("ingest_receipt_uri") if isinstance(result.get("ingest"), dict) else None,
@@ -1345,7 +1348,15 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="none",
                 snapshot_reason="review ingest writes export artifacts and artifact ledger rows",
                 result_touched_paths=lambda result: [
-                    path for path in [result.get("findings_uri"), result.get("findings_markdown_uri"), result.get("ingest_receipt_uri")] if path
+                    path
+                    for path in [
+                        result.get("raw_response_uri"),
+                        result.get("response_uri"),
+                        result.get("findings_uri"),
+                        result.get("findings_markdown_uri"),
+                        result.get("ingest_receipt_uri"),
+                    ]
+                    if path
                 ],
                 action=action,
             )

@@ -118,8 +118,44 @@ class ReviewBridgeTest(unittest.TestCase):
 
             self.assertEqual(job["subject_archive_sha256"], original_hash)
             self.assertEqual(Path(job["subject_archive_uri"]).name, "release.zip")
+            self.assertTrue(job["packet_coverage"]["coverage_limited"])
+            self.assertIn("packet_has_no_text_candidates", job["packet_warnings"])
             with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
                 self.assertIn("subject/release.zip", set(zf.namelist()))
+                manifest = json.loads(zf.read("source-manifest.json").decode("utf-8"))
+                packet = zf.read("review-packet.md").decode("utf-8")
+            self.assertEqual(manifest["subject_type"], "file")
+            self.assertIn("- Type: file", packet)
+
+    def test_review_capsule_redacts_local_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n\nReview me.\n", encoding="utf-8")
+
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            local_needles = [str(base), str(root), str(subject), str(Path(job["packet_uri"]).parent)]
+            with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
+                request = zf.read("request.json").decode("utf-8")
+                manifest = zf.read("source-manifest.json").decode("utf-8")
+                packet = zf.read("review-packet.md").decode("utf-8")
+
+            for text in (request, manifest, packet):
+                for needle in local_needles:
+                    with self.subTest(needle=needle):
+                        self.assertNotIn(needle, text)
+            request_json = json.loads(request)
+            manifest_json = json.loads(manifest)
+            self.assertTrue(request_json["local_paths_redacted"])
+            self.assertEqual(request_json["artifacts"]["review_packet"], "review-packet.md")
+            self.assertNotIn("subject_path", request_json)
+            self.assertNotIn("packet_uri", request_json)
+            self.assertEqual(manifest_json["subject"], "subject/")
+            self.assertTrue(manifest_json["local_paths_redacted"])
+            self.assertIn("- Path: subject/", packet)
 
     def test_zip_subject_secret_scan_allows_nested_test_fixtures(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -145,6 +181,63 @@ class ReviewBridgeTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
                 create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_review_secret_allowlist_suppresses_specific_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "fixture.txt").write_text("review_fixture_token = 'sk-" + ("A" * 32) + "'\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+                secret_allowlist_patterns=[r"review_fixture_token"],
+            )
+
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(request["secret_allowlist_pattern_count"], 1)
+            with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
+                public_request = json.loads(zf.read("request.json").decode("utf-8"))
+            self.assertEqual(public_request["secret_allowlist_pattern_count"], 1)
+
+    def test_snapshot_archive_and_packet_ignore_later_live_subject_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            target = subject / "app.py"
+            target.write_text('VERSION = "old"\n', encoding="utf-8")
+            original_copy = review_bridge_module._copy_snapshot_files
+
+            def copy_then_mutate(root_arg: Path, subject_arg: Path, files: list[Path], snapshot_subject: Path) -> list[Path]:
+                copied = original_copy(root_arg, subject_arg, files, snapshot_subject)
+                target.write_text('VERSION = "new"\n', encoding="utf-8")
+                return copied
+
+            with patch.object(review_bridge_module, "_copy_snapshot_files", side_effect=copy_then_mutate):
+                job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            packet = Path(job["packet_uri"]).read_text(encoding="utf-8")
+            self.assertIn('VERSION = "old"', packet)
+            self.assertNotIn('VERSION = "new"', packet)
+            with zipfile.ZipFile(job["subject_archive_uri"]) as zf:
+                archived = zf.read("app.py").decode("utf-8")
+            self.assertIn('VERSION = "old"', archived)
+            self.assertNotIn('VERSION = "new"', archived)
+            manifest = json.loads(Path(job["subject_manifest_uri"]).read_text(encoding="utf-8"))
+            manifest_hash = next(item["sha256"] for item in manifest["files"] if item["path"] == "app.py")
+            snapshot_hash = review_bridge_module.file_sha256(Path(job["packet_uri"]).parent / "snapshot" / "subject" / "app.py")
+            live_hash = review_bridge_module.file_sha256(target)
+            self.assertEqual(manifest_hash, snapshot_hash)
+            self.assertNotEqual(manifest_hash, live_hash)
 
     def test_limited_coverage_pass_is_downgraded(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -368,6 +461,25 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertEqual(status["error_type"], "ReviewBridgeError")
             self.assertTrue(Path(status["raw_response_uri"]).exists())
             self.assertTrue(Path(status["reviewer_content_uri"]).exists())
+
+    def test_direct_transport_failure_marks_transport_failed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Direct failure subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review through endpoint.", transport="direct-openai")
+
+            with patch.object(review_bridge_module, "_openai_chat_completion", side_effect=review_bridge_module.ReviewBridgeError("endpoint refused")):
+                with self.assertRaisesRegex(ValueError, "endpoint refused"):
+                    review_bridge_module.run_review_job(root, job_id=job["job_id"], transport="direct-openai")
+
+            status = review_job_status(root, job_id=job["job_id"])
+            self.assertEqual(status["status"], "transport_failed")
+            self.assertEqual(status["error_type"], "ReviewBridgeError")
+            self.assertIn("endpoint refused", status["error"])
+            self.assertTrue(Path(status["last_attempt_uri"]).exists())
 
 
 if __name__ == "__main__":

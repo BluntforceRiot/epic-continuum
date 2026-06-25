@@ -363,8 +363,28 @@ def _is_review_test_source(source: str) -> bool:
     return "tests" in segments
 
 
-def _allowlisted_review_secret_line(line: str, *, source: str) -> bool:
+def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pattern in patterns or []:
+        text = str(pattern or "").strip()
+        if not text:
+            continue
+        try:
+            compiled.append(re.compile(text))
+        except re.error as exc:
+            raise ReviewBridgeError(f"invalid review secret allowlist pattern {text!r}: {exc}") from exc
+    return compiled
+
+
+def _allowlisted_review_secret_line(
+    line: str,
+    *,
+    source: str,
+    extra_allowlist: list[re.Pattern[str]] | None = None,
+) -> bool:
     if any(pattern.search(line) for pattern in DEFAULT_REVIEW_SECRET_ALLOWLIST):
+        return True
+    if extra_allowlist and any(pattern.search(line) for pattern in extra_allowlist):
         return True
     if _is_review_test_source(source) and re.search(
         r"(?i)(assert|scan_text_for_secrets|write_text|write_bytes|metadata|source\s*=|reason\s*=|secret_path|notes\.txt|safe)",
@@ -374,10 +394,16 @@ def _allowlisted_review_secret_line(line: str, *, source: str) -> bool:
     return False
 
 
-def _scan_review_text_for_secrets(text: str, *, source: str, max_findings: int = 20) -> list[dict[str, Any]]:
+def _scan_review_text_for_secrets(
+    text: str,
+    *,
+    source: str,
+    max_findings: int = 20,
+    extra_allowlist: list[re.Pattern[str]] | None = None,
+) -> list[dict[str, Any]]:
     filtered_lines: list[str] = []
     for line in text.splitlines():
-        filtered_lines.append("" if _allowlisted_review_secret_line(line, source=source) else line)
+        filtered_lines.append("" if _allowlisted_review_secret_line(line, source=source, extra_allowlist=extra_allowlist) else line)
     findings: list[dict[str, Any]] = []
     for finding in scan_text_for_secrets("\n".join(filtered_lines), max_findings=max_findings):
         if _is_review_test_source(source) and finding.get("type") in {"secret_assignment", "sensitive_key_assignment"}:
@@ -388,14 +414,25 @@ def _scan_review_text_for_secrets(text: str, *, source: str, max_findings: int =
     return findings
 
 
-def _scan_review_file_for_secrets(path: Path, *, source: str, max_findings: int = 20) -> list[dict[str, Any]]:
+def _scan_review_file_for_secrets(
+    path: Path,
+    *,
+    source: str,
+    max_findings: int = 20,
+    extra_allowlist: list[re.Pattern[str]] | None = None,
+) -> list[dict[str, Any]]:
     text = _read_decodable_text(path)
     if text is None:
         return []
-    return _scan_review_text_for_secrets(text, source=source, max_findings=max_findings)
+    return _scan_review_text_for_secrets(text, source=source, max_findings=max_findings, extra_allowlist=extra_allowlist)
 
 
-def _scan_zip_members_for_secrets(path: Path, *, max_findings: int = 20) -> list[dict[str, Any]]:
+def _scan_zip_members_for_secrets(
+    path: Path,
+    *,
+    max_findings: int = 20,
+    extra_allowlist: list[re.Pattern[str]] | None = None,
+) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     try:
         with zipfile.ZipFile(path) as zf:
@@ -417,6 +454,7 @@ def _scan_zip_members_for_secrets(path: Path, *, max_findings: int = 20) -> list
                         text,
                         source=f"{path.name}!/{info.filename}",
                         max_findings=max_findings - len(findings),
+                        extra_allowlist=extra_allowlist,
                     )
                 )
                 if len(findings) >= max_findings:
@@ -475,6 +513,8 @@ def _build_packet(
     prompt: str,
     max_packet_bytes: int,
     max_file_bytes: int,
+    subject_label: str = "subject/",
+    subject_type: str | None = None,
 ) -> tuple[str, list[str], dict[str, Any]]:
     warnings: list[str] = []
     excerpted_paths: list[str] = []
@@ -486,8 +526,8 @@ def _build_packet(
         prompt.strip(),
         "",
         "## Subject",
-        f"- Path: {subject.resolve(strict=False)}",
-        f"- Type: {'directory' if subject.is_dir() else 'file'}",
+        f"- Path: {subject_label}",
+        f"- Type: {subject_type or ('directory' if subject.is_dir() else 'file')}",
         "",
         "## Git Snapshot",
         "```text",
@@ -549,10 +589,15 @@ def _build_packet(
     critical_omitted = [pattern for pattern in critical_present if pattern not in excerpted_set]
     if critical_omitted:
         warnings.append("critical_file_excerpt_omitted")
+    text_candidate_count = sum(1 for entry in manifest if entry.get("text_candidate"))
+    if manifest and not excerpted_paths:
+        warnings.append("packet_contains_no_file_excerpts")
+    if manifest and not text_candidate_count:
+        warnings.append("packet_has_no_text_candidates")
     coverage = {
         "review_surface": "packet_excerpt_only",
         "manifest_file_count": len(manifest),
-        "text_candidate_count": sum(1 for entry in manifest if entry.get("text_candidate")),
+        "text_candidate_count": text_candidate_count,
         "excerpted_file_count": len(excerpted_paths),
         "excerpted_paths": excerpted_paths,
         "omitted_text_paths": omitted_text_paths,
@@ -580,7 +625,7 @@ def _review_prompt_text(job: dict[str, Any]) -> str:
         f"- sentinel: {sentinel}\n\n"
         "Set review_complete to true only after the review is complete. Include the sentinel string in the "
         "`sentinel` field. If you cannot inspect the packet, return review_complete=false with a blocker finding.\n"
-        f"The packet is stored at: {job['packet_uri']}\n"
+        "The review packet content is supplied by the caller. In a review capsule, read `review-packet.md`.\n"
     )
 
 
@@ -618,6 +663,55 @@ def _review_capsule_instructions(job: dict[str, Any]) -> str:
         "Review the files under `subject/`, `source-manifest.json`, and `review-packet.md`. If coverage is limited, "
         "say so as a finding instead of returning a clean pass.\n"
     )
+
+
+def _public_review_request(job: dict[str, Any]) -> dict[str, Any]:
+    """Return the path-neutral request envelope placed inside review capsules."""
+    return {
+        "schema": job.get("schema"),
+        "schema_version": job.get("schema_version"),
+        "job_id": job.get("job_id"),
+        "review_id": job.get("review_id"),
+        "created_at": job.get("created_at"),
+        "reviewer_id": job.get("reviewer_id"),
+        "transport": job.get("transport"),
+        "model": job.get("model"),
+        "subject_type": job.get("subject_type"),
+        "subject_archive_sha256": job.get("subject_archive_sha256"),
+        "package_sha256": job.get("package_sha256"),
+        "subject_sha256": job.get("subject_sha256"),
+        "packet_sha256": job.get("packet_sha256"),
+        "schema_sha256": job.get("schema_sha256"),
+        "packet_warnings": job.get("packet_warnings"),
+        "packet_coverage": job.get("packet_coverage"),
+        "source_fingerprint": job.get("source_fingerprint"),
+        "include_diff": job.get("include_diff"),
+        "max_packet_bytes": job.get("max_packet_bytes"),
+        "max_file_bytes": job.get("max_file_bytes"),
+        "max_files": job.get("max_files"),
+        "secret_allowlist_pattern_count": job.get("secret_allowlist_pattern_count"),
+        "status": job.get("status"),
+        "sentinel": job.get("sentinel"),
+        "review_capsule_sha256": None,
+        "artifacts": {
+            "request": "request.json",
+            "expected_response_schema": "expected-response.schema.json",
+            "source_manifest": "source-manifest.json",
+            "review_packet": "review-packet.md",
+            "subject": "subject/",
+        },
+        "local_paths_redacted": True,
+    }
+
+
+def _public_source_manifest(subject_type: str, manifest: list[dict[str, Any]], packet_coverage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "subject": "subject/",
+        "subject_type": subject_type,
+        "files": manifest,
+        "packet_coverage": packet_coverage,
+        "local_paths_redacted": True,
+    }
 
 
 def _source_fingerprint(subject: Path, manifest: list[dict[str, Any]], git_info: dict[str, Any], subject_sha256: str | None) -> str:
@@ -681,7 +775,7 @@ def _write_review_capsule(job_dir: Path, job: dict[str, Any], snapshot_subject: 
     instructions = _review_capsule_instructions(job)
     with zipfile.ZipFile(capsule_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         _write_zip_text(zf, "REVIEW_INSTRUCTIONS.md", instructions)
-        _write_zip_file(zf, job_dir / REVIEW_REQUEST_NAME, "request.json")
+        _write_zip_text(zf, "request.json", json_dumps(_public_review_request(job)))
         _write_zip_file(zf, job_dir / "expected-response.schema.json", "expected-response.schema.json")
         _write_zip_file(zf, manifest_path, "source-manifest.json")
         _write_zip_file(zf, job_dir / "review-packet.md", "review-packet.md")
@@ -703,6 +797,7 @@ def create_review_job(
     max_packet_bytes: int = 512_000,
     max_file_bytes: int = 64_000,
     max_files: int = 300,
+    secret_allowlist_patterns: list[str] | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
     init_db(root)
@@ -714,6 +809,7 @@ def create_review_job(
     subject = Path(subject_path).resolve(strict=False)
     if not subject.exists():
         raise ReviewBridgeError(f"subject path does not exist: {subject}")
+    secret_allowlist = _compile_review_secret_allowlist(secret_allowlist_patterns)
 
     job_id = unique_id("review")
     job_dir = review_job_dir(root, job_id)
@@ -741,17 +837,35 @@ def create_review_job(
         prompt=prompt,
         max_packet_bytes=max_packet_bytes,
         max_file_bytes=max_file_bytes,
+        subject_label="subject/",
+        subject_type="directory" if subject.is_dir() else "file",
     )
     secret_findings: list[dict[str, Any]] = []
     for path in snapshot_files:
         rel = path.relative_to(snapshot_base).as_posix()
-        secret_findings.extend(_scan_review_file_for_secrets(path, source=rel, max_findings=20 - len(secret_findings)))
+        secret_findings.extend(
+            _scan_review_file_for_secrets(
+                path,
+                source=rel,
+                max_findings=20 - len(secret_findings),
+                extra_allowlist=secret_allowlist,
+            )
+        )
         if _is_zip_subject(path):
-            secret_findings.extend(_scan_zip_members_for_secrets(path, max_findings=20 - len(secret_findings)))
+            secret_findings.extend(
+                _scan_zip_members_for_secrets(path, max_findings=20 - len(secret_findings), extra_allowlist=secret_allowlist)
+            )
         if len(secret_findings) >= 20:
             break
     if len(secret_findings) < 20:
-        secret_findings.extend(_scan_review_text_for_secrets(packet_text, source="review-packet.md", max_findings=20 - len(secret_findings)))
+        secret_findings.extend(
+            _scan_review_text_for_secrets(
+                packet_text,
+                source="review-packet.md",
+                max_findings=20 - len(secret_findings),
+                extra_allowlist=secret_allowlist,
+            )
+        )
     if secret_findings:
         raise ReviewBridgeError(f"secret scan blocked review artifact: {len(secret_findings)} finding(s)")
 
@@ -768,12 +882,7 @@ def create_review_job(
     secure_write_text(
         manifest_path,
         json_dumps(
-            {
-                "subject": str(subject),
-                "snapshot_subject": str(snapshot_subject),
-                "files": manifest,
-                "packet_coverage": packet_coverage,
-            }
+            _public_source_manifest("directory" if subject.is_dir() else "file", manifest, packet_coverage)
         ),
     )
 
@@ -812,6 +921,7 @@ def create_review_job(
         "max_packet_bytes": int(max_packet_bytes),
         "max_file_bytes": int(max_file_bytes),
         "max_files": int(max_files),
+        "secret_allowlist_pattern_count": len(secret_allowlist),
         "operation_id": operation_id,
         "status": "prepared",
     }
@@ -846,6 +956,8 @@ def create_review_job(
         "review_capsule_uri": str(capsule_path),
         "review_capsule_sha256": capsule_sha256,
         "packet_sha256": request["packet_sha256"],
+        "packet_warnings": packet_warnings,
+        "packet_coverage": packet_coverage,
         "transport": transport,
         "model": str(model),
         "base_url": str(base_url),

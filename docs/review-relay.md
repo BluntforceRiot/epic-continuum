@@ -60,6 +60,11 @@ metadata, and optional diff material. Direct OpenAI-compatible review is a packe
 is truncated or critical files are omitted, Continuum downgrades a clean pass to `coverage_limited` during
 ingest.
 
+Review preparation scans every decodable snapshot file, every decodable member of a ZIP subject, and the
+packet text for obvious secret-like material before writing the capsule. Use
+`--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. The
+patterns are not written into the public capsule; only the count is recorded.
+
 ## Validation
 
 `review-ingest` fails closed unless the returned JSON proves it belongs to the exact job:
@@ -88,6 +93,18 @@ continuum review-prepare \
   --subject . \
   --prompt "Do a harsh release-boundary review." \
   --transport manual
+```
+
+If a fixture or documentation line trips the review secret scanner, suppress only that line with a narrow
+regex:
+
+```bash
+continuum review-prepare \
+  --root ./.continuum-demo \
+  --subject . \
+  --prompt "Do a harsh release-boundary review." \
+  --transport manual \
+  --secret-allowlist-pattern "example_fixture_token"
 ```
 
 Upload `review-capsule.zip` to the reviewer and paste the short instructions from `manual-handoff.md`.

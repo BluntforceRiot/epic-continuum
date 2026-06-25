@@ -196,6 +196,8 @@ The capsule is the only upload artifact, but it cannot contain its own final SHA
 
 For strict unattended loops, the OpenAI-compatible/vLLM path is the preferred automated reviewer, but it is a packet-only review unless the reviewer also has file access. Hermes remains supported, but invalid or partial Hermes output is marked `review_failed` and kept as evidence instead of being ingested. Before applying external findings after a long review, use `review-check-current` to prove the active subject still matches the frozen snapshot.
 
+Review preparation scans decodable files, ZIP members, and packet text for obvious secrets; narrow `--secret-allowlist-pattern` entries can suppress known false-positive fixture lines without recording the raw patterns in the capsule.
+
 ```bash
 continuum review-prepare \
   --root ./.continuum-demo \

@@ -496,6 +496,9 @@ version = "9.9.9"
             stage_root = Path(proc.stdout.strip())
             self.assertEqual(stage_root.parent.resolve(), stage_base.resolve())
             self.assertEqual(stage_root.name, "epic-continuum")
+            marker_path = stage_root / ".epic-continuum-stage.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker["schema"], "epic-continuum.codex-plugin-stage.v1")
 
             mcp_bytes = (stage_root / "plugins" / "continuum" / ".mcp.json").read_bytes()
             self.assertFalse(mcp_bytes.startswith(b"\xef\xbb\xbf"))
@@ -533,6 +536,37 @@ version = "9.9.9"
                 (second_stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text()
             )
             self.assertNotEqual(first_manifest_version, second_manifest["version"])
+
+    def test_codex_stage_helper_refuses_unowned_existing_stage_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(__file__).resolve().parents[1]
+            stage_base = Path(tmp) / "stage-base"
+            stage_root = stage_base / "epic-continuum"
+            stage_root.mkdir(parents=True)
+            sentinel = stage_root / "unrelated.txt"
+            sentinel.write_text("do not delete\n", encoding="utf-8")
+            script = repo_root / "scripts" / "stage_codex_plugin.py"
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo_root),
+                    "--root",
+                    str(Path(tmp) / "continuum-root"),
+                    "--python",
+                    sys.executable,
+                    "--stage-base",
+                    str(stage_base),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("ownership marker", proc.stderr)
+            self.assertTrue(sentinel.exists())
 
     def test_private_root_files_are_created_private_and_repairable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

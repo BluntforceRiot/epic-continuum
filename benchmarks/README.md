@@ -7,7 +7,7 @@ The first benchmark is `ContinuityBench`, a deterministic CPU-only suite that cr
 Additional local runners cover:
 
 - `FaultBench`: deterministic interruption, operation recovery, snapshot restore, proof tamper, and copied-root recovery checks.
-- `ScaleBench`: synthetic append, FTS, context compilation, worker-pass, snapshot/restore, bundle pack, and bundle verification timings with quick/full modes.
+- `ScaleBench`: synthetic append, FTS, context compilation, worker-pass, snapshot/restore, and optional bundle pack/verify timings; quick mode skips bundle timing unless requested.
 - `EricMemoryBench`: small comparison cases for the practical question "when does durable memory help beyond default recent context or QMD-style notes?" It compares recent-context, QMD-style notes, Epic Continuum automatic capture, and Epic Continuum card-assisted recall as separate modes, with optional live model/agent answer checks.
 
 ## Quick Run

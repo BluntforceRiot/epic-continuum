@@ -69,6 +69,7 @@ INCLUDE_TOP_LEVEL = {
     "ROADMAP.md",
     "SECURITY.md",
     "pyproject.toml",
+    "setup.py",
 }
 
 

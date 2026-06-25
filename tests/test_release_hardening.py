@@ -108,6 +108,28 @@ class ReleaseHardeningTest(unittest.TestCase):
 
         self.assertTrue(module.should_include(repo_root / "docs" / "review-relay.md", repo_root))
 
+    def test_sdist_tar_modes_are_normalized(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                [sys.executable, "setup.py", "sdist", "--dist-dir", tmp],
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            sdist = next(Path(tmp).glob("*.tar.gz"))
+            bad_modes: list[tuple[str, int, int]] = []
+            with tarfile.open(sdist, "r:gz") as tf:
+                for member in tf.getmembers():
+                    actual = member.mode & 0o777
+                    expected = 0o755 if (member.isdir() or (member.isfile() and member.name.endswith(".sh"))) else 0o644
+                    if actual != expected:
+                        bad_modes.append((member.name, actual, expected))
+
+        self.assertEqual(bad_modes, [])
+
     def test_static_release_metadata_matches_pyproject_version(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]

@@ -641,6 +641,34 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertIn("responses", Path(status["raw_response_uri"]).parts)
             self.assertTrue(Path(status["last_attempt_uri"]).exists())
 
+    def test_repeated_invalid_manual_responses_advance_attempt_ledger(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            for content in ("not json one", "not json two"):
+                with self.subTest(content=content), self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
+                    ingest_review_result(root, job_id=job["job_id"], content=content)
+
+            job_dir = Path(job["job_dir"])
+            responses = sorted((job_dir / "responses").glob("response-*.raw.txt"))
+            attempts = sorted((job_dir / "attempts").glob("attempt-*.json"))
+            status = review_job_status(root, job_id=job["job_id"])
+            stored_status = json.loads((job_dir / review_bridge_module.REVIEW_STATUS_NAME).read_text(encoding="utf-8"))
+            attempt_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in attempts]
+
+            self.assertEqual([path.name for path in responses], ["response-001.raw.txt", "response-002.raw.txt"])
+            self.assertEqual([path.read_text(encoding="utf-8") for path in responses], ["not json one", "not json two"])
+            self.assertEqual([path.name for path in attempts], ["attempt-001.json", "attempt-002.json"])
+            self.assertEqual([payload["attempt"] for payload in attempt_payloads], [1, 2])
+            self.assertEqual(stored_status["attempt_count"], 2)
+            self.assertEqual(Path(status["raw_response_uri"]).name, "response-002.raw.txt")
+            self.assertEqual(Path(status["last_attempt_uri"]).name, "attempt-002.json")
+
     def test_ingest_is_append_only_and_rejects_second_acceptance(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)

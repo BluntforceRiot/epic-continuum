@@ -928,6 +928,15 @@ def _write_attempt(job_dir: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
+def _next_attempt_number(job_dir: Path, job: dict[str, Any]) -> int:
+    attempts_dir = job_dir / "attempts"
+    existing_count = len(sorted(attempts_dir.glob("attempt-*.json"))) if attempts_dir.exists() else 0
+    stored_count = int(job.get("attempt_count") or 0)
+    if stored_count > existing_count:
+        return stored_count
+    return existing_count + 1
+
+
 def _next_numbered_path(directory: Path, prefix: str, suffix: str) -> Path:
     secure_mkdir(directory)
     existing = sorted(directory.glob(f"{prefix}-*{suffix}"))
@@ -1898,9 +1907,7 @@ def ingest_review_result(
         failed_job["last_response_uri"] = str(raw_response_path)
         failed_job["error"] = str(error)
         failed_job["error_type"] = type(error).__name__
-        failed_attempt_number = int(failed_job.get("attempt_count") or 0)
-        if failed_attempt_number < 1:
-            failed_attempt_number = 1
+        failed_attempt_number = _next_attempt_number(job_dir, failed_job)
         attempt_uri = _write_attempt(
             job_dir,
             {

@@ -360,6 +360,22 @@ def _read_decodable_text(path: Path, *, max_bytes: int = 2_000_000) -> str | Non
             return None
 
 
+def _read_full_decodable_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("utf-8", errors="replace")
+        except UnicodeError:
+            return None
+
+
 def _is_review_test_source(source: str) -> bool:
     normalized_source = source.replace("\\", "/")
     if "!/" in normalized_source:
@@ -499,7 +515,7 @@ def _scan_review_file_for_secrets(
     extra_allowlist: list[dict[str, Any]] | None = None,
     suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    text = _read_decodable_text(path)
+    text = _read_full_decodable_text(path)
     if text is None:
         return []
     return _scan_review_text_for_secrets(
@@ -1441,8 +1457,6 @@ def run_review_job(
                 model=str(model or job.get("model") or ""),
                 timeout_seconds=timeout_seconds,
             )
-            raw_path = job_dir / "raw-response.txt"
-            secure_write_text(raw_path, content)
         else:
             packet_text = Path(str(job["packet_uri"])).read_text(encoding="utf-8")
             prompt_text = Path(str(job["prompt_uri"])).read_text(encoding="utf-8")
@@ -1469,45 +1483,45 @@ def run_review_job(
                 timeout_seconds=timeout_seconds,
                 max_tokens=max_tokens,
             )
-            raw_path = job_dir / "raw-response.json"
+            raw_path = _next_numbered_path(job_dir / REVIEW_RESULT_DIR, "transport-response", ".raw.json")
             secure_write_text(raw_path, json_dumps(response))
             try:
                 content = str(response["choices"][0]["message"]["content"])
             except (KeyError, IndexError, TypeError):
                 content = json_dumps(response)
-        content_path = job_dir / "reviewer-content.txt"
+        content_path = _next_response_raw_path(job_dir)
         secure_write_text(content_path, content)
-        job["raw_response_uri"] = str(raw_path)
-        job["reviewer_content_uri"] = str(content_path)
-        _write_job(root, job)
-        ingested = ingest_review_result(root, job_id=job_id, content=content, operation_id=operation_id)
-    except ReviewBridgeError as exc:
-        job = _load_job(root, job_id)
-        failed_status = "review_failed" if content_path is not None else "transport_failed"
-        job["status"] = failed_status
-        job["updated_at"] = utc_now()
         if raw_path is not None:
             job["raw_response_uri"] = str(raw_path)
-        if content_path is not None:
-            job["reviewer_content_uri"] = str(content_path)
-        job["error"] = str(exc)
-        job["error_type"] = type(exc).__name__
-        attempt_uri = _write_attempt(
-            job_dir,
-            {
-                "attempt": attempt_count,
-                "transport": chosen_transport,
-                "started_at": started_at,
-                "finished_at": job["updated_at"],
-                "status": failed_status,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-                "raw_response_uri": job.get("raw_response_uri"),
-                "reviewer_content_uri": job.get("reviewer_content_uri"),
-            },
-        )
-        job["last_attempt_uri"] = str(attempt_uri)
+        job["reviewer_content_uri"] = str(content_path)
         _write_job(root, job)
+        ingested = ingest_review_result(root, job_id=job_id, result_path=content_path, operation_id=operation_id)
+    except ReviewBridgeError as exc:
+        job = _load_job(root, job_id)
+        if content_path is None:
+            failed_status = "transport_failed"
+            job["status"] = failed_status
+            job["updated_at"] = utc_now()
+            if raw_path is not None:
+                job["raw_response_uri"] = str(raw_path)
+            job["error"] = str(exc)
+            job["error_type"] = type(exc).__name__
+            attempt_uri = _write_attempt(
+                job_dir,
+                {
+                    "attempt": attempt_count,
+                    "transport": chosen_transport,
+                    "started_at": started_at,
+                    "finished_at": job["updated_at"],
+                    "status": failed_status,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "raw_response_uri": job.get("raw_response_uri"),
+                    "reviewer_content_uri": job.get("reviewer_content_uri"),
+                },
+            )
+            job["last_attempt_uri"] = str(attempt_uri)
+            _write_job(root, job)
         raise
     except Exception as exc:
         job = _load_job(root, job_id)
@@ -1629,6 +1643,13 @@ def _apply_coverage_guard(job: dict[str, Any], result: dict[str, Any]) -> dict[s
     coverage = job.get("packet_coverage") if isinstance(job.get("packet_coverage"), dict) else {}
     surface = str(result.get("review_surface") or "unknown")
     subject_inspected = result.get("subject_inspected") is True
+    transport = str(job.get("transport") or "")
+    if transport == "direct-openai":
+        surface = "packet_excerpt_only"
+        subject_inspected = False
+        result = dict(result)
+        result["review_surface"] = surface
+        result["subject_inspected"] = subject_inspected
     if surface in {"full_capsule", "local_files"} and subject_inspected:
         return result
     verdict = str(result.get("verdict") or "").casefold()
@@ -1853,9 +1874,17 @@ def ingest_review_result(
     if content is None:
         if result_path is None:
             raise ReviewBridgeError("result_path or content is required")
-        content = Path(result_path).read_text(encoding="utf-8", errors="replace")
-    raw_response_path = _next_response_raw_path(job_dir)
-    secure_write_text(raw_response_path, content)
+        source_result_path = Path(result_path)
+        content = source_result_path.read_text(encoding="utf-8", errors="replace")
+        responses_dir = job_dir / REVIEW_RESULT_DIR
+        if _is_relative_to(source_result_path, responses_dir) and source_result_path.name.startswith("response-") and source_result_path.name.endswith(".raw.txt"):
+            raw_response_path = source_result_path
+        else:
+            raw_response_path = _next_response_raw_path(job_dir)
+            secure_write_text(raw_response_path, content)
+    else:
+        raw_response_path = _next_response_raw_path(job_dir)
+        secure_write_text(raw_response_path, content)
     try:
         payload = _extract_json_object(content)
         _validate_review_schema_payload(payload)
@@ -1869,10 +1898,13 @@ def ingest_review_result(
         failed_job["last_response_uri"] = str(raw_response_path)
         failed_job["error"] = str(error)
         failed_job["error_type"] = type(error).__name__
+        failed_attempt_number = int(failed_job.get("attempt_count") or 0)
+        if failed_attempt_number < 1:
+            failed_attempt_number = 1
         attempt_uri = _write_attempt(
             job_dir,
             {
-                "attempt": int(failed_job.get("attempt_count") or 0) + 1,
+                "attempt": failed_attempt_number,
                 "transport": failed_job.get("transport"),
                 "started_at": utc_now(),
                 "finished_at": utc_now(),
@@ -1882,7 +1914,7 @@ def ingest_review_result(
                 "raw_response_uri": str(raw_response_path),
             },
         )
-        failed_job["attempt_count"] = int(failed_job.get("attempt_count") or 0) + 1
+        failed_job["attempt_count"] = failed_attempt_number
         failed_job["last_attempt_uri"] = str(attempt_uri)
         _write_job(root, failed_job)
         raise error

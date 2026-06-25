@@ -476,6 +476,41 @@ class ReviewBridgeTest(unittest.TestCase):
 
             self.assertEqual(receipt["verdict"], "pass")
 
+    def test_direct_transport_cannot_claim_full_capsule_review(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "a.py").write_text("print('a')\n", encoding="utf-8")
+            (subject / "b.py").write_text("print('b')\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review through endpoint.",
+                transport="direct-openai",
+                max_packet_bytes=220,
+            )
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            payload["verdict"] = "pass"
+            payload["findings"] = []
+            payload["review_surface"] = "full_capsule"
+            payload["subject_inspected"] = True
+
+            with patch.object(
+                review_bridge_module,
+                "_openai_chat_completion",
+                return_value={"choices": [{"message": {"content": json.dumps(payload)}}]},
+            ):
+                result = review_bridge_module.run_review_job(root, job_id=job["job_id"], transport="direct-openai")
+
+            self.assertEqual(result["ingest"]["verdict"], "coverage_limited")
+            findings = json.loads(Path(result["ingest"]["findings_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(findings["review_surface"], "packet_excerpt_only")
+            self.assertFalse(findings["subject_inspected"])
+
     def test_review_secret_scan_does_not_allowlist_semantic_words(self) -> None:
         probes = [
             'API_KEY = "sk-' + ("A" * 32) + '"  # example\n',
@@ -496,6 +531,24 @@ class ReviewBridgeTest(unittest.TestCase):
                 bridge_root = root / "exports" / "review_bridge"
                 leftovers = list(bridge_root.glob("**/config.py")) + list(bridge_root.glob("**/subject.zip"))
                 self.assertEqual(leftovers, [])
+
+    def test_review_secret_scan_reads_beyond_large_file_sample(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "large.txt").write_text(
+                ("x" * 2_000_001) + '\nOPENAI_API_KEY="sk-' + ("L" * 32) + '"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+            bridge_root = root / "exports" / "review_bridge"
+            self.assertEqual(list(bridge_root.glob("**/large.txt")), [])
+            self.assertEqual(list(bridge_root.glob("**/subject.zip")), [])
 
     def test_review_secret_allowlist_rejects_broad_patterns(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -750,6 +803,39 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertEqual(status["error_type"], "ReviewBridgeError")
             self.assertTrue(Path(status["raw_response_uri"]).exists())
             self.assertTrue(Path(status["reviewer_content_uri"]).exists())
+
+    def test_automated_review_failures_use_append_only_numbered_responses(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Failed review subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review through Hermes.", transport="hermes")
+            outputs = iter(["first invalid", "second invalid"])
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(command, 0, stdout=next(outputs), stderr="")
+
+            with patch.object(review_bridge_module.shutil, "which", return_value="hermes"), patch.object(
+                review_bridge_module.subprocess,
+                "run",
+                side_effect=fake_run,
+            ):
+                for expected in ("first invalid", "second invalid"):
+                    with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
+                        review_bridge_module.run_review_job(root, job_id=job["job_id"], transport="hermes")
+
+            job_dir = Path(job["job_dir"])
+            responses = sorted((job_dir / "responses").glob("response-*.raw.txt"))
+            attempts = sorted((job_dir / "attempts").glob("attempt-*.json"))
+            status = review_job_status(root, job_id=job["job_id"])
+
+            self.assertEqual([path.name for path in responses], ["response-001.raw.txt", "response-002.raw.txt"])
+            self.assertEqual([path.read_text(encoding="utf-8") for path in responses], ["first invalid", "second invalid"])
+            self.assertEqual([path.name for path in attempts], ["attempt-001.json", "attempt-002.json"])
+            self.assertEqual(Path(status["raw_response_uri"]).name, "response-002.raw.txt")
+            self.assertEqual(Path(status["reviewer_content_uri"]).name, "response-002.raw.txt")
 
     def test_direct_transport_failure_marks_transport_failed(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

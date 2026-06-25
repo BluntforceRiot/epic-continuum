@@ -164,8 +164,9 @@ class ReviewBridgeTest(unittest.TestCase):
             base = Path(tmp)
             root = base / "continuum"
             release_zip = base / "release.zip"
+            token = "s" + "k-" + ("S" * 32)
             with zipfile.ZipFile(release_zip, "w") as zf:
-                zf.writestr("pkg/tests/test_fixture.py", 'api_key="sk-" + "secretvalue12345678901234567890"\n')
+                zf.writestr("pkg/tests/test_fixture.py", f'api_key="{token}"\n')
                 zf.writestr("pkg/README.md", "# Release\n")
 
             with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
@@ -181,6 +182,23 @@ class ReviewBridgeTest(unittest.TestCase):
 
             self.assertTrue(job["ok"])
             self.assertEqual(Path(job["subject_archive_uri"]).name, "release.zip")
+
+    def test_source_release_zip_allows_synthetic_fixture_assignments(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            release_zip = base / "source-release.zip"
+            with zipfile.ZipFile(release_zip, "w") as zf:
+                zf.writestr("pkg/src/module.py", "api_key=args.api_key\n")
+                zf.writestr("pkg/docs/example.md", 'api_key: "none"\n')
+                zf.writestr("pkg/tests/test_fixture.py", 'self.assertTrue(scan_text_for_secrets("api_key=supersecretvalue123"))\n')
+
+            job = create_review_job(root, subject_path=release_zip, prompt="Review source release.", transport="manual")
+            report = json.loads(Path(job["secret_allowlist_report_uri"]).read_text(encoding="utf-8"))
+
+            self.assertTrue(job["ok"])
+            self.assertGreaterEqual(report["suppressed_count"], 1)
+            self.assertEqual(report.get("blocked_findings", []), [])
 
     def test_archive_candidate_secret_scan_reads_non_text_extension(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

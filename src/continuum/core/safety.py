@@ -39,15 +39,6 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    (
-        "secret_assignment",
-        re.compile(
-            r"(?i)(?<![A-Za-z0-9_])['\"]?"
-            r"((?:[A-Za-z0-9]+[_-])?(?:api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|signing[_-]?key|password|passwd|pwd|secret|authorization|cookie)|"
-            r"(?:api|access|auth|bearer|client|csrf|github|gitlab|hf|id|jwt|oauth|openai|private|refresh|session|slack|stripe|webhook)[_-]?token|token)"
-            r"\b['\"]?\s*[:=]\s*['\"]?[^'\"\s,}]{8,}"
-        ),
-    ),
 ]
 
 
@@ -102,14 +93,87 @@ def _normalized_assignment_value(value: str) -> str:
     return cleaned.strip()
 
 
+TYPE_HINT_VALUE_RE = re.compile(
+    r"^(?:"
+    r"(?:str|int|float|bool|bytes|Path|Any|None)"
+    r"(?:\s*\|\s*(?:str|int|float|bool|bytes|Path|Any|None))*"
+    r"|(?:dict|list|tuple|set)\[[^\]]+\]"
+    r")$"
+)
+CODE_REFERENCE_VALUE_RE = re.compile(
+    r"^(?:"
+    r"(?:args|self|cls|config|settings|model|os|Path|json|str|int|bool|dict|list)\.[A-Za-z_][A-Za-z0-9_.]*(?:\([^)]*\))?"
+    r"|[A-Za-z_][A-Za-z0-9_]*\([^)]*\)"
+    r")$"
+)
+NONSECRET_ASSIGNMENT_VALUES = {
+    "argument",
+    "configured",
+    "default",
+    "dummy",
+    "env",
+    "example",
+    "false",
+    "local",
+    "not",
+    "none",
+    "none_or_nonsecret",
+    "null",
+    "placeholder",
+    "redacted",
+    "true",
+}
+
+
+def _is_nonsecret_assignment_value(value: str) -> bool:
+    raw = value.strip()
+    normalized = raw.strip("'\"").casefold()
+    if not normalized or REDACTED_VALUE_RE.fullmatch(normalized):
+        return True
+    if normalized in NONSECRET_ASSIGNMENT_VALUES:
+        return True
+    if normalized.startswith(("env:", "your-", "your_", "${", "$env:", "os.environ[")):
+        return True
+    if normalized.startswith(("f\"env:", "f'env:", "not ")):
+        return True
+    if normalized.startswith(("args.", "match.", "os.environ", "os.getenv", "getenv(", "bool(", "str(", "int(", "float(", "Path(", "json.dumps(", "yaml_string(")):
+        return True
+    if " if " in normalized and " else " in normalized:
+        return True
+    if raw.startswith(("f\"", "f'")) and ("{" in raw or "}" in raw):
+        return True
+    if raw.startswith("{") and raw.endswith("}") and "(" in raw:
+        return True
+    if TYPE_HINT_VALUE_RE.fullmatch(value.strip()):
+        return True
+    if CODE_REFERENCE_VALUE_RE.fullmatch(value.strip()):
+        return True
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw) and "_" in raw:
+        return True
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*['\"]?(?:none|null|false|true)['\"]?", raw, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\[\], ]*(?:\s*\|\s*[A-Za-z_][A-Za-z0-9_\[\], ]*)+\s*=\s*(?:None|null|False|True|0|1)", raw):
+        return True
+    return False
+
+
+def _assignment_finding_type(value: str) -> str:
+    return "secret_assignment" if len(value) >= 20 else "sensitive_key_assignment"
+
+
 def _sensitive_assignment_line(line: str) -> tuple[str, str] | None:
+    stripped_line = line.strip()
+    if stripped_line.startswith(("def ", "class ")):
+        return None
     match = SENSITIVE_ASSIGNMENT_LINE_RE.match(line)
     if not match:
         return None
     key = match.group(1)
     raw_value = match.group(2)
     value = _normalized_assignment_value(raw_value)
-    if not value or _is_redacted_value_placeholder(value):
+    if value == key:
+        return None
+    if not value or _is_redacted_value_placeholder(value) or _is_nonsecret_assignment_value(value):
         return None
     if not _looks_sensitive_key(key):
         return None
@@ -129,13 +193,26 @@ def _redact_sensitive_assignment_line(line: str) -> str:
 
 
 def _embedded_sensitive_assignments(line: str) -> list[tuple[re.Match[str], str, str]]:
+    if line.strip().startswith(("def ", "class ")):
+        return []
     assignments: list[tuple[re.Match[str], str, str]] = []
-    for match in EMBEDDED_ASSIGNMENT_RE.finditer(line):
+    position = 0
+    while position < len(line):
+        match = EMBEDDED_ASSIGNMENT_RE.search(line, position)
+        if not match:
+            break
+        position = match.start() + 1
+        key_start = match.start("key")
+        if key_start > 0 and (line[key_start - 1].isalnum() or line[key_start - 1] == "_"):
+            continue
         key = match.group("key")
         value = _normalized_assignment_value(match.group("value"))
-        if not value or _is_redacted_value_placeholder(value) or not _looks_sensitive_key(key):
+        if value == key:
+            continue
+        if not value or _is_redacted_value_placeholder(value) or _is_nonsecret_assignment_value(value) or not _looks_sensitive_key(key):
             continue
         assignments.append((match, key, value))
+        position = match.end()
     return assignments
 
 
@@ -335,7 +412,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
                 key, value = assignment
                 findings.append(
                     {
-                        "type": "sensitive_key_assignment",
+                        "type": _assignment_finding_type(value),
                         "line": line_number,
                         "snippet": _redact_sensitive_assignment_line(line).strip()[:240],
                         **_secret_hash_payload(value, allow_low_entropy_hash=False),
@@ -349,7 +426,7 @@ def scan_text_for_secrets(text: str, *, max_findings: int = 20) -> list[dict[str
             for _match, key, value in _embedded_sensitive_assignments(line):
                 findings.append(
                     {
-                        "type": "sensitive_key_assignment",
+                        "type": _assignment_finding_type(value),
                         "line": line_number,
                         "snippet": _redact_embedded_sensitive_assignments(line).strip()[:240],
                         **_secret_hash_payload(value, allow_low_entropy_hash=False),

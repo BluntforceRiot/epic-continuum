@@ -82,6 +82,43 @@ REVIEW_RESULT_DIR = "responses"
 REVIEW_FINDINGS_DIR = "findings"
 REVIEW_RECEIPTS_DIR = "receipts"
 DEFAULT_REVIEW_SECRET_ALLOWLIST: list[re.Pattern[str]] = []
+REVIEW_HIGH_CONFIDENCE_SECRET_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r"|\bsk-[A-Za-z0-9_-]{20,}\b"
+    r"|\bgh[pousr]_[A-Za-z0-9_]{20,}\b"
+    r"|\bglpat-[A-Za-z0-9_-]{20,}\b"
+    r"|\bhf_[A-Za-z0-9]{20,}\b"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{20,}\b"
+    r"|\bsk_(?:live|test)_[0-9A-Za-z]{16,}\b"
+    r"|\brk_(?:live|test)_[0-9A-Za-z]{16,}\b"
+    r"|\bAIza[0-9A-Za-z_-]{35}\b"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|(?i:\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b)"
+)
+REVIEW_SYNTHETIC_SOURCE_SEGMENTS = {"benchmarks", "docs", "examples", "test", "tests"}
+REVIEW_ASSIGNMENT_FINDING_TYPES = {"secret_assignment", "sensitive_key_assignment"}
+REVIEW_CODE_REFERENCE_MARKERS = (
+    "args.",
+    "os.environ",
+    "os.getenv",
+    "getenv(",
+    "json.dumps(",
+    "yaml_string(",
+    "scan_text_for_secrets(",
+    "scan_value_for_secrets(",
+    "redact_text_secrets(",
+    "redact_value_secrets(",
+    "secure_write_text(",
+    ".write_text(",
+    "re.compile(",
+    "bool(",
+    "str(",
+    "int(",
+    "f\"",
+    "f'",
+    "{",
+    "}",
+)
 DEFAULT_EXCLUDE_BASENAME_PATTERNS = {
     "BUILD_RECEIPT_*.md",
     "BUILD_CYCLE_RECEIPT_*.md",
@@ -444,6 +481,36 @@ def _line_for_finding(text: str, finding: dict[str, Any]) -> str:
     return lines[line_number - 1]
 
 
+def _review_source_segments(source: str) -> list[str]:
+    normalized = source.replace("\\", "/")
+    if "!/" in normalized:
+        normalized = normalized.split("!/", 1)[1]
+    segments = [segment for segment in normalized.split("/") if segment]
+    if segments and re.fullmatch(r"epic-continuum-\d+(?:\.\d+){1,3}", segments[0]):
+        segments = segments[1:]
+    return segments
+
+
+def _looks_like_review_code_reference(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith(("def ", "class ", "return ", "self.assert", "assert ", "with ", "for ", "if ", "elif ", "else:", "#")):
+        return True
+    return any(marker in line for marker in REVIEW_CODE_REFERENCE_MARKERS)
+
+
+def _built_in_review_source_suppression(finding: dict[str, Any], *, line: str, source: str) -> str | None:
+    if str(finding.get("type") or "") not in REVIEW_ASSIGNMENT_FINDING_TYPES:
+        return None
+    if REVIEW_HIGH_CONFIDENCE_SECRET_RE.search(line):
+        return None
+    segments = _review_source_segments(source)
+    if any(segment in REVIEW_SYNTHETIC_SOURCE_SEGMENTS for segment in segments):
+        return "built_in_source_fixture_assignment"
+    if _looks_like_review_code_reference(line):
+        return "built_in_source_code_reference"
+    return None
+
+
 def _allowlisted_review_secret_finding(
     finding: dict[str, Any],
     *,
@@ -463,6 +530,9 @@ def _allowlisted_review_secret_finding(
             for item in extra_allowlist
         ):
             return "explicit_secret_allowlist_pattern"
+    source_suppression = _built_in_review_source_suppression(finding, line=line, source=source)
+    if source_suppression:
+        return source_suppression
     if _allowlisted_review_secret_line(line, source=source, extra_allowlist=None):
         return "built_in_narrow_allowlist"
     return None

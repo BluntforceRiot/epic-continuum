@@ -1,6 +1,6 @@
 {
   "name": "EricMemoryBench",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "seed": 20260621,
   "default_live_model": "Qwen/Qwen2.5-7B-Instruct",
   "description": "Small local cases for comparing recent-context, QMD-style notes, and Epic Continuum retrieval under common agent-memory failure modes.",

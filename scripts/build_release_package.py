@@ -271,7 +271,7 @@ def _provenance_payload(
         "git_status_short_sha256": hashlib.sha256(status_blob).hexdigest() if status_short else None,
         "member_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "member_count_without_root_or_provenance": len(members),
-        "member_count_with_root_and_provenance": len(members) + 2,
+        "member_count_with_root_and_provenance": len(members) + 3,
         "provenance_notes": [
             "No absolute repository path is recorded.",
             "Dirty development archives are review artifacts, not final public-release provenance.",
@@ -453,6 +453,7 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         require_clean=require_clean,
     )
     provenance_arcname = f"{package_name}/RELEASE_PROVENANCE.json"
+    package_provenance_arcname = f"{package_name}/src/continuum/assets/RELEASE_PROVENANCE.json"
 
     if zip_path.exists():
         zip_path.unlink()
@@ -467,7 +468,9 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         zf.writestr(root_info, b"")
         for member_source, arcname, mode in members:
             write_member(zf, member_source, arcname, mode=mode)
-        write_bytes_member(zf, provenance_arcname, _stable_json_bytes(provenance))
+        provenance_bytes = _stable_json_bytes(provenance)
+        write_bytes_member(zf, provenance_arcname, provenance_bytes)
+        write_bytes_member(zf, package_provenance_arcname, provenance_bytes)
 
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     checksum_path.write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8", newline="\n")

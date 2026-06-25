@@ -252,7 +252,10 @@ version = "9.9.9"
             )
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
             with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
-                provenance = json.loads(zf.read("epic-continuum-9.9.9/RELEASE_PROVENANCE.json"))
+                provenance_bytes = zf.read("epic-continuum-9.9.9/RELEASE_PROVENANCE.json")
+                package_provenance_bytes = zf.read("epic-continuum-9.9.9/src/continuum/assets/RELEASE_PROVENANCE.json")
+                provenance = json.loads(provenance_bytes)
+            self.assertEqual(package_provenance_bytes, provenance_bytes)
             self.assertTrue(provenance["allow_dirty"])
             self.assertTrue(provenance["git_dirty"])
             self.assertGreater(provenance["git_status_short_count"], 0)

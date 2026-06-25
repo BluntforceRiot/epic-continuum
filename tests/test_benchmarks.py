@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import benchmarks.runners.eric_memory_bench as eric_memory_bench
+import benchmarks.runners.scale_bench as scale_bench
 from benchmarks.runners.continuitybench import main as continuitybench_main
 from benchmarks.runners.eric_memory_bench import main as eric_memory_bench_main
 from benchmarks.runners.faultbench import main as faultbench_main
@@ -362,6 +363,18 @@ class TestScaleBenchSmoke(unittest.TestCase):
             self.assertTrue(row["high_entropy"])
             self.assertLessEqual(row["graph_edges_per_event"], 90.0)
             self.assertLess(row["database_growth_bytes"], 5_000_000)
+
+    def test_quick_runner_skips_bundle_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(scale_bench, "QUICK_EVENT_COUNTS", [3]):
+            out = Path(tmp) / "scalebench-quick"
+            rc = scalebench_main(["--quick", "--output-dir", str(out)])
+            self.assertEqual(rc, 0)
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            row = json.loads((out / "cases.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+            self.assertEqual(summary["event_counts"], [3])
+            self.assertTrue(summary["bundle_skipped"])
+            self.assertIsNone(row["bundle_ok"])
 
 
 if __name__ == "__main__":

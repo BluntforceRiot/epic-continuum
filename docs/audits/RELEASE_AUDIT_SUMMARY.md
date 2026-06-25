@@ -17,9 +17,11 @@ The release gate focused on:
 
 ## Current Gate
 
-The core test suite passed on Windows and Linux during release-candidate review.
-Disposable Debian 12 and Debian 13 validation both completed with the same
-passing test count as the local suite.
+The core test suite passed on Windows during this package build and in prior
+Linux release-candidate review. Internal review notes also reported disposable
+Debian 12 and Debian 13 validation with the same passing test count as the local
+suite. The public source package intentionally keeps this as a summary rather
+than bundling the full local run logs.
 
 Review hardening after the final private review pass added:
 

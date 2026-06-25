@@ -67,6 +67,12 @@ Quick mode is intended for local validation:
 python benchmarks/runners/scale_bench.py --quick --output-dir "${TMPDIR:-/tmp}/scalebench-local-quick"
 ```
 
+Quick mode uses small smoke counts (`10,100`) so it can be part of a release
+gate on ordinary developer machines. It skips bundle pack/verify timing by
+default; add `--with-bundle` when you explicitly want that slower measurement.
+Use `--event-counts 100,1000` or `--full` when you want heavier pressure-test
+numbers instead of a fast validation pass.
+
 High-entropy mode uses mostly unique tool/log-style terms to expose graph write
 amplification that repeated vocabulary can hide:
 
@@ -207,7 +213,7 @@ Environment metadata is intentionally runner-specific. ContinuityBench records t
 - No large external dataset is downloaded.
 - ScaleBench `tracemalloc` peak memory is Python allocation, not whole-process RSS.
 - ScaleBench high-entropy mode is a synthetic stress shape for graph fanout; it does not represent normal conversational language.
-- Quick-mode scale counts are validation checks, not capacity claims.
+- Quick-mode scale counts are fast validation checks, not capacity claims.
 - EricMemoryBench quick mode is a local scenario suite, not a product shootout.
   Live Hermes, OpenClaw, or model results must be labeled with the exact model,
   endpoint or command, hardware, timeout, and whether Continuum was installed in

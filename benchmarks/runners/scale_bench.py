@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - script execution path
     from _common import prepare_output_dir, sanitize_command  # type: ignore
 
 
-QUICK_EVENT_COUNTS = [100, 1000]
+QUICK_EVENT_COUNTS = [10, 100]
 FULL_EVENT_COUNTS = [10_000, 100_000]
 
 
@@ -228,8 +228,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-million", action="store_true", help="Add a 1,000,000-event count. Requires explicit opt-in.")
     parser.add_argument("--event-counts", help="Comma-separated override, for example 100,1000,10000.")
     parser.add_argument("--skip-bundle", action="store_true", help="Skip pack-root and verify-bundle timing.")
+    parser.add_argument("--with-bundle", action="store_true", help="Include pack-root and verify-bundle timing even in quick mode.")
     parser.add_argument("--high-entropy", action="store_true", help="Use mostly unique terms to expose graph write amplification.")
     args = parser.parse_args(argv)
+    if args.skip_bundle and args.with_bundle:
+        parser.error("--skip-bundle and --with-bundle cannot be used together")
 
     if args.event_counts:
         event_counts = [int(item.strip()) for item in args.event_counts.split(",") if item.strip()]
@@ -242,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         suite_mode = "quick"
     if args.include_million and 1_000_000 not in event_counts:
         event_counts.append(1_000_000)
+    skip_bundle = bool(args.skip_bundle or (suite_mode == "quick" and not args.with_bundle))
 
     output_dir = prepare_output_dir(args.output_dir, benchmark="ScaleBench")
     command = sanitize_command([Path(sys.executable).name, *(argv if argv is not None else sys.argv[1:])])
@@ -256,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                     base / f"root-{count}-{suffix}",
                     output_dir,
                     count,
-                    skip_bundle=args.skip_bundle,
+                    skip_bundle=skip_bundle,
                     high_entropy=args.high_entropy,
                 )
             )
@@ -269,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         "elapsed_seconds": time.perf_counter() - started,
         "event_counts": event_counts,
         "high_entropy": bool(args.high_entropy),
+        "bundle_skipped": skip_bundle,
         "environment_file": "environment.json",
         "cases_file": "cases.jsonl",
         "ok": all(row["restore_ok"] and (row["bundle_ok"] is not False) for row in rows_out),

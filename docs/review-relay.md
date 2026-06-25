@@ -55,6 +55,11 @@ The capsule cannot contain its own final SHA-256 because that would change the Z
 reported in `status.json`, `manual-handoff.md`, `review-status`, and `review-prepare` output. The reviewer
 must echo that hash in `review_capsule_sha256`.
 
+Only `review-capsule.zip` is intended to be uploaded or shared with the reviewer. The local job files
+(`request.json`, `status.json`, and `manual-handoff.md`) may contain local paths so Codex can resume,
+ingest, and run `review-check-current` on the original machine. The capsule's public request and source
+manifest use path-neutral `subject/` references instead.
+
 The packet contains the review objective, Git snapshot, file manifest, selected text excerpts, coverage
 metadata, and optional diff material. Direct OpenAI-compatible review is a packet-only review. If the packet
 is truncated or critical files are omitted, Continuum downgrades a clean pass to `coverage_limited` during

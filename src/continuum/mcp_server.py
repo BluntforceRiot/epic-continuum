@@ -155,6 +155,15 @@ def optional_str(args: JSON, key: str) -> str | None:
     return value
 
 
+def optional_str_list(args: JSON, key: str) -> list[str]:
+    value = args.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{key} must be a list of non-empty strings")
+    return value
+
+
 def optional_int(args: JSON, key: str, default: int) -> int:
     value = args.get(key, default)
     if value is None:
@@ -1037,6 +1046,11 @@ def tool_review_prepare(args: JSON) -> Any:
     transport = optional_str(args, "transport") or DEFAULT_REVIEW_TRANSPORT
     if transport not in SUPPORTED_TRANSPORTS:
         raise ValueError(f"transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORTS))}")
+    secret_allowlist_patterns = optional_str_list(args, "secret_allowlist_patterns")
+    secret_allowlist_files = [
+        validate_allowed_path(Path(path), purpose="review secret allowlist file")
+        for path in optional_str_list(args, "secret_allowlist_files")
+    ]
 
     def action(operation: OperationGuard) -> JSON:
         result = create_review_job(
@@ -1051,6 +1065,8 @@ def tool_review_prepare(args: JSON) -> Any:
             max_packet_bytes=optional_int(args, "max_packet_bytes", 512_000),
             max_file_bytes=optional_int(args, "max_file_bytes", 64_000),
             max_files=optional_int(args, "max_files", 300),
+            secret_allowlist_patterns=secret_allowlist_patterns,
+            secret_allowlist_files=secret_allowlist_files,
             operation_id=operation.operation_id,
         )
         operation.cursor({"phase": "review_job_created", "job_id": result["job_id"], "packet_sha256": result["packet_sha256"]})
@@ -1060,7 +1076,12 @@ def tool_review_prepare(args: JSON) -> Any:
         root,
         operation_type="mcp_review_prepare",
         title=f"Prepare review relay job for {subject.name}",
-        intent={"subject": str(subject), "transport": transport},
+        intent={
+            "subject": str(subject),
+            "transport": transport,
+            "secret_allowlist_pattern_count": len(secret_allowlist_patterns),
+            "secret_allowlist_file_count": len(secret_allowlist_files),
+        },
         snapshot_policy="none",
         snapshot_reason="review preparation writes export artifacts only",
         result_touched_paths=lambda result: [
@@ -1693,6 +1714,8 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "max_packet_bytes": {"type": "integer"},
                 "max_file_bytes": {"type": "integer"},
                 "max_files": {"type": "integer"},
+                "secret_allowlist_patterns": {"type": "array", "items": {"type": "string"}},
+                "secret_allowlist_files": {"type": "array", "items": {"type": "string"}},
             },
             "additionalProperties": False,
         },

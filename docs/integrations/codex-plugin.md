@@ -170,6 +170,12 @@ same packet is written to:
 - `continuum_review_check_current`
 - `continuum_review_browser_attempt_start`
 
+`continuum_review_prepare` accepts the same narrow secret-scan exceptions as
+the CLI: `secret_allowlist_patterns` for inline anchored `source:line:text`
+patterns and `secret_allowlist_files` for UTF text files containing one pattern
+per line. The public review capsule records only counts, not raw patterns or
+local allowlist file paths.
+
 ## MemPalace Import
 
 Epic Continuum can migrate the existing MemPalace palace into its Library and graph:

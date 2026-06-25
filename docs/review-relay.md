@@ -75,15 +75,15 @@ only because the packet excerpts were limited.
 
 Review preparation scans every decodable snapshot file, UTF-8/UTF-16 text, ZIP member contents, ZIP metadata,
 generated request/instruction text, and the completed capsule boundary for obvious secret-like material before
-publishing a capsule hash. Use
-`--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. Patterns
-must be anchored to Continuum's `source:line:text` target, such as
+publishing a capsule hash. Use `--secret-allowlist-pattern` only for known false-positive lines in review
+fixtures or documentation. For repeated fixture sets, place the same anchored patterns in a UTF text file and
+pass `--secret-allowlist-file`. Patterns must be anchored to Continuum's `source:line:text` target, such as
 `^tests/test_fixture.py:12:.*synthetic_token`. The source path and line number are treated as exact targets;
-wildcards in the source or line are rejected, and only the text tail is a regex. The patterns are not written
-into the public capsule; only the count is recorded. Suppressed findings are written to the local
-`secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan blocks,
-Continuum removes the temporary preparation directory and does not leave an uploadable capsule or subject
-archive behind.
+wildcards in the source or line are rejected, and only the text tail is a regex. Raw patterns and local
+allowlist file paths are not written into the public capsule; only counts are recorded. Suppressed findings
+are written to the local `secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan
+blocks, Continuum removes the temporary preparation directory and does not leave an uploadable capsule or
+subject archive behind.
 
 Directory subjects must fit under `--max-files`. If the file limit is reached, a custom `.continuumignore`
 rule excludes subject files, the subject is inside the Continuum root, or a non-empty subject produces an
@@ -132,6 +132,15 @@ continuum review-prepare \
   --secret-allowlist-pattern "^tests/test_fixture.py:12:.*example_fixture_token"
 ```
 
+```bash
+continuum review-prepare \
+  --root ./.continuum-demo \
+  --subject ./epic-continuum-0.2.0.zip \
+  --prompt "Do a harsh release-boundary review." \
+  --transport manual \
+  --secret-allowlist-file docs/review-fixture-secret-allowlist.txt
+```
+
 For a browser-only reviewer, reserve a response path before each attempt. Upload `review-capsule.zip` to the
 reviewer, paste the exact short prompt from `browser-handoff.md`, save the reviewer JSON to the reserved path,
 and ingest that exact file:
@@ -148,7 +157,8 @@ continuum review-ingest \
 ```
 
 If the reviewer returns malformed JSON, keep that raw response, run `review-browser-attempt-start` again, and
-use the newly reserved `response-002.raw.txt` path. Do not overwrite an earlier response file.
+use the newly reserved `response-002.raw.txt` path. Continuum rejects reused or consumed browser response
+paths, so a failed `response-001.raw.txt` remains evidence rather than becoming a retry slot.
 
 Check status:
 

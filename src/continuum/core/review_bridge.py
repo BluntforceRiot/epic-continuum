@@ -84,6 +84,8 @@ REVIEW_FINDINGS_DIR = "findings"
 REVIEW_RECEIPTS_DIR = "receipts"
 REVIEW_SECRET_SCAN_MAX_FINDINGS = 20
 REVIEW_MAX_ZIP_SCAN_DEPTH = 4
+REVIEW_SECRET_ALLOWLIST_MAX_BYTES = 1_000_000
+REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS = 5_000
 DEFAULT_EXCLUDE_BASENAME_PATTERNS = {
     "BUILD_RECEIPT_*.md",
     "BUILD_CYCLE_RECEIPT_*.md",
@@ -421,9 +423,46 @@ def _read_full_decodable_text(path: Path) -> str | None:
     return _decode_review_bytes(data)
 
 
-def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[dict[str, Any]]:
+def _review_secret_allowlist_file_patterns(path: Path) -> list[str]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ReviewBridgeError(f"review secret allowlist file is not readable: {path}") from exc
+    if stat.st_size > REVIEW_SECRET_ALLOWLIST_MAX_BYTES:
+        raise ReviewBridgeError(
+            f"review secret allowlist file is too large: {path} "
+            f"({stat.st_size} bytes > {REVIEW_SECRET_ALLOWLIST_MAX_BYTES})"
+        )
+    text = _read_full_decodable_text(path)
+    if text is None:
+        raise ReviewBridgeError(f"review secret allowlist file is not UTF text: {path}")
+    patterns: list[str] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line)
+        if len(patterns) > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
+            raise ReviewBridgeError(
+                f"review secret allowlist has too many patterns; "
+                f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS} (while reading {path}:{line_number})"
+            )
+    return patterns
+
+
+def _compile_review_secret_allowlist(
+    patterns: list[str] | None,
+    files: list[Path] | None = None,
+) -> list[dict[str, Any]]:
+    raw_patterns: list[str] = list(patterns or [])
+    for allowlist_file in files or []:
+        raw_patterns.extend(_review_secret_allowlist_file_patterns(Path(allowlist_file)))
+    if len(raw_patterns) > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
+        raise ReviewBridgeError(
+            f"review secret allowlist has too many patterns; limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS}"
+        )
     compiled: list[dict[str, Any]] = []
-    for pattern in patterns or []:
+    for pattern in raw_patterns:
         text = str(pattern or "").strip()
         if not text:
             continue
@@ -1061,6 +1100,7 @@ def _public_review_request(job: dict[str, Any]) -> dict[str, Any]:
         "max_file_bytes": job.get("max_file_bytes"),
         "max_files": job.get("max_files"),
         "secret_allowlist_pattern_count": job.get("secret_allowlist_pattern_count"),
+        "secret_allowlist_file_count": job.get("secret_allowlist_file_count"),
         "status": job.get("status"),
         "sentinel": job.get("sentinel"),
         "review_capsule_sha256_source": "browser-handoff.md",
@@ -1205,6 +1245,15 @@ def _reserved_browser_attempt_uri(job: dict[str, Any], raw_path: Path) -> str | 
     return None
 
 
+def _same_path(left: str | Path | None, right: Path) -> bool:
+    if not left:
+        return False
+    try:
+        return Path(str(left)).resolve(strict=False) == right.resolve(strict=False)
+    except OSError:
+        return str(left) == str(right)
+
+
 def _next_findings_json_path(job_dir: Path) -> Path:
     return _next_numbered_path(job_dir / REVIEW_FINDINGS_DIR, "findings", ".json")
 
@@ -1245,6 +1294,7 @@ def create_review_job(
     max_file_bytes: int = 64_000,
     max_files: int = 300,
     secret_allowlist_patterns: list[str] | None = None,
+    secret_allowlist_files: list[Path] | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
     init_db(root)
@@ -1258,7 +1308,7 @@ def create_review_job(
         raise ReviewBridgeError(f"subject path does not exist: {subject}")
     if _is_relative_to(subject, Path(root).resolve(strict=False)):
         raise ReviewBridgeError("review subject must not be inside the Continuum root")
-    secret_allowlist = _compile_review_secret_allowlist(secret_allowlist_patterns)
+    secret_allowlist = _compile_review_secret_allowlist(secret_allowlist_patterns, secret_allowlist_files)
 
     job_id = unique_id("review")
     job_dir = review_job_dir(root, job_id)
@@ -1414,6 +1464,7 @@ def create_review_job(
         "max_file_bytes": int(max_file_bytes),
         "max_files": int(max_files),
         "secret_allowlist_pattern_count": len(secret_allowlist),
+        "secret_allowlist_file_count": len(secret_allowlist_files or []),
         "secret_allowlist_report_uri": str(allowlist_report_path),
         "secret_allowlist_suppressed_count": len(suppressed_secret_findings),
         "operation_id": operation_id,
@@ -1425,6 +1476,7 @@ def create_review_job(
         "job_id": job_id,
         "created_at": utc_now(),
         "explicit_pattern_count": len(secret_allowlist),
+        "explicit_file_count": len(secret_allowlist_files or []),
         "suppressed_count": len(suppressed_secret_findings),
         "suppressed_findings": suppressed_secret_findings,
     }
@@ -2236,6 +2288,15 @@ def ingest_review_result(
         content = source_result_path.read_text(encoding="utf-8", errors="replace")
         responses_dir = job_dir / REVIEW_RESULT_DIR
         if _is_relative_to(source_result_path, responses_dir) and source_result_path.name.startswith("response-") and source_result_path.name.endswith(".raw.txt"):
+            current_browser_attempt = _same_path(job.get("browser_response_uri"), source_result_path)
+            current_reviewer_response = _same_path(job.get("reviewer_content_uri"), source_result_path)
+            if current_browser_attempt and str(job.get("status") or "") != "pending_browser_upload":
+                current_browser_attempt = False
+            if not current_browser_attempt and not current_reviewer_response:
+                raise ReviewBridgeError(
+                    "review response path is not the current reserved browser attempt; "
+                    "run review-browser-attempt-start before retrying"
+                )
             raw_response_path = source_result_path
         else:
             raw_response_path = _next_response_raw_path(job_dir)
@@ -2275,6 +2336,8 @@ def ingest_review_result(
             attempt_uri = _write_attempt(job_dir, attempt_payload)
         failed_job["attempt_count"] = failed_attempt_number
         failed_job["last_attempt_uri"] = str(attempt_uri)
+        failed_job.pop("browser_response_uri", None)
+        failed_job.pop("browser_attempt_uri", None)
         _write_job(root, failed_job)
         raise error
     result = _normalize_review_result(payload)
@@ -2356,6 +2419,8 @@ def ingest_review_result(
             ),
         )
         job["last_attempt_uri"] = str(attempt_uri)
+        job.pop("browser_response_uri", None)
+        job.pop("browser_attempt_uri", None)
     _write_job(root, job)
     return receipt
 

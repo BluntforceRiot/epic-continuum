@@ -247,6 +247,36 @@ class ReviewBridgeTest(unittest.TestCase):
                 public_request = json.loads(zf.read("request.json").decode("utf-8"))
             self.assertEqual(public_request["secret_allowlist_pattern_count"], 1)
 
+    def test_review_secret_allowlist_file_suppresses_specific_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            token = "s" + "k-" + ("A" * 32)
+            (subject / "fixture.txt").write_text(f'review_fixture_token="{token}"\n', encoding="utf-8")
+            allowlist_file = base / "review-secret-allowlist.txt"
+            allowlist_file.write_text("# exact synthetic fixture allowlist\n^fixture\\.txt:1:review_fixture_token\n", encoding="utf-8")
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+                secret_allowlist_files=[allowlist_file],
+            )
+
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            report = json.loads(Path(job["secret_allowlist_report_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(request["secret_allowlist_pattern_count"], 1)
+            self.assertEqual(request["secret_allowlist_file_count"], 1)
+            self.assertEqual(report["explicit_file_count"], 1)
+            with zipfile.ZipFile(job["review_capsule_uri"]) as zf:
+                public_request = json.loads(zf.read("request.json").decode("utf-8"))
+            self.assertEqual(public_request["secret_allowlist_pattern_count"], 1)
+            self.assertEqual(public_request["secret_allowlist_file_count"], 1)
+            self.assertNotIn(str(allowlist_file), json.dumps(public_request))
+
     def test_snapshot_archive_and_packet_ignore_later_live_subject_mutation(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
@@ -497,6 +527,7 @@ class ReviewBridgeTest(unittest.TestCase):
             subject.mkdir()
             (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
             job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
 
             first = review_browser_attempt_start(root, job_id=job["job_id"])
             first_path = Path(first["response_uri"])
@@ -505,6 +536,14 @@ class ReviewBridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
                 ingest_review_result(root, job_id=job["job_id"], result_path=first_path)
             self.assertEqual(first_path.read_text(encoding="utf-8"), "not json")
+            status_after_failure = review_job_status(root, job_id=job["job_id"])
+            self.assertIsNone(status_after_failure["browser_response_uri"])
+            self.assertIsNone(status_after_failure["browser_attempt_uri"])
+            first_path.write_text(json.dumps(valid_review_payload({**request, **status_after_failure})), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "current reserved browser attempt"):
+                ingest_review_result(root, job_id=job["job_id"], result_path=first_path)
+            failed_attempt = json.loads(Path(status_after_failure["last_attempt_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(failed_attempt["status"], "review_failed")
 
             second = review_browser_attempt_start(root, job_id=job["job_id"])
             second_path = Path(second["response_uri"])

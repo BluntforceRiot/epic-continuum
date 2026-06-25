@@ -414,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Anchored regex for one source:line:text review-secret false positive; repeat for multiple patterns.",
     )
+    p_review_prepare.add_argument(
+        "--secret-allowlist-file",
+        action="append",
+        default=[],
+        help="UTF text file containing one anchored source:line:text allowlist pattern per line; repeat for multiple files.",
+    )
 
     p_review_run = sub.add_parser("review-run", help="Run a review relay job with a direct OpenAI-compatible endpoint")
     p_review_run.add_argument("--root", required=True)
@@ -1249,6 +1255,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_file_bytes=args.max_file_bytes,
                 max_files=args.max_files,
                 secret_allowlist_patterns=args.secret_allowlist_pattern,
+                secret_allowlist_files=[Path(path) for path in args.secret_allowlist_file or []],
                 operation_id=operation.operation_id,
             )
             operation.cursor({"phase": "review_job_created", "job_id": result["job_id"], "packet_sha256": result["packet_sha256"]})
@@ -1265,6 +1272,7 @@ def _main(argv: list[str] | None = None) -> int:
                     "reviewer_id": args.reviewer_id,
                     "model": args.model,
                     "secret_allowlist_pattern_count": len(args.secret_allowlist_pattern or []),
+                    "secret_allowlist_file_count": len(args.secret_allowlist_file or []),
                 },
                 snapshot_policy="none",
                 snapshot_reason="review preparation writes export artifacts only",

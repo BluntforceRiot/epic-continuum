@@ -368,8 +368,8 @@ def _is_review_test_source(source: str) -> bool:
     return "tests" in segments
 
 
-def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[re.Pattern[str]]:
-    compiled: list[re.Pattern[str]] = []
+def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[dict[str, Any]]:
+    compiled: list[dict[str, Any]] = []
     for pattern in patterns or []:
         text = str(pattern or "").strip()
         if not text:
@@ -380,19 +380,25 @@ def _compile_review_secret_allowlist(patterns: list[str] | None) -> list[re.Patt
                 "(example: ^tests/test_fixture\\.py:12:.*synthetic_token)"
             )
         prefix = text[1:].split(":", 2)
-        source_part = prefix[0]
+        raw_source_part = prefix[0]
         line_part = prefix[1]
-        if not source_part or any(token in source_part for token in ("*", ".*", "[", "]", "(", ")", "|", "?")):
+        text_pattern = prefix[2]
+        source_part = raw_source_part.replace(r"\/", "/").replace(r"\.", ".")
+        if "\\" in source_part or not source_part or re.search(r"[*+\[\](){}|?^$]", source_part):
             raise ReviewBridgeError("review secret allowlist source must be an explicit file path, not a wildcard pattern")
         if not re.fullmatch(r"\d+", line_part):
             raise ReviewBridgeError("review secret allowlist line must be an explicit positive integer")
+        if int(line_part) < 1:
+            raise ReviewBridgeError("review secret allowlist line must be an explicit positive integer")
+        if not text_pattern:
+            raise ReviewBridgeError("review secret allowlist text pattern must not be empty")
         try:
-            pattern_re = re.compile(text)
+            pattern_re = re.compile(text_pattern)
         except re.error as exc:
             raise ReviewBridgeError(f"invalid review secret allowlist pattern {text!r}: {exc}") from exc
         if pattern_re.search(""):
             raise ReviewBridgeError("review secret allowlist pattern must not match empty text")
-        compiled.append(pattern_re)
+        compiled.append({"source": source_part, "line": int(line_part), "pattern": pattern_re})
     return compiled
 
 
@@ -400,16 +406,11 @@ def _allowlisted_review_secret_line(
     line: str,
     *,
     source: str,
-    extra_allowlist: list[re.Pattern[str]] | None = None,
+    extra_allowlist: list[dict[str, Any]] | None = None,
 ) -> bool:
     if any(pattern.search(line) for pattern in DEFAULT_REVIEW_SECRET_ALLOWLIST):
         return True
-    if extra_allowlist and any(pattern.search(line) for pattern in extra_allowlist):
-        return True
-    if _is_review_test_source(source) and re.search(
-        r"(?i)(scan_text_for_secrets|scan_value_for_secrets|redact_text_secrets|redact_value_secrets|write_text|write_bytes|patch\.dict|[\"'](?:sk-|ghp_)[\"']\s*\+|(?:api_key|token|secret)\s*=\s*[\"'](?:sk-|ghp_)[\"']\s*\+)",
-        line,
-    ):
+    if extra_allowlist and any(item["source"] == source and bool(item["pattern"].search(line)) for item in extra_allowlist):
         return True
     return False
 
@@ -432,18 +433,20 @@ def _allowlisted_review_secret_finding(
     *,
     line: str,
     source: str,
-    extra_allowlist: list[re.Pattern[str]] | None = None,
+    extra_allowlist: list[dict[str, Any]] | None = None,
 ) -> str | None:
     if extra_allowlist:
-        target = f"{source}:{finding.get('line') or ''}:{line}"
-        if any(pattern.search(target) for pattern in extra_allowlist):
+        try:
+            finding_line = int(finding.get("line") or 0)
+        except (TypeError, ValueError):
+            finding_line = 0
+        if any(
+            item["source"] == source
+            and item["line"] == finding_line
+            and bool(item["pattern"].search(line))
+            for item in extra_allowlist
+        ):
             return "explicit_secret_allowlist_pattern"
-    if _is_review_test_source(source) and finding.get("type") in {"secret_assignment", "sensitive_key_assignment"} and _allowlisted_review_secret_line(
-        line,
-        source=source,
-        extra_allowlist=None,
-    ):
-        return "review_test_source_secret_fixture"
     if _allowlisted_review_secret_line(line, source=source, extra_allowlist=None):
         return "built_in_narrow_allowlist"
     return None
@@ -466,7 +469,7 @@ def _scan_review_text_for_secrets(
     *,
     source: str,
     max_findings: int = 20,
-    extra_allowlist: list[re.Pattern[str]] | None = None,
+    extra_allowlist: list[dict[str, Any]] | None = None,
     suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
@@ -493,7 +496,7 @@ def _scan_review_file_for_secrets(
     *,
     source: str,
     max_findings: int = 20,
-    extra_allowlist: list[re.Pattern[str]] | None = None,
+    extra_allowlist: list[dict[str, Any]] | None = None,
     suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     text = _read_decodable_text(path)
@@ -512,7 +515,7 @@ def _scan_zip_members_for_secrets(
     path: Path,
     *,
     max_findings: int = 20,
-    extra_allowlist: list[re.Pattern[str]] | None = None,
+    extra_allowlist: list[dict[str, Any]] | None = None,
     suppressed_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
@@ -1624,8 +1627,6 @@ def _normalize_review_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _apply_coverage_guard(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     coverage = job.get("packet_coverage") if isinstance(job.get("packet_coverage"), dict) else {}
-    if not coverage or not coverage.get("coverage_limited"):
-        return result
     surface = str(result.get("review_surface") or "unknown")
     subject_inspected = result.get("subject_inspected") is True
     if surface in {"full_capsule", "local_files"} and subject_inspected:
@@ -1633,19 +1634,24 @@ def _apply_coverage_guard(job: dict[str, Any], result: dict[str, Any]) -> dict[s
     verdict = str(result.get("verdict") or "").casefold()
     if verdict not in {"pass", "passed", "ok", "clean", "approved"}:
         return result
+    if not coverage:
+        return result
     guarded = dict(result)
     guarded["verdict"] = "coverage_limited"
     findings = list(guarded.get("findings") or [])
     findings.append(
         {
             "severity": "medium",
-            "title": "Automated packet review had limited coverage",
+            "title": "Packet-only review is not full artifact approval",
             "detail": (
-                "The reviewer returned a pass, but the packet omitted one or more text files or exhausted the packet budget. "
-                "Treat this as a packet-only review, not proof that the full subject artifact was inspected."
+                "The reviewer returned a clean pass without inspecting a full capsule or local files. Treat this as a "
+                "packet-only review, not proof that the full subject artifact was inspected."
             ),
             "evidence": json_dumps(
                 {
+                    "review_surface": surface,
+                    "subject_inspected": subject_inspected,
+                    "coverage_limited": coverage.get("coverage_limited"),
                     "omitted_text_paths": coverage.get("omitted_text_paths", [])[:20],
                     "critical_omitted": coverage.get("critical_omitted", []),
                     "excerpted_file_count": coverage.get("excerpted_file_count"),

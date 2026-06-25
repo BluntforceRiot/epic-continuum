@@ -77,8 +77,9 @@ Review preparation scans every decodable snapshot file, every decodable member o
 packet text for obvious secret-like material before writing the capsule. Use
 `--secret-allowlist-pattern` only for known false-positive lines in review fixtures or documentation. Patterns
 must be anchored to Continuum's `source:line:text` target, such as
-`^tests/test_fixture\\.py:12:.*synthetic_token`; broad patterns such as `.*` are rejected. The patterns are
-not written into the public capsule; only the count is recorded. Suppressed findings are written to the local
+`^tests/test_fixture.py:12:.*synthetic_token`. The source path and line number are treated as exact targets;
+wildcards in the source or line are rejected, and only the text tail is a regex. The patterns are not written
+into the public capsule; only the count is recorded. Suppressed findings are written to the local
 `secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan blocks,
 Continuum removes the temporary preparation directory and does not leave an uploadable capsule or subject
 archive behind.
@@ -125,7 +126,7 @@ continuum review-prepare \
   --subject . \
   --prompt "Do a harsh release-boundary review." \
   --transport manual \
-  --secret-allowlist-pattern "^tests/test_fixture\\.py:12:.*example_fixture_token"
+  --secret-allowlist-pattern "^tests/test_fixture.py:12:.*example_fixture_token"
 ```
 
 Upload `review-capsule.zip` to the reviewer and paste the exact short prompt from `browser-handoff.md`.

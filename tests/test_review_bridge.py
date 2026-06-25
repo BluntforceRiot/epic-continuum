@@ -159,7 +159,7 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertTrue(manifest_json["local_paths_redacted"])
             self.assertIn("- Path: subject/", packet)
 
-    def test_zip_subject_secret_scan_allows_nested_test_fixtures(self) -> None:
+    def test_zip_subject_secret_scan_requires_explicit_nested_fixture_allowlist(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
             root = base / "continuum"
@@ -168,7 +168,16 @@ class ReviewBridgeTest(unittest.TestCase):
                 zf.writestr("pkg/tests/test_fixture.py", 'api_key="sk-" + "secretvalue12345678901234567890"\n')
                 zf.writestr("pkg/README.md", "# Release\n")
 
-            job = create_review_job(root, subject_path=release_zip, prompt="Review hard.", transport="manual")
+            with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
+                create_review_job(root, subject_path=release_zip, prompt="Review hard.", transport="manual")
+
+            job = create_review_job(
+                root,
+                subject_path=release_zip,
+                prompt="Review hard.",
+                transport="manual",
+                secret_allowlist_patterns=[r"^release.zip!/pkg/tests/test_fixture.py:1:.*api_key"],
+            )
 
             self.assertTrue(job["ok"])
             self.assertEqual(Path(job["subject_archive_uri"]).name, "release.zip")
@@ -262,7 +271,27 @@ class ReviewBridgeTest(unittest.TestCase):
             findings = json.loads(Path(receipt["findings_uri"]).read_text(encoding="utf-8"))
 
             self.assertEqual(receipt["verdict"], "coverage_limited")
-            self.assertEqual(findings["findings"][0]["title"], "Automated packet review had limited coverage")
+            self.assertEqual(findings["findings"][0]["title"], "Packet-only review is not full artifact approval")
+
+    def test_packet_only_clean_pass_is_downgraded_even_when_packet_is_complete(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n\nTiny file.\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            status = review_job_status(root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            payload["verdict"] = "pass"
+            payload["findings"] = []
+            payload["review_surface"] = "packet_only"
+            payload["subject_inspected"] = False
+
+            receipt = ingest_review_result(root, job_id=job["job_id"], content=json.dumps(payload))
+
+            self.assertEqual(receipt["verdict"], "coverage_limited")
 
     def test_review_check_current_detects_subject_changes(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -485,7 +514,7 @@ class ReviewBridgeTest(unittest.TestCase):
                     secret_allowlist_patterns=[r".*"],
                 )
 
-            for pattern in (r"^.*:.*", r"^.*:.*:.*", r"^config\.py:.*:.*"):
+            for pattern in (r"^.*:.*", r"^.*:.*:.*", r"^.+:1:.*", r"^config\.py:.*:.*"):
                 with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, "allowlist"):
                     create_review_job(
                         root,
@@ -502,7 +531,10 @@ class ReviewBridgeTest(unittest.TestCase):
             subject = base / "subject"
             tests_dir = subject / "tests"
             tests_dir.mkdir(parents=True)
-            (tests_dir / "test_live_secret.py").write_text('assert token == "sk-' + ("Y" * 32) + '"\n', encoding="utf-8")
+            (tests_dir / "test_live_secret.py").write_text(
+                'assert token == "sk-' + ("Y" * 32) + '"  # scan_text_for_secrets\n',
+                encoding="utf-8",
+            )
 
             with self.assertRaisesRegex(ValueError, "secret scan blocked review artifact"):
                 create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")

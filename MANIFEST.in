@@ -3,6 +3,7 @@ include .gitattributes .gitignore
 recursive-include docs *.md
 recursive-include benchmarks *.md *.py *.json
 recursive-include assets *
+recursive-include src/continuum/assets *
 recursive-include examples *
 recursive-include integrations *
 recursive-include plugins *

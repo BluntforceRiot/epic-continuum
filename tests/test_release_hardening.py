@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -367,6 +368,54 @@ version = "9.9.9"
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
             with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
                 self.assertIn("epic-continuum-9.9.9/docs/cue-recall.md", set(zf.namelist()))
+
+    def test_generated_release_provenance_survives_rebuilt_wheel_and_sdist(self) -> None:
+        if importlib.util.find_spec("build") is None:
+            self.skipTest("python -m build is required for release-source package smoke")
+
+        repo_root = Path(__file__).resolve().parents[1]
+        version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+        script = repo_root / "scripts" / "build_release_package.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            out = base / "release"
+            release = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo_root), "--out-dir", str(out), "--allow-dirty"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(release.returncode, 0, release.stdout + release.stderr)
+
+            zip_path = out / f"epic-continuum-{version}.zip"
+            with zipfile.ZipFile(zip_path) as zf:
+                root_provenance = zf.read(f"epic-continuum-{version}/RELEASE_PROVENANCE.json")
+                package_provenance = zf.read(
+                    f"epic-continuum-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+                )
+                zf.extractall(base / "extract")
+            self.assertEqual(package_provenance, root_provenance)
+
+            release_root = base / "extract" / f"epic-continuum-{version}"
+            build_out = base / "built"
+            built = subprocess.run(
+                [sys.executable, "-m", "build", "--sdist", "--wheel", "--outdir", str(build_out)],
+                cwd=release_root,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+
+            wheel_path = next(build_out.glob("*.whl"))
+            with zipfile.ZipFile(wheel_path) as wheel:
+                self.assertEqual(wheel.read("continuum/assets/RELEASE_PROVENANCE.json"), root_provenance)
+
+            sdist_path = next(build_out.glob("*.tar.gz"))
+            with tarfile.open(sdist_path, "r:gz") as sdist:
+                member_name = f"epic_continuum_memory-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+                extracted = sdist.extractfile(member_name)
+                self.assertIsNotNone(extracted)
+                assert extracted is not None
+                self.assertEqual(extracted.read(), root_provenance)
 
     def test_release_builder_walk_fallback_rejects_source_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

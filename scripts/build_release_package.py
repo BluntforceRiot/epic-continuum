@@ -166,8 +166,7 @@ def should_include(path: Path, repo_root: Path) -> bool:
         return False
     if any(part in EXCLUDED_PARTS for part in parts):
         return False
-    name = path.name
-    if any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_BASENAME_PATTERNS):
+    if any(fnmatch.fnmatch(part, pattern) for part in parts for pattern in EXCLUDED_BASENAME_PATTERNS):
         return False
     if "".join(path.suffixes[-2:]) == ".tar.gz":
         return False

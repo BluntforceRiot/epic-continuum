@@ -388,6 +388,7 @@ version = "9.9.9"
 
             zip_path = out / f"epic-continuum-{version}.zip"
             with zipfile.ZipFile(zip_path) as zf:
+                self.assertFalse(any(".egg-info/" in name for name in zf.namelist()))
                 root_provenance = zf.read(f"epic-continuum-{version}/RELEASE_PROVENANCE.json")
                 package_provenance = zf.read(
                     f"epic-continuum-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"

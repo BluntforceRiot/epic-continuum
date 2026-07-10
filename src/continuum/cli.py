@@ -26,6 +26,11 @@ from .core.operations import (
     verify_root,
     verify_proof_pack,
 )
+from .core.proof_archive import (
+    archive_legacy_catalog_snapshots,
+    configured_archive_root,
+    verify_relocation_ledger,
+)
 from .core.review_bridge import (
     DEFAULT_REVIEW_BASE_URL,
     DEFAULT_REVIEW_MODEL,
@@ -68,10 +73,12 @@ from .core.workers import (
     detect_conflicts,
     memory_health,
     prune_memory,
+    reconcile_worker_backlog,
     run_worker_pass,
     serve_workers,
 )
 from .core.safety import redact_text_secrets, scan_text_for_secrets
+from .core.writer_claim import claim_writer, writer_claim_status
 from .integrations.hermes_adapter import install_hermes_adapter
 
 
@@ -136,6 +143,7 @@ def guarded_result(
     action: Callable[[OperationGuard], Any],
     actor: str | None = None,
     proof: bool = True,
+    catalog_proof_mode: str | None = None,
 ) -> Any:
     with OperationGuard(
         root,
@@ -147,6 +155,7 @@ def guarded_result(
         snapshot_reason=snapshot_reason,
         touched_paths=touched_paths,
         proof=proof,
+        catalog_proof_mode=catalog_proof_mode,
     ) as operation:
         result = action(operation)
         extra_paths = result_touched_paths(result) if result_touched_paths else []
@@ -164,6 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show root status")
     p_status.add_argument("--root", required=True)
+
+    p_writer_status = sub.add_parser("writer-status", help="Show the root writer claim without changing it")
+    p_writer_status.add_argument("--root", required=True)
+
+    p_writer_claim = sub.add_parser("writer-claim", help="Claim an unclaimed root for this runtime and host")
+    p_writer_claim.add_argument("--root", required=True)
+    p_writer_claim.add_argument("--force", action="store_true", help="Transfer an existing or malformed claim")
+    p_writer_claim.add_argument(
+        "--acknowledge-writers-stopped",
+        action="store_true",
+        help="Confirm every Continuum writer was stopped before a forced transfer",
+    )
 
     p_config = sub.add_parser("config", help="Create/show root config")
     p_config.add_argument("--root", required=True)
@@ -202,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_context.add_argument("--query")
     p_context.add_argument("--card-scope", choices=["session", "global", "session_then_global", "project"])
     p_context.add_argument("--project-id")
+    p_context.add_argument("--include-cue-recall", action="store_true")
+    p_context.add_argument("--cue-recall-limit", type=int, default=4, help="Cue Recall candidates to include when enabled; clamped to 1..20")
 
     p_search = sub.add_parser("search", help="Search Library chunks with FTS5 or LIKE fallback")
     p_search.add_argument("--root", required=True)
@@ -265,6 +288,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--role", action="append", choices=["scribe", "librarian", "archivist"])
     p_serve.add_argument("--passes", type=int, default=0, help="Number of passes before exit; 0 runs until stopped")
     p_serve.add_argument("--interval-seconds", type=float, default=5.0)
+    p_serve.add_argument(
+        "--maintenance-interval-seconds",
+        type=float,
+        default=300.0,
+        help="Seconds between bounded maintenance passes",
+    )
+    p_serve.add_argument(
+        "--no-maintenance-on-start",
+        action="store_true",
+        help="Delay the first maintenance pass until the maintenance interval elapses",
+    )
+
+    p_reconcile_workers = sub.add_parser(
+        "reconcile-workers",
+        help="Dry-run or apply bounded reconciliation of legacy worker/card backlog",
+    )
+    p_reconcile_workers.add_argument("--root", required=True)
+    p_reconcile_workers.add_argument("--queue-limit", type=int, default=5000)
+    p_reconcile_workers.add_argument("--card-limit", type=int, default=5000)
+    p_reconcile_workers.add_argument("--apply", action="store_true", help="Apply the reconciliation; default is dry-run")
 
     p_health = sub.add_parser("memory-health", help="Report Epic Continuum capture, queue, storage, and learning health")
     p_health.add_argument("--root", required=True)
@@ -348,6 +391,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify_proof.add_argument("path")
     p_verify_proof.add_argument("--root", help="Override the continuum root for root-relative proof paths")
 
+    p_archive_proofs = sub.add_parser(
+        "archive-proofs",
+        help="Dry-run or relocate verified legacy catalog proof snapshots to an external archive",
+    )
+    p_archive_proofs.add_argument("--root", required=True)
+    p_archive_proofs.add_argument("--archive-root", required=True, help="External, non-overlapping proof archive directory")
+    p_archive_proofs.add_argument("--keep-latest", type=int, default=3, help="Keep this many newest eligible snapshots in-root")
+    p_archive_proofs.add_argument("--apply", action="store_true", help="Apply relocation; default is dry-run")
+
+    p_verify_proof_archive = sub.add_parser(
+        "verify-proof-archive",
+        help="Verify the configured or explicitly selected external proof archive ledger",
+    )
+    p_verify_proof_archive.add_argument("--root", required=True)
+    p_verify_proof_archive.add_argument("--archive-root", help="External archive; defaults to the root's verified locator")
+
     p_replay_op_log = sub.add_parser("replay-operation-log", help="Replay a hash-chained operation event JSONL log")
     p_replay_op_log.add_argument("path")
     p_replay_op_log.add_argument("--operation-id")
@@ -412,13 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--secret-allowlist-pattern",
         action="append",
         default=[],
-        help="Anchored regex for one source:line:text review-secret false positive; repeat for multiple patterns.",
+        help="Legacy anchored source:line:text regex for non-hashed review-secret false positives; exact fingerprints are required for hashed token findings.",
     )
     p_review_prepare.add_argument(
         "--secret-allowlist-file",
         action="append",
         default=[],
-        help="UTF text file containing one anchored source:line:text allowlist pattern per line; repeat for multiple files.",
+        help="UTF text/JSONL file containing exact review secret allowlist fingerprints; repeat for multiple files.",
     )
 
     p_review_run = sub.add_parser("review-run", help="Run a review relay job with a direct OpenAI-compatible endpoint")
@@ -476,6 +535,20 @@ def _main(argv: list[str] | None = None) -> int:
 
     root_arg_value = getattr(args, "root", None)
     root = Path(root_arg_value) if root_arg_value else None
+    if args.command == "writer-status":
+        assert root is not None
+        return emit_result(writer_claim_status(root))
+
+    if args.command == "writer-claim":
+        assert root is not None
+        return emit_result(
+            claim_writer(
+                root,
+                force=args.force,
+                acknowledge_writers_stopped=args.acknowledge_writers_stopped,
+            )
+        )
+
     if args.command == "init":
         assert root is not None
         def action(operation: OperationGuard) -> dict[str, Any]:
@@ -654,6 +727,8 @@ def _main(argv: list[str] | None = None) -> int:
                 query=args.query,
                 card_scope=args.card_scope,
                 project_id=args.project_id,
+                include_cue_recall=args.include_cue_recall,
+                cue_recall_limit=args.cue_recall_limit,
                 create=False,
             )
         )
@@ -887,7 +962,57 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "serve":
         assert root is not None
-        return emit_result(serve_workers(root, roles=args.role, limit=args.passes, interval_seconds=args.interval_seconds))
+        return emit_result(
+            serve_workers(
+                root,
+                roles=args.role,
+                limit=args.passes,
+                interval_seconds=args.interval_seconds,
+                maintenance_interval_seconds=args.maintenance_interval_seconds,
+                maintenance_on_start=not args.no_maintenance_on_start,
+            )
+        )
+
+    if args.command == "reconcile-workers":
+        assert root is not None
+        if not args.apply:
+            return emit_result(
+                reconcile_worker_backlog(
+                    root,
+                    dry_run=True,
+                    queue_limit=args.queue_limit,
+                    card_limit=args.card_limit,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = reconcile_worker_backlog(
+                root,
+                dry_run=False,
+                queue_limit=args.queue_limit,
+                card_limit=args.card_limit,
+            )
+            operation.cursor(
+                {
+                    "phase": "worker_backlog_reconciled",
+                    "queue_changed": (result.get("queue") or {}).get("changed"),
+                    "cards_changed": (result.get("cards") or {}).get("changed"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_reconcile_workers",
+                title="Reconcile Epic Continuum worker backlog",
+                intent={"queue_limit": args.queue_limit, "card_limit": args.card_limit},
+                snapshot_policy="auto",
+                snapshot_reason="worker backlog reconciliation mutates queue and card status",
+                touched_paths=[root / "catalog" / "catalog.sqlite3", root / "cards"],
+                action=action,
+            )
+        )
 
     if args.command == "memory-health":
         assert root is not None
@@ -935,6 +1060,7 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="auto",
                 snapshot_reason="pruning mutates card status/projection state",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
                 action=action,
             )
         )
@@ -1101,6 +1227,7 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="auto",
                 snapshot_reason="legacy secret cleanup mutates catalog text columns",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
                 action=action,
             )
         )
@@ -1109,6 +1236,55 @@ def _main(argv: list[str] | None = None) -> int:
         result = verify_proof_pack(Path(args.path), root=root, strict=True)
         emit(result)
         return 0 if result.get("ok") else 1
+
+    if args.command == "archive-proofs":
+        assert root is not None
+        archive_root = Path(args.archive_root)
+        if not args.apply:
+            return emit_result(
+                archive_legacy_catalog_snapshots(
+                    root,
+                    archive_root,
+                    keep_latest=args.keep_latest,
+                    dry_run=True,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = archive_legacy_catalog_snapshots(
+                root,
+                archive_root,
+                keep_latest=args.keep_latest,
+                dry_run=False,
+            )
+            operation.cursor(
+                {
+                    "phase": "legacy_catalog_proofs_archived",
+                    "archived_count": result.get("archived_count"),
+                    "archived_bytes": result.get("archived_bytes"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_archive_proofs",
+                title="Archive legacy catalog proof snapshots",
+                intent={"archive_root": str(archive_root), "keep_latest": args.keep_latest},
+                snapshot_policy="none",
+                snapshot_reason="proof relocation is content-addressed and independently restorable",
+                touched_paths=[root / "config" / "proof-archive.json", root / "exports" / "proof_artifacts"],
+                action=action,
+            )
+        )
+
+    if args.command == "verify-proof-archive":
+        assert root is not None
+        selected_archive_root = Path(args.archive_root) if args.archive_root else configured_archive_root(root)
+        if selected_archive_root is None:
+            return emit_result({"ok": False, "reason": "proof_archive_not_configured", "root": str(root)})
+        return emit_result(verify_relocation_ledger(root, selected_archive_root))
 
     if args.command == "replay-operation-log":
         result = replay_operation_event_log(Path(args.path), operation_id=args.operation_id)

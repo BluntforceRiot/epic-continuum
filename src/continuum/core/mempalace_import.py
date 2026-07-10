@@ -1452,6 +1452,7 @@ def _import_mempalace_locked(
             priority=65,
             payload={"import_id": import_id, "counts": counts, "snapshot": _root_relative_snapshot(root, snapshot)},
             preemptible=True,
+            dedupe_key=f"import:{import_id}",
         )
         audit_event(
             target,
@@ -1619,7 +1620,7 @@ def _import_mempalace_locked(
             source.close()
             source = None
         sqlite_backup(root / "catalog" / "catalog.sqlite3", catalog_backup_path)
-        proof_touched_paths = [
+        proof_touched_paths: list[Path | str] = [
             receipt_path,
             manifest_path,
             Path(str(resume_state["resume_state_uri"])),
@@ -1635,6 +1636,7 @@ def _import_mempalace_locked(
             root,
             operation_id,
             touched_paths=proof_touched_paths,
+            catalog_proof_mode="snapshot",
             extra={
                 "import_id": import_id,
                 "finished_receipt_hash": finished.get("receipt_hash"),
@@ -1714,10 +1716,12 @@ def _import_mempalace_locked(
         touched_paths.extend(imported_artifact_paths)
         touched_paths.extend(collect_import_artifact_paths(root, import_id))
         touched_paths = sorted({path for path in touched_paths if path.exists()}, key=lambda item: str(item))
+        failure_proof_touched_paths: list[Path | str] = list(touched_paths)
         create_proof_pack(
             root,
             operation_id,
-            touched_paths=touched_paths,
+            touched_paths=failure_proof_touched_paths,
+            catalog_proof_mode="snapshot",
             extra={
                 "failure_type": type(exc).__name__,
                 "import_id": import_id,

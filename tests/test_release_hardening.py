@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -97,7 +98,7 @@ class ReleaseHardeningTest(unittest.TestCase):
         with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "999999999999999999999999999"}):
             self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
 
-    def test_release_builder_includes_readme_linked_review_relay_doc(self) -> None:
+    def test_release_builder_includes_readme_linked_operational_docs(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "build_release_package.py"
         spec = importlib.util.spec_from_file_location("build_release_package_under_test", script)
@@ -106,7 +107,13 @@ class ReleaseHardeningTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        self.assertTrue(module.should_include(repo_root / "docs" / "review-relay.md", repo_root))
+        for relative_path in (
+            "docs/review-relay.md",
+            "docs/worker-operations.md",
+            "docs/writer-claims.md",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue(module.should_include(repo_root / relative_path, repo_root))
 
     def test_sdist_tar_modes_are_normalized(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -129,6 +136,45 @@ class ReleaseHardeningTest(unittest.TestCase):
                         bad_modes.append((member.name, actual, expected))
 
         self.assertEqual(bad_modes, [])
+
+    def test_sdist_is_reproducible_with_source_date_epoch(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        epoch = 1_700_000_000
+        payloads: list[bytes] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for build_number in range(2):
+                dist_dir = Path(tmp) / f"dist-{build_number}"
+                dist_dir.mkdir()
+                env = os.environ.copy()
+                env["SOURCE_DATE_EPOCH"] = str(epoch)
+                proc = subprocess.run(
+                    [sys.executable, "setup.py", "sdist", "--dist-dir", str(dist_dir)],
+                    cwd=repo_root,
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                sdist = next(dist_dir.glob("*.tar.gz"))
+                payload = sdist.read_bytes()
+                payloads.append(payload)
+
+                self.assertEqual(payload[:2], b"\x1f\x8b")
+                self.assertEqual(payload[3] & 0x08, 0, "gzip header must not contain an original filename")
+                self.assertEqual(int.from_bytes(payload[4:8], "little"), epoch)
+                with tarfile.open(sdist, "r:gz") as tf:
+                    members = tf.getmembers()
+                    self.assertTrue(members)
+                    for member in members:
+                        self.assertEqual(member.mtime, epoch, member.name)
+                        for header in ("mtime", "atime", "ctime"):
+                            if header in member.pax_headers:
+                                self.assertEqual(member.pax_headers[header], str(epoch), member.name)
+
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(hashlib.sha256(payloads[0]).hexdigest(), hashlib.sha256(payloads[1]).hexdigest())
 
     def test_static_release_metadata_matches_pyproject_version(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -392,7 +438,7 @@ version = "9.9.9"
                 self.assertIn("epic-continuum-9.9.9/docs/cue-recall.md", set(zf.namelist()))
 
     def test_generated_release_provenance_survives_rebuilt_wheel_and_sdist(self) -> None:
-        if importlib.util.find_spec("build") is None:
+        if importlib.util.find_spec("build.__main__") is None:
             self.skipTest("python -m build is required for release-source package smoke")
 
         repo_root = Path(__file__).resolve().parents[1]

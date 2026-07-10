@@ -132,6 +132,39 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertTrue(tools["continuum_pack_root"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_verify_bundle"]["annotations"]["openWorldHint"])
 
+    def test_mcp_catalog_proof_policy_separates_routine_and_high_risk_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                init_db(root)
+                append_scroll_event(
+                    root,
+                    session_id="proof-policy",
+                    event_type="message",
+                    role="user",
+                    content="policy event",
+                )
+                routine = call_tool(
+                    "continuum_reindex_memory",
+                    {"root": str(root), "dry_run": False, "limit": 10, "batch_size": 10},
+                )
+                routine_proof = json.loads(Path(routine["_operation"]["proof_pack_uri"]).read_text(encoding="utf-8"))
+                self.assertEqual(routine_proof["catalog_proof_mode"], "state_manifest")
+                self.assertIn(
+                    "sqlite_state_manifest",
+                    [item.get("kind") for item in routine_proof["path_substitutions"]],
+                )
+
+                for tool_name, arguments in (
+                    ("continuum_prune_memory", {"root": str(root), "all": True, "limit": 1}),
+                    ("continuum_redact_legacy_secrets", {"root": str(root), "apply": True, "limit": 1}),
+                ):
+                    with self.subTest(tool=tool_name):
+                        result = call_tool(tool_name, arguments)
+                        proof = json.loads(Path(result["_operation"]["proof_pack_uri"]).read_text(encoding="utf-8"))
+                        self.assertEqual(proof["catalog_proof_mode"], "snapshot")
+                        self.assertIn("sqlite_backup", [item.get("kind") for item in proof["path_substitutions"]])
+
     def test_project_and_reindex_mcp_schemas_match_supported_arguments(self) -> None:
         recover_props = TOOLS["continuum_recover_thread"][1]["properties"]
         compile_props = TOOLS["continuum_compile_context"][1]["properties"]
@@ -365,8 +398,15 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     for item in proof["paths"]
                     if item.get("kind") == "file"
                 }
-                self.assertIn(rolled["card_uri"], sidecar_paths)
-                self.assertIn("sha256", sidecar_paths[rolled["card_uri"]])
+                self.assertNotIn(rolled["card_uri"], sidecar_paths)
+                sidecar_substitution = next(
+                    item
+                    for item in proof["path_substitutions"]
+                    if item.get("kind") == "mutable_internal_file_snapshot"
+                )
+                frozen_sidecar = str(Path(root) / sidecar_substitution["frozen"]["uri"])
+                self.assertIn(frozen_sidecar, sidecar_paths)
+                self.assertIn("sha256", sidecar_paths[frozen_sidecar])
 
                 recovery = call_tool(
                     "continuum_recover_thread",

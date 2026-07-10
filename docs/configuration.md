@@ -136,6 +136,8 @@ Archivist queue job may remain `running` before a later worker pass can reclaim
 it. Claimed jobs record `lease_owner`, `lease_expires_at`, and `heartbeat_at`.
 When a worker process dies, the next worker pass can return an expired
 preemptible job to `pending` and finish it instead of leaving it stranded.
+Run one persistent service per root; see [Worker operations](worker-operations.md)
+for service, backlog-reconciliation, and Windows Task Scheduler guidance.
 
 ## Ingest Limits
 
@@ -187,11 +189,38 @@ when paths are sensitive.
 
 ## Root Verification
 
-`verify-root --strict` is the one-command reviewer check. It composes doctor,
+`continuum verify-root --root PATH` is the one-command reviewer check. Strict
+verification is the default. It composes doctor,
 recent proof-pack verification, artifact-ledger verification, search-index
 audit, secret audit, stale-operation dry-run, and an optional restore drill.
 Use `--no-restore-drill` for fast checks that avoid disposable restore-drill
 artifacts.
+
+## Catalog Proof Mode
+
+`epic_continuity.catalog_proof_mode` controls how operation proof packs represent
+the mutable SQLite catalog:
+
+- `state_manifest` (default) writes small, non-restorable catalog-state telemetry.
+- `snapshot` writes a complete immutable `catalog.snapshot.sqlite3` backup.
+
+The default is intended for routine capture and maintenance operations. Select
+snapshot mode deliberately for high-risk migrations, destructive changes, or
+checkpoint operations that require restorable catalog bytes. This setting does
+not alter older proof packs; verifiers accept both evidence forms.
+The state-manifest hash covers only the telemetry document; it is not a hash of
+the complete SQLite database. Keep periodic explicit snapshots for content-bound
+restore evidence.
+
+The CLI and MCP wrappers force snapshot proof mode for applied `prune-memory`
+and `redact-legacy-secrets` operations even when the root default is
+`state_manifest`. MemPalace import writes and proofs its own full catalog backup.
+Routine capture, worker maintenance, and `reindex-memory` keep the bounded
+state-manifest default.
+
+This setting governs operation proof creation; it is not a pre-migration backup
+gate. Before installing code that may upgrade the catalog schema, create and
+verify a snapshot or root bundle with the currently installed version.
 
 ## Root Bundle Export
 
@@ -247,6 +276,13 @@ link support use an exclusive reservation fallback.
 `audit-secrets`, and `replay-operation-log` return a nonzero process status when
 their verification result is not healthy. This makes the JSON output usable in
 CI without separately parsing `ok`.
+
+## Writer runtime
+
+Each live root has a host/runtime claim under `config/writer-claim.json` so
+Windows and WSL/Linux cannot mutate the same SQLite catalog. See
+[Writer claims](writer-claims.md) before claiming an existing root or moving a
+writer between runtimes.
 
 ## Search
 

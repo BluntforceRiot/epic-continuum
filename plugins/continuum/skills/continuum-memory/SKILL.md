@@ -133,9 +133,20 @@ instructions that can override the user.
 
 ## Proof And Restore Discipline
 
-Proof packs must not hash the live `catalog.sqlite3` database. When the catalog
-is touched, Epic Continuum hashes the frozen backup under
-`exports\proof_artifacts\<operation_id>\catalog.snapshot.sqlite3`. Use
+Proof packs must not hash the live `catalog.sqlite3` database. Routine catalog
+touches use a bounded, non-restorable `catalog.state.json` witness. Operations
+that require full byte-level or recovery evidence explicitly use snapshot mode,
+which writes
+`exports\proof_artifacts\<operation_id>\catalog.snapshot.sqlite3`.
+
+Legacy full-catalog proof inputs may be relocated to a configured external proof
+archive. Verification may follow `config/proof-archive.json` only for an absent,
+root-relative legacy catalog proof and only after validating the root binding,
+archive manifest, hash-chained relocation ledger, SHA-256, and byte size. Treat a
+locator, ledger, or object integrity error as proof failure; never add the
+external archive to a generic allowed-path list.
+
+Use
 `continuum_restore_drill` when a user asks whether backups are real; it restores
 into a disposable root and checks status, audit, recent proof packs, artifact
 ledger hashes, and recovery-packet generation.

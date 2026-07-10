@@ -27,6 +27,7 @@ from .safety import (
     scan_value_for_secrets,
 )
 from .units import format_size, parse_size
+from .writer_claim import ensure_writer_claim, writer_claim_status
 
 
 # Catalog schema version is intentionally independent from the package version.
@@ -749,7 +750,8 @@ def verify_snapshot_manifest_for_root(
         if actual_counts != expected_counts:
             errors.append({"error": "snapshot_counts_mismatch", "expected": expected_counts, "actual": actual_counts})
     sidecars_path = snapshot_sidecars_path(snapshot_path)
-    expected_sidecars = manifest.get("card_sidecars") if isinstance(manifest.get("card_sidecars"), dict) else {}
+    raw_expected_sidecars = manifest.get("card_sidecars")
+    expected_sidecars: dict[str, Any] = raw_expected_sidecars if isinstance(raw_expected_sidecars, dict) else {}
     actual_sidecars = _sidecar_hashes(sidecars_path)
     if actual_sidecars != expected_sidecars:
         errors.append({"error": "snapshot_sidecars_mismatch", "expected_count": len(expected_sidecars), "actual_count": len(actual_sidecars)})
@@ -1868,6 +1870,9 @@ def truncate_to_token_budget(text: str, token_budget: int) -> tuple[str, bool]:
 
 
 def connect(root: Path) -> sqlite3.Connection:
+    # This is the single live-catalog write connection factory. Keep the claim
+    # check here so direct library callers cannot bypass the runtime boundary.
+    ensure_writer_claim(root)
     db_path = root / "catalog" / "catalog.sqlite3"
     secure_mkdir(root, secure_existing=True)
     secure_mkdir(db_path.parent, secure_existing=True)
@@ -2105,6 +2110,7 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
         ("queue_jobs", "lease_owner", "lease_owner TEXT"),
         ("queue_jobs", "lease_expires_at", "lease_expires_at TEXT"),
         ("queue_jobs", "heartbeat_at", "heartbeat_at TEXT"),
+        ("queue_jobs", "dedupe_key", "dedupe_key TEXT"),
         ("graph_edges", "last_decay_at", "last_decay_at TEXT"),
         ("graph_edge_sources", "status", "status TEXT NOT NULL DEFAULT 'active'"),
         ("graph_edge_sources", "decay_count", "decay_count INTEGER NOT NULL DEFAULT 0"),
@@ -2128,11 +2134,17 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lease_expiry ON queue_jobs(status, lease_expires_at)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key "
+        "ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL"
+    )
     conn.execute("PRAGMA user_version = 2")
     return applied
 
 
 def init_db(root: Path) -> None:
+    # Claim before creating layout/config files or running schema migrations.
+    ensure_writer_claim(root)
     cache_key = str(root.resolve(strict=False))
     if cache_key in _INIT_DB_CACHE and is_initialized(root) and config_path(root).exists():
         return
@@ -2534,6 +2546,8 @@ def reindex_memory(
 
 
 SQLITE_SECRET_AUDIT_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
+SECRET_AUDIT_SOURCE_SUFFIXES = {".py", ".pyi"}
+SECRET_AUDIT_BINARY_SUFFIXES = {".pyc", ".pyo"}
 LEGACY_SECRET_REDACTION_COLUMNS: dict[str, set[str]] = {
     "audit_events": {"actor", "target_id", "payload_json"},
     "snapshots": {"reason"},
@@ -2859,6 +2873,16 @@ def _scan_sqlite_text_for_secrets(path: Path, *, max_findings: int) -> list[dict
     return findings
 
 
+def _has_sqlite_signature(path: Path) -> bool:
+    if path.suffix.casefold() not in SQLITE_SECRET_AUDIT_SUFFIXES:
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
 def audit_secrets(
     root: Path,
     *,
@@ -2915,22 +2939,35 @@ def audit_secrets(
 
     candidates = sorted(root.rglob("*"), key=lambda item: item.as_posix()) if root.exists() else []
     for path in candidates:
-        if not path.is_file() and not path.is_symlink():
+        try:
+            is_symlink = path.is_symlink()
+            is_file = False if is_symlink else path.is_file()
+        except OSError as exc:
+            files_skipped += 1
+            skipped.append(
+                {
+                    "path": continuum_uri(root, path),
+                    "path_redacted": False,
+                    "reason": "unreadable",
+                    "error": str(exc),
+                }
+            )
             continue
-        is_allowlist_file = path.resolve(strict=False) == allowlist_path.resolve(strict=False)
+        if not is_file and not is_symlink:
+            continue
+        is_allowlist_file = os.path.normcase(str(path.absolute())) == os.path.normcase(str(allowlist_path.absolute()))
         try:
             rel = lexical_continuum_uri(root, path) if path.is_symlink() else continuum_uri(root, path)
             path_findings = scan_text_for_secrets(rel, max_findings=5)
             safe_rel = redact_text_secrets(rel) if path_findings else rel
             path_redacted = safe_rel != rel
             if path.is_symlink():
+                link_error: str | None = None
                 try:
                     link_target = os.readlink(path)
                 except OSError as exc:
                     link_target = ""
                     link_error = str(exc)
-                else:
-                    link_error = None
                 try:
                     size = path.lstat().st_size
                 except OSError:
@@ -3002,6 +3039,19 @@ def audit_secrets(
                     break
             if len(findings) >= max_findings:
                 break
+            if path.suffix.casefold() in SECRET_AUDIT_BINARY_SUFFIXES:
+                files_skipped += 1
+                skipped.append(
+                    {
+                        "path": safe_rel,
+                        "path_redacted": path_redacted,
+                        **({"path_hash": content_hash(rel)} if path_redacted else {}),
+                        "reason": "binary_cache_skipped",
+                        "size_bytes": size,
+                    }
+                )
+                continue
+            sqlite_file = _has_sqlite_signature(path)
             sqlite_remaining = max_findings - len(findings)
             for finding in _scan_sqlite_text_for_secrets(path, max_findings=sqlite_remaining):
                 scoped = dict(finding)
@@ -3015,6 +3065,19 @@ def audit_secrets(
                     break
             if len(findings) >= max_findings:
                 break
+            if size > max_file_bytes and sqlite_file and not is_allowlist_file:
+                files_scanned += 1
+                skipped.append(
+                    {
+                        "path": safe_rel,
+                        "path_redacted": path_redacted,
+                        **({"path_hash": content_hash(rel)} if path_redacted else {}),
+                        "reason": "sqlite_raw_bytes_skipped_after_structured_scan",
+                        "size_bytes": size,
+                        "max_file_bytes": max_file_bytes,
+                    }
+                )
+                continue
             if size > max_file_bytes and not is_allowlist_file:
                 files_skipped += 1
                 skipped.append(
@@ -3050,6 +3113,12 @@ def audit_secrets(
             break
         text = data.decode("utf-8", errors="replace")
         text_findings = scan_text_for_secrets(text, max_findings=remaining)
+        if path.suffix.casefold() in SECRET_AUDIT_SOURCE_SUFFIXES:
+            text_findings = [
+                finding
+                for finding in text_findings
+                if finding.get("type") not in {"secret_assignment", "sensitive_key_assignment"}
+            ]
         if len(text_findings) < remaining:
             text_findings.extend(
                 _scan_serialized_json_value_for_secrets(
@@ -3274,6 +3343,7 @@ def enqueue_job(
     payload: dict[str, Any],
     related_card_ids: list[str] | None = None,
     preemptible: bool = True,
+    dedupe_key: str | None = None,
 ) -> str:
     # Queue rows are a durable sink too. Most call sites only pass generated IDs,
     # but direct/API use can otherwise smuggle secrets into payload_json. Redact
@@ -3282,28 +3352,61 @@ def enqueue_job(
     safe_related_card_ids = redact_value_secrets(related_card_ids or [])
     safe_role = redact_text_secrets(str(role))
     safe_job_type = redact_text_secrets(str(job_type))
+    stored_dedupe_key = None
+    if dedupe_key is not None:
+        raw_dedupe_key = str(dedupe_key).strip()
+        if not raw_dedupe_key:
+            raise ValueError("dedupe_key must not be empty")
+        # Store an opaque, fully scoped digest so stable object identities cannot
+        # leak secret-bearing source IDs into the durable queue catalog. Including
+        # role and type prevents unrelated worker protocols from colliding when
+        # they happen to use the same object identifier.
+        stored_dedupe_key = "queue_v1_" + content_hash(
+            json_dumps([safe_role, safe_job_type, raw_dedupe_key])
+        )
+        existing = conn.execute(
+            "SELECT id FROM queue_jobs WHERE status = 'pending' AND dedupe_key = ? LIMIT 1",
+            (stored_dedupe_key,),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
     now = utc_now()
     job_id = unique_id("job")
-    conn.execute(
-        """
-        INSERT INTO queue_jobs(
-            id, role, job_type, priority, status, preemptible,
-            related_card_ids_json, payload_json, created_at, updated_at
+    try:
+        conn.execute(
+            """
+            INSERT INTO queue_jobs(
+                id, role, job_type, priority, status, preemptible, dedupe_key,
+                related_card_ids_json, payload_json, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                safe_role,
+                safe_job_type,
+                priority,
+                1 if preemptible else 0,
+                stored_dedupe_key,
+                json_dumps(safe_related_card_ids),
+                json_dumps(safe_payload),
+                now,
+                now,
+            ),
         )
-        VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
-        """,
-        (
-            job_id,
-            safe_role,
-            safe_job_type,
-            priority,
-            1 if preemptible else 0,
-            json_dumps(safe_related_card_ids),
-            json_dumps(safe_payload),
-            now,
-            now,
-        ),
-    )
+    except sqlite3.IntegrityError:
+        # A concurrent writer can win after the lookup above. The pending-only
+        # unique index is the authority; reuse its row without touching terminal
+        # history. Re-raise unrelated integrity failures.
+        if stored_dedupe_key is None:
+            raise
+        existing = conn.execute(
+            "SELECT id FROM queue_jobs WHERE status = 'pending' AND dedupe_key = ? LIMIT 1",
+            (stored_dedupe_key,),
+        ).fetchone()
+        if existing is None:
+            raise
+        return str(existing["id"])
     return job_id
 
 
@@ -3475,6 +3578,7 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
                     priority=25,
                     payload={"card_id": card_id, "reason": "post_commit_sync_failed"},
                     related_card_ids=[card_id],
+                    dedupe_key=f"card:{card_id}",
                 )
         conn.commit()
     except Exception as exc:
@@ -3678,7 +3782,7 @@ def add_graph_edge(
     last_decay_at = now if defer_initial_decay else None
     existing = conn.execute(
         """
-        SELECT source_refs_json
+        SELECT id, source_refs_json
         FROM graph_edges
         WHERE source_node_id = ? AND relation = ? AND target_node_id = ?
         """,
@@ -3716,6 +3820,15 @@ def add_graph_edge(
             last_decay_at,
         ),
     )
+    edge_row = conn.execute(
+        """
+        SELECT id
+        FROM graph_edges
+        WHERE source_node_id = ? AND relation = ? AND target_node_id = ?
+        """,
+        (source_node_id, relation, target_node_id),
+    ).fetchone()
+    actual_edge_id = str(edge_row["id"]) if edge_row else edge_id
     for ref in source_refs:
         if not isinstance(ref, dict):
             continue
@@ -3743,10 +3856,10 @@ def add_graph_edge(
                 last_decay_at = coalesce(excluded.last_decay_at, graph_edge_sources.last_decay_at),
                 updated_at = excluded.updated_at
             """,
-            (edge_id, source_ref_key, source_ref_json, weight, confidence, now, now, now, last_decay_at),
+            (actual_edge_id, source_ref_key, source_ref_json, weight, confidence, now, now, now, last_decay_at),
         )
-    refresh_graph_edge_aggregate(conn, edge_id, now=now)
-    return edge_id
+    refresh_graph_edge_aggregate(conn, actual_edge_id, now=now)
+    return actual_edge_id
 
 
 def index_scroll_event_associations(
@@ -4191,6 +4304,7 @@ def _append_scroll_event_once(
                 **({"project_id": str(metadata["project_id"])} if metadata.get("project_id") else {}),
                 "visibility_scope": metadata.get("visibility_scope", "global"),
             },
+            dedupe_key=f"session:{session_id}",
         )
         audit_event(
             conn,
@@ -4405,6 +4519,7 @@ def roll_scroll_segment(root: Path, *, session_id: str, start_seq: int, end_seq:
                 **({"project_id": segment_project_id} if segment_project_id else {}),
             },
             related_card_ids=[card_id],
+            dedupe_key=f"card:{card_id}",
         )
         archivist_job = enqueue_job(
             conn,
@@ -4419,6 +4534,7 @@ def roll_scroll_segment(root: Path, *, session_id: str, start_seq: int, end_seq:
                 **({"project_id": segment_project_id} if segment_project_id else {}),
             },
             related_card_ids=[card_id],
+            dedupe_key=f"segment:{segment_id}",
         )
         audit_event(
             conn,
@@ -4634,6 +4750,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
             priority=70,
             payload={"card_id": card_id, "book_id": book_id},
             related_card_ids=[card_id],
+            dedupe_key=f"card:{card_id}",
         )
         archivist_job = enqueue_job(
             conn,
@@ -4642,6 +4759,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
             priority=80,
             payload={"book_id": book_id, "content_hash": digest},
             related_card_ids=[card_id],
+            dedupe_key=f"book:{book_id}",
         )
         audit_event(
             conn,
@@ -4747,6 +4865,32 @@ def reinforce_card_recall(
     return updated
 
 
+def _cue_recall_context_payload(item: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {"source": "cue_recall_candidate", "authority": "non_authoritative_evidence"}
+    for key in (
+        "kind",
+        "id",
+        "score",
+        "reasons",
+        "related_terms",
+        "title",
+        "summary",
+        "source_refs",
+        "session_id",
+        "project_id",
+        "seq",
+        "event_type",
+        "created_at",
+    ):
+        value = item.get(key)
+        if value is None or value == "" or (isinstance(value, (list, dict)) and not value):
+            continue
+        if key == "score" and isinstance(value, (int, float)):
+            value = round(float(value), 6)
+        result[key] = value
+    return result
+
+
 def compile_context(
     root: Path,
     *,
@@ -4756,9 +4900,15 @@ def compile_context(
     create: bool = True,
     card_scope: str | None = None,
     project_id: str | None = None,
+    include_cue_recall: bool = False,
+    cue_recall_limit: int = 4,
 ) -> dict[str, Any]:
     session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
+    try:
+        bounded_cue_recall_limit = max(1, min(int(cue_recall_limit), 20))
+    except (TypeError, ValueError):
+        bounded_cue_recall_limit = 4
     if create:
         init_db(root)
     elif not is_initialized(root):
@@ -4766,6 +4916,9 @@ def compile_context(
             "session_id": session_id,
             "initialized": False,
             "token_budget": token_budget,
+            "include_cue_recall": bool(include_cue_recall),
+            "cue_recall_limit": bounded_cue_recall_limit,
+            "cue_recall_result_count": 0,
             "estimated_tokens": 0,
             "remaining_budget": max(0, token_budget),
             "section_count": 0,
@@ -4791,6 +4944,7 @@ def compile_context(
         remaining = usable_context_budget
         sections: list[dict[str, Any]] = []
         truncated_items: list[dict[str, Any]] = []
+        cue_recall_result_count = 0
         recent_events = _visible_scroll_rows(
             conn,
             session_id=session_id,
@@ -4921,6 +5075,70 @@ def compile_context(
             if card_lines:
                 sections.append({"kind": "recalled_cards", "text": "\n".join(card_lines), "card_ids": emitted_card_ids})
 
+        if include_cue_recall and query and remaining > 0:
+            cue_result = cue_recall(
+                root,
+                cue=query,
+                session_id=session_id,
+                project_id=project_id,
+                limit=bounded_cue_recall_limit,
+                max_associations=max(8, min(32, bounded_cue_recall_limit * 4)),
+                create=False,
+            )
+            cue_results = list(cue_result.get("results", []))
+            cue_recall_result_count = len(cue_results)
+            cue_lines: list[str] = []
+            for item in cue_results:
+                if remaining <= 0:
+                    truncated_items.append(
+                        {
+                            "kind": "cue_recall_candidate",
+                            "id": item.get("id"),
+                            "included_estimated_tokens": 0,
+                            "reason": "omitted_due_to_budget",
+                        }
+                    )
+                    break
+                payload = _cue_recall_context_payload(item)
+                line = markdown_json_evidence(payload)
+                cost = estimate_tokens(line)
+                if remaining - cost < 0:
+                    truncated_line, was_truncated = markdown_json_evidence_for_budget(payload, remaining)
+                    included_cost = estimate_tokens(truncated_line)
+                    if truncated_line and included_cost <= remaining:
+                        cue_lines.append(truncated_line)
+                        remaining -= included_cost
+                        if was_truncated:
+                            truncated_items.append(
+                                {
+                                    "kind": "cue_recall_candidate",
+                                    "id": payload.get("id"),
+                                    "original_estimated_tokens": cost,
+                                    "included_estimated_tokens": included_cost,
+                                }
+                            )
+                    else:
+                        truncated_items.append(
+                            {
+                                "kind": "cue_recall_candidate",
+                                "id": payload.get("id"),
+                                "original_estimated_tokens": cost,
+                                "included_estimated_tokens": 0,
+                                "reason": "omitted_due_to_budget",
+                            }
+                        )
+                    break
+                cue_lines.append(line)
+                remaining -= cost
+            if cue_lines:
+                sections.append(
+                    {
+                        "kind": "cue_recall_candidates",
+                        "text": "\n".join(cue_lines),
+                        "result_count": cue_recall_result_count,
+                    }
+                )
+
         context_text = "\n\n".join(f"## {section['kind']}\n{section['text']}" for section in sections)
         context_truncated = bool(truncated_items)
         if estimate_tokens(context_text) > usable_context_budget:
@@ -4948,6 +5166,9 @@ def compile_context(
             "section_count": len(sections),
             "recent_scroll_fetch_limit": event_fetch_limit,
             "card_recall_scope": card_scope,
+            "include_cue_recall": bool(include_cue_recall),
+            "cue_recall_limit": bounded_cue_recall_limit,
+            "cue_recall_result_count": cue_recall_result_count,
             "truncated": context_truncated or bool(truncated_items),
             "truncated_items": truncated_items,
             "context_text": context_text,
@@ -4981,7 +5202,6 @@ def search_memory(
     try:
         terms = extract_terms(query, limit=8)
         bounded_limit = max(1, min(int(limit), 100))
-        scoped = bool(session_id or project_id)
 
         def book_visible(metadata_json: str | None) -> bool:
             metadata = json_loads(metadata_json, {})
@@ -6006,6 +6226,21 @@ def record_project_state(
             confidence=0.8,
             source_refs=[{"event_id": event["event_id"], "card_id": card_id}],
         )
+        librarian_job_id = enqueue_job(
+            conn,
+            role="librarian",
+            job_type="review_card_placement",
+            priority=70,
+            payload={
+                "card_id": card_id,
+                "event_id": event["event_id"],
+                "session_id": safe_session_id,
+                "project_id": safe_project_id,
+                "visibility_scope": safe_visibility_scope,
+            },
+            related_card_ids=[card_id],
+            dedupe_key=f"card:{card_id}",
+        )
         conn.commit()
         sync_card_sidecars_after_commit(root, [card_id])
         return {
@@ -6013,6 +6248,7 @@ def record_project_state(
             "event_id": event["event_id"],
             "seq": event["seq"],
             "card_id": card_id,
+            "librarian_job_id": librarian_job_id,
             "project_id": safe_project_id,
             "agent_id": safe_agent_id,
             "repo_ref": repo_ref,
@@ -6640,11 +6876,32 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
+    protected_snapshot_uris: set[str] = set()
+    if is_initialized(root):
+        conn = connect_existing(root)
+        try:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").fetchone():
+                rows = conn.execute("SELECT uri FROM artifacts WHERE immutable = 1").fetchall()
+                for row in rows:
+                    candidate = resolve_stored_uri(root, str(row["uri"]))
+                    if (
+                        candidate.name.startswith("continuum_catalog_")
+                        and candidate.suffix == ".sqlite3"
+                        and candidate.parent.resolve(strict=False) == snapshots_dir.resolve(strict=False)
+                    ):
+                        protected_snapshot_uris.add(continuum_uri(root, candidate))
+        finally:
+            conn.close()
     deleted = 0
+    protected = 0
     retired_snapshot_uris: list[str] = []
     retired_snapshot_ids: list[str] = []
     for old_snapshot in snapshots[keep:]:
-        retired_snapshot_uris.append(continuum_uri(root, old_snapshot))
+        old_snapshot_uri = continuum_uri(root, old_snapshot)
+        if old_snapshot_uri in protected_snapshot_uris:
+            protected += 1
+            continue
+        retired_snapshot_uris.append(old_snapshot_uri)
         if snapshot_id := snapshot_id_from_catalog_path(old_snapshot):
             retired_snapshot_ids.append(snapshot_id)
         sidecars = snapshot_sidecars_path(old_snapshot)
@@ -6684,7 +6941,13 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             conn.commit()
         finally:
             conn.close()
-    return {"policy": policy, "deleted": deleted, "kept": keep, "catalog_rows_retired": catalog_rows_retired}
+    return {
+        "policy": policy,
+        "deleted": deleted,
+        "kept": keep,
+        "protected": protected,
+        "catalog_rows_retired": catalog_rows_retired,
+    }
 
 
 def _snapshot_link_like_reason(path: Path) -> str | None:
@@ -6892,6 +7155,7 @@ def status(root: Path, *, create: bool = True) -> dict[str, Any]:
             "root": str(root),
             "initialized": False,
             "schema_version": SCHEMA_VERSION,
+            "writer_claim": writer_claim_status(root),
             "config": {
                 "path": str(config_path(root)),
                 "exists": config_path(root).exists(),
@@ -6918,6 +7182,7 @@ def status(root: Path, *, create: bool = True) -> dict[str, Any]:
             "root": str(root),
             "initialized": initialized,
             "schema_version": SCHEMA_VERSION,
+            "writer_claim": writer_claim_status(root),
             "config": {
                 "path": str(root / "config" / "continuum.config.json"),
                 "vram_active_pane_budget": format_size(parse_size(config["hardware"]["vram"]["active_pane_budget"])),

@@ -53,6 +53,9 @@ _TRANSIENT_PREFIXES = (
 _TRANSIENT_NAMES = {
     "catalog/catalog.sqlite3-wal",
     "catalog/catalog.sqlite3-shm",
+    # A writer claim describes one live host/runtime, not portable root data.
+    # Extracted bundles intentionally require an explicit claim before writing.
+    "config/writer-claim.json",
     BUNDLE_MANIFEST_NAME,
 }
 
@@ -845,7 +848,7 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
                     }
                 )
                 continue
-        for line_number, parsed in values:
+        for value_line_number, parsed in values:
             remaining = max_findings - len(findings)
             if remaining <= 0:
                 break
@@ -853,10 +856,10 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
                 parsed,
                 scan_embedded_paths=rel.suffix.casefold() == ".log",
             )[:remaining]:
-                item["source"] = "jsonl" if line_number is not None else "json"
+                item["source"] = "jsonl" if value_line_number is not None else "json"
                 item["file"] = rel.as_posix()
-                if line_number is not None:
-                    item["line"] = line_number
+                if value_line_number is not None:
+                    item["line"] = value_line_number
                 findings.append(item)
 
     remaining = max_findings - len(findings)

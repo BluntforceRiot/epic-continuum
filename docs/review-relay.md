@@ -29,10 +29,12 @@ exports/review_bridge/jobs/review_.../
   review-prompt.md
   expected-response.schema.json
   source-manifest.json
+  inner-archive-manifest.json   # present when the subject is a ZIP
   subject.zip
   review-capsule.zip
   manual-handoff.md
   browser-handoff.md
+  browser-handoffs/
   secret-allowlist-report.json
   responses/
   findings/
@@ -52,14 +54,20 @@ review-capsule.zip
   request.json
   expected-response.schema.json
   source-manifest.json
+  inner-archive-manifest.json   # present when a ZIP subject is expanded
   review-packet.md
+  original/release.zip          # original ZIP subject, when applicable
   subject/...
 ```
 
+When the subject is a ZIP file, Continuum validates the ZIP, computes an inner member manifest, preserves the
+original archive under `original/`, and expands reviewable members directly under `subject/`. A full-capsule
+review result for such jobs must echo both `inner_archive_manifest_sha256` and `inner_archive_member_count`.
+
 The capsule cannot contain its own final SHA-256 because that would change the ZIP. The final capsule hash is
-reported in `status.json`, `manual-handoff.md`, `browser-handoff.md`, `review-status`, and `review-prepare`
-output. The reviewer must echo that hash in `review_capsule_sha256`. `browser-handoff.md` is generated only
-after the capsule exists, so it is the source of truth for browser-only Pro relays.
+reported in `status.json`, `manual-handoff.md`, the mutable latest `browser-handoff.md`, `review-status`, and
+`review-prepare` output. The reviewer must echo that hash in `review_capsule_sha256`. Browser-only Pro relays
+should use the immutable numbered handoff returned as `browser_handoff_uri` after `review-browser-attempt-start`.
 
 Only `review-capsule.zip` is intended to be uploaded or shared with the reviewer. The local job files
 (`request.json`, `status.json`, and `manual-handoff.md`) may contain local paths so Codex can resume,
@@ -73,17 +81,32 @@ is truncated or critical files are omitted, Continuum downgrades a clean packet-
 `review_surface: "full_capsule"` and `subject_inspected: true`; that full-capsule signal is not downgraded
 only because the packet excerpts were limited.
 
-Review preparation scans every decodable snapshot file, UTF-8/UTF-16 text, ZIP member contents, ZIP metadata,
-generated request/instruction text, and the completed capsule boundary for obvious secret-like material before
-publishing a capsule hash. Use `--secret-allowlist-pattern` only for known false-positive lines in review
-fixtures or documentation. For repeated fixture sets, place the same anchored patterns in a UTF text file and
-pass `--secret-allowlist-file`. Patterns must be anchored to Continuum's `source:line:text` target, such as
-`^tests/test_fixture.py:12:.*synthetic_token`. The source path and line number are treated as exact targets;
-wildcards in the source or line are rejected, and only the text tail is a regex. Raw patterns and local
-allowlist file paths are not written into the public capsule; only counts are recorded. Suppressed findings
-are written to the local `secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan
-blocks, Continuum removes the temporary preparation directory and does not leave an uploadable capsule or
-subject archive behind.
+Review preparation scans every snapshot file with a raw-byte credential pass, decodable UTF-8/UTF-16/UTF-32
+text, ZIP member contents, ZIP metadata, generated request/instruction text, and the completed capsule
+boundary for obvious secret-like material before publishing a capsule hash. ZIP scans enforce nesting, member
+count, per-member size, cumulative uncompressed size, and compression-ratio limits. Invalid or unscanned
+archive material fails closed.
+
+Use `--secret-allowlist-file` for synthetic review fixtures that intentionally contain fake credentials. The
+preferred file format is JSONL with exact finding fingerprints:
+
+```json
+{"source":"tests/test_fixture.py","line":12,"finding_type":"openai_key","secret_sha256":"...","line_sha256":"...","reason":"synthetic fixture"}
+```
+
+The fingerprint must match the canonical scanner source, line number, finding type, matched secret SHA-256,
+and full line SHA-256. Replacing the fixture value with a different token invalidates the exception. The legacy
+`--secret-allowlist-pattern` route remains only for non-hashed false positives; hashed token and private-key
+findings are never suppressed by a source-line regex alone. Raw allowlist file paths are not written into the
+public capsule; only counts are recorded. Suppressed findings are written to the local
+`secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan blocks, Continuum removes
+the temporary preparation directory and does not leave an uploadable capsule or subject archive behind.
+
+Maintainers reconcile the repository fixture allowlist with
+`python scripts/generate_review_fixture_allowlist.py --check`. After deliberately reviewing and adding an exact
+fingerprint for any new synthetic fixture, run the script with `--write`. It relocates existing approvals when
+only line numbers change, removes and reports obsolete approvals, and refuses to write if any scanned finding
+does not match an approved source/type/secret/line fingerprint.
 
 Directory subjects must fit under `--max-files`. If the file limit is reached, a custom `.continuumignore`
 rule excludes subject files, the subject is inside the Continuum root, or a non-empty subject produces an
@@ -120,8 +143,8 @@ continuum review-prepare \
   --transport manual
 ```
 
-If a fixture or documentation line trips the review secret scanner, suppress only that line with a narrow
-regex:
+If a fixture or documentation line trips the review secret scanner, prefer an exact fingerprint allowlist file.
+Legacy regex patterns can only suppress non-hashed findings:
 
 ```bash
 continuum review-prepare \
@@ -138,12 +161,12 @@ continuum review-prepare \
   --subject ./epic-continuum-0.2.0.zip \
   --prompt "Do a harsh release-boundary review." \
   --transport manual \
-  --secret-allowlist-file docs/review-fixture-secret-allowlist.txt
+  --secret-allowlist-file docs/review-fixture-secret-allowlist.jsonl
 ```
 
 For a browser-only reviewer, reserve a response path before each attempt. Upload `review-capsule.zip` to the
-reviewer, paste the exact short prompt from `browser-handoff.md`, save the reviewer JSON to the reserved path,
-and ingest that exact file:
+reviewer, paste the exact short prompt from the numbered handoff returned as `browser_handoff_uri`, save the
+reviewer JSON to the reserved path, and ingest that exact file:
 
 ```bash
 continuum review-browser-attempt-start \
@@ -157,8 +180,14 @@ continuum review-ingest \
 ```
 
 If the reviewer returns malformed JSON, keep that raw response, run `review-browser-attempt-start` again, and
-use the newly reserved `response-002.raw.txt` path. Continuum rejects reused or consumed browser response
-paths, so a failed `response-001.raw.txt` remains evidence rather than becoming a retry slot.
+use the newly reserved `response-002.raw.txt` path. Continuum writes immutable per-attempt handoffs under
+`browser-handoffs/` and keeps `browser-handoff.md` as a mutable latest pointer. Continuum rejects reused or
+consumed browser response paths, so a failed `response-001.raw.txt` remains evidence rather than becoming a
+retry slot.
+
+If a process stops after validation while status is `ingesting`, rerun `review-ingest` with the same reserved
+response path. The pending response hash and deterministic output paths make that continuation idempotent;
+changing the raw response during recovery is rejected.
 
 Check status:
 

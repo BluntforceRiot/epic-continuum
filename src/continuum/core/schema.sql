@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     lease_owner TEXT,
     lease_expires_at TEXT,
     heartbeat_at TEXT,
+    dedupe_key TEXT,
     related_card_ids_json TEXT NOT NULL DEFAULT '[]',
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -222,6 +223,7 @@ CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status, salience DESC);
 CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC);
 CREATE INDEX IF NOT EXISTS idx_books_tier ON books(storage_tier, status);
 CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_edge ON graph_edge_sources(edge_id);

@@ -78,6 +78,7 @@
   "epic_continuity": {
     "operation_receipts": true,
     "principle": "No one said we could not back it up while building it.",
+    "catalog_proof_mode": "state_manifest",
     "run_dir": "run/operations",
     "export_dir": "exports/operation_receipts",
     "proof_pack_dir": "exports/proof_packs",

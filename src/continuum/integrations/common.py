@@ -204,7 +204,7 @@ def record_tool_event(
             return None
         if not text:
             return None
-    result = append_scroll_event(
+    event = append_scroll_event(
         resolved_root,
         session_id=session_id,
         event_type=f"{source}_{kind}",
@@ -212,8 +212,8 @@ def record_tool_event(
         content=text,
         metadata=event_metadata,
     )
-    maybe_maintain_after_capture(resolved_root, session_id=result["session_id"])
-    return result
+    maybe_maintain_after_capture(resolved_root, session_id=event["session_id"])
+    return event
 
 
 def compile_context_packet(
@@ -223,6 +223,8 @@ def compile_context_packet(
     query: Any = None,
     token_budget: int = DEFAULT_TOKEN_BUDGET,
     header: str = DEFAULT_CONTEXT_HEADER,
+    include_cue_recall: bool = False,
+    cue_recall_limit: int = 4,
 ) -> str:
     resolved_root = Path(root) if root else default_continuum_root()
     context = compile_context(
@@ -230,6 +232,8 @@ def compile_context_packet(
         session_id=session_id,
         token_budget=int(token_budget),
         query=as_text(query).strip() or None,
+        include_cue_recall=include_cue_recall,
+        cue_recall_limit=cue_recall_limit,
     )
     return format_context_packet(context, header=header)
 

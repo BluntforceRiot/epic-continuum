@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/proof_artifact_relocation.schema.json",
+  "title": "Epic Continuum proof artifact relocation record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "sequence",
+    "action",
+    "recorded_at",
+    "root_binding",
+    "source_uri",
+    "archive_uri",
+    "sha256",
+    "size_bytes",
+    "previous_record_hash",
+    "record_hash"
+  ],
+  "properties": {
+    "schema": {
+      "const": "epic_continuum.proof_artifact_relocation.v1"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "action": {
+      "enum": ["archived", "restored"]
+    },
+    "recorded_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_binding": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_uri": {
+      "type": "string",
+      "pattern": "^exports/proof_artifacts/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/catalog[.]snapshot[.]sqlite3$"
+    },
+    "archive_uri": {
+      "type": "string",
+      "pattern": "^objects/sha256/[0-9a-f]{2}/[0-9a-f]{64}[.]sqlite3$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "previous_record_hash": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "record_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

@@ -30,7 +30,7 @@ The current core compiler reports:
 
 ## Current Implementation Notes
 
-The current `compile-context` command emphasizes recent Scroll events and matching Cards. It enforces visibility and project/session scope, then ranks direct text matches by relevance, recency, and salience. Library evidence is available through `search`, loose associative recall is available through `cue-recall`, and shared handoff checkpoints are available through project-state Cards.
+The current `compile-context` command emphasizes recent Scroll events and matching Cards by default. It enforces visibility and project/session scope, then ranks direct text matches by relevance, recency, and salience. When a caller explicitly enables `--include-cue-recall` / `include_cue_recall`, the compiler can also add a budgeted `cue_recall_candidates` section from loose associative recall. Library evidence remains available through `search`, broader associative recall remains available through `cue-recall`, and shared handoff checkpoints are available through project-state Cards.
 
 This distinction matters for accurate public claims:
 

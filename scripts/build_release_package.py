@@ -187,9 +187,11 @@ def should_include(path: Path, repo_root: Path) -> bool:
                 "docs/how-memory-works.md",
                 "docs/ORIGINAL_DESIGN_COVERAGE_2026-06-17.md",
                 "docs/recovery-and-continuity.md",
-                "docs/review-fixture-secret-allowlist.txt",
+                "docs/review-fixture-secret-allowlist.jsonl",
                 "docs/review-relay.md",
                 "docs/shared-agent-state.md",
+                "docs/worker-operations.md",
+                "docs/writer-claims.md",
             }
         )
         if not allowed_docs:

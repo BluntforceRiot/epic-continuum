@@ -41,6 +41,7 @@ class EpicContinuumConfigTest(unittest.TestCase):
             self.assertEqual(config["capture"]["max_tool_result_bytes"], "256KB")
             self.assertEqual(config["retention"]["prune_policy"], "ask")
             self.assertFalse(config["retention"]["delete_raw_evidence"])
+            self.assertEqual(config["epic_continuity"]["catalog_proof_mode"], "state_manifest")
             self.assertTrue((root / "config" / "continuum.config.json").exists())
 
     def test_capture_policy_can_disable_automatic_adapter_turns(self) -> None:
@@ -718,6 +719,11 @@ class EpicContinuumConfigTest(unittest.TestCase):
 
         config = default_config()
         config["retention"]["proof_pack_retention"] = "ninety-days"
+        with self.assertRaises(ValueError):
+            validate_config(config)
+
+        config = default_config()
+        config["epic_continuity"]["catalog_proof_mode"] = "copy_every_time"
         with self.assertRaises(ValueError):
             validate_config(config)
 

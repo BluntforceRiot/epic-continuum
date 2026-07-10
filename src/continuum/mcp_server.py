@@ -5,7 +5,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, overload
 
 from . import __version__
 from .core.bundle import pack_root, verify_root_bundle
@@ -122,7 +122,7 @@ def validate_allowed_path(path: Path, *, purpose: str) -> Path:
     allowed = ", ".join(str(root) for root in roots)
     raise ValueError(
         f"{purpose} path is outside this MCP server's allowed roots: {path}. "
-        f"Set CONTINUUM_ROOT or CONTINUUM_ALLOWED_ROOTS to include it."
+        f"Allowed roots: {allowed or '(none)'}. Set CONTINUUM_ROOT or CONTINUUM_ALLOWED_ROOTS to include it."
     )
 
 
@@ -164,7 +164,15 @@ def optional_str_list(args: JSON, key: str) -> list[str]:
     return value
 
 
-def optional_int(args: JSON, key: str, default: int) -> int:
+@overload
+def optional_int(args: JSON, key: str, default: int) -> int: ...
+
+
+@overload
+def optional_int(args: JSON, key: str, default: None) -> int | None: ...
+
+
+def optional_int(args: JSON, key: str, default: int | None) -> int | None:
     value = args.get(key, default)
     if value is None:
         return default
@@ -263,6 +271,7 @@ def guarded_tool(
     touched_paths: list[Path | str] | None = None,
     result_touched_paths: Callable[[Any], list[Path | str]] | None = None,
     proof: bool = True,
+    catalog_proof_mode: str | None = None,
     action: Callable[[OperationGuard], Any],
 ) -> Any:
     with OperationGuard(
@@ -275,6 +284,7 @@ def guarded_tool(
         snapshot_reason=snapshot_reason,
         touched_paths=touched_paths,
         proof=proof,
+        catalog_proof_mode=catalog_proof_mode,
     ) as operation:
         result = action(operation)
         extra_paths = result_touched_paths(result) if result_touched_paths else []
@@ -459,6 +469,8 @@ def tool_compile_context(args: JSON) -> Any:
         query=optional_str(args, "query"),
         card_scope=optional_str(args, "card_scope"),
         project_id=project_id,
+        include_cue_recall=optional_bool(args, "include_cue_recall"),
+        cue_recall_limit=optional_int(args, "cue_recall_limit", 4),
         create=False,
     )
 
@@ -611,22 +623,32 @@ def tool_reindex_memory(args: JSON) -> Any:
     root = root_arg(args)
     dry_run = optional_bool(args, "dry_run", True)
     promote_exact_memory = optional_bool(args, "promote_exact_memory", True)
-    common = {
-        "session_id": validate_public_partition_arg(root, "session_id", optional_str(args, "session_id")),
-        "after_seq": optional_int(args, "after_seq", 0),
-        "after_rowid": optional_int(args, "after_rowid", 0),
-        "limit": optional_int(args, "limit", 500),
-        "batch_size": optional_int(args, "batch_size", 100),
-        "promote_exact_memory": promote_exact_memory,
-    }
-    if common["after_seq"] and not common["session_id"]:
+    session_id = validate_public_partition_arg(root, "session_id", optional_str(args, "session_id"))
+    after_seq = optional_int(args, "after_seq", 0)
+    after_rowid = optional_int(args, "after_rowid", 0)
+    limit = optional_int(args, "limit", 500)
+    batch_size = optional_int(args, "batch_size", 100)
+    if after_seq and not session_id:
         raise ValueError("after_seq can only be used with session_id; use after_rowid for root-wide reindex")
-    safe_session_id = public_partition_label(common["session_id"])
+    safe_session_id = public_partition_label(session_id)
+
+    def run_reindex(*, dry_run: bool) -> JSON:
+        return reindex_memory(
+            root,
+            session_id=session_id,
+            after_seq=after_seq,
+            after_rowid=after_rowid,
+            limit=limit,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            promote_exact_memory=promote_exact_memory,
+        )
+
     if dry_run:
-        return reindex_memory(root, dry_run=True, **common)
+        return run_reindex(dry_run=True)
 
     def action(operation: OperationGuard) -> JSON:
-        result = reindex_memory(root, dry_run=False, **common)
+        result = run_reindex(dry_run=False)
         operation.cursor(
             {
                 "phase": "memory_reindexed",
@@ -641,9 +663,16 @@ def tool_reindex_memory(args: JSON) -> Any:
 
     return guarded_tool(
         root,
-                operation_type="mcp_reindex_memory",
-                title="Reindex Epic Continuum Scroll associations",
-                intent={**common, "session_id": safe_session_id},
+        operation_type="mcp_reindex_memory",
+        title="Reindex Epic Continuum Scroll associations",
+        intent={
+            "session_id": safe_session_id,
+            "after_seq": after_seq,
+            "after_rowid": after_rowid,
+            "limit": limit,
+            "batch_size": batch_size,
+            "promote_exact_memory": promote_exact_memory,
+        },
         snapshot_policy="auto",
         snapshot_reason="memory reindex mutates derived graph/card state",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
@@ -778,6 +807,7 @@ def tool_prune_memory(args: JSON) -> Any:
         snapshot_policy="auto",
         snapshot_reason="pruning mutates card status/projection state",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        catalog_proof_mode="snapshot",
         action=action,
     )
 
@@ -916,6 +946,7 @@ def tool_redact_legacy_secrets(args: JSON) -> Any:
         snapshot_policy="auto",
         snapshot_reason="legacy secret cleanup mutates catalog text columns",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        catalog_proof_mode="snapshot",
         action=action,
     )
 
@@ -1315,6 +1346,8 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
                 "card_scope": {"type": "string", "enum": ["session", "global", "session_then_global", "project"]},
+                "include_cue_recall": {"type": "boolean"},
+                "cue_recall_limit": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "additionalProperties": False,
         },
@@ -1925,6 +1958,7 @@ def serve() -> int:
         line = line.strip()
         if not line:
             continue
+        response: JSON | None
         try:
             request = json.loads(line)
         except json.JSONDecodeError as exc:

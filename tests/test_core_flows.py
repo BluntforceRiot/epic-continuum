@@ -936,6 +936,153 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             self.assertGreaterEqual(len(context["truncated_items"]), 1)
             self.assertGreaterEqual(context["remaining_budget"], 0)
 
+    def test_compile_context_cue_recall_candidates_are_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            marker = "CUE_BRIDGE_DEFAULT_OFF_MARKER_9KA"
+            append_scroll_event(
+                root,
+                session_id="cue-context-default",
+                event_type="message",
+                role="user",
+                content=f"Remember this buried cue idea: {marker}",
+            )
+
+            context = compile_context(
+                root,
+                session_id="cue-context-default",
+                query=marker,
+                token_budget=3000,
+            )
+
+            self.assertFalse(context["include_cue_recall"])
+            self.assertEqual(context["cue_recall_limit"], 4)
+            self.assertNotIn("## cue_recall_candidates", context["context_text"])
+
+    def test_compile_context_can_include_cue_recall_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            marker = "CUE_BRIDGE_INCLUDED_MARKER_4XQ"
+            append_scroll_event(
+                root,
+                session_id="cue-context-included",
+                event_type="message",
+                role="user",
+                content=f"The buried bridge concept uses marker {marker}",
+            )
+
+            context = compile_context(
+                root,
+                session_id="cue-context-included",
+                query=marker,
+                token_budget=3000,
+                include_cue_recall=True,
+                cue_recall_limit=3,
+            )
+
+            self.assertTrue(context["include_cue_recall"])
+            self.assertEqual(context["cue_recall_limit"], 3)
+            self.assertGreaterEqual(context["cue_recall_result_count"], 1)
+            self.assertIn("## cue_recall_candidates", context["context_text"])
+            self.assertIn(marker, context["context_text"])
+            self.assertIn('"source": "cue_recall_candidate"', context["context_text"])
+
+    def test_compile_context_cue_recall_candidates_respect_project_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            alpha_marker = "ALPHA_CUE_BRIDGE_MARKER_71Q"
+            beta_marker = "BETA_CUE_BRIDGE_MARKER_82Z"
+            append_scroll_event(
+                root,
+                session_id="shared-cue-context",
+                event_type="message",
+                role="user",
+                content=f"Alpha project cue evidence {alpha_marker}",
+                metadata={"visibility_scope": "project", "project_id": "alpha"},
+            )
+            append_scroll_event(
+                root,
+                session_id="shared-cue-context",
+                event_type="message",
+                role="user",
+                content=f"Beta project cue evidence {beta_marker}",
+                metadata={"visibility_scope": "project", "project_id": "beta"},
+            )
+
+            context = compile_context(
+                root,
+                session_id="shared-cue-context",
+                project_id="alpha",
+                query=f"{alpha_marker} {beta_marker}",
+                token_budget=4000,
+                include_cue_recall=True,
+            )
+
+            self.assertIn("## cue_recall_candidates", context["context_text"])
+            self.assertIn(alpha_marker, context["context_text"])
+            self.assertNotIn(beta_marker, context["context_text"])
+
+    def test_compile_context_cue_recall_candidates_do_not_reinforce_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            marker = "ZXQJXQ999777"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="project_state",
+                    title="Alpha graph route target",
+                    summary="This Card is reached only through a synthetic association route.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="cue-no-reinforce",
+                    project_id="alpha",
+                    salience=0.5,
+                    confidence=0.8,
+                )
+                term_node = upsert_graph_node(conn, kind="term", label=marker)
+                card_node = upsert_graph_node(conn, kind="card", label="Alpha graph route target", card_id=card_id)
+                add_graph_edge(
+                    conn,
+                    source_node_id=term_node,
+                    relation="points_to",
+                    target_node_id=card_node,
+                    weight=0.9,
+                    confidence=0.9,
+                    source_refs=[{"card_id": card_id, "visibility_scope": "project", "project_id": "alpha"}],
+                    merge_mode="max",
+                )
+                conn.commit()
+
+            with closing(connect_catalog(root)) as conn:
+                before = conn.execute(
+                    "SELECT recall_count, salience FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+
+            context = compile_context(
+                root,
+                session_id="another-agent",
+                project_id="alpha",
+                query=marker,
+                token_budget=4000,
+                include_cue_recall=True,
+                create=True,
+            )
+
+            self.assertIn("## cue_recall_candidates", context["context_text"])
+            self.assertNotIn("## recalled_cards", context["context_text"])
+            self.assertIn(card_id, context["context_text"])
+            with closing(connect_catalog(root)) as conn:
+                after = conn.execute(
+                    "SELECT recall_count, salience FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+            self.assertEqual(before["recall_count"], after["recall_count"])
+            self.assertEqual(before["salience"], after["salience"])
+
     def test_project_scoped_recovery_cue_and_context_do_not_cross_projects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -1221,6 +1368,45 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                 conn.close()
             self.assertGreaterEqual(changed, 1)
             self.assertEqual(source_count, 2)
+
+    def test_add_graph_edge_uses_existing_legacy_edge_id_for_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(conn, kind="term", label="legacy-source")
+                target = upsert_graph_node(conn, kind="term", label="legacy-target")
+                conn.execute(
+                    """
+                    INSERT INTO graph_edges(
+                        id, source_node_id, relation, target_node_id, weight, confidence,
+                        source_refs_json, created_at, updated_at
+                    )
+                    VALUES(
+                        'edge_legacy_id', ?, 'mentions', ?, 0.2, 0.7,
+                        '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    )
+                    """,
+                    (source, target),
+                )
+                conn.commit()
+
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[{"card_id": "card_legacy"}],
+                )
+                conn.commit()
+                source_rows = conn.execute(
+                    "SELECT edge_id FROM graph_edge_sources WHERE source_ref_json LIKE '%card_legacy%'"
+                ).fetchall()
+
+            self.assertEqual(edge_id, "edge_legacy_id")
+            self.assertEqual([row["edge_id"] for row in source_rows], ["edge_legacy_id"])
 
     def test_semantic_integrity_rejects_graph_sources_with_missing_catalog_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

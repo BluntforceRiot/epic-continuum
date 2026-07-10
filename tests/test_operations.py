@@ -19,13 +19,18 @@ import continuum.core.store as store_module
 from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
 from continuum.core.permissions import secure_write_text
+from continuum.core.proof_archive import apply_legacy_catalog_archive, configured_archive_root
+from continuum.core.writer_claim import claim_writer
 from continuum.core.store import (
     audit_secrets,
     append_scroll_event,
     compile_context,
+    connect,
     connect_existing,
+    enforce_snapshot_retention,
     ingest_file,
     init_db,
+    record_artifact,
     roll_scroll_segment,
     snapshot,
     snapshot_manifest_path,
@@ -426,7 +431,7 @@ class OperationLedgerTest(unittest.TestCase):
             verification = verify_proof_pack(Path(proof["proof_pack_uri"]), root=root)
             self.assertTrue(verification["ok"], verification["errors"])
 
-    def test_proof_pack_freezes_live_catalog_and_records_artifacts(self) -> None:
+    def test_proof_pack_explicit_snapshot_freezes_live_catalog_and_records_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
             append_scroll_event(root, session_id="proof-freeze", event_type="message", role="user", content="freeze db")
@@ -434,7 +439,12 @@ class OperationLedgerTest(unittest.TestCase):
             started = start_operation(root, operation_type="freeze_test", title="Freeze live DB")
             finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
 
-            proof = create_proof_pack(root, started["operation_id"], touched_paths=[live_catalog])
+            proof = create_proof_pack(
+                root,
+                started["operation_id"],
+                touched_paths=[live_catalog],
+                catalog_proof_mode="snapshot",
+            )
 
             proof_paths = {item.get("uri") or item["path"] for item in proof["paths"]}
             self.assertNotIn(str(live_catalog), proof_paths)
@@ -455,6 +465,248 @@ class OperationLedgerTest(unittest.TestCase):
                 conn.close()
             self.assertIn("proof_pack", artifact_kinds)
             self.assertIn("proof_input", artifact_kinds)
+
+            proof_path = Path(proof["proof_pack_uri"])
+            legacy = json.loads(proof_path.read_text(encoding="utf-8"))
+            legacy.pop("catalog_proof_mode")
+            legacy["proof_pack_hash"] = _proof_pack_hash(legacy)
+            proof_path.write_text(json.dumps(legacy, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            ledger = sqlite3.connect(root / "catalog" / "catalog.sqlite3")
+            try:
+                ledger.execute(
+                    "UPDATE artifacts SET sha256 = ?, size_bytes = ? WHERE kind = 'proof_pack' AND operation_id = ?",
+                    (hashlib.sha256(proof_path.read_bytes()).hexdigest(), proof_path.stat().st_size, started["operation_id"]),
+                )
+                ledger.commit()
+            finally:
+                ledger.close()
+            legacy_verification = verify_proof_pack(proof_path, root=root)
+            self.assertTrue(legacy_verification["ok"], legacy_verification["errors"])
+
+    def test_proof_pack_freezes_mutable_catalog_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(root, session_id="sidecar-proof", event_type="message", role="user", content="freeze sidecar")
+            segment = roll_scroll_segment(root, session_id="sidecar-proof", start_seq=1, end_seq=1)
+            sidecar = Path(segment["card_uri"])
+            started = start_operation(root, operation_type="sidecar_freeze", title="Freeze mutable sidecar")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+
+            proof = create_proof_pack(root, started["operation_id"], touched_paths=[sidecar])
+            sidecar.write_text(sidecar.read_text(encoding="utf-8") + "# later mutation\n", encoding="utf-8")
+
+            substitutions = [
+                item
+                for item in proof["path_substitutions"]
+                if item.get("kind") == "mutable_internal_file_snapshot"
+            ]
+            self.assertEqual(len(substitutions), 1)
+            frozen_uri = substitutions[0]["frozen"]["uri"]
+            self.assertTrue((root / frozen_uri).exists())
+            verification = verify_proof_pack(Path(proof["proof_pack_uri"]), root=root)
+            self.assertTrue(verification["ok"], verification["errors"])
+            conn = connect_existing(root)
+            try:
+                live_sidecar_artifacts = conn.execute(
+                    "SELECT count(*) AS n FROM artifacts WHERE immutable = 1 AND uri = ?",
+                    (root_uri(root, sidecar),),
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertEqual(live_sidecar_artifacts, 0)
+
+    def test_relocated_catalog_proof_verifies_through_root_bound_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            archive = base / "external-proof-archive"
+            append_scroll_event(root, session_id="relocated-proof", event_type="message", role="user", content="proof")
+            live_catalog = root / "catalog" / "catalog.sqlite3"
+            ordinary_evidence = root / "archive" / "ordinary-evidence.txt"
+            ordinary_evidence.parent.mkdir(parents=True, exist_ok=True)
+            ordinary_evidence.write_text("root-bound evidence\n", encoding="utf-8")
+            started = start_operation(root, operation_type="relocated_proof", title="Relocated proof")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            proof = create_proof_pack(
+                root,
+                started["operation_id"],
+                touched_paths=[live_catalog, ordinary_evidence],
+                catalog_proof_mode="snapshot",
+            )
+            proof_path = Path(proof["proof_pack_uri"])
+            catalog_item = next(
+                item
+                for item in proof["paths"]
+                if str(item.get("uri") or item.get("path")).endswith("catalog.snapshot.sqlite3")
+            )
+            original_catalog_proof = proof_item_path(root, catalog_item)
+
+            archived = apply_legacy_catalog_archive(root, archive)
+            self.assertTrue(archived["ok"], archived)
+            self.assertFalse(original_catalog_proof.exists())
+
+            verification = verify_proof_pack(proof_path, root=root, allowed_roots=[root])
+            self.assertTrue(verification["ok"], verification["errors"])
+            relocated_checks = [
+                check for check in verification["checks"] if check.get("storage") == "external_proof_archive"
+            ]
+            self.assertEqual(len(relocated_checks), 1)
+            self.assertEqual(relocated_checks[0]["path"], str(original_catalog_proof))
+            self.assertTrue(
+                Path(relocated_checks[0]["resolved_path"]).resolve().is_relative_to(archive.resolve())
+            )
+
+            health = doctor(root)
+            self.assertTrue(health["ok"], health["checks"])
+            artifact_check = next(
+                check for check in health["checks"] if check["name"] == "artifact_ledger_portable_and_hashes_match"
+            )
+            self.assertGreaterEqual(artifact_check["relocated"], 1)
+            self.assertTrue(artifact_check["proof_archive"]["ok"])
+
+            ordinary_evidence.unlink()
+            missing_unrelated = verify_proof_pack(proof_path, root=root, allowed_roots=[root])
+            self.assertFalse(missing_unrelated["ok"])
+            ordinary_path_check = next(
+                check for check in missing_unrelated["checks"] if check.get("path") == str(ordinary_evidence)
+            )
+            self.assertNotIn("storage", ordinary_path_check)
+
+    def test_relocated_catalog_proof_and_doctor_fail_closed_on_archive_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            archive = base / "external-proof-archive"
+            append_scroll_event(root, session_id="tampered-relocation", event_type="message", role="user", content="proof")
+            started = start_operation(root, operation_type="tampered_relocation", title="Tampered relocation")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            proof = create_proof_pack(
+                root,
+                started["operation_id"],
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
+            )
+            proof_path = Path(proof["proof_pack_uri"])
+            archived = apply_legacy_catalog_archive(root, archive)
+            self.assertTrue(archived["ok"])
+            object_path = archive.joinpath(*archived["results"][0]["archive_uri"].split("/"))
+            object_bytes = object_path.read_bytes()
+            object_path.write_bytes(bytes([object_bytes[0] ^ 1]) + object_bytes[1:])
+
+            object_tamper = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(object_tamper["ok"])
+            self.assertTrue(
+                any(
+                    "RelocatedArtifactIntegrityError" in str(error.get("relocation_error"))
+                    for error in object_tamper["errors"]
+                ),
+                object_tamper["errors"],
+            )
+            object_path.write_bytes(object_bytes)
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+
+            ledger_path = archive / "relocations.jsonl"
+            record = json.loads(ledger_path.read_text(encoding="utf-8"))
+            record["size_bytes"] += 1
+            ledger_path.write_text(
+                json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+            verification = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(verification["ok"])
+            self.assertTrue(
+                any("RelocationLedgerError" in str(error.get("relocation_error")) for error in verification["errors"]),
+                verification["errors"],
+            )
+            health = doctor(root)
+            self.assertFalse(health["ok"])
+            artifact_check = next(
+                check for check in health["checks"] if check["name"] == "artifact_ledger_portable_and_hashes_match"
+            )
+            self.assertFalse(artifact_check["proof_archive"]["ok"])
+
+    def test_proof_pack_defaults_to_bounded_catalog_state_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(root, session_id="proof-state", event_type="message", role="user", content="state db")
+            live_catalog = root / "catalog" / "catalog.sqlite3"
+            started = start_operation(root, operation_type="state_test", title="Witness live DB")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+
+            proof = create_proof_pack(root, started["operation_id"], touched_paths=[live_catalog])
+
+            self.assertEqual(proof["catalog_proof_mode"], "state_manifest")
+            substitutions = [
+                item for item in proof["path_substitutions"] if item.get("kind") == "sqlite_state_manifest"
+            ]
+            self.assertEqual(len(substitutions), 1)
+            state_path = root / substitutions[0]["frozen"]["uri"]
+            self.assertTrue(state_path.exists())
+            self.assertFalse((state_path.parent / "catalog.snapshot.sqlite3").exists())
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema"], "epic_continuum.catalog_state.v1")
+            self.assertEqual(state["operation_id"], started["operation_id"])
+            self.assertEqual(state["source"]["uri"], "catalog/catalog.sqlite3")
+            self.assertEqual(state["assurance"], "non_restorable_catalog_state_telemetry")
+            self.assertFalse(state["restorable"])
+            self.assertFalse(state["content_binding"]["catalog_bytes_bound"])
+            self.assertNotIn("row_count", state["table_state"]["artifacts"])
+            self.assertTrue(state["state_hash"])
+            verification = verify_proof_pack(Path(proof["proof_pack_uri"]), root=root)
+            self.assertTrue(verification["ok"], verification["errors"])
+
+            state["table_state"]["artifacts"]["rowid_high_water"] += 1
+            state_path.write_text(json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tampered = verify_proof_pack(Path(proof["proof_pack_uri"]), root=root)
+            self.assertFalse(tampered["ok"])
+            self.assertTrue(any(error.get("check") == "catalog_state_manifest_0_semantic" for error in tampered["errors"]))
+
+    def test_repeated_catalog_proofs_do_not_copy_catalog_per_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            live_catalog = root / "catalog" / "catalog.sqlite3"
+            for index in range(20):
+                with OperationGuard(
+                    root,
+                    operation_type="bounded_catalog_proof",
+                    title=f"Bounded catalog proof {index}",
+                    touched_paths=[live_catalog],
+                ) as operation:
+                    append_scroll_event(
+                        root,
+                        session_id="bounded-proof",
+                        event_type="message",
+                        role="user",
+                        content=f"bounded proof event {index}",
+                    )
+                    operation.succeed({"ok": True, "index": index})
+
+            proof_artifacts = root / "exports" / "proof_artifacts"
+            state_manifests = list(proof_artifacts.rglob("catalog.state.json"))
+            catalog_copies = list(proof_artifacts.rglob("catalog.snapshot.sqlite3"))
+            self.assertEqual(len(state_manifests), 20)
+            self.assertEqual(catalog_copies, [])
+            self.assertLess(sum(path.stat().st_size for path in state_manifests), 1024 * 1024)
+
+    def test_cli_high_risk_catalog_commands_force_snapshot_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            commands = (
+                ["prune-memory", "--root", str(root), "--all"],
+                ["redact-legacy-secrets", "--root", str(root), "--apply", "--limit", "1"],
+            )
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        exit_code = cli_main(command)
+                    self.assertEqual(exit_code, 0, output.getvalue())
+                    result = json.loads(output.getvalue())
+                    proof = json.loads(Path(result["_operation"]["proof_pack_uri"]).read_text(encoding="utf-8"))
+                    self.assertEqual(proof["catalog_proof_mode"], "snapshot")
+                    self.assertIn("sqlite_backup", [item.get("kind") for item in proof["path_substitutions"]])
 
     def test_doctor_reports_healthy_initialized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,6 +751,22 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(result["ok"], result["checks"])
             self.assertTrue(result["sections"]["secret_audit"]["skipped"])
             self.assertTrue(any(check["name"] == "secret_audit_skipped" for check in result["checks"]))
+
+    def test_secret_audit_treats_large_sqlite_as_structurally_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+
+            result = audit_secrets(root, max_file_bytes=100_000)
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result["complete"], result)
+            sqlite_skips = [
+                item
+                for item in result["skipped"]
+                if item.get("reason") == "sqlite_raw_bytes_skipped_after_structured_scan"
+            ]
+            self.assertTrue(sqlite_skips)
 
     def test_recover_stale_operations_marks_interrupted_and_writes_packet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -574,6 +842,7 @@ class OperationLedgerTest(unittest.TestCase):
     def test_strict_proof_verifier_rejects_fake_empty_and_malformed_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
+            claim_writer(root)
             fake = root / "exports" / "proof_packs" / "fake.json"
             fake.parent.mkdir(parents=True)
             fake.write_text(
@@ -772,6 +1041,7 @@ class OperationLedgerTest(unittest.TestCase):
     def test_directory_proof_uses_frozen_manifest_that_survives_later_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
+            claim_writer(root)
             evidence_dir = root / "archive" / "evidence"
             evidence_dir.mkdir(parents=True)
             nested = evidence_dir / "nested" / "item.txt"
@@ -1104,6 +1374,39 @@ class OperationLedgerTest(unittest.TestCase):
                 Path(result["drill_root"]).resolve(strict=False),
             )
 
+    def test_restore_drill_uses_source_bound_archive_without_transplanting_machine_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            archive = base / "external-proof-archive"
+            append_scroll_event(root, session_id="relocated-restore", event_type="message", role="user", content="proof")
+            started = start_operation(root, operation_type="relocated_restore", title="Relocated restore")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            create_proof_pack(
+                root,
+                started["operation_id"],
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
+            )
+            archived = apply_legacy_catalog_archive(root, archive)
+            self.assertTrue(archived["ok"], archived)
+
+            result = restore_drill(root, verify_recent_proof_packs=0)
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertGreaterEqual(result["artifact_ledger"]["relocated"], 1)
+            self.assertEqual(
+                Path(result["artifact_ledger"]["relocation_evidence_root"]).resolve(strict=False),
+                root.resolve(strict=False),
+            )
+            self.assertEqual(
+                set(result["removed_machine_local_config"]),
+                {"proof-archive.json", "writer-claim.json"},
+            )
+            drill_root = Path(result["drill_root"])
+            self.assertIsNone(configured_archive_root(drill_root))
+            self.assertTrue(result["restored_writer_claim"]["compatible"])
+
     def test_restore_drill_refuses_linked_output_parent_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1387,6 +1690,41 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertEqual(len(rows), 20)
             for row in rows:
                 self.assertTrue((root / row["snapshot_uri"]).exists())
+
+    def test_snapshot_retention_preserves_immutable_proof_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            snapshots_dir = root / "snapshots"
+            snapshots: list[Path] = []
+            base_mtime_ns = 1_700_000_000_000_000_000
+            for index in range(22):
+                path = snapshots_dir / f"continuum_catalog_snapshot_20260101T0000{index:02d}Z_{index:032x}.sqlite3"
+                path.write_bytes(f"snapshot-{index}".encode("utf-8"))
+                timestamp = base_mtime_ns + (index * 1_000_000_000)
+                os.utime(path, ns=(timestamp, timestamp))
+                snapshots.append(path)
+            protected = snapshots[0]
+            payload = protected.read_bytes()
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=root_uri(root, protected),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                    size_bytes=len(payload),
+                    immutable=True,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = enforce_snapshot_retention(root)
+
+            self.assertEqual(result["protected"], 1)
+            self.assertTrue(protected.exists())
+            self.assertEqual(len(list(snapshots_dir.glob("continuum_catalog_*.sqlite3"))), 21)
 
     def test_snapshot_restore_preserves_alias_key_for_original_external_identifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

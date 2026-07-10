@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - 2026-06-20
+## 0.2.0 - 2026-07-09
 
 - Added Cue Recall for loose, associative recovery of buried ideas from vague
   prompts while preserving exact Scroll evidence.
@@ -38,6 +38,22 @@
   packet-only review surfaces, blocked-scan cleanup, file-limit refusal, malformed
   response preservation, append-only ingest, Git snapshot stability, and source
   mode metadata binding.
+- Added one-per-root persistent worker services with process locking, bounded
+  maintenance cadence, Windows Task Scheduler support, and operational guidance.
+- Added pending-only queue deduplication and bounded backlog reconciliation that
+  preserves audit history while repairing redundant notifications, stale Cards,
+  missing Librarian reviews, and previously no-op MemPalace import reviews.
+- Added explicit writer claims that prevent Windows, WSL/Linux, macOS, or another
+  host from concurrently mutating the same SQLite root and require an acknowledged
+  stopped-writer handoff before forced transfer.
+- Added compact catalog-state proof manifests for routine operations and a
+  verified external proof archive with a root-bound, hash-chained relocation
+  ledger for legacy full catalog snapshots.
+- Hardened evidence retention by protecting immutable referenced snapshots,
+  freezing mutable Card sidecars before proof hashing, and resolving relocated
+  proof inputs only through verified archive records.
+- Hardened restore drills, SQLite audit behavior, secret-scan coverage reporting,
+  generated fixture allowlisting, release packaging, and static-analysis CI.
 
 ## 0.1.0 - 2026-06-19
 

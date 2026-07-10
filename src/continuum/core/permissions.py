@@ -112,7 +112,7 @@ def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
     tmp_path = Path(tmp_name)
     try:
         if posix_permissions_supported(tmp_path):
-            os.fchmod(fd, PRIVATE_FILE_MODE)
+            os.fchmod(fd, PRIVATE_FILE_MODE)  # type: ignore[attr-defined]  # POSIX-only API
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -154,7 +154,7 @@ def secure_append_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     fd = os.open(str(path), flags, PRIVATE_FILE_MODE)
     try:
         if posix_permissions_supported(path):
-            os.fchmod(fd, PRIVATE_FILE_MODE)
+            os.fchmod(fd, PRIVATE_FILE_MODE)  # type: ignore[attr-defined]  # POSIX-only API
         data = text.encode(encoding)
         view = memoryview(data)
         while view:

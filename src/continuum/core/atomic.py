@@ -105,7 +105,8 @@ def _split_key_value(content: str) -> tuple[str, str]:
         return stripped[:end], rest[1:]
     if ":" not in content:
         raise ValueError(f"invalid atomic YAML line: {content!r}")
-    return content.split(":", 1)
+    key, value = content.split(":", 1)
+    return key, value
 
 
 def _yaml_lines(text: str) -> list[tuple[int, str]]:

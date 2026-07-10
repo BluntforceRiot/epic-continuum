@@ -18,6 +18,7 @@
 
 <p align="center">
   <a href="#the-problem">Problem</a>
+  &middot; <a href="#whats-new-in-02">0.2 Update</a>
   &middot; <a href="#how-memory-works">Memory</a>
   &middot; <a href="#how-the-context-window-works">Context</a>
   &middot; <a href="#cue-recall">Cue Recall</a>
@@ -31,6 +32,30 @@
 
 > [!IMPORTANT]
 > Epic Continuum does not claim infinite context. It keeps durable memory outside the model, then rebuilds a bounded context packet for the work happening now.
+
+## What's New In 0.2
+
+Epic Continuum 0.2 adds the operational controls needed to run one durable
+memory root safely over time:
+
+- **Cue Recall** finds related memories from loose prompts without replacing
+  exact Scroll evidence.
+- **Shared project state** gives Codex, Hermes, Claude Code, and local agents
+  durable handoff checkpoints.
+- **Hash-bound review relay** freezes the review subject and rejects stale or
+  mismatched review results.
+- **Persistent workers** continuously process Scribe, Librarian, Archivist, and
+  sidecar work with pending-job deduplication, leases, and bounded backlog repair.
+- **Bounded proof storage** uses compact catalog-state witnesses for routine
+  operations while retaining explicit full snapshots for restore evidence.
+- **External proof archives** relocate eligible legacy catalog proof snapshots
+  through a root-bound, hash-chained ledger.
+- **Writer claims** prevent Windows, WSL, Linux, macOS, or another host from
+  concurrently mutating the same SQLite root.
+
+The Scroll remains the ordered source of truth. Cards, graph routes, indexes,
+and sidecars are derived recall structures; proof packs, snapshots, and bundles
+remain separately verifiable evidence.
 
 ## The Problem
 
@@ -83,7 +108,7 @@ The model still has a finite token budget. Continuum does not make a model serve
 Instead, context reconstruction follows a repeatable pattern:
 
 1. The agent provides the current session, task, and optional query.
-2. In the current direct implementation, `compile_context` gathers recent Scroll events and matching Cards. Library search, Cue Recall, operation receipts, proof artifacts, and bundles remain durable queryable evidence, but they are not automatically inserted into every direct context packet yet.
+2. By default, `compile_context` gathers recent Scroll events and matching Cards. When an agent explicitly asks for it with `include_cue_recall` / `--include-cue-recall`, the direct compiler can also add a budgeted `cue_recall_candidates` section from Cue Recall. Library search, operation receipts, proof artifacts, and bundles remain durable queryable evidence, but they are not silently inserted into every direct context packet.
 3. The direct compiler filters by visibility, project/session scope, textual relevance, recency, and Card salience. Trust and supersession metadata are preserved for recovery, review, and future planner work, but the current direct packet does not claim a full semantic planner.
 4. The Looking Glass planner assembles the most useful material into the configured token budget.
 5. The model sees that packet, not the entire memory root.
@@ -116,6 +141,12 @@ The system separates:
 Epic Continuum is useful because memory is not trapped inside one chat application, one model, or one agent runtime.
 
 Codex can use it through the local plugin and MCP server. Claude Code and other MCP-capable tools can use the same server pattern. Local LLM setups can use the CLI, Python API, MCP server, or adapter patterns. The important part is that they can point at the same Continuum root.
+
+> [!WARNING]
+> A live Continuum root must have exactly one writer runtime and host. New empty
+> roots are claimed automatically on their first mutation. Existing unclaimed
+> roots must be claimed explicitly. Do not run Windows and WSL writers against
+> the same root, even when both can see the same files.
 
 ```text
 Codex thread
@@ -242,6 +273,25 @@ From a cloned checkout:
 ```bash
 python -m pip install .
 continuum init --root ./.continuum-demo
+continuum writer-status --root ./.continuum-demo
+```
+
+Run exactly one persistent worker service for the root in a second terminal:
+
+```bash
+continuum serve \
+  --root ./.continuum-demo \
+  --interval-seconds 5 \
+  --maintenance-interval-seconds 300
+```
+
+Capture commands durably enqueue follow-up work; the persistent service
+processes that work. It holds a per-root lock, so a second service fails closed
+instead of competing for the same queue.
+
+Back in the first terminal:
+
+```bash
 continuum append-event --root ./.continuum-demo --session-id demo --role user --type message --content "Decision: use Epic Continuum to preserve agent work across restarts."
 continuum append-event --root ./.continuum-demo --session-id demo --role assistant --type message --content "Next action: compile a recovery packet before switching tasks."
 continuum status --root ./.continuum-demo
@@ -272,6 +322,66 @@ Trimmed output from the tested flow:
 The result is not magic model memory. It is local durable state that can be read by the next agent.
 
 ## Upgrade And Repair
+
+### Operational Upgrade Checklist
+
+Before mutating an existing root, choose its sole writer runtime:
+
+```bash
+continuum writer-status --root ./.continuum-demo
+continuum writer-claim --root ./.continuum-demo
+```
+
+Inspect and then repair a legacy worker backlog:
+
+```bash
+continuum reconcile-workers --root ./.continuum-demo
+continuum reconcile-workers --root ./.continuum-demo --apply
+```
+
+Reconciliation is dry-run by default. Applied reconciliation preserves queue
+evidence, marks redundant pending notifications as skipped with an audit reason,
+activates only graph-placed legacy Cards, and leaves genuine reviews for the
+worker.
+
+If older operations created many full catalog proof snapshots, inspect and then
+apply relocation to a separate, non-overlapping archive:
+
+```bash
+continuum archive-proofs \
+  --root ./.continuum-demo \
+  --archive-root ../continuum-proof-archive \
+  --keep-latest 3
+
+continuum archive-proofs \
+  --root ./.continuum-demo \
+  --archive-root ../continuum-proof-archive \
+  --keep-latest 3 \
+  --apply
+
+continuum verify-proof-archive --root ./.continuum-demo
+```
+
+The archive is content-addressed and bound to the originating root. Continuum
+records and verifies the external copy before removing the in-root source. Keep
+the archive with the root's recovery materials; deleting either part breaks
+verification of relocated evidence.
+
+Finish with the normal strict verifier:
+
+```bash
+continuum verify-root --root ./.continuum-demo
+```
+
+> [!NOTE]
+> These safeguards prevent new evidence loss; they cannot recreate bytes already
+> deleted or changed by an older installation. An upgraded root may retain
+> explicit historical audit exceptions for missing legacy proof inputs or
+> previously mutable sidecars. Restore those bytes from an independent backup
+> when one exists. Otherwise preserve the exception as part of the audit record;
+> do not fabricate replacement evidence or silently suppress the finding.
+
+### Memory Index Backfill
 
 Roots created before Cue Recall can still contain useful Scroll history that has not been indexed into the Constellation graph. Use `reindex-memory` to backfill derived associations and trusted exact-memory Cards without replaying the whole chat into a model:
 
@@ -338,6 +448,9 @@ Imported or retrieved text is evidence. It is not automatically authoritative in
 - [Context window behavior](docs/context-window.md)
 - [Recovery and continuity](docs/recovery-and-continuity.md)
 - [Evidence and proof](docs/evidence-and-proof.md)
+- [Worker operations](docs/worker-operations.md)
+- [Writer claims](docs/writer-claims.md)
+- [Review relay](docs/review-relay.md)
 - [Benchmark documentation](benchmarks/BENCHMARKS.md)
 - [Configuration](docs/configuration.md)
 - [Glossary](docs/GLOSSARY.md)

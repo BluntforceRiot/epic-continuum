@@ -1,4 +1,6 @@
 .venv/
+.continuum/
+/nul
 .git.broken.*/
 __pycache__/
 *.pyc

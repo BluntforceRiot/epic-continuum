@@ -10,6 +10,8 @@ from typing import Any
 
 EXCLUDED_PARTS = {"__pycache__", ".pytest_cache"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
+STAGE_MARKER_NAME = ".epic-continuum-stage.json"
+STAGE_MARKER_SCHEMA = "epic-continuum.codex-plugin-stage.v1"
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -61,6 +63,30 @@ def _is_direct_child(child: Path, parent: Path) -> bool:
         return False
 
 
+def _write_stage_marker(stage_root: Path, *, cache: str, repo_root: Path) -> None:
+    marker = {
+        "schema": STAGE_MARKER_SCHEMA,
+        "name": "epic-continuum",
+        "cachebuster": cache,
+        "source_repo_name": repo_root.name,
+    }
+    (stage_root / STAGE_MARKER_NAME).write_bytes(_json_bytes(marker))
+
+
+def _validate_owned_stage(stage_root: Path) -> None:
+    marker_path = stage_root / STAGE_MARKER_NAME
+    if not marker_path.is_file():
+        raise ValueError(
+            f"refusing to replace existing stage directory without Epic Continuum ownership marker: {stage_root}"
+        )
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"refusing to replace stage directory with unreadable ownership marker: {stage_root}") from exc
+    if marker.get("schema") != STAGE_MARKER_SCHEMA or marker.get("name") != "epic-continuum":
+        raise ValueError(f"refusing to replace stage directory with invalid ownership marker: {stage_root}")
+
+
 def stage_codex_plugin(
     *,
     repo_root: Path,
@@ -90,6 +116,7 @@ def stage_codex_plugin(
     if stage_root.exists():
         if not _is_direct_child(stage_root, stage_base) or stage_root.name != "epic-continuum":
             raise ValueError(f"refusing to remove unsafe stage path: {stage_root}")
+        _validate_owned_stage(stage_root)
         shutil.rmtree(stage_root)
 
     stage_agents = stage_root / ".agents" / "plugins"
@@ -108,6 +135,7 @@ def stage_codex_plugin(
     base_version = str(manifest.get("version", "0.0.0"))
     manifest["version"] = f"{base_version}.local.{cache[:12]}"
     manifest_path.write_bytes(_json_bytes(manifest))
+    _write_stage_marker(stage_root, cache=cache, repo_root=repo_root)
     return stage_root
 
 

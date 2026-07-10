@@ -1,4 +1,6 @@
 .venv/
+.continuum/
+/nul
 .git.broken.*/
 __pycache__/
 *.pyc
@@ -7,6 +9,7 @@ __pycache__/
 *.sqlite3-wal
 .pytest_cache/
 .mypy_cache/
+benchmarks/results/
 dist/
 build/
 *.egg-info/

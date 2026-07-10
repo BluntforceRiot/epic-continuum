@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from continuum.cli import main as cli_main
+from continuum.core.bundle import _is_transient
+from continuum.core.operations import start_operation, verify_root
+from continuum.core.store import append_scroll_event, connect, connect_existing, init_db, status
+from continuum.core.writer_claim import (
+    WRITER_CLAIM_SCHEMA,
+    WriterClaimError,
+    _is_wsl_windows_mount,
+    claim_writer,
+    detect_runtime_identity,
+    ensure_writer_claim,
+    writer_claim_path,
+    writer_claim_status,
+)
+
+
+WINDOWS = {"runtime": "windows", "host": "continuum-host"}
+WSL = {"runtime": "wsl", "host": "continuum-host"}
+LINUX = {"runtime": "linux", "host": "linux-host"}
+
+
+class WriterClaimTests(unittest.TestCase):
+    def test_runtime_detection_distinguishes_windows_wsl_linux_and_macos(self) -> None:
+        self.assertEqual(
+            detect_runtime_identity(system="Windows", environ={}, osrelease="", hostname="HOST-A"),
+            {"runtime": "windows", "host": "host-a"},
+        )
+        self.assertEqual(
+            detect_runtime_identity(
+                system="Linux",
+                environ={"WSL_DISTRO_NAME": "Ubuntu"},
+                osrelease="6.6.0-linux",
+                hostname="HOST-A",
+            ),
+            {"runtime": "wsl", "host": "host-a"},
+        )
+        self.assertEqual(
+            detect_runtime_identity(system="Linux", environ={}, osrelease="6.8.0-generic", hostname="HOST-B"),
+            {"runtime": "linux", "host": "host-b"},
+        )
+        self.assertEqual(
+            detect_runtime_identity(system="Darwin", environ={}, osrelease="24.0", hostname="MacBook"),
+            {"runtime": "macos", "host": "macbook"},
+        )
+        self.assertEqual(
+            detect_runtime_identity(
+                system="Linux",
+                environ={},
+                osrelease="5.15.153.1-microsoft-standard-WSL2",
+                hostname="HOST-A",
+            )["runtime"],
+            "wsl",
+        )
+
+    def test_new_root_is_atomically_claimed_before_catalog_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                state = status(root, create=False)
+
+            marker = writer_claim_path(root)
+            claim = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(set(claim), {"schema", "runtime", "host", "claimed_at"})
+            self.assertEqual(claim["schema"], WRITER_CLAIM_SCHEMA)
+            self.assertEqual(claim["runtime"], "windows")
+            self.assertEqual(claim["host"], "continuum-host")
+            self.assertTrue(state["writer_claim"]["compatible"])
+            self.assertTrue((root / "catalog" / "catalog.sqlite3").exists())
+
+    def test_missing_root_status_is_read_only_and_does_not_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                state = status(root, create=False)
+
+            self.assertFalse(state["initialized"])
+            self.assertFalse(state["writer_claim"]["claimed"])
+            self.assertFalse(root.exists())
+
+    def test_bootstrap_config_and_lock_do_not_masquerade_as_legacy_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "bootstrap"
+            (root / "config").mkdir(parents=True)
+            (root / "config" / "continuum.config.json").write_text("{}\n", encoding="utf-8")
+            (root / "run" / "locks").mkdir(parents=True)
+
+            claim = ensure_writer_claim(root, identity=WINDOWS)
+
+            self.assertTrue(claim["claimed"])
+            self.assertTrue(claim["compatible"])
+            self.assertFalse(claim["root_has_existing_state"])
+
+    def test_explicit_wal_aware_read_only_connection_observes_committed_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "wal-aware"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                writer = connect(root)
+                try:
+                    writer.execute("PRAGMA wal_autocheckpoint = 0")
+                    writer.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('wal_probe', 'visible')")
+                    writer.commit()
+                    reader = connect_existing(root, immutable=False)
+                    try:
+                        row = reader.execute("SELECT value FROM meta WHERE key = 'wal_probe'").fetchone()
+                    finally:
+                        reader.close()
+                finally:
+                    writer.close()
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row["value"], "visible")
+
+    def test_existing_unclaimed_root_requires_explicit_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "legacy"
+            (root / "catalog").mkdir(parents=True)
+            (root / "catalog" / "catalog.sqlite3").write_bytes(b"legacy catalog placeholder")
+
+            with self.assertRaisesRegex(WriterClaimError, "existing Continuum root has no writer claim"):
+                ensure_writer_claim(root, identity=WINDOWS)
+
+            claimed = claim_writer(root, identity=WINDOWS)
+            self.assertTrue(claimed["changed"])
+            self.assertTrue(claimed["compatible"])
+
+    def test_windows_claim_blocks_wsl_catalog_and_operation_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WSL):
+                read_state = status(root, create=False)
+                self.assertTrue(read_state["initialized"])
+                self.assertFalse(read_state["writer_claim"]["compatible"])
+                with self.assertRaisesRegex(WriterClaimError, "write-claimed by windows@continuum-host"):
+                    connect(root)
+                with self.assertRaises(WriterClaimError):
+                    append_scroll_event(
+                        root,
+                        session_id="blocked",
+                        event_type="message",
+                        role="user",
+                        content="must remain read only",
+                    )
+                before = list((root / "run" / "operations").glob("*.json")) if (root / "run" / "operations").exists() else []
+                with self.assertRaises(WriterClaimError):
+                    start_operation(root, operation_type="blocked", title="blocked")
+                after = list((root / "run" / "operations").glob("*.json")) if (root / "run" / "operations").exists() else []
+                self.assertEqual(after, before)
+
+    def test_strict_verify_degrades_to_read_only_on_runtime_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+
+            with (
+                patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WSL),
+                patch("continuum.core.operations.restore_drill", side_effect=AssertionError("must not mutate")),
+            ):
+                result = verify_root(
+                    root,
+                    strict=True,
+                    run_restore_drill=True,
+                    verify_recent_proof_packs=0,
+                    scan_secrets=False,
+                )
+
+            self.assertTrue(result["restore_drill_requested"])
+            self.assertFalse(result["run_restore_drill"])
+            self.assertTrue(result["sections"]["restore_drill"]["skipped"])
+            self.assertEqual(
+                result["sections"]["restore_drill"]["reason"],
+                "writer_claim_incompatible_read_only_verification",
+            )
+
+    def test_force_transfer_requires_stopped_writer_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            claim_writer(root, identity=WINDOWS)
+
+            with self.assertRaisesRegex(WriterClaimError, "stop every Continuum writer"):
+                claim_writer(root, identity=LINUX)
+            with self.assertRaisesRegex(WriterClaimError, "stop every Continuum writer"):
+                claim_writer(root, identity=LINUX, force=True)
+            transferred = claim_writer(
+                root,
+                identity=LINUX,
+                force=True,
+                acknowledge_writers_stopped=True,
+            )
+
+            self.assertTrue(transferred["changed"])
+            self.assertEqual(transferred["claim"]["runtime"], "linux")
+            self.assertEqual(transferred["previous_claim"]["runtime"], "windows")
+
+    def test_cli_exposes_read_only_status_and_explicit_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            output = io.StringIO()
+            with (
+                patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(cli_main(["writer-status", "--root", str(root)]), 0)
+                self.assertEqual(cli_main(["writer-claim", "--root", str(root)]), 0)
+
+            lines = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertFalse(lines[0]["claimed"])
+            self.assertTrue(lines[1]["claimed"])
+            self.assertTrue(lines[1]["compatible"])
+
+    def test_wsl_mounted_windows_drive_never_auto_claims(self) -> None:
+        self.assertTrue(_is_wsl_windows_mount(Path("/mnt/c/continuum")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch("continuum.core.writer_claim._is_wsl_windows_mount", return_value=True),
+                self.assertRaisesRegex(WriterClaimError, "WSL will not auto-claim"),
+            ):
+                ensure_writer_claim(root, identity=WSL)
+            self.assertFalse(root.exists())
+
+    def test_claim_refuses_linked_config_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            root.mkdir()
+            target = base / "outside"
+            target.mkdir()
+            try:
+                (root / "config").symlink_to(target, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+            with self.assertRaisesRegex(WriterClaimError, "unsafe writer-claim config directory"):
+                claim_writer(root, identity=WINDOWS)
+            self.assertFalse((target / "writer-claim.json").exists())
+
+    def test_writer_claim_is_not_portable_bundle_state(self) -> None:
+        self.assertTrue(_is_transient(Path("config/writer-claim.json")))
+
+    def test_status_reports_malformed_marker_without_mutating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            marker = root / "config" / "writer-claim.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("{not json", encoding="utf-8")
+            before = marker.read_bytes()
+
+            state = writer_claim_status(root, identity=WINDOWS)
+
+            self.assertFalse(state["ok"])
+            self.assertFalse(state["compatible"])
+            self.assertEqual(marker.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

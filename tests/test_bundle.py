@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import stat
 import struct
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -32,6 +33,7 @@ from continuum.core.config import load_config, write_config
 from continuum.core.operations import recover_stale_operations, start_operation, verify_root
 from continuum.core.permissions import secure_file, secure_mkdir, secure_sqlite_files, secure_tree, secure_write_text
 from continuum.core.store import audit_secrets, file_sha256, init_db
+from continuum.core.store import append_scroll_event
 
 
 def _write_private_bytes(path: Path, data: bytes) -> None:
@@ -85,6 +87,24 @@ def _write_canonical_bundle_from_root(
                 arcname=f"{BUNDLE_ROOT_NAME}/{rel}",
                 mode_override=0o644 if rel == BUNDLE_MANIFEST_NAME else None,
             )
+
+
+def _make_link_like_dir(testcase: unittest.TestCase, link: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.returncode != 0:
+            testcase.skipTest(f"junction creation unavailable: {completed.stdout} {completed.stderr}")
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        testcase.skipTest(f"symlink creation unavailable: {exc}")
 
 
 class RootBundleTest(unittest.TestCase):
@@ -465,6 +485,26 @@ class RootBundleTest(unittest.TestCase):
                 self.skipTest(f"symlink creation unavailable: {exc}")
 
             with self.assertRaisesRegex(ValueError, "symlink"):
+                pack_root(
+                    root,
+                    out_path=Path(tmp) / "should-not-exist.zip",
+                    profile="shareable",
+                    run_restore_drill=False,
+                )
+
+    def test_pack_root_rejects_link_like_directory_for_shareable_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            external = Path(tmp) / "external-directory"
+            init_db(root)
+            link_parent = root / "archive" / "originals"
+            link_parent.mkdir(parents=True, exist_ok=True)
+            link = link_parent / "hot"
+            if link.exists() and not link.is_symlink():
+                shutil.rmtree(link)
+            _make_link_like_dir(self, link, external)
+
+            with self.assertRaisesRegex(ValueError, "symlink|junction|reparse"):
                 pack_root(
                     root,
                     out_path=Path(tmp) / "should-not-exist.zip",
@@ -1051,6 +1091,30 @@ class RootBundleTest(unittest.TestCase):
 
             self.assertTrue(result["ok"], result)
             self.assertTrue(verify_root_bundle(output)["ok"])
+
+    def test_shareable_bundle_with_partition_aliases_verifies_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "continuum-shareable.zip"
+            init_db(root)
+            config = load_config(root)
+            config["security"]["secret_scan_action"] = "warn"
+            write_config(root, config)
+            secret_session = "sk-" + "A" * 40
+            append_scroll_event(
+                root,
+                session_id=secret_session,
+                event_type="message",
+                role="user",
+                content="shareable alias bundle marker",
+            )
+
+            result = pack_root(root, out_path=output, profile="shareable", run_restore_drill=False)
+            verification = verify_root_bundle(output)
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(verification["ok"], verification)
 
     def test_bundle_verifier_rejects_unnecessary_member_zip64_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

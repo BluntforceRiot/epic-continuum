@@ -1,6 +1,6 @@
 # Release Audit Summary
 
-This file curates the release-gate evidence for Epic Continuum `0.1.0` without
+This file curates the release-gate evidence for Epic Continuum `0.2.0` without
 shipping the full internal build-review history.
 
 ## Scope
@@ -17,9 +17,11 @@ The release gate focused on:
 
 ## Current Gate
 
-The core test suite passed on Windows and Linux during release-candidate review.
-Disposable Debian 12 and Debian 13 validation both completed with the same
-passing test count as the local suite.
+The core test suite passed on Windows during this package build and in prior
+Linux release-candidate review. Internal review notes also reported disposable
+Debian 12 and Debian 13 validation with the same passing test count as the local
+suite. The public source package intentionally keeps this as a summary rather
+than bundling the full local run logs.
 
 Review hardening after the final private review pass added:
 
@@ -45,6 +47,32 @@ Review hardening after the final private review pass added:
 - absolute tool-result byte caps and true no-event skip semantics;
 - portable recovery packets and bounded recovery filenames;
 - link-safe release assembly and coherent portable symlink-skip behavior.
+- Cue Recall associative recovery with scoped project/session visibility;
+- shared project-state recording for multi-agent handoff;
+- corrected benchmark methodology, safer benchmark output directories, and
+  unpublished local benchmark results;
+- refreshed public documentation for context-window behavior, Cue Recall,
+  recovery, evidence/proof, and shared agent state.
+- hash-bound review relay packaging with browser handoffs, schema-bound ingest,
+  append-only response/findings receipts, full-capsule versus packet-only review
+  surface checks, and fresh-source verification before applying review findings.
+- review2 boundary hardening for private project-state derivatives, mixed-scope
+  Scroll segment compaction, queue-job provenance, generic MCP exact-memory
+  provenance, root-wide reindex cursors, visibility-aware deduplication, and
+  secret policy checks on project identifiers.
+- restore-drill source and output path hardening so strict root verification
+  and direct restore drills refuse symlink, junction, or reparse-point
+  redirection before copying source trees or writing disposable drill output,
+  with restore-drill tree copies walked by Continuum's guarded copy loop rather
+  than delegated to whole-tree `shutil.copytree`.
+
+The Python package version is `0.2.0`, and the catalog capability
+`SCHEMA_VERSION` is `0.2.0`. This cycle includes additive catalog migrations for
+durable Scroll visibility fields, source-scoped graph edge contributions,
+partition aliases, snapshot integrity bindings, sidecar synchronization queues,
+and proof/bundle hardening. Existing roots are upgraded in place, with legacy
+partition identifiers rewritten across SQL text fields, graph provenance, and
+card sidecars before sharing or strict verification.
 
 See `MAINTAINABILITY_HOTSPOTS.md` for the non-blocking large-function
 refactor map identified during release review.

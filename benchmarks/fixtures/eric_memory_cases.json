@@ -1,0 +1,136 @@
+{
+  "name": "EricMemoryBench",
+  "version": "0.2.0",
+  "seed": 20260621,
+  "default_live_model": "Qwen/Qwen2.5-7B-Instruct",
+  "description": "Small local cases for comparing recent-context, QMD-style notes, and Epic Continuum retrieval under common agent-memory failure modes.",
+  "cases": [
+    {
+      "id": "buried_release_blocker",
+      "session_id": "eric-buried-release",
+      "project_id": "epic-continuum",
+      "query": "What release blocker did we identify before the later cleanup noise?",
+      "events": [
+        "Decision: EVID:BLOCKER-REPARSE The release blocker is the Windows reparse-point health check bug, not the README wording.",
+        "Next action: patch the health check and add a regression test before asking for another review.",
+        "Noise: update badge wording.",
+        "Noise: review screenshot crop.",
+        "Noise: sort docs links.",
+        "Noise: compare two logo exports.",
+        "Noise: inspect cache directory names.",
+        "Noise: check local formatter output.",
+        "Noise: prepare handoff wording.",
+        "Noise: verify benchmark result folder stays untracked.",
+        "Noise: read unrelated packaging note.",
+        "Noise: make sure old review zips are excluded."
+      ],
+      "cards": [
+        "Release gate memory: EVID:BLOCKER-REPARSE The Windows reparse-point health check bug blocked release until patched."
+      ],
+      "qmd_note": "## Current Notes\nThe public README wording still needs a final proofread.\nThe screenshot folder should stay out of the release archive.",
+      "required_evidence": ["EVID:BLOCKER-REPARSE"],
+      "forbidden_evidence": []
+    },
+    {
+      "id": "curated_qmd_success",
+      "session_id": "eric-curated-qmd",
+      "project_id": "epic-continuum",
+      "query": "What is the next task from the manually curated project notes?",
+      "events": [
+        "Discussion: we need one more pass on adapter docs.",
+        "Decision: EVID:CURATED-QMD-TASK The next task is to smoke-test Codex, Hermes, and Claude Code adapter install docs.",
+        "Noise: local window was resized.",
+        "Noise: compare two shell transcript formats.",
+        "Noise: archive an old receipt."
+      ],
+      "cards": [
+        "Adapter docs next task: EVID:CURATED-QMD-TASK smoke-test Codex, Hermes, and Claude Code adapter install docs."
+      ],
+      "qmd_note": "## QMD Project State\nNext task: EVID:CURATED-QMD-TASK smoke-test Codex, Hermes, and Claude Code adapter install docs.\nOwner: operator.",
+      "required_evidence": ["EVID:CURATED-QMD-TASK"],
+      "forbidden_evidence": []
+    },
+    {
+      "id": "stale_qmd_superseded",
+      "session_id": "eric-stale-qmd",
+      "project_id": "epic-continuum",
+      "query": "Which storage policy is current after the later correction?",
+      "events": [
+        "Old note: EVID:OLD-STORAGE-POLICY Put all benchmark outputs under benchmarks/results.",
+        "Correction: EVID:CURRENT-STORAGE-POLICY Benchmark outputs must go to caller-selected marked output directories and generated results must stay out of source distributions.",
+        "Noise: update benchmark table header.",
+        "Noise: inspect CI line endings.",
+        "Noise: rerun fixture checksum.",
+        "Noise: save a receipt."
+      ],
+      "cards": [
+        "Current benchmark storage policy: EVID:CURRENT-STORAGE-POLICY generated benchmark outputs go to caller-selected marked output directories and stay out of sdists."
+      ],
+      "qmd_note": "## QMD Project State\nStorage policy: EVID:OLD-STORAGE-POLICY Put all benchmark outputs under benchmarks/results.",
+      "required_evidence": ["EVID:CURRENT-STORAGE-POLICY"],
+      "superseded_evidence": ["EVID:OLD-STORAGE-POLICY"],
+      "superseded_by_evidence": {
+        "EVID:OLD-STORAGE-POLICY": "EVID:CURRENT-STORAGE-POLICY"
+      },
+      "forbidden_evidence": ["EVID:OLD-STORAGE-POLICY"]
+    },
+    {
+      "id": "cross_agent_handoff",
+      "session_id": "eric-cross-agent",
+      "project_id": "epic-continuum",
+      "query": "What did the previous agent leave as the handoff objective?",
+      "events": [
+        "Agent handoff: EVID:HANDOFF-OBJECTIVE finish Cue Recall docs, add shared-agent-state examples, then request a blind review.",
+        "Noise: review local model alias.",
+        "Noise: compare shell paths.",
+        "Noise: inspect temporary output marker.",
+        "Noise: update changelog date.",
+        "Noise: check Python minor version."
+      ],
+      "project_state": {
+        "agent_id": "codex",
+        "objective": "EVID:HANDOFF-OBJECTIVE finish Cue Recall docs, add shared-agent-state examples, then request a blind review.",
+        "open_tasks": [
+          "Finish Cue Recall docs.",
+          "Add shared-agent-state examples.",
+          "Request a blind review."
+        ],
+        "decisions": [
+          "Keep the handoff in the shared project state, not only the active chat."
+        ]
+      },
+      "cards": [
+        "Shared agent state handoff: EVID:HANDOFF-OBJECTIVE finish Cue Recall docs, add shared-agent-state examples, then request a blind review."
+      ],
+      "qmd_note": "## QMD Project State\nLast visible task: update changelog date.",
+      "required_evidence": ["EVID:HANDOFF-OBJECTIVE"],
+      "forbidden_evidence": []
+    },
+    {
+      "id": "scoped_project_separation",
+      "session_id": "eric-scope-alpha",
+      "project_id": "project-alpha",
+      "query": "For project alpha, which model route should be used?",
+      "events": [
+        "Project alpha decision: EVID:ALPHA-MODEL-ROUTE use qwen-local through the OpenAI-compatible endpoint at the tested native context length.",
+        "Noise: alpha screenshot queue.",
+        "Noise: beta deployment note.",
+        "Noise: alpha receipt cleanup.",
+        "Noise: beta changelog draft."
+      ],
+      "extra_project_events": [
+        {
+          "project_id": "project-beta",
+          "session_id": "eric-scope-beta",
+          "content": "Project beta decision: EVID:BETA-MODEL-ROUTE use a cloud model and do not reuse alpha's local route."
+        }
+      ],
+      "cards": [
+        "Project alpha route: EVID:ALPHA-MODEL-ROUTE use qwen-local through the OpenAI-compatible endpoint at the tested native context length."
+      ],
+      "qmd_note": "## Global QMD Project State\nProject alpha: EVID:ALPHA-MODEL-ROUTE use qwen-local through the OpenAI-compatible endpoint.\nProject beta: EVID:BETA-MODEL-ROUTE use a cloud model and do not reuse alpha's local route.",
+      "required_evidence": ["EVID:ALPHA-MODEL-ROUTE"],
+      "forbidden_evidence": ["EVID:BETA-MODEL-ROUTE"]
+    }
+  ]
+}

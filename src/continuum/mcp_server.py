@@ -5,14 +5,15 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, overload
 
 from . import __version__
 from .core.bundle import pack_root, verify_root_bundle
-from .core.config import config_path, load_config, optimize_config, write_default_config
+from .core.config import config_path, default_config, load_config, optimize_config, write_default_config
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace
+from .core.safety import redact_text_secrets, scan_text_for_secrets
 from .core.operations import (
     OperationGuard,
     doctor,
@@ -26,22 +27,39 @@ from .core.operations import (
     verify_root,
     verify_proof_pack,
 )
+from .core.review_bridge import (
+    DEFAULT_REVIEW_BASE_URL,
+    DEFAULT_REVIEW_MODEL,
+    DEFAULT_REVIEW_TRANSPORT,
+    SUPPORTED_TRANSPORTS,
+    create_review_job,
+    ingest_review_result,
+    review_browser_attempt_start,
+    review_check_current,
+    review_job_status,
+    run_review_job,
+)
 from .core.store import (
     append_scroll_event,
     audit,
     audit_search_index,
     audit_secrets,
     compile_context,
+    cue_recall,
     ingest_file,
     init_db,
     recover_thread,
+    record_project_state,
     rebuild_search_index,
     redact_legacy_secrets,
+    reindex_memory,
     roll_scroll_segment,
     search_memory,
     snapshot,
     source_file_reference,
     status,
+    canonical_partition_identifier,
+    validate_partition_identifier,
 )
 from .core.workers import (
     apply_storage_tiering,
@@ -104,7 +122,7 @@ def validate_allowed_path(path: Path, *, purpose: str) -> Path:
     allowed = ", ".join(str(root) for root in roots)
     raise ValueError(
         f"{purpose} path is outside this MCP server's allowed roots: {path}. "
-        f"Set CONTINUUM_ROOT or CONTINUUM_ALLOWED_ROOTS to include it."
+        f"Allowed roots: {allowed or '(none)'}. Set CONTINUUM_ROOT or CONTINUUM_ALLOWED_ROOTS to include it."
     )
 
 
@@ -137,7 +155,24 @@ def optional_str(args: JSON, key: str) -> str | None:
     return value
 
 
-def optional_int(args: JSON, key: str, default: int) -> int:
+def optional_str_list(args: JSON, key: str) -> list[str]:
+    value = args.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{key} must be a list of non-empty strings")
+    return value
+
+
+@overload
+def optional_int(args: JSON, key: str, default: int) -> int: ...
+
+
+@overload
+def optional_int(args: JSON, key: str, default: None) -> int | None: ...
+
+
+def optional_int(args: JSON, key: str, default: int | None) -> int | None:
     value = args.get(key, default)
     if value is None:
         return default
@@ -160,6 +195,50 @@ def optional_metadata(args: JSON) -> JSON | None:
     if not isinstance(value, dict):
         raise ValueError("metadata must be an object")
     return value
+
+
+PUBLIC_METADATA_FORBIDDEN_FRAGMENTS = (
+    "authority",
+    "exact_memory",
+    "explicit_memory",
+    "protect",
+    "trust",
+)
+PUBLIC_METADATA_FORBIDDEN_KEYS = {"session_id", "project_id", "visibility_scope"}
+
+
+def public_metadata(args: JSON, *, disable_exact_memory: bool = False) -> JSON:
+    metadata = dict(optional_metadata(args) or {})
+    for key in list(metadata):
+        normalized = key.casefold()
+        if normalized in PUBLIC_METADATA_FORBIDDEN_KEYS:
+            raise ValueError(f"metadata.{key} is not accepted; pass partition fields as top-level tool arguments")
+        if normalized == "continuum_disable_exact_memory" or any(fragment in normalized for fragment in PUBLIC_METADATA_FORBIDDEN_FRAGMENTS):
+            metadata.pop(key, None)
+    if disable_exact_memory:
+        metadata["continuum_disable_exact_memory"] = True
+    return metadata
+
+
+def validate_public_partition_arg(root: Path, kind: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if scan_text_for_secrets(text, max_findings=1):
+        security = (load_config(root) if config_path(root).exists() else default_config()).get("security", {})
+        if bool(security.get("secret_scan_enabled", True)) and str(security.get("secret_scan_action") or "block") == "block":
+            raise ValueError(f"secret scan blocked {kind} before operation receipt")
+        return text
+    if canonical_partition_identifier(root, kind, text, lookup=True) != text:
+        return text
+    clean = validate_partition_identifier(kind, text)
+    return clean
+
+
+def public_partition_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return redact_text_secrets(value) if scan_text_for_secrets(value, max_findings=1) else value
 
 
 def tool_result(value: Any, *, is_error: bool = False) -> JSON:
@@ -191,6 +270,8 @@ def guarded_tool(
     snapshot_reason: str | None = None,
     touched_paths: list[Path | str] | None = None,
     result_touched_paths: Callable[[Any], list[Path | str]] | None = None,
+    proof: bool = True,
+    catalog_proof_mode: str | None = None,
     action: Callable[[OperationGuard], Any],
 ) -> Any:
     with OperationGuard(
@@ -202,6 +283,8 @@ def guarded_tool(
         snapshot_policy=snapshot_policy,
         snapshot_reason=snapshot_reason,
         touched_paths=touched_paths,
+        proof=proof,
+        catalog_proof_mode=catalog_proof_mode,
     ) as operation:
         result = action(operation)
         extra_paths = result_touched_paths(result) if result_touched_paths else []
@@ -284,10 +367,14 @@ def tool_optimize_config(args: JSON) -> Any:
 
 def tool_append_event(args: JSON) -> Any:
     root = root_arg(args)
-    session_id = require_str(args, "session_id")
+    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
+    safe_session_id = public_partition_label(session_id)
     event_type = optional_str(args, "event_type") or "message"
-    role = optional_str(args, "role") or "user"
+    role = optional_str(args, "role") or "agent"
     content = require_str(args, "content")
+    # Public MCP callers control metadata, so trust/authority/protection and
+    # exact-memory elevation fields are never accepted from generic tools.
+    metadata = public_metadata(args, disable_exact_memory=True)
 
     def action(operation: OperationGuard) -> JSON:
         result = append_scroll_event(
@@ -296,7 +383,7 @@ def tool_append_event(args: JSON) -> Any:
             event_type=event_type,
             role=role,
             content=content,
-            metadata=optional_metadata(args),
+            metadata=metadata,
         )
         operation.cursor({"phase": "event_appended", "session_id": result["session_id"], "seq": result["seq"]})
         return result
@@ -304,23 +391,27 @@ def tool_append_event(args: JSON) -> Any:
     return guarded_tool(
         root,
         operation_type="mcp_append_event",
-        title=f"Append Scroll event for {session_id}",
-        intent={"session_id": session_id, "event_type": event_type, "role": role},
+        title=f"Append Scroll event for {safe_session_id}",
+        intent={"session_id": safe_session_id, "event_type": event_type, "role": role},
         snapshot_policy="none",
         snapshot_reason="append-only Scroll event",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        proof=False,
         action=action,
     )
 
 
 def tool_roll_segment(args: JSON) -> Any:
     root = root_arg(args)
-    session_id = require_str(args, "session_id")
+    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
+    safe_session_id = public_partition_label(session_id)
     start_seq = optional_int(args, "start_seq", 1)
     end_seq = optional_int(args, "end_seq", 1)
+    if start_seq < 1 or end_seq < start_seq:
+        raise ValueError("start_seq must be >= 1 and end_seq must be >= start_seq")
 
     def action(operation: OperationGuard) -> JSON:
-        operation.cursor({"phase": "before_roll", "session_id": session_id, "start_seq": start_seq, "end_seq": end_seq})
+        operation.cursor({"phase": "before_roll", "session_id": safe_session_id, "start_seq": start_seq, "end_seq": end_seq})
         result = roll_scroll_segment(root, session_id=session_id, start_seq=start_seq, end_seq=end_seq)
         operation.cursor({"phase": "segment_rolled", "segment_id": result["segment_id"], "card_id": result["card_id"]})
         return result
@@ -328,8 +419,8 @@ def tool_roll_segment(args: JSON) -> Any:
     return guarded_tool(
         root,
         operation_type="mcp_roll_segment",
-        title=f"Roll Scroll segment {session_id}:{start_seq}-{end_seq}",
-        intent={"session_id": session_id, "start_seq": start_seq, "end_seq": end_seq},
+        title=f"Roll Scroll segment {safe_session_id}:{start_seq}-{end_seq}",
+        intent={"session_id": safe_session_id, "start_seq": start_seq, "end_seq": end_seq},
         snapshot_policy="auto",
         snapshot_reason="roll segment mutates catalog/cards/graph",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
@@ -368,37 +459,46 @@ def tool_ingest_file(args: JSON) -> Any:
 
 def tool_compile_context(args: JSON) -> Any:
     # Intentionally unguarded: this is a read-only context compilation.
+    root = root_arg(args)
+    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
+    project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
     return compile_context(
-        root_arg(args),
-        session_id=require_str(args, "session_id"),
+        root,
+        session_id=session_id,
         token_budget=optional_int(args, "token_budget", 0),
         query=optional_str(args, "query"),
         card_scope=optional_str(args, "card_scope"),
-        project_id=optional_str(args, "project_id"),
+        project_id=project_id,
+        include_cue_recall=optional_bool(args, "include_cue_recall"),
+        cue_recall_limit=optional_int(args, "cue_recall_limit", 4),
         create=False,
     )
 
 
 def tool_recover_thread(args: JSON) -> Any:
     root = root_arg(args)
-    session_id = require_str(args, "session_id")
+    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
+    project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
+    safe_session_id = public_partition_label(session_id)
+    safe_project_id = public_partition_label(project_id)
 
     def action(operation: OperationGuard) -> JSON:
         result = recover_thread(
             root,
             session_id=session_id,
+            project_id=project_id,
             query=optional_str(args, "query"),
             token_budget=optional_int(args, "token_budget", 0),
             recent_event_limit=optional_int(args, "recent_event_limit", 24),
         )
-        operation.cursor({"phase": "thread_recovered", "session_id": session_id, "packet_uri": result["packet_uri"]})
+        operation.cursor({"phase": "thread_recovered", "session_id": safe_session_id, "packet_uri": result["packet_uri"]})
         return result
 
     return guarded_tool(
         root,
         operation_type="mcp_recover_thread",
-        title=f"Recover thread {session_id}",
-        intent={"session_id": session_id, "query": optional_str(args, "query")},
+        title=f"Recover thread {safe_session_id}",
+        intent={"session_id": safe_session_id, "project_id": safe_project_id, "query": optional_str(args, "query")},
         snapshot_policy="none",
         snapshot_reason="recovery packet is an export over existing evidence",
         result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
@@ -407,11 +507,84 @@ def tool_recover_thread(args: JSON) -> Any:
 
 
 def tool_search(args: JSON) -> Any:
+    root = root_arg(args)
+    session_id = validate_public_partition_arg(root, "session_id", optional_str(args, "session_id"))
+    project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
     return search_memory(
-        root_arg(args),
+        root,
         query=require_str(args, "query"),
         limit=optional_int(args, "limit", 10),
+        session_id=session_id,
+        project_id=project_id,
         create=False,
+    )
+
+
+def tool_cue_recall(args: JSON) -> Any:
+    root = root_arg(args)
+    session_id = validate_public_partition_arg(root, "session_id", optional_str(args, "session_id"))
+    project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
+    return cue_recall(
+        root,
+        cue=require_str(args, "cue"),
+        session_id=session_id,
+        project_id=project_id,
+        limit=optional_int(args, "limit", 8),
+        max_associations=optional_int(args, "max_associations", 16),
+        create=False,
+    )
+
+
+def tool_record_project_state(args: JSON) -> Any:
+    root = root_arg(args)
+    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
+    agent_id = str(validate_public_partition_arg(root, "agent_id", require_str(args, "agent_id")))
+    project_id = str(validate_public_partition_arg(root, "project_id", require_str(args, "project_id")))
+    safe_session_id = public_partition_label(session_id)
+    safe_agent_id = public_partition_label(agent_id)
+    safe_project_id = public_partition_label(project_id)
+    dirty_value = args.get("dirty")
+    if dirty_value is not None and not isinstance(dirty_value, bool):
+        raise ValueError("dirty must be a boolean when provided")
+    changed_files = args.get("changed_files") or []
+    decisions = args.get("decisions") or []
+    open_tasks = args.get("open_tasks") or []
+    if not isinstance(changed_files, list) or not all(isinstance(item, str) for item in changed_files):
+        raise ValueError("changed_files must be a list of strings")
+    if not isinstance(decisions, list) or not all(isinstance(item, str) for item in decisions):
+        raise ValueError("decisions must be a list of strings")
+    if not isinstance(open_tasks, list) or not all(isinstance(item, str) for item in open_tasks):
+        raise ValueError("open_tasks must be a list of strings")
+
+    def action(operation: OperationGuard) -> JSON:
+        result = record_project_state(
+            root,
+            session_id=session_id,
+            agent_id=agent_id,
+            project_id=project_id,
+            objective=optional_str(args, "objective"),
+            repo_path=optional_str(args, "repo_path"),
+            branch=optional_str(args, "branch"),
+            commit=optional_str(args, "commit"),
+            dirty=dirty_value,
+            changed_files=changed_files,
+            decisions=decisions,
+            open_tasks=open_tasks,
+            notes=optional_str(args, "notes"),
+            metadata=public_metadata(args, disable_exact_memory=True),
+        )
+        operation.cursor({"phase": "project_state_recorded", "card_id": result.get("card_id"), "project_id": safe_project_id})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_record_project_state",
+        title=f"Record shared project state for {safe_project_id}",
+        intent={"project_id": safe_project_id, "agent_id": safe_agent_id, "session_id": safe_session_id},
+        snapshot_policy="auto",
+        snapshot_reason="shared project-state checkpoint mutates Scroll/Cards/Constellation",
+        touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        action=action,
     )
 
 
@@ -441,6 +614,67 @@ def tool_rebuild_search_index(args: JSON) -> Any:
         intent={"root": str(root)},
         snapshot_policy="auto",
         snapshot_reason="search index rebuild mutates derived catalog FTS state",
+        touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        action=action,
+    )
+
+
+def tool_reindex_memory(args: JSON) -> Any:
+    root = root_arg(args)
+    dry_run = optional_bool(args, "dry_run", True)
+    promote_exact_memory = optional_bool(args, "promote_exact_memory", True)
+    session_id = validate_public_partition_arg(root, "session_id", optional_str(args, "session_id"))
+    after_seq = optional_int(args, "after_seq", 0)
+    after_rowid = optional_int(args, "after_rowid", 0)
+    limit = optional_int(args, "limit", 500)
+    batch_size = optional_int(args, "batch_size", 100)
+    if after_seq and not session_id:
+        raise ValueError("after_seq can only be used with session_id; use after_rowid for root-wide reindex")
+    safe_session_id = public_partition_label(session_id)
+
+    def run_reindex(*, dry_run: bool) -> JSON:
+        return reindex_memory(
+            root,
+            session_id=session_id,
+            after_seq=after_seq,
+            after_rowid=after_rowid,
+            limit=limit,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            promote_exact_memory=promote_exact_memory,
+        )
+
+    if dry_run:
+        return run_reindex(dry_run=True)
+
+    def action(operation: OperationGuard) -> JSON:
+        result = run_reindex(dry_run=False)
+        operation.cursor(
+            {
+                "phase": "memory_reindexed",
+                "processed_count": result.get("processed_count"),
+                "edge_delta": result.get("edge_delta"),
+                "exact_memory_cards": result.get("exact_memory_cards"),
+                "next_cursor": result.get("next_cursor"),
+                "has_more": result.get("has_more"),
+            }
+        )
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_reindex_memory",
+        title="Reindex Epic Continuum Scroll associations",
+        intent={
+            "session_id": safe_session_id,
+            "after_seq": after_seq,
+            "after_rowid": after_rowid,
+            "limit": limit,
+            "batch_size": batch_size,
+            "promote_exact_memory": promote_exact_memory,
+        },
+        snapshot_policy="auto",
+        snapshot_reason="memory reindex mutates derived graph/card state",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
         action=action,
     )
@@ -573,6 +807,7 @@ def tool_prune_memory(args: JSON) -> Any:
         snapshot_policy="auto",
         snapshot_reason="pruning mutates card status/projection state",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        catalog_proof_mode="snapshot",
         action=action,
     )
 
@@ -711,6 +946,7 @@ def tool_redact_legacy_secrets(args: JSON) -> Any:
         snapshot_policy="auto",
         snapshot_reason="legacy secret cleanup mutates catalog text columns",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        catalog_proof_mode="snapshot",
         action=action,
     )
 
@@ -834,6 +1070,187 @@ def tool_restore_drill(args: JSON) -> Any:
     )
 
 
+def tool_review_prepare(args: JSON) -> Any:
+    root = root_arg(args)
+    subject = validate_allowed_path(Path(require_str(args, "subject")), purpose="review subject")
+    prompt = require_str(args, "prompt")
+    transport = optional_str(args, "transport") or DEFAULT_REVIEW_TRANSPORT
+    if transport not in SUPPORTED_TRANSPORTS:
+        raise ValueError(f"transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORTS))}")
+    secret_allowlist_patterns = optional_str_list(args, "secret_allowlist_patterns")
+    secret_allowlist_files = [
+        validate_allowed_path(Path(path), purpose="review secret allowlist file")
+        for path in optional_str_list(args, "secret_allowlist_files")
+    ]
+
+    def action(operation: OperationGuard) -> JSON:
+        result = create_review_job(
+            root,
+            subject_path=subject,
+            prompt=prompt,
+            reviewer_id=optional_str(args, "reviewer_id") or "local-reviewer",
+            transport=transport,
+            model=optional_str(args, "model") or DEFAULT_REVIEW_MODEL,
+            base_url=optional_str(args, "base_url") or DEFAULT_REVIEW_BASE_URL,
+            include_diff=optional_bool(args, "include_diff", True),
+            max_packet_bytes=optional_int(args, "max_packet_bytes", 512_000),
+            max_file_bytes=optional_int(args, "max_file_bytes", 64_000),
+            max_files=optional_int(args, "max_files", 300),
+            secret_allowlist_patterns=secret_allowlist_patterns,
+            secret_allowlist_files=secret_allowlist_files,
+            operation_id=operation.operation_id,
+        )
+        operation.cursor({"phase": "review_job_created", "job_id": result["job_id"], "packet_sha256": result["packet_sha256"]})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_review_prepare",
+        title=f"Prepare review relay job for {subject.name}",
+        intent={
+            "subject": str(subject),
+            "transport": transport,
+            "secret_allowlist_pattern_count": len(secret_allowlist_patterns),
+            "secret_allowlist_file_count": len(secret_allowlist_files),
+        },
+        snapshot_policy="none",
+        snapshot_reason="review preparation writes export artifacts only",
+        result_touched_paths=lambda result: [
+            path
+            for path in [
+                result.get("job_dir"),
+                result.get("request_uri"),
+                result.get("packet_uri"),
+                result.get("prompt_uri"),
+                result.get("schema_uri"),
+                result.get("subject_manifest_uri"),
+                result.get("subject_archive_uri"),
+                result.get("review_capsule_uri"),
+                result.get("manual_handoff_uri"),
+                result.get("browser_handoff_uri"),
+                result.get("secret_allowlist_report_uri"),
+            ]
+            if path
+        ],
+        action=action,
+    )
+
+
+def tool_review_run(args: JSON) -> Any:
+    root = root_arg(args)
+    transport = optional_str(args, "transport")
+    if transport is not None and transport not in SUPPORTED_TRANSPORTS:
+        raise ValueError(f"transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORTS))}")
+
+    def action(operation: OperationGuard) -> JSON:
+        result = run_review_job(
+            root,
+            job_id=require_str(args, "job_id"),
+            transport=transport,
+            model=optional_str(args, "model"),
+            base_url=optional_str(args, "base_url"),
+            timeout_seconds=optional_int(args, "timeout_seconds", 900),
+            max_tokens=optional_int(args, "max_tokens", 4096),
+            operation_id=operation.operation_id,
+        )
+        operation.cursor({"phase": "review_job_ran", "job_id": args.get("job_id"), "status": result.get("status")})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_review_run",
+        title=f"Run review relay job {args.get('job_id')}",
+        intent={"job_id": args.get("job_id"), "transport": transport},
+        snapshot_policy="none",
+        snapshot_reason="review run writes export artifacts only",
+        result_touched_paths=lambda result: [
+            path
+            for path in [
+                result.get("raw_response_uri"),
+                result.get("reviewer_content_uri"),
+                (result.get("ingest") or {}).get("findings_uri") if isinstance(result.get("ingest"), dict) else None,
+                (result.get("ingest") or {}).get("findings_markdown_uri") if isinstance(result.get("ingest"), dict) else None,
+                (result.get("ingest") or {}).get("ingest_receipt_uri") if isinstance(result.get("ingest"), dict) else None,
+            ]
+            if path
+        ],
+        action=action,
+    )
+
+
+def tool_review_ingest(args: JSON) -> Any:
+    root = root_arg(args)
+    result_path = optional_str(args, "result_path")
+    content = optional_str(args, "content")
+    if not result_path and content is None:
+        raise ValueError("result_path or content is required")
+    validated_result_path = validate_allowed_path(Path(result_path), purpose="review result") if result_path else None
+
+    def action(operation: OperationGuard) -> JSON:
+        result = ingest_review_result(
+            root,
+            job_id=require_str(args, "job_id"),
+            result_path=validated_result_path,
+            content=content,
+            operation_id=operation.operation_id,
+        )
+        operation.cursor({"phase": "review_result_ingested", "job_id": args.get("job_id"), "verdict": result.get("verdict")})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_review_ingest",
+        title=f"Ingest review result {args.get('job_id')}",
+        intent={"job_id": args.get("job_id"), "result_path": result_path},
+        snapshot_policy="none",
+        snapshot_reason="review ingest writes export artifacts and artifact ledger rows",
+        result_touched_paths=lambda result: [
+            path
+            for path in [
+                result.get("raw_response_uri"),
+                result.get("response_uri"),
+                result.get("findings_uri"),
+                result.get("findings_markdown_uri"),
+                result.get("ingest_receipt_uri"),
+            ]
+            if path
+        ],
+        action=action,
+    )
+
+
+def tool_review_status(args: JSON) -> Any:
+    return review_job_status(root_arg(args), job_id=require_str(args, "job_id"))
+
+
+def tool_review_check_current(args: JSON) -> Any:
+    return review_check_current(root_arg(args), job_id=require_str(args, "job_id"))
+
+
+def tool_review_browser_attempt_start(args: JSON) -> Any:
+    root = root_arg(args)
+
+    def action(operation: OperationGuard) -> JSON:
+        result = review_browser_attempt_start(root, job_id=require_str(args, "job_id"))
+        operation.cursor({"phase": "review_browser_attempt_reserved", "job_id": args.get("job_id"), "attempt": result.get("attempt")})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_review_browser_attempt_start",
+        title=f"Reserve browser review response path {args.get('job_id')}",
+        intent={"job_id": args.get("job_id")},
+        snapshot_policy="none",
+        snapshot_reason="browser attempt reservation writes review export artifacts only",
+        result_touched_paths=lambda result: [
+            path
+            for path in [result.get("response_uri"), result.get("attempt_uri"), result.get("browser_handoff_uri")]
+            if path
+        ],
+        action=action,
+    )
+
+
 TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
     "continuum_init": (
         "Initialize an Epic Continuum root and database.",
@@ -925,10 +1342,12 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "properties": {
                 "root": {"type": "string"},
                 "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
                 "card_scope": {"type": "string", "enum": ["session", "global", "session_then_global", "project"]},
-                "project_id": {"type": "string"},
+                "include_cue_recall": {"type": "boolean"},
+                "cue_recall_limit": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "additionalProperties": False,
         },
@@ -942,6 +1361,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "properties": {
                 "root": {"type": "string"},
                 "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
                 "recent_event_limit": {"type": "integer"},
@@ -959,10 +1379,54 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "root": {"type": "string"},
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
+                "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
             },
             "additionalProperties": False,
         },
         tool_search,
+    ),
+    "continuum_cue_recall": (
+        "Recover buried ideas from loose associative cues across Scroll, Cards, Library, and graph routes.",
+        {
+            "type": "object",
+            "required": ["cue"],
+            "properties": {
+                "root": {"type": "string"},
+                "cue": {"type": "string"},
+                "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "max_associations": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        tool_cue_recall,
+    ),
+    "continuum_record_project_state": (
+        "Record a durable shared project-state checkpoint for cross-agent handoff.",
+        {
+            "type": "object",
+            "required": ["session_id", "agent_id", "project_id"],
+            "properties": {
+                "root": {"type": "string"},
+                "session_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "project_id": {"type": "string"},
+                "objective": {"type": "string"},
+                "repo_path": {"type": "string"},
+                "branch": {"type": "string"},
+                "commit": {"type": "string"},
+                "dirty": {"type": "boolean"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+                "decisions": {"type": "array", "items": {"type": "string"}},
+                "open_tasks": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        tool_record_project_state,
     ),
     "continuum_audit_search_index": (
         "Audit Library chunk FTS index consistency.",
@@ -973,6 +1437,24 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         "Rebuild Library chunk FTS index from canonical chunks.",
         {"type": "object", "properties": {"root": {"type": "string"}}, "additionalProperties": False},
         tool_rebuild_search_index,
+    ),
+    "continuum_reindex_memory": (
+        "Backfill Scroll association routes and trusted exact-memory Cards without duplicating graph weights.",
+        {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string"},
+                "session_id": {"type": "string"},
+                "after_seq": {"type": "integer"},
+                "after_rowid": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "batch_size": {"type": "integer"},
+                "dry_run": {"type": "boolean"},
+                "promote_exact_memory": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        tool_reindex_memory,
     ),
     "continuum_audit": (
         "Run an Epic Continuum integrity and queue audit.",
@@ -1248,6 +1730,93 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         },
         tool_restore_drill,
     ),
+    "continuum_review_prepare": (
+        "Create a hash-bound review relay job for a repo, package, or file.",
+        {
+            "type": "object",
+            "required": ["subject", "prompt"],
+            "properties": {
+                "root": {"type": "string"},
+                "subject": {"type": "string"},
+                "prompt": {"type": "string"},
+                "reviewer_id": {"type": "string"},
+                "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
+                "model": {"type": "string"},
+                "base_url": {"type": "string"},
+                "include_diff": {"type": "boolean"},
+                "max_packet_bytes": {"type": "integer"},
+                "max_file_bytes": {"type": "integer"},
+                "max_files": {"type": "integer"},
+                "secret_allowlist_patterns": {"type": "array", "items": {"type": "string"}},
+                "secret_allowlist_files": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
+        tool_review_prepare,
+    ),
+    "continuum_review_run": (
+        "Run a review relay job through a direct OpenAI-compatible endpoint or prepare a manual/Hermes handoff.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "root": {"type": "string"},
+                "job_id": {"type": "string"},
+                "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
+                "model": {"type": "string"},
+                "base_url": {"type": "string"},
+                "timeout_seconds": {"type": "integer"},
+                "max_tokens": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        tool_review_run,
+    ),
+    "continuum_review_ingest": (
+        "Ingest a completed review result after verifying its job and artifact hashes.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "root": {"type": "string"},
+                "job_id": {"type": "string"},
+                "result_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        tool_review_ingest,
+    ),
+    "continuum_review_status": (
+        "Show review relay job status and artifact paths.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        tool_review_status,
+    ),
+    "continuum_review_check_current": (
+        "Check whether the reviewed source still matches the active subject before applying findings.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        tool_review_check_current,
+    ),
+    "continuum_review_browser_attempt_start": (
+        "Reserve a unique append-only response path before a browser-only Pro review attempt.",
+        {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        tool_review_browser_attempt_start,
+    ),
 }
 
 
@@ -1255,6 +1824,7 @@ READ_ONLY_TOOLS = {
     "continuum_status",
     "continuum_compile_context",
     "continuum_search",
+    "continuum_cue_recall",
     "continuum_audit_search_index",
     "continuum_audit",
     "continuum_audit_secrets",
@@ -1263,12 +1833,15 @@ READ_ONLY_TOOLS = {
     "continuum_replay_operation_log",
     "continuum_list_operations",
     "continuum_operation_summary",
+    "continuum_review_status",
+    "continuum_review_check_current",
 }
 
 
 IDEMPOTENT_MUTATING_TOOLS = {
     "continuum_init",
     "continuum_rebuild_search_index",
+    "continuum_reindex_memory",
     "continuum_repair_permissions",
 }
 
@@ -1285,6 +1858,9 @@ OPEN_WORLD_TOOLS = {
     "continuum_import_mempalace",
     "continuum_pack_root",
     "continuum_verify_bundle",
+    "continuum_review_prepare",
+    "continuum_review_run",
+    "continuum_review_ingest",
 }
 
 
@@ -1382,6 +1958,7 @@ def serve() -> int:
         line = line.strip()
         if not line:
             continue
+        response: JSON | None
         try:
             request = json.loads(line)
         except json.JSONDecodeError as exc:

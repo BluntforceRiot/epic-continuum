@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/catalog_state.schema.json",
+  "title": "Epic Continuum Catalog State Witness",
+  "type": "object",
+  "required": [
+    "schema",
+    "operation_id",
+    "captured_at",
+    "source",
+    "assurance",
+    "restorable",
+    "content_binding",
+    "catalog_schema_version",
+    "meta",
+    "pragmas",
+    "file_sizes",
+    "table_state",
+    "sqlite_schema_sha256",
+    "integrity_check",
+    "state_hash"
+  ],
+  "properties": {
+    "schema": {"const": "epic_continuum.catalog_state.v1"},
+    "operation_id": {"type": "string", "pattern": "^op_"},
+    "captured_at": {"type": "string"},
+    "source": {
+      "type": "object",
+      "required": ["uri", "uri_base"],
+      "properties": {
+        "path": {"type": "string"},
+        "uri": {"const": "catalog/catalog.sqlite3"},
+        "uri_base": {"const": "continuum_root"}
+      },
+      "additionalProperties": false
+    },
+    "assurance": {"const": "non_restorable_catalog_state_telemetry"},
+    "restorable": {"const": false},
+    "content_binding": {
+      "type": "object",
+      "required": ["catalog_bytes_bound", "reason"],
+      "properties": {
+        "catalog_bytes_bound": {"const": false},
+        "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "catalog_schema_version": {"type": "string"},
+    "meta": {"type": "object", "additionalProperties": {"type": "string"}},
+    "pragmas": {
+      "type": "object",
+      "required": ["user_version", "schema_version", "page_count", "freelist_count", "page_size"],
+      "properties": {
+        "user_version": {"type": "integer", "minimum": 0},
+        "schema_version": {"type": "integer", "minimum": 0},
+        "page_count": {"type": "integer", "minimum": 0},
+        "freelist_count": {"type": "integer", "minimum": 0},
+        "page_size": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "file_sizes": {
+      "type": "object",
+      "required": ["catalog", "wal", "shm"],
+      "properties": {
+        "catalog": {"type": "integer", "minimum": -1},
+        "wal": {"type": "integer", "minimum": -1},
+        "shm": {"type": "integer", "minimum": -1}
+      },
+      "additionalProperties": false
+    },
+    "table_state": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["rowid_high_water"],
+        "properties": {
+          "rowid_high_water": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "sqlite_schema_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "integrity_check": {
+      "type": "object",
+      "required": ["performed", "reason"],
+      "properties": {
+        "performed": {"const": false},
+        "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "state_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Hash of this telemetry document, not of the SQLite catalog bytes."
+    }
+  },
+  "additionalProperties": false
+}

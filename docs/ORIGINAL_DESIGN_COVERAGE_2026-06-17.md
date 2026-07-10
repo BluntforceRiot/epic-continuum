@@ -7,7 +7,7 @@ This matrix maps the original operator design to the current package behavior.
 | Original idea | Current status | Notes |
 |---|---|---|
 | Scroll as full ordered event log | Included | `scroll_events` stores ordered session events with deduplication and secret policy. |
-| Looking Glass / active pane | Included | `compile-context` builds token-bounded context with Scroll, Cards, Books, and graph-aware recall. |
+| Looking Glass / active pane | Included | `compile-context` builds token-bounded context from recent Scroll events and matching Cards. Library search and Cue Recall are separate retrieval paths that can be added to the agent's working context when needed. |
 | Compactor rolls older context into Cards | Included | `roll-segment`, Scribe worker auto-roll, and adapter maintenance hooks compact Scroll spans. |
 | Scribe writes and chunks | Included | Scribe queue jobs write Scroll events, roll segments, and create Card projections. |
 | Library of Books | Included | File ingest creates originals, reader editions, chunks, FTS rows, and artifact ledger entries. |

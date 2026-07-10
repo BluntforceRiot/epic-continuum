@@ -5,514 +5,461 @@
 <h1 align="center">Epic Continuum</h1>
 
 <p align="center">
-  Persistent memory, bounded context, and crash recovery for local AI agents.
+  Durable local memory for AI agents, with bounded context reconstruction, crash recovery, and verifiable handoff bundles.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f4c76a?style=flat-square&labelColor=05070d"></a>
   <a href="pyproject.toml"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-79f0ff?style=flat-square&labelColor=05070d&logo=python&logoColor=79f0ff"></a>
-  <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20Codex%20%7C%20Claude%20%7C%20Hermes-99a7ff?style=flat-square&labelColor=05070d"></a>
+  <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20CLI%20%7C%20Python-99a7ff?style=flat-square&labelColor=05070d"></a>
   <a href="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Release: 0.1.0" src="https://img.shields.io/badge/release-0.1.0-8df3ff?style=flat-square&labelColor=05070d"></a>
+  <a href="CHANGELOG.md"><img alt="Release: 0.2.0" src="https://img.shields.io/badge/release-0.2.0-8df3ff?style=flat-square&labelColor=05070d"></a>
 </p>
 
 <p align="center">
-  <a href="#the-problem">The Problem</a>
+  <a href="#the-problem">Problem</a>
+  &middot; <a href="#whats-new-in-02">0.2 Update</a>
   &middot; <a href="#how-memory-works">Memory</a>
-  &middot; <a href="#how-the-context-window-works">Context Window</a>
-  &middot; <a href="#what-this-looks-like-in-agents">Agent Flow</a>
-  &middot; <a href="#how-continuum-keeps-work-from-being-lost">Recovery</a>
+  &middot; <a href="#how-the-context-window-works">Context</a>
+  &middot; <a href="#cue-recall">Cue Recall</a>
+  &middot; <a href="#shared-agent-state">Agent State</a>
+  &middot; <a href="#review-relay">Review Relay</a>
+  &middot; <a href="#how-work-is-not-lost">Recovery</a>
   &middot; <a href="#quick-start">Quick Start</a>
-  &middot; <a href="#mcp-and-agent-integrations">Integrations</a>
+  &middot; <a href="#benchmarks">Benchmarks</a>
+  &middot; <a href="#documentation">Docs</a>
 </p>
 
 > [!IMPORTANT]
-> Epic Continuum does not make a model's native context window infinite. It keeps durable memory outside the model, then assembles the most useful subset into a bounded context packet for the work happening now.
+> Epic Continuum does not claim infinite context. It keeps durable memory outside the model, then rebuilds a bounded context packet for the work happening now.
+
+## What's New In 0.2
+
+Epic Continuum 0.2 adds the operational controls needed to run one durable
+memory root safely over time:
+
+- **Cue Recall** finds related memories from loose prompts without replacing
+  exact Scroll evidence.
+- **Shared project state** gives Codex, Hermes, Claude Code, and local agents
+  durable handoff checkpoints.
+- **Hash-bound review relay** freezes the review subject and rejects stale or
+  mismatched review results.
+- **Persistent workers** continuously process Scribe, Librarian, Archivist, and
+  sidecar work with pending-job deduplication, leases, and bounded backlog repair.
+- **Bounded proof storage** uses compact catalog-state witnesses for routine
+  operations while retaining explicit full snapshots for restore evidence.
+- **External proof archives** relocate eligible legacy catalog proof snapshots
+  through a root-bound, hash-chained ledger.
+- **Writer claims** prevent Windows, WSL, Linux, macOS, or another host from
+  concurrently mutating the same SQLite root.
+
+The Scroll remains the ordered source of truth. Cards, graph routes, indexes,
+and sidecars are derived recall structures; proof packs, snapshots, and bundles
+remain separately verifiable evidence.
 
 ## The Problem
 
-A language model only sees what fits inside its current context window. That window is fast and useful, but finite and disposable.
+AI agents do useful work inside a finite, temporary context window. That creates a practical failure mode:
 
-During long-running work:
+- old messages eventually fall out of the active window or get compressed;
+- applications restart or crash;
+- one agent hands work to another agent;
+- decisions, paths, artifacts, and next actions can be lost;
+- replaying a whole transcript is expensive, noisy, and often impossible.
 
-- early decisions fall out of context;
-- summaries replace details;
-- tool results become difficult to trace;
-- a crash or restart can erase the active thread;
-- a new agent may inherit files without knowing what happened;
-- the model may remember the conclusion but lose the evidence behind it.
-
-Epic Continuum separates **durable memory** from **active context**.
-
-The complete history and evidence live on disk. The model receives a smaller, task-relevant working set that fits its current token budget. When the task restarts, Continuum rebuilds that working set from durable state rather than hoping the conversation survived.
-
-```text
-Model context window     fast, limited, temporary working memory
-Epic Continuum root      durable, searchable, recoverable memory
-Looking Glass packet     selected memory brought back into the model
-```
-
-The goal is not to put everything into every prompt. The goal is to preserve what matters, retrieve what is relevant, and make interrupted work resumable.
+Epic Continuum treats memory as local infrastructure instead of a chat feature. The model thinks inside the current window. Continuum remembers outside it.
 
 ## How Memory Works
 
-Epic Continuum uses several memory layers instead of treating all history as one giant transcript.
+Epic Continuum stores several kinds of memory because a transcript, a summary, and a verified artifact are not the same thing.
 
-### 1. The Scroll captures experience in order
+- **Scroll:** the ordered event history of user turns, assistant turns, tool activity, and operation events.
+- **Cards:** compact durable meaning extracted from older work, including decisions, open tasks, topics, and source references.
+- **Library:** source material, ingested files, reader editions, searchable chunks, hashes, and provenance.
+- **Constellation:** relationships between memory objects, including associations that can strengthen through use or decay when stale.
+- **Looking Glass:** the selected memory packet that fits the next model context budget.
+- **Continuity evidence:** operation ledgers, receipts, snapshots, proof packs, recovery packets, and portable bundles.
 
-Every captured user message, assistant response, tool event, and operation event becomes an ordered Scroll entry.
+Raw evidence and compact recall objects have different jobs. The Scroll and Library preserve what happened and where evidence lives. Cards and graph routes make recall faster. Receipts, snapshots, proof packs, and bundles make recovery and handoff inspectable.
 
-```text
-session: build-release
-  101 user[message]       Verify the portable bundle before publishing.
-  102 assistant[message]  I will run the strict root checks first.
-  103 tool[call]          continuum_verify_root(...)
-  104 tool[result]        root verification passed
+```mermaid
+flowchart TD
+    A["Agent / User / Tools"] --> B["Scroll: ordered events"]
+    B --> C["Recent events"]
+    B --> D["Scribe compaction"]
+    D --> E["Cards: compact meaning"]
+    E --> F["Library + Constellation"]
+    C --> G["Looking Glass selection"]
+    F --> G
+    G --> H["Token budget"]
+    H --> I["Context packet for the model"]
+    B --> J["Continuity / evidence path"]
+    J --> K["Receipts"]
+    J --> L["Snapshots"]
+    J --> M["Proof packs"]
+    J --> N["Recovery packets"]
+    J --> O["Portable bundles"]
 ```
 
-The Scroll is the episodic record. Sequence matters because later summaries are easier to trust when the original order still exists.
+## How The Context Window Works
 
-Scroll events include durable identifiers, timestamps, roles, event types, content hashes, token estimates, and metadata. Secret policy is applied before persistence.
+The model still has a finite token budget. Continuum does not make a model server attend to more tokens than it supports.
 
-### 2. Cards preserve compact meaning
+Instead, context reconstruction follows a repeatable pattern:
 
-Recent events are useful, but a model cannot reread an unlimited transcript every turn. Older spans can be rolled into **Cards**.
+1. The agent provides the current session, task, and optional query.
+2. By default, `compile_context` gathers recent Scroll events and matching Cards. When an agent explicitly asks for it with `include_cue_recall` / `--include-cue-recall`, the direct compiler can also add a budgeted `cue_recall_candidates` section from Cue Recall. Library search, operation receipts, proof artifacts, and bundles remain durable queryable evidence, but they are not silently inserted into every direct context packet.
+3. The direct compiler filters by visibility, project/session scope, textual relevance, recency, and Card salience. Trust and supersession metadata are preserved for recovery, review, and future planner work, but the current direct packet does not claim a full semantic planner.
+4. The Looking Glass planner assembles the most useful material into the configured token budget.
+5. The model sees that packet, not the entire memory root.
+6. Durable memory stays outside the model and can be queried again later.
 
-A Card is a compact structured memory unit that can contain:
+Context compilation must never silently exceed the requested budget. If material does not fit, it must be excluded or explicitly truncated with metadata.
 
-- a title and summary;
-- decisions;
-- open tasks;
-- entities and topics;
-- salience and recall history;
-- source and session references;
-- links to related memory objects.
+## How Work Is Not Lost
 
-Cards are stored in SQLite and as portable YAML sidecars. They are summaries and routing objects, not replacements for the underlying evidence.
+Epic Continuum records work while it happens:
 
-### 3. The Library preserves source evidence
+- conversation and tool events are appended to the Scroll;
+- long operations receive durable operation state;
+- progress and cursor state are written during execution;
+- important artifacts can be hashed and described;
+- snapshots preserve restorable state;
+- recovery packets identify current state and next actions;
+- portable bundles support verified handoff.
 
-Files and imported material become Library books. Continuum keeps:
+The system separates:
 
-- an archived original;
-- a normalized reader edition;
-- searchable chunks;
-- content hashes and provenance;
-- storage-tier and integrity metadata.
+- **remembered conversation:** what was said and done;
+- **searchable evidence:** source files, chunks, and provenance;
+- **current task state:** decisions, open work, operation status, and next actions;
+- **verified artifacts:** files and receipts with hashes;
+- **restorable system state:** snapshots and bundles that can be checked later.
 
-SQLite FTS5 provides lexical search when available, with a simpler fallback otherwise.
+## Agent Flow
 
-```bash
-continuum search \
-  --root "$CONTINUUM_ROOT" \
-  --query "release restore drill"
-```
+Epic Continuum is useful because memory is not trapped inside one chat application, one model, or one agent runtime.
 
-The Library answers, "Where is the evidence?" Cards answer, "What is important about it?" The Scroll answers, "What happened, and in what order?"
+Codex can use it through the local plugin and MCP server. Claude Code and other MCP-capable tools can use the same server pattern. Local LLM setups can use the CLI, Python API, MCP server, or adapter patterns. The important part is that they can point at the same Continuum root.
 
-### 4. The Constellation records associations
-
-Cards and other memory objects can be connected through weighted graph relationships. Recall reinforces useful routes. Maintenance workers can decay routes that are no longer used.
-
-The graph helps related memory become easier to find without making the graph itself the source of truth. Preserved evidence remains authoritative.
-
-### 5. Operations preserve work in progress
-
-Long or mutating actions are recorded as guarded operations with:
-
-- intent and status;
-- progress updates;
-- append-only operation event logs;
-- result and error records;
-- receipts;
-- frozen proof artifacts;
-- proof packs.
-
-This is operational memory. It answers, "What was the agent doing when it stopped?"
-
-## How the Context Window Works
-
-The model's native context remains finite. Epic Continuum works around that limit by compiling a **Looking Glass** packet.
-
-The Looking Glass is not the entire memory store. It is a bounded view over durable memory.
-
-Think of the model context as the agent's current working set. It is fast, but it has a hard size limit and disappears when the session is gone. Continuum is the durable state beside it: Scroll entries, Cards, Library evidence, operations, receipts, and snapshots. The Looking Glass is the selected slice of that durable state that gets brought back into the model for the next turn.
-
-That means Continuum does not make a 16K, 64K, or 200K model internally larger. Instead, it gives the agent a fast external memory loop:
-
-```text
-conversation/tool activity
-        |
-        v
-capture to durable Scroll and operations
-        |
-        v
-compact into Cards and searchable Library evidence
-        |
-        v
-retrieve the relevant subset
-        |
-        v
-compile a token-bounded Looking Glass packet
-        |
-        v
-agent receives only what it needs right now
-```
-
-The context window still has a budget. Continuum makes that budget repeatable, inspectable, and recoverable.
-
-### Current context-compilation flow
-
-When `compile-context` runs, Continuum:
-
-1. applies the requested token budget and the configured maximum;
-2. loads the newest Scroll events for the selected session;
-3. preserves chronological order in the emitted packet;
-4. extracts terms from an optional query;
-5. recalls matching Cards within the selected session, project, or global scope;
-6. orders Card candidates by salience and recency;
-7. adds material until the usable budget is exhausted;
-8. truncates the final item safely when needed;
-9. reports estimated tokens, remaining budget, and every truncation.
-
-```bash
-continuum compile-context \
-  --root "$CONTINUUM_ROOT" \
-  --session-id build-release \
-  --query "current release blockers and next action" \
-  --token-budget 4000
-```
-
-The returned packet includes machine-readable budget information and a plain `context_text` section that can be passed to the agent.
-
-```text
-Durable memory on disk
-        |
-        +---- recent Scroll events
-        +---- query-matched Cards
-        +---- session/project/global scope
-        |
-        v
-Token-budgeted Looking Glass
-        |
-        v
-Model's active context window
-```
-
-Current context compilation directly emphasizes recent Scroll events and matching Cards. Deeper Library evidence is retrieved through `search`, while thread recovery also gathers recent books, pending jobs, decisions, and open tasks.
-
-This is deliberate. Recent work stays close. Compact meaning is recalled when relevant. Full evidence remains available without being stuffed into every prompt.
-
-### Why this is safer than an ever-growing prompt
-
-An ever-growing prompt eventually forces silent truncation, aggressive summarization, or both. That creates two different failure modes:
-
-- information disappears without a durable record;
-- compressed conclusions survive while their evidence vanishes.
-
-Continuum keeps the durable record outside the prompt. Context can be rebuilt repeatedly without deleting the source history.
-
-## What This Looks Like In Agents
-
-Epic Continuum is useful because the memory is not trapped inside one chat application, one model, or one agent runtime.
-
-Codex can use it through the local Codex plugin and MCP server. Claude Code and other MCP-capable tools can use the same server pattern. Hermes Agent and local LLM setups can use the Hermes adapter or the generic CLI/OpenAI-compatible adapter pattern. The model can be a hosted model, a local Qwen/vLLM route, another OpenAI-compatible endpoint, or a smaller model running on local hardware.
-
-The important part is that they can point at the same Continuum root.
+> [!WARNING]
+> A live Continuum root must have exactly one writer runtime and host. New empty
+> roots are claimed automatically on their first mutation. Existing unclaimed
+> roots must be claimed explicitly. Do not run Windows and WSL writers against
+> the same root, even when both can see the same files.
 
 ```text
 Codex thread
         |
 Claude Code session ----> shared Epic Continuum root
         |
-Hermes/local LLM
+Local LLM / agent runtime
 ```
 
-Each agent can write events, read recovery packets, search Library evidence, and compile a bounded Looking Glass from the same durable state. That makes Continuum a shared memory layer rather than a per-client transcript.
-
-In practice, the loop feels simple:
+A typical flow:
 
 ```text
 You: Remember that the release blocker is the Windows reparse-point health bug.
 Agent: writes that event into the Scroll through Continuum.
 
 You: What were we doing before the restart?
-Agent: asks Continuum for status and recovery context.
-Continuum: returns recent events, Cards, open tasks, and operation receipts.
-Agent: answers with the current state instead of starting cold.
+Agent: asks Continuum for recovery context.
+Continuum: returns recent events, Cards, open tasks, receipts, and relevant evidence.
+Agent: resumes from durable state instead of starting cold.
 ```
 
-The memory is stored in the configured Continuum root. A restarted Codex thread, a Claude Code session, Hermes, or another MCP-compatible agent can point at that same root and recover the same project state.
+## Cue Recall
 
-This is why a useful memory can appear "a few seconds later": the agent is not waiting for a model to retrain or for a giant transcript to be pasted back in. It writes a small structured event locally, then retrieves or compiles that local state when it is needed.
+Sometimes the problem is not a crash. Sometimes the idea is still in memory, but buried so deeply that neither the user nor the next agent remembers the exact words.
 
-This helps in a few concrete ways:
-
-- **Cross-agent handoff:** Codex can do implementation work, Claude Code can review it later, and both can see the same recovery packets and operation receipts.
-- **Local model continuity:** a local LLM with a smaller native context can still use durable project memory by receiving only the relevant Looking Glass packet for the current turn.
-- **Fair model comparison:** different models can be tested against the same saved context instead of relying on whatever one chat happened to remember.
-- **Crash recovery:** if a desktop client, terminal, or model server dies, the next agent can recover from disk-backed Scroll events, Cards, and receipts.
-- **Less prompt stuffing:** large evidence stays in the Library and only selected summaries or search results enter the model context.
-
-Typical agent commands are conversational:
+Cue Recall is for loose prompts like:
 
 ```text
-"Remember this decision."
-"Recover the thread from yesterday."
-"Check Continuum status before we continue."
-"Compile the current release context."
-"Write a recovery packet before we switch tasks."
+remember that local-agent upgrade idea?
+the fake big context thing
+what did Codex leave for review?
 ```
 
-Under the hood those requests map to tools such as `continuum_append_event`, `continuum_status`, `continuum_compile_context`, `continuum_recover_thread`, and `continuum_snapshot`. For local LLMs, Continuum does not increase the model server's native context length; it improves the effective working memory around that limit by retrieving and compressing the right durable context before inference.
-
-## How Continuum Keeps Work From Being Lost
-
-Continuum protects work at several boundaries.
-
-### During the conversation
-
-Adapters or MCP tools capture turns and tool activity into the Scroll. The memory does not depend on one client preserving one chat transcript.
-
-### During long operations
-
-Guarded operations write receipts and append-only event logs as work progresses. A crash does not have to erase every intermediate step.
+Continuum preserves the exact Scroll, extracts useful terms, dampens common filler words, traverses meaningful associations in the Constellation, and returns likely candidate memories with related terms and evidence trails. If a user says `remember this exactly`, Continuum also creates a protected exact-memory Card while keeping the original Scroll event intact.
 
 ```bash
-continuum operations --root "$CONTINUUM_ROOT"
-continuum recover-operations --root "$CONTINUUM_ROOT"
+continuum cue-recall \
+  --root ./.continuum-demo \
+  --project-id epic-continuum \
+  --cue "what did codex leave for review"
 ```
 
-### At context boundaries
+Cue Recall returns candidates, not commandments. It is meant to help an agent find the right thought, cite why it looks related, and admit when several nearby ideas are plausible.
 
-Older Scroll spans can be rolled into Cards while the source events remain available.
+## Shared Agent State
+
+Epic Continuum is strongest when project continuity belongs to the project, not to one chat window.
+
+Agents can record durable project-state checkpoints into the same root:
 
 ```bash
-continuum roll-segment \
-  --root "$CONTINUUM_ROOT" \
-  --session-id build-release
+continuum record-project-state \
+  --root ./.continuum-demo \
+  --session-id codex-session-1 \
+  --agent-id codex \
+  --project-id epic-continuum \
+  --objective "Prepare Cue Recall for review" \
+  --branch main \
+  --dirty \
+  --changed-file src/continuum/core/store.py \
+  --decision "Keep raw Scroll evidence intact" \
+  --open-task "Have another agent review the package"
 ```
 
-Background workers can perform compaction and maintenance automatically:
+Another agent can later recover that state through Cue Recall, `recover-thread --project-id`, or a bounded Looking Glass packet. This is the core design claim: agents should share durable local project state instead of trapping memory inside separate chats.
+
+## Review Relay
+
+Epic Continuum can also act as an auditable bridge between a builder agent and a reviewer agent. The bridge creates a frozen snapshot, a packet, a subject artifact, a request JSON, an expected response schema, and one uploadable `review-capsule.zip`. Review results are rejected unless they match the exact job id, packet hash, capsule hash, subject hash, completion flag, and sentinel.
+
+This supports a few workflows:
+
+- Codex builds a candidate and asks a local OpenAI-compatible model to review it.
+- Hermes receives the packet paths in one-shot mode and returns schema-bound findings when the selected model follows the JSON contract.
+- A human or GUI relay uploads the single capsule to a separate review model, saves the JSON response, and Continuum verifies it before Codex acts on it.
+
+The capsule is the only upload artifact, but it cannot contain its own final SHA-256 without changing itself. Give the reviewer the capsule hash from `manual-handoff.md`, `review-status`, or the `review-prepare` output and require it in `review_capsule_sha256`.
+
+For strict unattended loops, the OpenAI-compatible/vLLM path is the preferred automated reviewer, but it is a packet-only review unless the reviewer also has file access. Hermes remains supported, but invalid or partial Hermes output is marked `review_failed` and kept as evidence instead of being ingested. Before applying external findings after a long review, use `review-check-current` to prove the active subject still matches the frozen snapshot.
+
+Review preparation scans decodable files, UTF-8/UTF-16 text, ZIP contents and metadata, generated request text, and the completed capsule boundary for obvious secrets; narrow `--secret-allowlist-pattern` entries or `--secret-allowlist-file` fixture lists can suppress known false-positive lines without recording the raw patterns or local file paths in the capsule.
 
 ```bash
-continuum run-workers --root "$CONTINUUM_ROOT"
+continuum review-prepare \
+  --root ./.continuum-demo \
+  --subject . \
+  --prompt "Do a harsh release-boundary review." \
+  --transport manual
+
+continuum review-browser-attempt-start \
+  --root ./.continuum-demo \
+  --job-id review_...
+
+continuum review-ingest \
+  --root ./.continuum-demo \
+  --job-id review_... \
+  --result-path "<reserved response path printed by review-browser-attempt-start>"
+
+continuum review-check-current \
+  --root ./.continuum-demo \
+  --job-id review_...
 ```
 
-### At restart or handoff
-
-`recover-thread` creates a recovery packet containing:
-
-- a fresh Looking Glass context;
-- recent Scroll events;
-- recalled Cards;
-- explicit decisions and open tasks;
-- pending worker jobs;
-- recent Library books;
-- a resume instruction.
+For local model review through a vLLM/OpenAI-compatible endpoint:
 
 ```bash
-continuum recover-thread \
-  --root "$CONTINUUM_ROOT" \
-  --session-id build-release \
-  --query "resume release validation"
+continuum review-prepare \
+  --root ./.continuum-demo \
+  --subject . \
+  --prompt "Do a harsh release-boundary review." \
+  --transport direct-openai \
+  --model local-reviewer \
+  --base-url http://127.0.0.1:8020/v1
+
+continuum review-run --root ./.continuum-demo --job-id review_...
 ```
 
-The packet is written under `exports/thread_recovery/` so another model, another client, or a later session can resume from durable state.
-
-### At the filesystem boundary
-
-Snapshots, proof packs, artifact hashes, restore drills, and strict root verification test whether the stored state is actually usable.
-
-```bash
-continuum snapshot --root "$CONTINUUM_ROOT" --reason "before release"
-continuum restore-drill --root "$CONTINUUM_ROOT"
-continuum verify-root --root "$CONTINUUM_ROOT" --strict
-```
-
-### At the handoff boundary
-
-A shareable root bundle is verified before publication:
-
-```bash
-continuum pack-root \
-  --root "$CONTINUUM_ROOT" \
-  --profile shareable \
-  --out ./epic-continuum-root.zip
-
-continuum verify-bundle \
-  --path ./epic-continuum-root.zip
-```
-
-The bundle workflow checks root health, secrets, portability, proof packs, artifact hashes, archive safety, and restore behavior. The goal is not merely to copy files. It is to produce a handoff object that can prove what it contains.
-
-## Recommended Operating Pattern
-
-For the best continuity, use this lifecycle:
-
-```text
-1. Initialize one Continuum root.
-2. Give every meaningful task a stable session or project identity.
-3. Capture user, assistant, and tool events continuously.
-4. Ingest important source files into the Library.
-5. Compile a bounded Looking Glass before or during major turns.
-6. Roll older spans into Cards or run background workers.
-7. Record mutating work as guarded operations.
-8. Generate a recovery packet at task boundaries and before handoff.
-9. Run strict verification before backup, transfer, or release.
-10. Pack a shareable bundle instead of copying a live root blindly.
-```
-
-The minimum practical rule is simple:
-
-> Capture before compaction, preserve before pruning, and verify before handoff.
+See [docs/review-relay.md](docs/review-relay.md) for the file layout, validation rules, and MCP tool names.
 
 ## Quick Start
 
-### Install
+From a cloned checkout:
 
 ```bash
-git clone https://github.com/BluntforceRiot/epic-continuum.git
-cd epic-continuum
-python -m venv .venv
-```
-
-PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
 python -m pip install .
-$env:CONTINUUM_ROOT = "$HOME\.continuum"
+continuum init --root ./.continuum-demo
+continuum writer-status --root ./.continuum-demo
 ```
 
-Linux, macOS, or WSL:
+Run exactly one persistent worker service for the root in a second terminal:
 
 ```bash
-source .venv/bin/activate
-python -m pip install .
-export CONTINUUM_ROOT="$HOME/.continuum"
+continuum serve \
+  --root ./.continuum-demo \
+  --interval-seconds 5 \
+  --maintenance-interval-seconds 300
 ```
 
-### Initialize and record a session
+Capture commands durably enqueue follow-up work; the persistent service
+processes that work. It holds a per-root lock, so a second service fails closed
+instead of competing for the same queue.
+
+Back in the first terminal:
 
 ```bash
-continuum init --root "$CONTINUUM_ROOT"
-
-continuum append-event \
-  --root "$CONTINUUM_ROOT" \
-  --session-id demo \
-  --role user \
-  --type message \
-  --content "Keep this deployment task recoverable across restarts."
+continuum append-event --root ./.continuum-demo --session-id demo --role user --type message --content "Decision: use Epic Continuum to preserve agent work across restarts."
+continuum append-event --root ./.continuum-demo --session-id demo --role assistant --type message --content "Next action: compile a recovery packet before switching tasks."
+continuum status --root ./.continuum-demo
+continuum compile-context --root ./.continuum-demo --session-id demo --query "decision next action" --token-budget 1000
+continuum recover-thread --root ./.continuum-demo --session-id demo --query "resume the demo task"
 ```
 
-### Compile working context
+For offline or `--no-index` installs, use a built wheel or preinstall the build
+backend requirements from `pyproject.toml` such as `setuptools>=77`; otherwise
+pip build isolation may fail before Epic Continuum itself is installed.
+
+Trimmed output from the tested flow:
+
+```json
+{"initialized": true, "scroll_events": 2, "cards": 0}
+{"session_id": "demo", "token_budget": 1000, "section_count": 1}
+{"session_id": "demo", "recent_event_count": 2}
+```
+
+## Interruption / Recovery Walkthrough
+
+1. Record a decision: "use Epic Continuum to preserve agent work."
+2. Record the next action: "compile a recovery packet before switching tasks."
+3. Start a fresh agent session with no active transcript.
+4. Ask Continuum to recover the `demo` session.
+5. The recovery packet returns the recent Scroll, compiled context, decisions or tasks found in Cards, recent Library books, pending jobs, and a resume instruction.
+
+The result is not magic model memory. It is local durable state that can be read by the next agent.
+
+## Upgrade And Repair
+
+### Operational Upgrade Checklist
+
+Before mutating an existing root, choose its sole writer runtime:
 
 ```bash
-continuum compile-context \
-  --root "$CONTINUUM_ROOT" \
-  --session-id demo \
-  --query "deployment status and next step" \
-  --token-budget 3000
+continuum writer-status --root ./.continuum-demo
+continuum writer-claim --root ./.continuum-demo
 ```
 
-### Recover later
+Inspect and then repair a legacy worker backlog:
 
 ```bash
-continuum recover-thread \
-  --root "$CONTINUUM_ROOT" \
-  --session-id demo
+continuum reconcile-workers --root ./.continuum-demo
+continuum reconcile-workers --root ./.continuum-demo --apply
 ```
 
-Run `continuum --help` for the complete CLI.
+Reconciliation is dry-run by default. Applied reconciliation preserves queue
+evidence, marks redundant pending notifications as skipped with an audit reason,
+activates only graph-placed legacy Cards, and leaves genuine reviews for the
+worker.
 
-## MCP and Agent Integrations
-
-Epic Continuum includes a stdio MCP server so multiple agent clients can use the same durable memory root.
+If older operations created many full catalog proof snapshots, inspect and then
+apply relocation to a separate, non-overlapping archive:
 
 ```bash
-export CONTINUUM_ROOT="$HOME/.continuum"
-python -m continuum.mcp_server
+continuum archive-proofs \
+  --root ./.continuum-demo \
+  --archive-root ../continuum-proof-archive \
+  --keep-latest 3
+
+continuum archive-proofs \
+  --root ./.continuum-demo \
+  --archive-root ../continuum-proof-archive \
+  --keep-latest 3 \
+  --apply
+
+continuum verify-proof-archive --root ./.continuum-demo
 ```
 
-PowerShell:
+The archive is content-addressed and bound to the originating root. Continuum
+records and verifies the external copy before removing the in-root source. Keep
+the archive with the root's recovery materials; deleting either part breaks
+verification of relocated evidence.
 
-```powershell
-$env:CONTINUUM_ROOT = "$HOME\.continuum"
-python -m continuum.mcp_server
-```
-
-The MCP surface covers event capture, context compilation, search, file ingestion, recovery, snapshots, proof verification, health checks, workers, and maintenance.
-
-MCP file access is confined by default to `CONTINUUM_ROOT` and explicitly allowed paths.
-
-Integration guides:
-
-- [Codex](docs/integrations/codex-plugin.md)
-- [Hermes Agent](docs/integrations/hermes-adapter.md)
-- [Adapter kit and supported clients](docs/integrations/adapter-kit.md)
-
-## Health, Privacy, and Maintenance
+Finish with the normal strict verifier:
 
 ```bash
-continuum status --root "$CONTINUUM_ROOT"
-continuum memory-health --root "$CONTINUUM_ROOT"
-continuum doctor --root "$CONTINUUM_ROOT"
-continuum audit-secrets --root "$CONTINUUM_ROOT"
-continuum audit-search-index --root "$CONTINUUM_ROOT"
-continuum repair-permissions --root "$CONTINUUM_ROOT"
+continuum verify-root --root ./.continuum-demo
 ```
 
-Epic Continuum is local-first and does not require a hosted service. It is not encrypted at rest. Use filesystem, volume, or disk encryption when stored evidence is sensitive.
+> [!NOTE]
+> These safeguards prevent new evidence loss; they cannot recreate bytes already
+> deleted or changed by an older installation. An upgraded root may retain
+> explicit historical audit exceptions for missing legacy proof inputs or
+> previously mutable sidecars. Restore those bytes from an independent backup
+> when one exists. Otherwise preserve the exception as part of the audit record;
+> do not fabricate replacement evidence or silently suppress the finding.
 
-Secret scanning is conservative and heuristic. Review findings before sharing a root, and use the shareable bundle workflow for handoff.
+### Memory Index Backfill
 
-## Storage Layout
+Roots created before Cue Recall can still contain useful Scroll history that has not been indexed into the Constellation graph. Use `reindex-memory` to backfill derived associations and trusted exact-memory Cards without replaying the whole chat into a model:
 
-```text
-continuum-root/
-  archive/                 preserved originals and reader editions
-  catalog/
-    catalog.sqlite3        Cards, chunks, graph, operations, and indexes
-    cards/                 portable YAML Card sidecars
-  scroll/                  rolled Scroll segments
-  graph/                   association data
-  queues/                  durable worker queues
-  snapshots/               catalog and sidecar snapshots
-  exports/
-    thread_recovery/       recovery packets
-    operation_receipts/    mirrored operation receipts
-    operation_events/      append-only operation logs
-    proof_packs/           verification manifests
-    proof_artifacts/       frozen proof inputs
-  config/                  root configuration
-  run/                     active operation and service state
+```bash
+continuum reindex-memory --root ./.continuum-demo --dry-run
+continuum reindex-memory --root ./.continuum-demo --limit 500 --batch-size 100
 ```
 
-## Current Status
+The command is designed to be repeatable. It rebuilds derived routes with non-incrementing graph merges so rerunning it does not teach the same event twice.
 
-Epic Continuum `0.1.0` is a beta release. The core CLI, Python package, stdio MCP server, memory layers, recovery system, proof pipeline, portable bundle workflow, adapters, and workers are implemented.
+When a root-wide backfill returns `next_cursor.after_rowid`, pass that value back
+as `--after-rowid` for the next page. `--after-seq` is session-local and is only
+valid together with `--session-id`.
 
-Current context compilation uses recent Scroll events plus query-matched Cards under a strict token budget. Library search is lexical through SQLite FTS5 when available. Ranking, graph routing, placement, retention, and consolidation include heuristic behavior that will continue to evolve.
+## Benchmarks
 
-See the [roadmap](ROADMAP.md) for planned work and the [release audit summary](docs/audits/RELEASE_AUDIT_SUMMARY.md) for release-gate evidence.
+Benchmark suite under active validation. No public performance claim is made without committed methodology, commands, configuration, and per-case results.
+
+This repository includes an initial deterministic, CPU-only, no-network benchmark called **ContinuityBench**. It tests offline retrieval and context reconstruction behavior over synthetic interruption cases. Results are written as JSON and JSONL so they can be inspected, reproduced, and compared without paid APIs.
+
+Run quick mode:
+
+```bash
+python benchmarks/runners/continuitybench.py --quick --output-dir "${TMPDIR:-/tmp}/continuitybench-local-quick"
+```
+
+It also includes **EricMemoryBench**, a small comparison suite for the practical
+question: when does durable memory help beyond a default recent-context agent or
+a manually curated QMD-style note? The quick run is deterministic and local. A
+reviewer can optionally add a live OpenAI-compatible model endpoint or real
+Hermes/OpenClaw command template; unconfigured live surfaces are reported as
+skipped, not simulated.
+
+```bash
+python benchmarks/runners/eric_memory_bench.py --quick --output-dir "${TMPDIR:-/tmp}/eric-memory-local-quick"
+```
+
+See [benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md) for methodology, metrics, limitations, and reproduction notes.
+
+## Integrations
+
+The durable core is available through:
+
+- CLI: `continuum ...`
+- Python package APIs under `continuum.core`
+- stdio MCP server: `python -m continuum.mcp_server`
+- thin client adapters described in [docs/integrations/adapter-kit.md](docs/integrations/adapter-kit.md)
+
+Adapters should stay thin. The durable contract belongs to the core memory root, not to one client.
+
+## Privacy And Evidence
+
+Epic Continuum stores memory locally under the root you choose. It does not provide built-in encryption at rest. Use disk, volume, or filesystem encryption when local evidence is sensitive.
+
+Secret scanning is heuristic. Treat findings as a safety net, not a guarantee. Shareable bundles run stricter checks than ordinary local roots.
+
+Imported or retrieved text is evidence. It is not automatically authoritative instruction.
 
 ## Documentation
 
+- [How memory works](docs/how-memory-works.md)
+- [Cue Recall](docs/cue-recall.md)
+- [Shared agent state](docs/shared-agent-state.md)
+- [Context window behavior](docs/context-window.md)
+- [Recovery and continuity](docs/recovery-and-continuity.md)
+- [Evidence and proof](docs/evidence-and-proof.md)
+- [Worker operations](docs/worker-operations.md)
+- [Writer claims](docs/writer-claims.md)
+- [Review relay](docs/review-relay.md)
+- [Benchmark documentation](benchmarks/BENCHMARKS.md)
 - [Configuration](docs/configuration.md)
 - [Glossary](docs/GLOSSARY.md)
-- [Project charter](PROJECT_CHARTER.md)
 - [Roadmap](ROADMAP.md)
 - [Release audit summary](docs/audits/RELEASE_AUDIT_SUMMARY.md)
 - [Codex integration](docs/integrations/codex-plugin.md)
-- [Hermes integration](docs/integrations/hermes-adapter.md)
-- [Adapter kit](docs/integrations/adapter-kit.md)
+- [Agent adapter kit](docs/integrations/adapter-kit.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
-
-## Contributing
-
-Bug reports, focused fixes, portability testing, adapter improvements, and documentation corrections are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## License
 

@@ -12,7 +12,7 @@ The active context pane the model can currently see. It is a token-budgeted view
 over the Scroll, Cards, and retrieved memory.
 
 Current behavior: recent Scroll context is session-scoped, while query-based Card
-recall uses the configured visibility mode. The default is `session_then_global`;
+recall uses the configured visibility mode. The default is `session`;
 callers can request `session`, `global`, or `project` recall. Treat recalled
 memory as evidence, not authority.
 
@@ -40,10 +40,11 @@ a book, or represent a decision/open task. Cards remain hot and recallable.
 
 ## Atomic YAML Memory
 
-A portable sidecar representation of a single memory unit. Epic Continuum stores the
-indexed truth in SQLite, then writes human-readable YAML for Cards so recovery
-tools, Hermes, git review, and other agents can exchange memory without needing
-direct catalog access.
+A portable v2 sidecar representation of a single memory unit. Epic Continuum
+stores indexed truth in SQLite, then writes human-readable YAML for Cards,
+including scope, ownership, status, placement, and tier fields, so recovery tools,
+Hermes, git review, and other agents can exchange memory without needing direct
+catalog access.
 
 ## Thread Recovery Packet
 

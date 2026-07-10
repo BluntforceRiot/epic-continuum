@@ -5,19 +5,19 @@
       "name": "Codex",
       "path": "plugins/continuum",
       "surface": "Codex plugin + stdio MCP",
-      "status": "packaged"
+      "status": "source_package"
     },
     {
       "name": "Hermes Agent",
       "path": "integrations/hermes",
       "surface": "Hermes plugin hooks",
-      "status": "packaged"
+      "status": "source_package"
     },
     {
       "name": "Claude Code",
       "path": "integrations/claude-code",
       "surface": "Claude Code plugin + MCP + hooks",
-      "status": "packaged"
+      "status": "source_package"
     },
     {
       "name": "Claude Desktop",
@@ -47,19 +47,19 @@
       "name": "OpenClaw",
       "path": "integrations/openclaw",
       "surface": "MCP + mission card handoff",
-      "status": "packaged"
+      "status": "source_package"
     },
     {
       "name": "Ollama",
       "path": "integrations/ollama",
       "surface": "OpenAI-compatible wrapper + Modelfile guidance",
-      "status": "packaged"
+      "status": "guidance"
     },
     {
       "name": "OpenAI-compatible runtimes",
       "path": "integrations/openai-compatible",
       "surface": "request wrapper",
-      "status": "packaged"
+      "status": "source_package"
     },
     {
       "name": "LangChain",

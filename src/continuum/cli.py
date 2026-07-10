@@ -6,7 +6,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from .core.config import config_path, load_config, optimize_config, write_default_config
+from . import __version__
+from .core.config import config_path, default_config, load_config, optimize_config, write_default_config
 from .core.bundle import pack_root, verify_root_bundle
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
@@ -20,9 +21,27 @@ from .core.operations import (
     recovery_drill,
     repair_permissions,
     replay_operation_event_log,
+    audit_restore_drill_paths,
     restore_drill,
     verify_root,
     verify_proof_pack,
+)
+from .core.proof_archive import (
+    archive_legacy_catalog_snapshots,
+    configured_archive_root,
+    verify_relocation_ledger,
+)
+from .core.review_bridge import (
+    DEFAULT_REVIEW_BASE_URL,
+    DEFAULT_REVIEW_MODEL,
+    DEFAULT_REVIEW_TRANSPORT,
+    SUPPORTED_TRANSPORTS,
+    create_review_job,
+    ingest_review_result,
+    review_browser_attempt_start,
+    review_check_current,
+    review_job_status,
+    run_review_job,
 )
 from .core.store import (
     append_scroll_event,
@@ -31,16 +50,22 @@ from .core.store import (
     audit_secrets,
     audit_secrets_sarif,
     compile_context,
+    cue_recall,
     ingest_file,
     init_db,
     recover_thread,
+    record_project_state,
     rebuild_search_index,
     redact_legacy_secrets,
+    reindex_memory,
+    resolve_stored_uri,
     roll_scroll_segment,
     search_memory,
     source_file_reference,
     snapshot,
     status,
+    canonical_partition_identifier,
+    validate_partition_identifier,
 )
 from .core.workers import (
     apply_storage_tiering,
@@ -48,10 +73,12 @@ from .core.workers import (
     detect_conflicts,
     memory_health,
     prune_memory,
+    reconcile_worker_backlog,
     run_worker_pass,
     serve_workers,
 )
-from .core.safety import redact_text_secrets
+from .core.safety import redact_text_secrets, scan_text_for_secrets
+from .core.writer_claim import claim_writer, writer_claim_status
 from .integrations.hermes_adapter import install_hermes_adapter
 
 
@@ -82,6 +109,27 @@ def emit_result(result: Any) -> int:
     return 0
 
 
+def prevalidate_cli_partition(root: Path, kind: str, value: str | None) -> str | None:
+    """Validate a CLI partition id before any operation artifact is created.
+
+    The returned value is safe for operation titles/intents. Core write paths
+    still perform canonical aliasing at commit time.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if scan_text_for_secrets(text, max_findings=1):
+        security = (load_config(root) if config_path(root).exists() else default_config()).get("security", {})
+        if bool(security.get("secret_scan_enabled", True)) and str(security.get("secret_scan_action") or "block") == "block":
+            raise ValueError(f"secret scan blocked {kind} before operation receipt")
+        return redact_text_secrets(text)
+    canonical = canonical_partition_identifier(root, kind, text, lookup=True)
+    if canonical != text:
+        return redact_text_secrets(text)
+    validate_partition_identifier(kind, text)
+    return text
+
+
 def guarded_result(
     root: Path,
     *,
@@ -94,6 +142,8 @@ def guarded_result(
     result_touched_paths: Callable[[Any], list[Path | str]] | None = None,
     action: Callable[[OperationGuard], Any],
     actor: str | None = None,
+    proof: bool = True,
+    catalog_proof_mode: str | None = None,
 ) -> Any:
     with OperationGuard(
         root,
@@ -104,6 +154,8 @@ def guarded_result(
         snapshot_policy=snapshot_policy,
         snapshot_reason=snapshot_reason,
         touched_paths=touched_paths,
+        proof=proof,
+        catalog_proof_mode=catalog_proof_mode,
     ) as operation:
         result = action(operation)
         extra_paths = result_touched_paths(result) if result_touched_paths else []
@@ -113,6 +165,7 @@ def guarded_result(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Epic Continuum persistent-memory substrate")
+    parser.add_argument("--version", action="version", version=f"epic-continuum-memory {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Initialize an Epic Continuum root")
@@ -120,6 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show root status")
     p_status.add_argument("--root", required=True)
+
+    p_writer_status = sub.add_parser("writer-status", help="Show the root writer claim without changing it")
+    p_writer_status.add_argument("--root", required=True)
+
+    p_writer_claim = sub.add_parser("writer-claim", help="Claim an unclaimed root for this runtime and host")
+    p_writer_claim.add_argument("--root", required=True)
+    p_writer_claim.add_argument("--force", action="store_true", help="Transfer an existing or malformed claim")
+    p_writer_claim.add_argument(
+        "--acknowledge-writers-stopped",
+        action="store_true",
+        help="Confirm every Continuum writer was stopped before a forced transfer",
+    )
 
     p_config = sub.add_parser("config", help="Create/show root config")
     p_config.add_argument("--root", required=True)
@@ -158,17 +223,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_context.add_argument("--query")
     p_context.add_argument("--card-scope", choices=["session", "global", "session_then_global", "project"])
     p_context.add_argument("--project-id")
+    p_context.add_argument("--include-cue-recall", action="store_true")
+    p_context.add_argument("--cue-recall-limit", type=int, default=4, help="Cue Recall candidates to include when enabled; clamped to 1..20")
 
     p_search = sub.add_parser("search", help="Search Library chunks with FTS5 or LIKE fallback")
     p_search.add_argument("--root", required=True)
     p_search.add_argument("--query", required=True)
     p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--session-id")
+    p_search.add_argument("--project-id")
+
+    p_cue = sub.add_parser("cue-recall", help="Recover buried ideas from loose associative cues")
+    p_cue.add_argument("--root", required=True)
+    p_cue.add_argument("--cue", required=True)
+    p_cue.add_argument("--session-id")
+    p_cue.add_argument("--project-id")
+    p_cue.add_argument("--limit", type=int, default=8)
+    p_cue.add_argument("--max-associations", type=int, default=16)
+
+    p_project_state = sub.add_parser("record-project-state", help="Record a durable shared project-state checkpoint")
+    p_project_state.add_argument("--root", required=True)
+    p_project_state.add_argument("--session-id", required=True)
+    p_project_state.add_argument("--agent-id", required=True)
+    p_project_state.add_argument("--project-id", required=True)
+    p_project_state.add_argument("--objective")
+    p_project_state.add_argument("--repo-path")
+    p_project_state.add_argument("--branch")
+    p_project_state.add_argument("--commit")
+    p_project_state.add_argument("--dirty", action="store_true")
+    p_project_state.add_argument("--clean", action="store_true")
+    p_project_state.add_argument("--changed-file", action="append", default=[])
+    p_project_state.add_argument("--decision", action="append", default=[])
+    p_project_state.add_argument("--open-task", action="append", default=[])
+    p_project_state.add_argument("--notes")
 
     p_audit_search = sub.add_parser("audit-search-index", help="Audit Library chunk FTS index consistency")
     p_audit_search.add_argument("--root", required=True)
 
     p_rebuild_search = sub.add_parser("rebuild-search-index", help="Rebuild Library chunk FTS index from chunks")
     p_rebuild_search.add_argument("--root", required=True)
+
+    p_reindex_memory = sub.add_parser("reindex-memory", help="Backfill Scroll association routes and trusted exact-memory Cards")
+    p_reindex_memory.add_argument("--root", required=True)
+    p_reindex_memory.add_argument("--session-id")
+    p_reindex_memory.add_argument("--after-seq", type=int, default=0)
+    p_reindex_memory.add_argument("--after-rowid", type=int, default=0)
+    p_reindex_memory.add_argument("--limit", type=int, default=500)
+    p_reindex_memory.add_argument("--batch-size", type=int, default=100)
+    p_reindex_memory.add_argument("--dry-run", action="store_true")
+    p_reindex_memory.add_argument(
+        "--no-promote-exact-memory",
+        action="store_true",
+        help="Only rebuild graph associations; do not create trusted exact-memory Cards.",
+    )
 
     p_workers = sub.add_parser("run-workers", help="Run one Scribe/Librarian/Archivist worker pass")
     p_workers.add_argument("--root", required=True)
@@ -181,6 +288,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--role", action="append", choices=["scribe", "librarian", "archivist"])
     p_serve.add_argument("--passes", type=int, default=0, help="Number of passes before exit; 0 runs until stopped")
     p_serve.add_argument("--interval-seconds", type=float, default=5.0)
+    p_serve.add_argument(
+        "--maintenance-interval-seconds",
+        type=float,
+        default=300.0,
+        help="Seconds between bounded maintenance passes",
+    )
+    p_serve.add_argument(
+        "--no-maintenance-on-start",
+        action="store_true",
+        help="Delay the first maintenance pass until the maintenance interval elapses",
+    )
+
+    p_reconcile_workers = sub.add_parser(
+        "reconcile-workers",
+        help="Dry-run or apply bounded reconciliation of legacy worker/card backlog",
+    )
+    p_reconcile_workers.add_argument("--root", required=True)
+    p_reconcile_workers.add_argument("--queue-limit", type=int, default=5000)
+    p_reconcile_workers.add_argument("--card-limit", type=int, default=5000)
+    p_reconcile_workers.add_argument("--apply", action="store_true", help="Apply the reconciliation; default is dry-run")
 
     p_health = sub.add_parser("memory-health", help="Report Epic Continuum capture, queue, storage, and learning health")
     p_health.add_argument("--root", required=True)
@@ -215,6 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_recover = sub.add_parser("recover-thread", help="Build a crash-recovery packet for a session")
     p_recover.add_argument("--root", required=True)
     p_recover.add_argument("--session-id", required=True)
+    p_recover.add_argument("--project-id")
     p_recover.add_argument("--query")
     p_recover.add_argument("--token-budget", type=int, default=0)
     p_recover.add_argument("--recent-event-limit", type=int, default=24)
@@ -263,6 +391,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify_proof.add_argument("path")
     p_verify_proof.add_argument("--root", help="Override the continuum root for root-relative proof paths")
 
+    p_archive_proofs = sub.add_parser(
+        "archive-proofs",
+        help="Dry-run or relocate verified legacy catalog proof snapshots to an external archive",
+    )
+    p_archive_proofs.add_argument("--root", required=True)
+    p_archive_proofs.add_argument("--archive-root", required=True, help="External, non-overlapping proof archive directory")
+    p_archive_proofs.add_argument("--keep-latest", type=int, default=3, help="Keep this many newest eligible snapshots in-root")
+    p_archive_proofs.add_argument("--apply", action="store_true", help="Apply relocation; default is dry-run")
+
+    p_verify_proof_archive = sub.add_parser(
+        "verify-proof-archive",
+        help="Verify the configured or explicitly selected external proof archive ledger",
+    )
+    p_verify_proof_archive.add_argument("--root", required=True)
+    p_verify_proof_archive.add_argument("--archive-root", help="External archive; defaults to the root's verified locator")
+
     p_replay_op_log = sub.add_parser("replay-operation-log", help="Replay a hash-chained operation event JSONL log")
     p_replay_op_log.add_argument("path")
     p_replay_op_log.add_argument("--operation-id")
@@ -309,6 +453,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_restore_drill.add_argument("--name", default="epic-continuum-restore-drill")
     p_restore_drill.add_argument("--verify-recent-proof-packs", type=int, default=1)
 
+    p_review_prepare = sub.add_parser("review-prepare", help="Create a hash-bound review relay job")
+    p_review_prepare.add_argument("--root", required=True)
+    p_review_prepare.add_argument("--subject", required=True, help="File or directory to package for review")
+    review_prompt = p_review_prepare.add_mutually_exclusive_group(required=True)
+    review_prompt.add_argument("--prompt", help="Review instructions")
+    review_prompt.add_argument("--prompt-file", help="Read review instructions from this file")
+    p_review_prepare.add_argument("--reviewer-id", default="local-reviewer")
+    p_review_prepare.add_argument("--transport", choices=sorted(SUPPORTED_TRANSPORTS), default=DEFAULT_REVIEW_TRANSPORT)
+    p_review_prepare.add_argument("--model", default=DEFAULT_REVIEW_MODEL)
+    p_review_prepare.add_argument("--base-url", default=DEFAULT_REVIEW_BASE_URL)
+    p_review_prepare.add_argument("--no-diff", action="store_true")
+    p_review_prepare.add_argument("--max-packet-bytes", type=int, default=512_000)
+    p_review_prepare.add_argument("--max-file-bytes", type=int, default=64_000)
+    p_review_prepare.add_argument("--max-files", type=int, default=300)
+    p_review_prepare.add_argument(
+        "--secret-allowlist-pattern",
+        action="append",
+        default=[],
+        help="Legacy anchored source:line:text regex for non-hashed review-secret false positives; exact fingerprints are required for hashed token findings.",
+    )
+    p_review_prepare.add_argument(
+        "--secret-allowlist-file",
+        action="append",
+        default=[],
+        help="UTF text/JSONL file containing exact review secret allowlist fingerprints; repeat for multiple files.",
+    )
+
+    p_review_run = sub.add_parser("review-run", help="Run a review relay job with a direct OpenAI-compatible endpoint")
+    p_review_run.add_argument("--root", required=True)
+    p_review_run.add_argument("--job-id", required=True)
+    p_review_run.add_argument("--transport", choices=sorted(SUPPORTED_TRANSPORTS))
+    p_review_run.add_argument("--model")
+    p_review_run.add_argument("--base-url")
+    p_review_run.add_argument("--timeout-seconds", type=int, default=900)
+    p_review_run.add_argument("--max-tokens", type=int, default=4096)
+
+    p_review_ingest = sub.add_parser("review-ingest", help="Ingest a completed hash-bound review result")
+    p_review_ingest.add_argument("--root", required=True)
+    p_review_ingest.add_argument("--job-id", required=True)
+    review_result = p_review_ingest.add_mutually_exclusive_group(required=True)
+    review_result.add_argument("--result-path", help="Path to reviewer JSON or markdown containing a JSON object")
+    review_result.add_argument("--content", help="Reviewer result content")
+
+    p_review_status = sub.add_parser("review-status", help="Show one review relay job status")
+    p_review_status.add_argument("--root", required=True)
+    p_review_status.add_argument("--job-id", required=True)
+
+    p_review_check_current = sub.add_parser("review-check-current", help="Check whether the reviewed subject still matches the frozen review snapshot")
+    p_review_check_current.add_argument("--root", required=True)
+    p_review_check_current.add_argument("--job-id", required=True)
+
+    p_review_browser_attempt = sub.add_parser("review-browser-attempt-start", help="Reserve a unique browser-review response path")
+    p_review_browser_attempt.add_argument("--root", required=True)
+    p_review_browser_attempt.add_argument("--job-id", required=True)
+
     p_hermes = sub.add_parser("install-hermes-adapter", help="Install the Epic Continuum Hermes plugin adapter")
     p_hermes.add_argument("--root", required=True)
     p_hermes.add_argument("--hermes-home")
@@ -336,6 +535,20 @@ def _main(argv: list[str] | None = None) -> int:
 
     root_arg_value = getattr(args, "root", None)
     root = Path(root_arg_value) if root_arg_value else None
+    if args.command == "writer-status":
+        assert root is not None
+        return emit_result(writer_claim_status(root))
+
+    if args.command == "writer-claim":
+        assert root is not None
+        return emit_result(
+            claim_writer(
+                root,
+                force=args.force,
+                acknowledge_writers_stopped=args.acknowledge_writers_stopped,
+            )
+        )
+
     if args.command == "init":
         assert root is not None
         def action(operation: OperationGuard) -> dict[str, Any]:
@@ -413,6 +626,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "append-event":
         assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = append_scroll_event(
                     root,
@@ -428,11 +642,12 @@ def _main(argv: list[str] | None = None) -> int:
             guarded_result(
                 root,
                 operation_type="cli_append_event",
-                title=f"Append Scroll event for {args.session_id}",
-                intent={"session_id": args.session_id, "event_type": args.type, "role": args.role},
+                title=f"Append Scroll event for {safe_session_id}",
+                intent={"session_id": safe_session_id, "event_type": args.type, "role": args.role},
                 snapshot_policy="none",
                 snapshot_reason="append-only Scroll event",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                proof=False,
                 action=action,
             )
         )
@@ -440,8 +655,11 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "roll-segment":
         assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
+        if args.start_seq < 1 or args.end_seq < args.start_seq:
+            raise ValueError("start_seq must be >= 1 and end_seq must be >= start_seq")
         def action(operation: OperationGuard) -> dict[str, Any]:
-            operation.cursor({"phase": "before_roll", "session_id": args.session_id, "start_seq": args.start_seq, "end_seq": args.end_seq})
+            operation.cursor({"phase": "before_roll", "session_id": safe_session_id, "start_seq": args.start_seq, "end_seq": args.end_seq})
             result = roll_scroll_segment(
                     root,
                     session_id=args.session_id,
@@ -455,8 +673,8 @@ def _main(argv: list[str] | None = None) -> int:
             guarded_result(
                 root,
                 operation_type="cli_roll_segment",
-                title=f"Roll Scroll segment {args.session_id}:{args.start_seq}-{args.end_seq}",
-                intent={"session_id": args.session_id, "start_seq": args.start_seq, "end_seq": args.end_seq},
+                title=f"Roll Scroll segment {safe_session_id}:{args.start_seq}-{args.end_seq}",
+                intent={"session_id": safe_session_id, "start_seq": args.start_seq, "end_seq": args.end_seq},
                 snapshot_policy="auto",
                 snapshot_reason="roll segment mutates catalog/cards/graph",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
@@ -509,6 +727,8 @@ def _main(argv: list[str] | None = None) -> int:
                 query=args.query,
                 card_scope=args.card_scope,
                 project_id=args.project_id,
+                include_cue_recall=args.include_cue_recall,
+                cue_recall_limit=args.cue_recall_limit,
                 create=False,
             )
         )
@@ -516,23 +736,26 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "recover-thread":
         assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
+        safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = recover_thread(
                     root,
                     session_id=args.session_id,
+                    project_id=args.project_id,
                     query=args.query,
                     token_budget=args.token_budget,
                     recent_event_limit=args.recent_event_limit,
             )
-            operation.cursor({"phase": "thread_recovered", "session_id": args.session_id, "packet_uri": result["packet_uri"]})
+            operation.cursor({"phase": "thread_recovered", "session_id": safe_session_id, "packet_uri": result["packet_uri"]})
             return result
 
         emit(
             guarded_result(
                 root,
                 operation_type="cli_recover_thread",
-                title=f"Recover thread {args.session_id}",
-                intent={"session_id": args.session_id, "query": args.query, "token_budget": args.token_budget},
+                title=f"Recover thread {safe_session_id}",
+                intent={"session_id": safe_session_id, "project_id": safe_project_id, "query": args.query, "token_budget": args.token_budget},
                 snapshot_policy="none",
                 snapshot_reason="recovery packet is an export over existing evidence",
                 result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
@@ -543,8 +766,83 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "search":
         assert root is not None
-        emit(search_memory(root, query=args.query, limit=args.limit, create=False))
+        if args.session_id:
+            prevalidate_cli_partition(root, "session_id", args.session_id)
+        if args.project_id:
+            prevalidate_cli_partition(root, "project_id", args.project_id)
+        emit(
+            search_memory(
+                root,
+                query=args.query,
+                limit=args.limit,
+                session_id=args.session_id,
+                project_id=args.project_id,
+                create=False,
+            )
+        )
         return 0
+
+    if args.command == "cue-recall":
+        assert root is not None
+        emit(
+            cue_recall(
+                root,
+                cue=args.cue,
+                session_id=args.session_id,
+                project_id=args.project_id,
+                limit=args.limit,
+                max_associations=args.max_associations,
+                create=False,
+            )
+        )
+        return 0
+
+    if args.command == "record-project-state":
+        assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
+        safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
+        safe_agent_id = prevalidate_cli_partition(root, "agent_id", args.agent_id)
+        dirty: bool | None
+        if args.dirty and args.clean:
+            parser.error("--dirty and --clean are mutually exclusive")
+        if args.dirty:
+            dirty = True
+        elif args.clean:
+            dirty = False
+        else:
+            dirty = None
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = record_project_state(
+                root,
+                session_id=args.session_id,
+                agent_id=args.agent_id,
+                project_id=args.project_id,
+                objective=args.objective,
+                repo_path=args.repo_path,
+                branch=args.branch,
+                commit=args.commit,
+                dirty=dirty,
+                changed_files=args.changed_file,
+                decisions=args.decision,
+                open_tasks=args.open_task,
+                notes=args.notes,
+            )
+            operation.cursor({"phase": "project_state_recorded", "card_id": result.get("card_id"), "project_id": safe_project_id})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_record_project_state",
+                title=f"Record shared project state for {safe_project_id}",
+                intent={"project_id": safe_project_id, "agent_id": safe_agent_id, "session_id": safe_session_id},
+                snapshot_policy="auto",
+                snapshot_reason="shared project-state checkpoint mutates Scroll/Cards/Constellation",
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                action=action,
+            )
+        )
 
     if args.command == "audit-search-index":
         assert root is not None
@@ -579,6 +877,68 @@ def _main(argv: list[str] | None = None) -> int:
             )
         )
 
+    if args.command == "reindex-memory":
+        assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id) if args.session_id else None
+        if args.after_seq and not args.session_id:
+            raise ValueError("after_seq can only be used with session_id; use after_rowid for root-wide reindex")
+        if args.dry_run:
+            return emit_result(
+                reindex_memory(
+                    root,
+                    session_id=args.session_id,
+                    after_seq=args.after_seq,
+                    after_rowid=args.after_rowid,
+                    limit=args.limit,
+                    batch_size=args.batch_size,
+                    dry_run=True,
+                    promote_exact_memory=not args.no_promote_exact_memory,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = reindex_memory(
+                root,
+                session_id=args.session_id,
+                after_seq=args.after_seq,
+                after_rowid=args.after_rowid,
+                limit=args.limit,
+                batch_size=args.batch_size,
+                dry_run=False,
+                promote_exact_memory=not args.no_promote_exact_memory,
+            )
+            operation.cursor(
+                {
+                    "phase": "memory_reindexed",
+                    "processed_count": result.get("processed_count"),
+                    "edge_delta": result.get("edge_delta"),
+                    "exact_memory_cards": result.get("exact_memory_cards"),
+                    "next_cursor": result.get("next_cursor"),
+                    "has_more": result.get("has_more"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_reindex_memory",
+                title="Reindex Epic Continuum Scroll associations",
+                intent={
+                    "session_id": safe_session_id,
+                    "after_seq": args.after_seq,
+                    "after_rowid": args.after_rowid,
+                    "limit": args.limit,
+                    "batch_size": args.batch_size,
+                    "promote_exact_memory": not args.no_promote_exact_memory,
+                },
+                snapshot_policy="auto",
+                snapshot_reason="memory reindex mutates derived graph/card state",
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                action=action,
+            )
+        )
+
     if args.command == "run-workers":
         assert root is not None
 
@@ -602,7 +962,57 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "serve":
         assert root is not None
-        return emit_result(serve_workers(root, roles=args.role, limit=args.passes, interval_seconds=args.interval_seconds))
+        return emit_result(
+            serve_workers(
+                root,
+                roles=args.role,
+                limit=args.passes,
+                interval_seconds=args.interval_seconds,
+                maintenance_interval_seconds=args.maintenance_interval_seconds,
+                maintenance_on_start=not args.no_maintenance_on_start,
+            )
+        )
+
+    if args.command == "reconcile-workers":
+        assert root is not None
+        if not args.apply:
+            return emit_result(
+                reconcile_worker_backlog(
+                    root,
+                    dry_run=True,
+                    queue_limit=args.queue_limit,
+                    card_limit=args.card_limit,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = reconcile_worker_backlog(
+                root,
+                dry_run=False,
+                queue_limit=args.queue_limit,
+                card_limit=args.card_limit,
+            )
+            operation.cursor(
+                {
+                    "phase": "worker_backlog_reconciled",
+                    "queue_changed": (result.get("queue") or {}).get("changed"),
+                    "cards_changed": (result.get("cards") or {}).get("changed"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_reconcile_workers",
+                title="Reconcile Epic Continuum worker backlog",
+                intent={"queue_limit": args.queue_limit, "card_limit": args.card_limit},
+                snapshot_policy="auto",
+                snapshot_reason="worker backlog reconciliation mutates queue and card status",
+                touched_paths=[root / "catalog" / "catalog.sqlite3", root / "cards"],
+                action=action,
+            )
+        )
 
     if args.command == "memory-health":
         assert root is not None
@@ -650,6 +1060,7 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="auto",
                 snapshot_reason="pruning mutates card status/projection state",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
                 action=action,
             )
         )
@@ -816,6 +1227,7 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="auto",
                 snapshot_reason="legacy secret cleanup mutates catalog text columns",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                catalog_proof_mode="snapshot",
                 action=action,
             )
         )
@@ -824,6 +1236,55 @@ def _main(argv: list[str] | None = None) -> int:
         result = verify_proof_pack(Path(args.path), root=root, strict=True)
         emit(result)
         return 0 if result.get("ok") else 1
+
+    if args.command == "archive-proofs":
+        assert root is not None
+        archive_root = Path(args.archive_root)
+        if not args.apply:
+            return emit_result(
+                archive_legacy_catalog_snapshots(
+                    root,
+                    archive_root,
+                    keep_latest=args.keep_latest,
+                    dry_run=True,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = archive_legacy_catalog_snapshots(
+                root,
+                archive_root,
+                keep_latest=args.keep_latest,
+                dry_run=False,
+            )
+            operation.cursor(
+                {
+                    "phase": "legacy_catalog_proofs_archived",
+                    "archived_count": result.get("archived_count"),
+                    "archived_bytes": result.get("archived_bytes"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_archive_proofs",
+                title="Archive legacy catalog proof snapshots",
+                intent={"archive_root": str(archive_root), "keep_latest": args.keep_latest},
+                snapshot_policy="none",
+                snapshot_reason="proof relocation is content-addressed and independently restorable",
+                touched_paths=[root / "config" / "proof-archive.json", root / "exports" / "proof_artifacts"],
+                action=action,
+            )
+        )
+
+    if args.command == "verify-proof-archive":
+        assert root is not None
+        selected_archive_root = Path(args.archive_root) if args.archive_root else configured_archive_root(root)
+        if selected_archive_root is None:
+            return emit_result({"ok": False, "reason": "proof_archive_not_configured", "root": str(root)})
+        return emit_result(verify_relocation_ledger(root, selected_archive_root))
 
     if args.command == "replay-operation-log":
         result = replay_operation_event_log(Path(args.path), operation_id=args.operation_id)
@@ -907,6 +1368,20 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "restore-drill":
         assert root is not None
+        preflight = audit_restore_drill_paths(root)
+        if not preflight.get("ok"):
+            return emit_result(
+                restore_drill(
+                    root,
+                    snapshot_uri=args.snapshot_uri,
+                    drill_name=args.name,
+                    verify_recent_proof_packs=args.verify_recent_proof_packs,
+                )
+            )
+        if args.snapshot_uri:
+            selected_snapshot = resolve_stored_uri(root, args.snapshot_uri)
+            if not selected_snapshot.exists():
+                raise FileNotFoundError(str(selected_snapshot))
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = restore_drill(
                 root,
@@ -933,6 +1408,160 @@ def _main(argv: list[str] | None = None) -> int:
                 action=action,
             )
         )
+
+    if args.command == "review-prepare":
+        assert root is not None
+        prompt_text = args.prompt
+        if args.prompt_file:
+            prompt_text = Path(args.prompt_file).read_text(encoding="utf-8", errors="replace")
+        subject_path = Path(args.subject)
+        subject_ref = source_file_reference(root, subject_path) if subject_path.exists() else {"name": subject_path.name}
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = create_review_job(
+                root,
+                subject_path=subject_path,
+                prompt=str(prompt_text or ""),
+                reviewer_id=args.reviewer_id,
+                transport=args.transport,
+                model=args.model,
+                base_url=args.base_url,
+                include_diff=not args.no_diff,
+                max_packet_bytes=args.max_packet_bytes,
+                max_file_bytes=args.max_file_bytes,
+                max_files=args.max_files,
+                secret_allowlist_patterns=args.secret_allowlist_pattern,
+                secret_allowlist_files=[Path(path) for path in args.secret_allowlist_file or []],
+                operation_id=operation.operation_id,
+            )
+            operation.cursor({"phase": "review_job_created", "job_id": result["job_id"], "packet_sha256": result["packet_sha256"]})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_review_prepare",
+                title=f"Prepare review relay job for {subject_ref.get('name')}",
+                intent={
+                    "subject": source_file_reference(root, subject_path) if subject_path.exists() else str(subject_path),
+                    "transport": args.transport,
+                    "reviewer_id": args.reviewer_id,
+                    "model": args.model,
+                    "secret_allowlist_pattern_count": len(args.secret_allowlist_pattern or []),
+                    "secret_allowlist_file_count": len(args.secret_allowlist_file or []),
+                },
+                snapshot_policy="none",
+                snapshot_reason="review preparation writes export artifacts only",
+                result_touched_paths=lambda result: [
+                    path
+                    for path in [
+                        result.get("job_dir"),
+                        result.get("request_uri"),
+                        result.get("packet_uri"),
+                        result.get("prompt_uri"),
+                        result.get("schema_uri"),
+                        result.get("subject_manifest_uri"),
+                        result.get("subject_archive_uri"),
+                        result.get("review_capsule_uri"),
+                        result.get("manual_handoff_uri"),
+                        result.get("browser_handoff_uri"),
+                        result.get("secret_allowlist_report_uri"),
+                    ]
+                    if path
+                ],
+                action=action,
+            )
+        )
+
+    if args.command == "review-run":
+        assert root is not None
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = run_review_job(
+                root,
+                job_id=args.job_id,
+                transport=args.transport,
+                model=args.model,
+                base_url=args.base_url,
+                timeout_seconds=args.timeout_seconds,
+                max_tokens=args.max_tokens,
+                operation_id=operation.operation_id,
+            )
+            operation.cursor({"phase": "review_job_ran", "job_id": args.job_id, "status": result.get("status")})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_review_run",
+                title=f"Run review relay job {args.job_id}",
+                intent={"job_id": args.job_id, "transport": args.transport, "model": args.model},
+                snapshot_policy="none",
+                snapshot_reason="review run writes export artifacts only",
+                result_touched_paths=lambda result: [
+                    path
+                    for path in [
+                        result.get("raw_response_uri"),
+                        result.get("reviewer_content_uri"),
+                        result.get("last_response_uri"),
+                        (result.get("ingest") or {}).get("findings_uri") if isinstance(result.get("ingest"), dict) else None,
+                        (result.get("ingest") or {}).get("findings_markdown_uri") if isinstance(result.get("ingest"), dict) else None,
+                        (result.get("ingest") or {}).get("ingest_receipt_uri") if isinstance(result.get("ingest"), dict) else None,
+                    ]
+                    if path
+                ],
+                action=action,
+            )
+        )
+
+    if args.command == "review-ingest":
+        assert root is not None
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = ingest_review_result(
+                root,
+                job_id=args.job_id,
+                result_path=Path(args.result_path) if args.result_path else None,
+                content=args.content,
+                operation_id=operation.operation_id,
+            )
+            operation.cursor({"phase": "review_result_ingested", "job_id": args.job_id, "verdict": result.get("verdict")})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_review_ingest",
+                title=f"Ingest review result {args.job_id}",
+                intent={"job_id": args.job_id, "result_path": args.result_path},
+                snapshot_policy="none",
+                snapshot_reason="review ingest writes export artifacts and artifact ledger rows",
+                result_touched_paths=lambda result: [
+                    path
+                    for path in [
+                        result.get("raw_response_uri"),
+                        result.get("response_uri"),
+                        result.get("findings_uri"),
+                        result.get("findings_markdown_uri"),
+                        result.get("ingest_receipt_uri"),
+                    ]
+                    if path
+                ],
+                action=action,
+            )
+        )
+
+    if args.command == "review-status":
+        assert root is not None
+        return emit_result(review_job_status(root, job_id=args.job_id))
+
+    if args.command == "review-check-current":
+        assert root is not None
+        return emit_result(review_check_current(root, job_id=args.job_id))
+
+    if args.command == "review-browser-attempt-start":
+        assert root is not None
+        return emit_result(review_browser_attempt_start(root, job_id=args.job_id))
 
     if args.command == "install-hermes-adapter":
         assert root is not None

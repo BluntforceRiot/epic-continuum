@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from continuum.core.store import append_scroll_event, init_db, status
+from continuum.core.writer_claim import claim_writer
 
 
 class EpicContinuumSmokeTest(unittest.TestCase):
@@ -66,6 +67,7 @@ class EpicContinuumSmokeTest(unittest.TestCase):
             finally:
                 conn.close()
 
+            claim_writer(root)
             init_db(root)
 
             conn = sqlite3.connect(catalog / "catalog.sqlite3")

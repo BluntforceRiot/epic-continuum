@@ -13,16 +13,16 @@ class AdapterEntry:
 
 
 ADAPTERS: tuple[AdapterEntry, ...] = (
-    AdapterEntry("Codex", "plugins/continuum", "Codex plugin + stdio MCP", "packaged", "Current working adapter."),
-    AdapterEntry("Hermes Agent", "integrations/hermes", "Hermes plugin hooks", "packaged", "Records turns and injects Looking Glass context."),
-    AdapterEntry("Claude Code", "integrations/claude-code", "Claude Code plugin + MCP + hooks", "packaged", "Uses UserPromptSubmit, SessionStart, and Stop hooks."),
+    AdapterEntry("Codex", "plugins/continuum", "Codex plugin + stdio MCP", "source_package", "Current working adapter in the source/review ZIP."),
+    AdapterEntry("Hermes Agent", "integrations/hermes", "Hermes plugin hooks", "source_package", "Records turns and injects Looking Glass context; wheel includes Hermes assets."),
+    AdapterEntry("Claude Code", "integrations/claude-code", "Claude Code plugin + MCP + hooks", "source_package", "Uses UserPromptSubmit, SessionStart, and Stop hooks."),
     AdapterEntry("Claude Desktop", "integrations/mcp-generic", "stdio MCP config", "template", "Uses the generic MCP server config."),
     AdapterEntry("Cursor", "integrations/mcp-generic", "stdio MCP config", "template", "Use as an MCP memory server from the IDE."),
     AdapterEntry("Windsurf", "integrations/mcp-generic", "stdio MCP config", "template", "Use as an MCP memory server from the IDE."),
     AdapterEntry("Continue.dev", "integrations/openai-compatible", "context gateway pattern", "template", "Best through an OpenAI-compatible gateway or MCP tool call."),
-    AdapterEntry("OpenClaw", "integrations/openclaw", "MCP + mission card handoff", "packaged", "Maps context to OpenClaw decision/evidence/gate cards."),
-    AdapterEntry("Ollama", "integrations/ollama", "OpenAI-compatible wrapper + Modelfile guidance", "packaged", "Best used through an agent or gateway."),
-    AdapterEntry("OpenAI-compatible runtimes", "integrations/openai-compatible", "request wrapper", "packaged", "For vLLM, LM Studio, llama.cpp server, LocalAI, and similar endpoints."),
+    AdapterEntry("OpenClaw", "integrations/openclaw", "MCP + mission card handoff", "source_package", "Maps context to OpenClaw decision/evidence/gate cards."),
+    AdapterEntry("Ollama", "integrations/ollama", "OpenAI-compatible wrapper + Modelfile guidance", "guidance", "Best used through an agent or gateway."),
+    AdapterEntry("OpenAI-compatible runtimes", "integrations/openai-compatible", "request wrapper", "source_package", "For vLLM, LM Studio, llama.cpp server, LocalAI, and similar endpoints."),
     AdapterEntry("LangChain", "integrations/langchain", "retriever/memory shim", "template", "Uses the CLI/MCP surface as the durable store."),
     AdapterEntry("LlamaIndex", "integrations/llamaindex", "query engine/memory shim", "template", "Treats Continuum context as a retrievable pack."),
     AdapterEntry("CrewAI", "integrations/crewai", "tool adapter", "template", "Expose recover/context/append as crew tools."),

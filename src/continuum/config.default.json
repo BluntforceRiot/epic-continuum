@@ -21,7 +21,7 @@
     "max_token_budget": 128000,
     "scroll_event_fetch_limit": 500,
     "reserve_output_tokens": 1024,
-    "card_recall_scope": "session_then_global"
+    "card_recall_scope": "session"
   },
   "capture": {
     "mode": "automatic",
@@ -73,11 +73,12 @@
   "atomic_memory": {
     "write_card_sidecars": true,
     "card_sidecar_dir": "catalog/cards",
-    "schema": "continuum.atomic_memory.v1"
+    "schema": "continuum.atomic_memory.v2"
   },
   "epic_continuity": {
     "operation_receipts": true,
     "principle": "No one said we could not back it up while building it.",
+    "catalog_proof_mode": "state_manifest",
     "run_dir": "run/operations",
     "export_dir": "exports/operation_receipts",
     "proof_pack_dir": "exports/proof_packs",

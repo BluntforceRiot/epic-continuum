@@ -12,9 +12,10 @@ The adapter does not own the model. It prepares the request:
 4. let the caller send the request to its normal model endpoint
 5. record the assistant response after the model returns
 
-If the request already has a system message, Continuum appends the memory packet
-to that existing message instead of prepending a second system message. The packet
-explicitly says current user/developer/system instructions win over stale memory.
+If the request already has system or developer messages, Continuum leaves them
+unchanged and inserts a separate non-authoritative context message after them.
+The packet explicitly says current user/developer/system instructions win over
+stale memory.
 
 Python helper:
 
@@ -25,6 +26,6 @@ from continuum.integrations.openai_context_adapter import (
 )
 ```
 
-This is the cleanest route for a Neuroforge direct gateway because it keeps Epic
+This is the cleanest route for a direct local gateway because it keeps Epic
 Continuum model-neutral while letting Qwen, Llama, Mistral, or any future model
 remain behind a normal OpenAI-compatible endpoint.

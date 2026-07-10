@@ -28,12 +28,31 @@ jobs:
         run: python --version
       - name: Install project under test
         run: |
-          python -m pip install --upgrade pip "setuptools>=77"
+          python -m pip install --upgrade pip "setuptools>=77" build
           python -m pip install --no-deps --no-build-isolation -e .
+      - name: Verify review fixture secret allowlist
+        run: python scripts/generate_review_fixture_allowlist.py --check
       - name: Compile source and tests
         run: python -m compileall -q src tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+  static-analysis:
+    name: Ruff and mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Install static-analysis tooling
+        run: |
+          python -m pip install --upgrade pip "setuptools>=77" "ruff==0.15.*" "mypy==2.2.*"
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Run Ruff
+        run: ruff check src tests scripts setup.py
+      - name: Run mypy
+        run: mypy src/continuum
 
   package-smoke:
     name: Build, install, and bundle smoke
@@ -46,7 +65,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install build tooling
-        run: python -m pip install --upgrade pip setuptools wheel
+        run: python -m pip install --upgrade pip setuptools wheel build
       - name: Build wheel and source distribution
         shell: bash
         run: |
@@ -61,12 +80,24 @@ jobs:
           /tmp/continuum-ci-wheel-venv/bin/python -m pip install --no-index --find-links dist epic-continuum-memory
           ROOT="${RUNNER_TEMP}/continuum-wheel-root"
           BUNDLE="${RUNNER_TEMP}/continuum-wheel-root.zip"
+          /tmp/continuum-ci-wheel-venv/bin/continuum --version
           /tmp/continuum-ci-wheel-venv/bin/continuum init --root "$ROOT"
           /tmp/continuum-ci-wheel-venv/bin/continuum status --root "$ROOT"
           /tmp/continuum-ci-wheel-venv/bin/continuum audit-secrets --root "$ROOT"
-          /tmp/continuum-ci-wheel-venv/bin/continuum verify-root --root "$ROOT" --no-restore-drill
-          /tmp/continuum-ci-wheel-venv/bin/continuum pack-root --root "$ROOT" --out "$BUNDLE" --no-restore-drill
+          /tmp/continuum-ci-wheel-venv/bin/continuum verify-root --root "$ROOT"
+          /tmp/continuum-ci-wheel-venv/bin/continuum pack-root --root "$ROOT" --out "$BUNDLE"
           /tmp/continuum-ci-wheel-venv/bin/continuum verify-bundle --path "$BUNDLE"
+          HOSTILE_ROOT="${RUNNER_TEMP}/continuum-hostile-root"
+          HOSTILE_OUTSIDE="${RUNNER_TEMP}/continuum-hostile-outside"
+          /tmp/continuum-ci-wheel-venv/bin/continuum init --root "$HOSTILE_ROOT"
+          mkdir -p "$HOSTILE_ROOT/run" "$HOSTILE_OUTSIDE"
+          ln -s "$HOSTILE_OUTSIDE" "$HOSTILE_ROOT/run/restore_drills"
+          if /tmp/continuum-ci-wheel-venv/bin/continuum verify-root --root "$HOSTILE_ROOT" --no-secret-scan > "${RUNNER_TEMP}/continuum-hostile-verify.json"; then
+            cat "${RUNNER_TEMP}/continuum-hostile-verify.json"
+            echo "verify-root unexpectedly accepted a linked restore-drill output parent"
+            exit 1
+          fi
+          test -z "$(find "$HOSTILE_OUTSIDE" -mindepth 1 -maxdepth 1 -print -quit)"
           /tmp/continuum-ci-wheel-venv/bin/python -c "from importlib.resources import files; assert files('continuum').joinpath('assets/schemas/root_bundle_manifest.schema.json').is_file()"
       - name: Clean source-distribution install smoke
         shell: bash
@@ -77,8 +108,18 @@ jobs:
           ROOT="${RUNNER_TEMP}/continuum-sdist-root"
           /tmp/continuum-ci-sdist-venv/bin/continuum init --root "$ROOT"
           /tmp/continuum-ci-sdist-venv/bin/continuum status --root "$ROOT"
-          /tmp/continuum-ci-sdist-venv/bin/continuum verify-root --root "$ROOT" --no-restore-drill
+          /tmp/continuum-ci-sdist-venv/bin/continuum verify-root --root "$ROOT"
           /tmp/continuum-ci-sdist-venv/bin/python -c "from importlib.resources import files; assert files('continuum').joinpath('assets/schemas/root_bundle_manifest.schema.json').is_file()"
+      - name: Deterministic benchmark smoke
+        shell: bash
+        run: |
+          python benchmarks/runners/continuitybench.py \
+            --quick \
+            --budgets 1000 \
+            --output-dir "${RUNNER_TEMP}/continuitybench-ci"
+          test -f "${RUNNER_TEMP}/continuitybench-ci/summary.json"
+          test -f "${RUNNER_TEMP}/continuitybench-ci/cases.jsonl"
+          test -f "${RUNNER_TEMP}/continuitybench-ci/environment.json"
       - name: Write distribution checksums
         shell: bash
         run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
@@ -119,14 +160,14 @@ jobs:
           if command -v pwsh >/dev/null 2>&1; then
             pwsh -NoProfile -File scripts/install_codex_plugin.ps1 \
               -StageRoot "${RUNNER_TEMP}/codex-stage-ps" \
-              -Root "${RUNNER_TEMP}/continuum-codex-ps" \
+              -ContinuumRoot "${RUNNER_TEMP}/continuum-codex-ps" \
               -Python python \
               -StageOnly
             test -f "${RUNNER_TEMP}/codex-stage-ps/keep.txt"
             test -f "${RUNNER_TEMP}/codex-stage-ps"/epic-continuum/plugins/continuum/.mcp.json
 
             pwsh -NoProfile -File scripts/install_hermes_adapter.ps1 \
-              -Root "${RUNNER_TEMP}/continuum-hermes-ps" \
+              -ContinuumRoot "${RUNNER_TEMP}/continuum-hermes-ps" \
               -HermesHome "${RUNNER_TEMP}/hermes-ps" \
               -Python python \
               -DryRun \
@@ -150,6 +191,26 @@ jobs:
               names = zf.namelist()
               assert all(name.startswith(prefix) for name in names)
               assert f"{prefix}docs/GITHUB_PUBLICATION_DRAFT.md" not in names
+              assert not any("/benchmarks/results/" in name for name in names)
+              for linked in (
+                  "docs/how-memory-works.md",
+                  "docs/context-window.md",
+                  "docs/cue-recall.md",
+                  "docs/recovery-and-continuity.md",
+                  "docs/evidence-and-proof.md",
+                  "docs/shared-agent-state.md",
+                  "docs/worker-operations.md",
+                  "docs/writer-claims.md",
+                  "benchmarks/BENCHMARKS.md",
+                  "benchmarks/README.md",
+                  "benchmarks/datasets/README.md",
+                  "benchmarks/fixtures/continuitybench_cases.json",
+                  "benchmarks/runners/_common.py",
+                  "benchmarks/runners/continuitybench.py",
+                  "benchmarks/runners/faultbench.py",
+                  "benchmarks/runners/scale_bench.py",
+              ):
+                  assert f"{prefix}{linked}" in names, linked
               for name in (
                   f"{prefix}scripts/install_codex_plugin.sh",
                   f"{prefix}scripts/install_hermes_adapter.sh",

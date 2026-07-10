@@ -1,6 +1,6 @@
 [project]
 name = "epic-continuum-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Epic Continuum persistent-memory substrate for agent continuity."
 readme = "README.md"
 license = "MIT"
@@ -37,6 +37,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 continuum = [
   "config.default.json",
+  "assets/RELEASE_PROVENANCE.json",
   "core/schema.sql",
   "assets/hermes/epic_continuum/plugin.yaml",
   "assets/hermes/epic_continuum/__init__.py",

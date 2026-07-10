@@ -9,6 +9,7 @@ from typing import Any
 from .hardware import apply_inventory_overrides, detect_hardware, recommend_config
 from .permissions import secure_mkdir, secure_write_text
 from .units import parse_size
+from .writer_claim import ensure_writer_claim
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.default.json"
@@ -24,6 +25,7 @@ LARGE_RESULT_POLICIES = {"truncate_with_notice", "summarize_and_link", "truncate
 PRUNE_POLICIES = {"ask", "manual", "auto_tier_only", "auto_prune"}
 SNAPSHOT_RETENTION_POLICIES = {"last_20", "keep_all"}
 PROOF_PACK_RETENTION_POLICIES = {"keep_successful_90_days", "keep_all"}
+CATALOG_PROOF_MODES = {"state_manifest", "snapshot"}
 
 
 def normalize_root_relative_config_path(value: Any, *, field: str) -> str:
@@ -102,6 +104,7 @@ def config_path(root: Path) -> Path:
 def write_config(root: Path, config: dict[str, Any]) -> Path:
     validate_config(config)
     validate_config_root_paths(root, config)
+    ensure_writer_claim(root)
     path = config_path(root)
     secure_write_text(
         path,
@@ -113,10 +116,11 @@ def write_config(root: Path, config: dict[str, Any]) -> Path:
 
 def write_default_config(root: Path) -> Path:
     config_dir = root / "config"
-    secure_mkdir(root, secure_existing=True)
-    secure_mkdir(config_dir, secure_existing=True)
     path = config_path(root)
     if not path.exists():
+        ensure_writer_claim(root)
+        secure_mkdir(root, secure_existing=True)
+        secure_mkdir(config_dir, secure_existing=True)
         secure_write_text(
             path,
             json.dumps(default_config(), ensure_ascii=True, indent=2, sort_keys=True) + "\n",
@@ -240,7 +244,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("context token budgets must be positive")
     if scroll_event_fetch_limit <= 0:
         raise ValueError("context.scroll_event_fetch_limit must be positive")
-    if context.get("card_recall_scope", "session_then_global") not in {"session", "global", "session_then_global", "project"}:
+    if context.get("card_recall_scope", "session") not in {"session", "global", "session_then_global", "project"}:
         raise ValueError("context.card_recall_scope must be session, global, session_then_global, or project")
     if default_budget > max_budget:
         raise ValueError("default_token_budget cannot exceed max_token_budget")
@@ -329,3 +333,6 @@ def validate_config(config: dict[str, Any]) -> None:
     queues = config.get("queues", {})
     if int(queues.get("worker_lease_seconds", 300)) <= 0:
         raise ValueError("queues.worker_lease_seconds must be positive")
+    epic_continuity = config.get("epic_continuity", {})
+    if epic_continuity.get("catalog_proof_mode", "state_manifest") not in CATALOG_PROOF_MODES:
+        raise ValueError("epic_continuity.catalog_proof_mode must be state_manifest or snapshot")

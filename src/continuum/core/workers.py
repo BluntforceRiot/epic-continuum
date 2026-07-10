@@ -2,30 +2,38 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from .config import load_config, retention_policy
+from .config import config_path, default_config, load_config, retention_policy
+from .operations import operation_lock
 from .permissions import secure_move_file
 from .store import (
     add_graph_edge,
     audit_event,
+    canonical_partition_identifier,
     connect,
     connect_existing,
     content_hash,
     continuum_uri,
-    estimate_tokens,
+    enqueue_job,
     extract_terms,
     file_sha256,
     init_db,
     is_initialized,
     json_dumps,
     json_loads,
+    mark_card_sidecar_outbox,
+    refresh_graph_edge_aggregate,
     resolve_stored_uri,
     roll_scroll_segment,
     segment_hash_material,
     snapshot,
+    sync_card_sidecar,
+    sync_card_sidecars_after_commit,
     unique_id,
     upsert_graph_node,
     utc_now,
@@ -36,6 +44,11 @@ from .units import parse_size
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "skipped"}
 ACTIVE_JOB_STATUS = "running"
 PENDING_JOB_STATUS = "pending"
+DEFAULT_BACKLOG_RECONCILE_LIMIT = 5000
+MAX_BACKLOG_RECONCILE_LIMIT = 10000
+DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
+_WORKER_SERVICE_ROOTS: set[str] = set()
+_WORKER_SERVICE_ROOTS_GUARD = threading.Lock()
 
 
 def _lease_expiry(seconds: int) -> str:
@@ -82,8 +95,46 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
     role_clause = ""
     if roles:
         placeholders = ",".join("?" for _ in roles)
-        role_clause = f" AND role IN ({placeholders})"
+        role_clause = f" AND queue_jobs.role IN ({placeholders})"
         params.extend(sorted(roles))
+    superseded_cursor = conn.execute(
+        f"""
+        UPDATE queue_jobs
+        SET status = 'skipped', finished_at = ?, lease_owner = NULL,
+            lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?,
+            error_json = ?
+        WHERE status = ?
+          AND preemptible = 1
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= ?
+          AND dedupe_key IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM queue_jobs AS pending
+              WHERE pending.status = ?
+                AND pending.dedupe_key = queue_jobs.dedupe_key
+                AND pending.id != queue_jobs.id
+          ){role_clause}
+        """,
+        [
+            now,
+            now,
+            json_dumps(
+                {
+                    "error": None,
+                    "result": {
+                        "skipped": True,
+                        "reason": "expired_lease_superseded_by_pending_dedupe_job",
+                    },
+                }
+            ),
+            ACTIVE_JOB_STATUS,
+            now,
+            PENDING_JOB_STATUS,
+            *params[1:],
+        ],
+    )
+    superseded = int(superseded_cursor.rowcount or 0)
     cursor = conn.execute(
         f"""
         UPDATE queue_jobs
@@ -115,7 +166,7 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
             *params,
         ],
     )
-    return reclaimed + int(failed_cursor.rowcount or 0)
+    return superseded + reclaimed + int(failed_cursor.rowcount or 0)
 
 
 def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_seconds: int) -> dict[str, Any] | None:
@@ -222,6 +273,489 @@ def _finish_owned_job(
         raise RuntimeError("worker lease lost before job finish")
 
 
+def _bounded_reconcile_limit(value: int, *, field: str) -> int:
+    limit = int(value)
+    if limit <= 0:
+        raise ValueError(f"{field} must be positive")
+    if limit > MAX_BACKLOG_RECONCILE_LIMIT:
+        raise ValueError(f"{field} must be at most {MAX_BACKLOG_RECONCILE_LIMIT}")
+    return limit
+
+
+_REDUNDANT_SCRIBE_CTE = """
+WITH base AS (
+    SELECT id, created_at,
+           CASE WHEN json_valid(payload_json)
+                THEN json_extract(payload_json, '$.session_id')
+                ELSE NULL
+           END AS session_id
+    FROM queue_jobs
+    WHERE status = 'pending' AND job_type = 'scroll_event_ingested'
+), ranked AS (
+    SELECT id, created_at, session_id,
+           first_value(id) OVER (
+               PARTITION BY session_id
+               ORDER BY created_at DESC, id DESC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+           ) AS keeper_job_id,
+           row_number() OVER (
+               PARTITION BY session_id
+               ORDER BY created_at DESC, id DESC
+           ) AS session_ordinal
+    FROM base
+    WHERE typeof(session_id) = 'text' AND trim(session_id) != ''
+)
+"""
+
+
+def _redundant_scribe_notifications(conn, *, limit: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        _REDUNDANT_SCRIBE_CTE
+        + """
+        SELECT id, session_id, keeper_job_id, created_at
+        FROM ranked
+        WHERE session_ordinal > 1
+        ORDER BY session_id, created_at, id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _count_redundant_scribe_notifications(conn) -> int:
+    row = conn.execute(
+        _REDUNDANT_SCRIBE_CTE
+        + """
+        SELECT count(*) AS n
+        FROM ranked
+        WHERE session_ordinal > 1
+        """
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _legacy_card_where(*, import_id: str | None = None) -> tuple[str, list[Any]]:
+    type_clause = "(c.card_type = 'project_state' OR c.card_type LIKE 'mempalace_%')"
+    params: list[Any] = []
+    if import_id is not None:
+        type_clause = "c.card_type LIKE 'mempalace_%'"
+        import_clause = """
+          AND CASE WHEN json_valid(c.metadata_json)
+                   THEN json_extract(c.metadata_json, '$.import_id')
+                   ELSE NULL
+              END = ?
+        """
+        params.append(import_id)
+    else:
+        import_clause = ""
+    return (
+        f"""
+        c.status = 'pending_librarian_review'
+        AND {type_clause}
+        {import_clause}
+        AND EXISTS (
+            SELECT 1
+            FROM graph_nodes n
+            WHERE n.card_id = c.id
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM graph_edges e
+                      WHERE e.source_node_id = n.id AND e.status = 'active'
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM graph_edges e
+                      WHERE e.target_node_id = n.id AND e.status = 'active'
+                  )
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM queue_jobs q
+            WHERE q.status IN ('pending', 'running')
+              AND q.job_type = 'review_card_placement'
+              AND (
+                  CASE WHEN json_valid(q.payload_json)
+                       THEN json_extract(q.payload_json, '$.card_id')
+                       ELSE NULL
+                  END = c.id
+                  OR EXISTS (
+                      SELECT 1
+                      FROM json_each(
+                          CASE WHEN json_valid(q.related_card_ids_json)
+                               THEN q.related_card_ids_json
+                               ELSE '[]'
+                          END
+                      ) related
+                      WHERE related.value = c.id
+                  )
+              )
+        )
+        """,
+        params,
+    )
+
+
+def _legacy_card_candidates(conn, *, limit: int, import_id: str | None = None) -> list[dict[str, Any]]:
+    where_clause, params = _legacy_card_where(import_id=import_id)
+    rows = conn.execute(
+        f"""
+        SELECT c.id, c.card_type, c.project_id, c.metadata_json, c.created_at
+        FROM cards c
+        WHERE {where_clause}
+        ORDER BY c.created_at, c.id
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _count_legacy_card_candidates(conn, *, import_id: str | None = None) -> int:
+    where_clause, params = _legacy_card_where(import_id=import_id)
+    row = conn.execute(f"SELECT count(*) AS n FROM cards c WHERE {where_clause}", params).fetchone()
+    return int(row["n"] or 0)
+
+
+def _count_genuine_pending_card_reviews(conn) -> int:
+    row = conn.execute(
+        """
+        SELECT count(DISTINCT c.id) AS n
+        FROM cards c
+        WHERE c.status = 'pending_librarian_review'
+          AND EXISTS (
+              SELECT 1
+              FROM queue_jobs q
+              WHERE q.status IN ('pending', 'running')
+                AND q.job_type = 'review_card_placement'
+                AND (
+                    CASE WHEN json_valid(q.payload_json)
+                         THEN json_extract(q.payload_json, '$.card_id')
+                         ELSE NULL
+                    END = c.id
+                    OR EXISTS (
+                        SELECT 1
+                        FROM json_each(
+                            CASE WHEN json_valid(q.related_card_ids_json)
+                                 THEN q.related_card_ids_json
+                                 ELSE '[]'
+                            END
+                        ) related
+                        WHERE related.value = c.id
+                    )
+                )
+          )
+        """
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _legacy_unqueued_card_reviews(conn, *, limit: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT c.id, c.card_type, c.project_id, c.metadata_json, c.created_at
+        FROM cards c
+        WHERE c.status = 'pending_librarian_review'
+          AND (c.card_type = 'project_state' OR c.card_type LIKE 'mempalace_%')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM graph_nodes n
+              WHERE n.card_id = c.id
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM graph_edges e
+                        WHERE e.source_node_id = n.id AND e.status = 'active'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM graph_edges e
+                        WHERE e.target_node_id = n.id AND e.status = 'active'
+                    )
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM queue_jobs q
+              WHERE q.status IN ('pending', 'running')
+                AND q.job_type = 'review_card_placement'
+                AND (
+                    CASE WHEN json_valid(q.payload_json)
+                         THEN json_extract(q.payload_json, '$.card_id')
+                         ELSE NULL
+                    END = c.id
+                    OR EXISTS (
+                        SELECT 1
+                        FROM json_each(
+                            CASE WHEN json_valid(q.related_card_ids_json)
+                                 THEN q.related_card_ids_json
+                                 ELSE '[]'
+                            END
+                        ) related
+                        WHERE related.value = c.id
+                    )
+                )
+          )
+        ORDER BY c.created_at, c.id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _count_legacy_unqueued_card_reviews(conn) -> int:
+    return len(_legacy_unqueued_card_reviews(conn, limit=MAX_BACKLOG_RECONCILE_LIMIT))
+
+
+def _enqueue_legacy_card_reviews(conn, cards: list[dict[str, Any]]) -> list[str]:
+    job_ids: list[str] = []
+    for card in cards:
+        card_id = str(card["id"])
+        job_id = enqueue_job(
+            conn,
+            role="librarian",
+            job_type="review_card_placement",
+            priority=70,
+            payload={"card_id": card_id, "reason": "legacy_missing_librarian_job"},
+            related_card_ids=[card_id],
+            dedupe_key=f"card:{card_id}",
+        )
+        job_ids.append(job_id)
+        audit_event(
+            conn,
+            action="enqueue_legacy_card_review",
+            target_type="card",
+            target_id=card_id,
+            payload={"job_id": job_id, "card_type": card["card_type"]},
+            actor="worker",
+        )
+    return job_ids
+
+
+def _legacy_card_placement(card: dict[str, Any]) -> tuple[str, str]:
+    metadata = json_loads(card.get("metadata_json"), {})
+    card_type = str(card.get("card_type") or "")
+    if card_type == "project_state":
+        project_id = str(card.get("project_id") or metadata.get("project_id") or "project_state").strip()
+        return "projects", project_id.casefold()[:96] or "project_state"
+    wing = str(metadata.get("mempalace_wing") or "mempalace").strip()
+    room = str(metadata.get("mempalace_room") or "unshelved").strip()
+    shelf = "/".join(part for part in (wing, room) if part).casefold()
+    return "mempalace", shelf[:96] or "mempalace"
+
+
+def _apply_graph_placed_card_reconciliation(
+    conn,
+    cards: list[dict[str, Any]],
+    *,
+    reason: str,
+) -> list[str]:
+    changed: list[str] = []
+    now = utc_now()
+    for card in cards:
+        collection, shelf = _legacy_card_placement(card)
+        cursor = conn.execute(
+            """
+            UPDATE cards
+            SET status = 'active',
+                placement_collection = coalesce(placement_collection, ?),
+                shelf = coalesce(shelf, ?),
+                storage_tier = coalesce(storage_tier, 'hot'),
+                updated_at = ?
+            WHERE id = ? AND status = 'pending_librarian_review'
+            """,
+            (collection, shelf, now, card["id"]),
+        )
+        if int(cursor.rowcount or 0) != 1:
+            continue
+        changed.append(str(card["id"]))
+        audit_event(
+            conn,
+            action="reconcile_graph_placed_card",
+            target_type="card",
+            target_id=str(card["id"]),
+            payload={
+                "reason": reason,
+                "card_type": card["card_type"],
+                "previous_status": "pending_librarian_review",
+                "status": "active",
+                "placement_collection": collection,
+                "shelf": shelf,
+            },
+            actor="worker",
+        )
+    if changed:
+        mark_card_sidecar_outbox(conn, changed, reason=reason)
+    return changed
+
+
+def _apply_redundant_scribe_reconciliation(conn, jobs: list[dict[str, Any]]) -> list[str]:
+    changed: list[str] = []
+    now = utc_now()
+    for job in jobs:
+        result = {
+            "skipped": True,
+            "reason": "superseded_pending_scroll_notification",
+            "session_id": job["session_id"],
+            "keeper_job_id": job["keeper_job_id"],
+        }
+        cursor = conn.execute(
+            """
+            UPDATE queue_jobs
+            SET status = 'skipped', finished_at = ?, updated_at = ?,
+                error_json = ?, lease_owner = NULL, lease_expires_at = NULL,
+                heartbeat_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (now, now, json_dumps({"error": None, "result": result}), now, job["id"]),
+        )
+        if int(cursor.rowcount or 0) != 1:
+            continue
+        changed.append(str(job["id"]))
+        audit_event(
+            conn,
+            action="supersede_redundant_scribe_notification",
+            target_type="queue_job",
+            target_id=str(job["id"]),
+            payload=result,
+            actor="worker",
+        )
+    return changed
+
+
+def reconcile_worker_backlog(
+    root: Path,
+    *,
+    dry_run: bool = True,
+    queue_limit: int = DEFAULT_BACKLOG_RECONCILE_LIMIT,
+    card_limit: int = DEFAULT_BACKLOG_RECONCILE_LIMIT,
+) -> dict[str, Any]:
+    """Reconcile legacy worker backlog without deleting queue or card evidence."""
+    queue_limit = _bounded_reconcile_limit(queue_limit, field="queue_limit")
+    card_limit = _bounded_reconcile_limit(card_limit, field="card_limit")
+    if not is_initialized(root):
+        return {"ok": False, "initialized": False, "root": str(root), "reason": "catalog_missing", "dry_run": dry_run}
+
+    if not dry_run:
+        init_db(root)
+    conn = connect_existing(root) if dry_run else connect(root)
+    changed_jobs: list[str] = []
+    changed_cards: list[str] = []
+    enqueued_card_review_jobs: list[str] = []
+    try:
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+        redundant_before = _count_redundant_scribe_notifications(conn)
+        card_candidates_before = _count_legacy_card_candidates(conn)
+        unqueued_card_reviews_before = _count_legacy_unqueued_card_reviews(conn)
+        genuine_reviews_before = _count_genuine_pending_card_reviews(conn)
+        jobs = _redundant_scribe_notifications(conn, limit=queue_limit)
+        cards = _legacy_card_candidates(conn, limit=card_limit)
+        unqueued_cards = _legacy_unqueued_card_reviews(conn, limit=max(0, card_limit - len(cards)))
+        if not dry_run:
+            changed_jobs = _apply_redundant_scribe_reconciliation(conn, jobs)
+            changed_cards = _apply_graph_placed_card_reconciliation(
+                conn,
+                cards,
+                reason="legacy_graph_placed_card_reconciliation",
+            )
+            enqueued_card_review_jobs = _enqueue_legacy_card_reviews(conn, unqueued_cards)
+            conn.commit()
+        redundant_remaining = _count_redundant_scribe_notifications(conn) if not dry_run else redundant_before
+        card_candidates_remaining = _count_legacy_card_candidates(conn) if not dry_run else card_candidates_before
+        unqueued_card_reviews_remaining = (
+            _count_legacy_unqueued_card_reviews(conn) if not dry_run else unqueued_card_reviews_before
+        )
+        genuine_reviews_after = _count_genuine_pending_card_reviews(conn)
+    except Exception:
+        if not dry_run:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    sidecars: dict[str, Any] = {"ok": True, "synced": 0, "failed": 0, "skipped": dry_run}
+    if changed_cards:
+        sidecars = sync_card_sidecars_after_commit(root, changed_cards)
+    return {
+        "ok": bool(sidecars.get("ok", True)),
+        "initialized": True,
+        "root": str(root),
+        "dry_run": dry_run,
+        "limits": {"queue_limit": queue_limit, "card_limit": card_limit},
+        "queue": {
+            "redundant_before": redundant_before,
+            "selected": len(jobs),
+            "changed": len(changed_jobs),
+            "remaining_redundant": redundant_remaining,
+            "complete": redundant_remaining == 0,
+            "keeper_strategy": "newest_pending_notification_per_session",
+            "sample_job_ids": [str(item["id"]) for item in jobs[:25]],
+        },
+        "cards": {
+            "eligible_before": card_candidates_before,
+            "selected": len(cards),
+            "changed": len(changed_cards),
+            "remaining_eligible": card_candidates_remaining,
+            "complete": card_candidates_remaining == 0 and unqueued_card_reviews_remaining == 0,
+            "genuine_pending_reviews_before": genuine_reviews_before,
+            "genuine_pending_reviews_after": genuine_reviews_after,
+            "unqueued_reviews_before": unqueued_card_reviews_before,
+            "unqueued_reviews_selected": len(unqueued_cards),
+            "review_jobs_enqueued": len(enqueued_card_review_jobs),
+            "unqueued_reviews_remaining": unqueued_card_reviews_remaining,
+            "sample_review_job_ids": enqueued_card_review_jobs[:25],
+            "sample_card_ids": [str(item["id"]) for item in cards[:25]],
+        },
+        "sidecars": sidecars,
+    }
+
+
+def review_mempalace_import(
+    root: Path,
+    *,
+    import_id: str,
+    limit: int = MAX_BACKLOG_RECONCILE_LIMIT,
+) -> dict[str, Any]:
+    """Complete Librarian placement for graph-linked cards from one MemPalace import."""
+    import_id = str(import_id or "").strip()
+    if not import_id:
+        return {"ok": False, "reason": "import_id_missing", "reviewed_import": import_id}
+    limit = _bounded_reconcile_limit(limit, field="limit")
+    init_db(root)
+    conn = connect(root)
+    changed_cards: list[str] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        eligible_before = _count_legacy_card_candidates(conn, import_id=import_id)
+        cards = _legacy_card_candidates(conn, limit=limit, import_id=import_id)
+        changed_cards = _apply_graph_placed_card_reconciliation(
+            conn,
+            cards,
+            reason="reviewed_mempalace_import",
+        )
+        remaining = _count_legacy_card_candidates(conn, import_id=import_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    sidecars: dict[str, Any] = {"ok": True, "synced": 0, "failed": 0}
+    if changed_cards:
+        sidecars = sync_card_sidecars_after_commit(root, changed_cards)
+    return {
+        "ok": remaining == 0 and bool(sidecars.get("ok", True)),
+        "reviewed_import": import_id,
+        "eligible_before": eligible_before,
+        "reviewed_cards": len(changed_cards),
+        "remaining_eligible": remaining,
+        "limit": limit,
+        "sidecars": sidecars,
+    }
+
+
 def _last_segment_end(conn, session_id: str) -> int:
     row = conn.execute(
         "SELECT coalesce(max(end_seq), 0) AS end_seq FROM scroll_segments WHERE session_id = ?",
@@ -230,10 +764,45 @@ def _last_segment_end(conn, session_id: str) -> int:
     return int(row["end_seq"] or 0)
 
 
+def _scroll_security_runs(conn, *, session_id: str, start_seq: int, end_seq: int) -> list[tuple[int, int]]:
+    rows = conn.execute(
+        """
+        SELECT seq, visibility_scope, project_id
+        FROM scroll_events
+        WHERE session_id = ? AND seq BETWEEN ? AND ?
+        ORDER BY seq
+        """,
+        (session_id, start_seq, end_seq),
+    ).fetchall()
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    run_end: int | None = None
+    run_boundary: tuple[str, str, str] | None = None
+    for row in rows:
+        seq = int(row["seq"])
+        boundary = (str(row["visibility_scope"] or "session"), str(row["project_id"] or ""), session_id)
+        if run_start is None:
+            run_start = seq
+            run_end = seq
+            run_boundary = boundary
+            continue
+        assert run_end is not None
+        if seq != run_end + 1 or boundary != run_boundary:
+            runs.append((run_start, run_end))
+            run_start = seq
+            run_boundary = boundary
+        run_end = seq
+    if run_start is not None and run_end is not None:
+        runs.append((int(run_start), int(run_end)))
+    return runs
+
+
 def roll_due_scroll_segments(root: Path, *, session_id: str | None = None, force: bool = False) -> dict[str, Any]:
     init_db(root)
     config = load_config(root)
     threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
+    if session_id:
+        session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
     rolled: list[dict[str, Any]] = []
     conn = connect(root)
     try:
@@ -253,11 +822,15 @@ def roll_due_scroll_segments(root: Path, *, session_id: str | None = None, force
                 end = max_seq if force else min(max_seq, start + threshold - 1)
                 if end < start:
                     break
+                runs = _scroll_security_runs(conn, session_id=current_session, start_seq=start, end_seq=end)
+                if not runs:
+                    break
                 conn.close()
-                result = roll_scroll_segment(root, session_id=current_session, start_seq=start, end_seq=end)
-                rolled.append(result)
+                for run_start, run_end in runs:
+                    result = roll_scroll_segment(root, session_id=current_session, start_seq=run_start, end_seq=run_end)
+                    rolled.append(result)
                 conn = connect(root)
-                start = end + 1
+                start = runs[-1][1] + 1
                 pending = max_seq - start + 1
                 if not force:
                     break
@@ -302,7 +875,9 @@ def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
             ("library", shelf, now, card_id),
         )
         audit_event(conn, action="librarian_review_card", target_type="card", target_id=card_id, payload={"shelf": shelf})
+        mark_card_sidecar_outbox(conn, [card_id], reason="librarian_review_card")
         conn.commit()
+        sync_card_sidecars_after_commit(root, [card_id])
         conflict = detect_conflicts(root, card_id=card_id, limit=10)
         return {"ok": True, "card_id": card_id, "shelf": shelf, "term_edges": len(terms[:16]), "conflicts": conflict}
     finally:
@@ -416,6 +991,46 @@ def verify_segment_integrity(root: Path, *, segment_id: str, segment_hash: str |
         conn.close()
 
 
+def _graph_source_security_domain(conn, source_ref_json: str | None) -> str:
+    ref = json_loads(source_ref_json or "{}", {})
+    if not isinstance(ref, dict):
+        return "global"
+    project_id = str(ref.get("project_id") or "")
+    if project_id:
+        return f"project:{project_id}"
+    if card_id := ref.get("card_id"):
+        row = conn.execute(
+            "SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ?",
+            (str(card_id),),
+        ).fetchone()
+        if row is not None:
+            if row["project_id"]:
+                return f"project:{row['project_id']}"
+            if row["session_id"]:
+                return f"session:{row['session_id']}"
+            if row["visibility_scope"]:
+                return f"scope:{row['visibility_scope']}"
+    if event_id := ref.get("event_id"):
+        row = conn.execute(
+            "SELECT visibility_scope, session_id, project_id FROM scroll_events WHERE id = ?",
+            (str(event_id),),
+        ).fetchone()
+        if row is not None:
+            if row["project_id"]:
+                return f"project:{row['project_id']}"
+            if row["session_id"]:
+                return f"session:{row['session_id']}"
+            if row["visibility_scope"]:
+                return f"scope:{row['visibility_scope']}"
+    session_id = str(ref.get("session_id") or "")
+    if session_id:
+        return f"session:{session_id}"
+    visibility_scope = str(ref.get("visibility_scope") or "")
+    if visibility_scope:
+        return f"scope:{visibility_scope}"
+    return "global"
+
+
 def decay_graph_routes(root: Path, *, limit: int = 200, prune_threshold: int = 3) -> dict[str, Any]:
     init_db(root)
     learning = load_config(root).get("learning", {})
@@ -426,41 +1041,87 @@ def decay_graph_routes(root: Path, *, limit: int = 200, prune_threshold: int = 3
     cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=min_interval)).replace(microsecond=0).isoformat()
     conn = connect(root)
     try:
-        rows = conn.execute(
+        due_rows = conn.execute(
             """
-            SELECT id, weight, decay_count, pinned
-            FROM graph_edges
-            WHERE status = 'active' AND pinned = 0
-              AND (? <= 0 OR last_decay_at IS NULL OR last_decay_at <= ?)
-            ORDER BY coalesce(last_used_at, created_at) ASC
-            LIMIT ?
+            SELECT ges.edge_id, ges.source_ref_key, ges.source_ref_json, ges.weight, ges.decay_count
+            FROM graph_edge_sources ges
+            JOIN graph_edges ge ON ge.id = ges.edge_id
+            WHERE ges.status = 'active'
+              AND ge.pinned = 0
+              AND (? <= 0 OR ges.last_decay_at IS NULL OR ges.last_decay_at <= ?)
+            ORDER BY coalesce(ges.last_used_at, ges.created_at) ASC, ges.edge_id, ges.source_ref_key
             """,
-            (min_interval, cutoff, max(1, int(limit))),
+            (min_interval, cutoff),
         ).fetchall()
+        grouped: dict[str, list[Any]] = {}
+        for row in due_rows:
+            grouped.setdefault(_graph_source_security_domain(conn, row["source_ref_json"]), []).append(row)
+        total_limit = max(0, int(limit))
+        rows: list[Any] = []
+        positions = {domain: 0 for domain in grouped}
+        domains = sorted(grouped)
+        while len(rows) < total_limit and any(positions[domain] < len(grouped[domain]) for domain in domains):
+            for domain in domains:
+                position = positions[domain]
+                if position >= len(grouped[domain]):
+                    continue
+                rows.append(grouped[domain][position])
+                positions[domain] = position + 1
+                if len(rows) >= total_limit:
+                    break
         decayed = 0
         pruned = 0
         now = utc_now()
+        touched_edges: set[str] = set()
         for row in rows:
             new_decay = int(row["decay_count"] or 0) + 1
             new_weight = max(weight_floor, float(row["weight"] or 0.25) * weight_factor)
             status = "pruned" if new_decay >= prune_threshold and new_weight < prune_weight_threshold else "active"
+            conn.execute(
+                """
+                UPDATE graph_edge_sources
+                SET weight = ?,
+                    decay_count = ?,
+                    status = ?,
+                    last_decay_at = ?,
+                    updated_at = ?
+                WHERE edge_id = ? AND source_ref_key = ? AND status = 'active'
+                """,
+                (new_weight, new_decay, status, now, now, row["edge_id"], row["source_ref_key"]),
+            )
             if status == "pruned":
                 pruned += 1
             else:
                 decayed += 1
-            conn.execute(
-                "UPDATE graph_edges SET weight = ?, decay_count = ?, status = ?, last_decay_at = ?, updated_at = ? WHERE id = ?",
-                (new_weight, new_decay, status, now, now, row["id"]),
-            )
+            touched_edges.add(str(row["edge_id"]))
+        for edge_id in touched_edges:
+            refresh_graph_edge_aggregate(conn, edge_id, now=now)
         audit_event(
             conn,
             action="librarian_decay_routes",
             target_type="graph",
             target_id=None,
-            payload={"decayed": decayed, "pruned": pruned, "min_interval_seconds": min_interval},
+            payload={
+                "decayed": decayed,
+                "pruned": pruned,
+                "min_interval_seconds": min_interval,
+                "due_sources": len(due_rows),
+                "domains": len(grouped),
+                "global_limit": total_limit,
+            },
         )
         conn.commit()
-        return {"ok": True, "decayed": decayed, "pruned": pruned, "skipped_recent": max(0, int(limit) - len(rows)) if min_interval > 0 else 0, "min_interval_seconds": min_interval}
+        return {
+            "ok": True,
+            "decayed": decayed,
+            "pruned": pruned,
+            "processed": len(rows),
+            "due_sources": len(due_rows),
+            "domains": len(grouped),
+            "global_limit": total_limit,
+            "skipped_recent": 0 if min_interval <= 0 else max(0, len(due_rows) - len(rows)),
+            "min_interval_seconds": min_interval,
+        }
     finally:
         conn.close()
 
@@ -470,28 +1131,45 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
     conn = connect(root)
     try:
         if card_id:
-            candidates = conn.execute("SELECT id, title, summary FROM cards WHERE id = ?", (card_id,)).fetchall()
+            candidates = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchall()
         else:
             candidates = conn.execute(
-                "SELECT id, title, summary FROM cards WHERE status != 'pruned' ORDER BY updated_at DESC LIMIT ?",
+                "SELECT * FROM cards WHERE status != 'pruned' ORDER BY updated_at DESC LIMIT ?",
                 (max(1, int(limit)),),
             ).fetchall()
         conflicts: list[dict[str, Any]] = []
+        touched_cards: set[str] = set()
         now = utc_now()
         for card in candidates:
             terms = extract_terms(f"{card['title']} {card['summary']}", limit=6)
             if not terms:
                 continue
             pattern = f"%{terms[0]}%"
+            scope = str(card["visibility_scope"] or "session")
+            project_id = str(card["project_id"] or "")
+            session_id = str(card["session_id"] or "")
+            if scope == "project" and project_id:
+                scope_clause = "visibility_scope = 'project' AND coalesce(project_id, '') = ?"
+                scope_params: list[Any] = [project_id]
+            elif scope == "global":
+                scope_clause = "visibility_scope = 'global' AND coalesce(project_id, '') = ''"
+                scope_params = []
+            else:
+                scope_clause = (
+                    "visibility_scope = ? AND coalesce(project_id, '') = ? "
+                    "AND coalesce(session_id, '') = ?"
+                )
+                scope_params = [scope, project_id, session_id]
             others = conn.execute(
-                """
+                f"""
                 SELECT id, title, summary
                 FROM cards
                 WHERE id != ? AND status != 'pruned'
+                  AND {scope_clause}
                   AND (title LIKE ? OR summary LIKE ?)
                 LIMIT 5
                 """,
-                (card["id"], pattern, pattern),
+                (card["id"], *scope_params, pattern, pattern),
             ).fetchall()
             negative = any(word in card["summary"].casefold() for word in (" not ", " no ", "never", "disable", "removed"))
             for other in others:
@@ -500,9 +1178,12 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                     continue
                 group = content_hash("|".join(sorted([card["id"], other["id"]]))[:512])[:16]
                 conn.execute("UPDATE cards SET conflict_group = ?, updated_at = ? WHERE id IN (?, ?)", (group, now, card["id"], other["id"]))
+                touched_cards.update([str(card["id"]), str(other["id"])])
                 conflicts.append({"conflict_group": group, "card_ids": [card["id"], other["id"]]})
                 audit_event(conn, action="librarian_detect_conflict", target_type="card", target_id=card["id"], payload={"other_card_id": other["id"], "conflict_group": group})
+        mark_card_sidecar_outbox(conn, list(touched_cards), reason="conflict_group_updated")
         conn.commit()
+        sync_card_sidecars_after_commit(root, list(touched_cards))
         return {"ok": True, "conflict_count": len(conflicts), "conflicts": conflicts}
     finally:
         conn.close()
@@ -652,10 +1333,69 @@ def prune_memory(
             )
         if not dry_run:
             audit_event(conn, action="librarian_prune_memory", target_type="cards", target_id=None, payload={"action": action, "topic": topic, "card_ids": touched})
+            mark_card_sidecar_outbox(conn, touched, reason="memory_pruned")
             conn.commit()
+            sync_card_sidecars_after_commit(root, touched)
         return {"ok": True, "dry_run": dry_run, "action": action, "topic": topic, "card_count": len(touched), "card_ids": touched}
     finally:
         conn.close()
+
+
+def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
+    conn = connect(root)
+    try:
+        location_uri = sync_card_sidecar(root, conn, card_id)
+        if location_uri is None:
+            audit_event(
+                conn,
+                action="card_sidecar_sync_skipped",
+                target_type="card",
+                target_id=card_id,
+                payload={"reason": "card_missing_or_sidecars_disabled"},
+            )
+            conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
+            conn.commit()
+            return {"ok": False, "reason": "card_missing_or_sidecars_disabled", "card_id": card_id}
+        audit_event(
+            conn,
+            action="card_sidecar_synced",
+            target_type="card",
+            target_id=card_id,
+            payload={"location_uri": location_uri, "worker": "archivist"},
+        )
+        conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
+        conn.commit()
+        return {"ok": True, "card_id": card_id, "location_uri": location_uri}
+    finally:
+        conn.close()
+
+
+def drain_card_sidecar_outbox(root: Path, *, limit: int = 50) -> dict[str, Any]:
+    init_db(root)
+    conn = connect(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT card_id
+            FROM card_sidecar_outbox
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    card_ids = [str(row["card_id"]) for row in rows]
+    if not card_ids:
+        return {"ok": True, "pending": 0, "synced": 0, "failed": 0, "failures": []}
+    result = sync_card_sidecars_after_commit(root, card_ids)
+    return {
+        "ok": bool(result.get("ok")),
+        "pending": len(card_ids),
+        "synced": int(result.get("synced", 0)),
+        "failed": int(result.get("failed", 0)),
+        "failures": result.get("failures", []),
+    }
 
 
 def _process_job(root: Path, job: dict[str, Any]) -> dict[str, Any]:
@@ -669,8 +1409,10 @@ def _process_job(root: Path, job: dict[str, Any]) -> dict[str, Any]:
         return verify_book_integrity(root, book_id=str(payload["book_id"]), content_hash_value=payload.get("content_hash"))
     if job_type == "verify_segment_integrity":
         return verify_segment_integrity(root, segment_id=str(payload["segment_id"]), segment_hash=payload.get("segment_hash"))
+    if job_type == "sync_card_sidecar":
+        return sync_card_sidecar_job(root, card_id=str(payload["card_id"]))
     if job_type == "review_mempalace_import":
-        return {"ok": True, "reviewed_import": payload.get("import_id")}
+        return review_mempalace_import(root, import_id=str(payload.get("import_id") or ""))
     return {"ok": True, "skipped": True, "reason": "unknown_job_type", "job_type": job_type}
 
 
@@ -728,6 +1470,7 @@ def run_worker_pass(
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "ok": False, "error": str(exc)})
     maintenance_result: dict[str, Any] = {}
     if maintenance:
+        maintenance_result["sidecars"] = drain_card_sidecar_outbox(root, limit=50)
         maintenance_result["decay"] = decay_graph_routes(root, limit=50)
         maintenance_result["tiering"] = apply_storage_tiering(root, dry_run=False, limit=50)
         maintenance_result["conflicts"] = detect_conflicts(root, limit=25)
@@ -742,28 +1485,63 @@ def run_worker_pass(
     }
 
 
+@contextmanager
+def _worker_service_lock(root: Path) -> Iterator[None]:
+    key = os.path.normcase(str(root.resolve(strict=False)))
+    with _WORKER_SERVICE_ROOTS_GUARD:
+        if key in _WORKER_SERVICE_ROOTS:
+            raise RuntimeError(f"worker service already running for root: {root}")
+        _WORKER_SERVICE_ROOTS.add(key)
+    try:
+        try:
+            with operation_lock(root, "worker-service", timeout_seconds=0.0):
+                yield
+        except TimeoutError as exc:
+            raise RuntimeError(f"worker service already running for root: {root}") from exc
+    finally:
+        with _WORKER_SERVICE_ROOTS_GUARD:
+            _WORKER_SERVICE_ROOTS.discard(key)
+
+
 def serve_workers(
     root: Path,
     *,
     roles: list[str] | None = None,
     limit: int = 0,
     interval_seconds: float = 5.0,
+    maintenance_interval_seconds: float = DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS,
+    maintenance_on_start: bool = True,
 ) -> dict[str, Any]:
     passes = 0
     processed = 0
-    while True:
-        result = run_worker_pass(root, roles=roles, limit=50, maintenance=True)
-        passes += 1
-        processed += int(result.get("processed_count", 0))
-        if limit and passes >= limit:
-            return {"ok": True, "passes": passes, "processed_count": processed}
-        time.sleep(max(0.1, float(interval_seconds)))
+    maintenance_passes = 0
+    maintenance_interval = max(1.0, float(maintenance_interval_seconds))
+    next_maintenance_at = time.monotonic() if maintenance_on_start else time.monotonic() + maintenance_interval
+    with _worker_service_lock(root):
+        while True:
+            now = time.monotonic()
+            maintenance_due = now >= next_maintenance_at
+            result = run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
+            passes += 1
+            processed += int(result.get("processed_count", 0))
+            if maintenance_due:
+                maintenance_passes += 1
+                next_maintenance_at = time.monotonic() + maintenance_interval
+            if limit and passes >= limit:
+                return {
+                    "ok": True,
+                    "passes": passes,
+                    "processed_count": processed,
+                    "maintenance_passes": maintenance_passes,
+                    "maintenance_interval_seconds": maintenance_interval,
+                }
+            time.sleep(max(0.1, float(interval_seconds)))
 
 
 def memory_health(root: Path) -> dict[str, Any]:
     if not is_initialized(root):
         return {"ok": False, "initialized": False, "root": str(root), "reason": "catalog_missing"}
-    config = load_config(root)
+    config = load_config(root) if config_path(root).exists() else default_config()
     conn = connect_existing(root)
     try:
         pending_jobs = conn.execute("SELECT count(*) AS n FROM queue_jobs WHERE status = 'pending'").fetchone()["n"]

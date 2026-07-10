@@ -14,7 +14,7 @@ from continuum.core.safety import (
 class EpicContinuumSafetyTest(unittest.TestCase):
     def test_known_secret_patterns_are_detected_and_redacted(self) -> None:
         samples = {
-            "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "private_key": "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
             "openai_key": "sk-" + "A" * 24,
             "github_token": "ghp_" + "A" * 36,
             "gitlab_token": "glpat-" + "A" * 24,
@@ -38,6 +38,12 @@ class EpicContinuumSafetyTest(unittest.TestCase):
         self.assertEqual(findings[0]["type"], "sensitive_key_assignment")
         self.assertIn("secret_hash", findings[0])
         self.assertEqual(findings[0]["secret_hash_risk"], "low_entropy_secret_value")
+
+    def test_underscore_identifier_secret_values_are_not_whitelisted(self) -> None:
+        findings = scan_text_for_secrets('client_secret = "prod_live_db_password_9F3E7A6B5C4D2E1F"')
+
+        self.assertTrue(findings)
+        self.assertEqual(findings[0]["type"], "secret_assignment")
 
     def test_redacted_placeholders_do_not_create_findings(self) -> None:
         text = "OPENAI_API_KEY=[REDACTED]\nclient_secret: [REDACTED]\n"

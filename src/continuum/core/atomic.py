@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,24 @@ def _parse_key(raw: str) -> str:
     return text
 
 
+def _split_key_value(content: str) -> tuple[str, str]:
+    stripped = content.strip()
+    if stripped.startswith('"'):
+        decoder = json.JSONDecoder()
+        try:
+            _key, end = decoder.raw_decode(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid quoted atomic YAML key: {content!r}") from exc
+        rest = stripped[end:].lstrip()
+        if not rest.startswith(":"):
+            raise ValueError(f"invalid atomic YAML mapping line: {content!r}")
+        return stripped[:end], rest[1:]
+    if ":" not in content:
+        raise ValueError(f"invalid atomic YAML line: {content!r}")
+    key, value = content.split(":", 1)
+    return key, value
+
+
 def _yaml_lines(text: str) -> list[tuple[int, str]]:
     lines: list[tuple[int, str]] = []
     for line in text.splitlines():
@@ -106,7 +125,9 @@ def _parse_block(lines: list[tuple[int, str]], index: int, indent: int) -> tuple
     current_indent, current = lines[index]
     if current_indent < indent:
         return {}, index
-    if current.startswith("-"):
+    if current_indent == indent and current in {"{}", "[]"}:
+        return _parse_scalar(current), index + 1
+    if current == "-" or current.startswith("- "):
         items: list[Any] = []
         while index < len(lines):
             line_indent, content = lines[index]
@@ -126,9 +147,7 @@ def _parse_block(lines: list[tuple[int, str]], index: int, indent: int) -> tuple
         line_indent, content = lines[index]
         if line_indent != indent or content.startswith("-"):
             break
-        if ":" not in content:
-            raise ValueError(f"invalid atomic YAML line: {content!r}")
-        key_text, value_text = content.split(":", 1)
+        key_text, value_text = _split_key_value(content)
         key = _parse_key(key_text)
         value_text = value_text.strip()
         index += 1
@@ -145,6 +164,10 @@ def load_atomic_yaml(text: str) -> Any:
     lines = _yaml_lines(text)
     if not lines:
         return {}
+    if len(lines) == 1:
+        _indent, content = lines[0]
+        if content not in {"-", "{}"} and not content.startswith("- ") and ":" not in content:
+            return _parse_scalar(content)
     result, index = _parse_block(lines, 0, lines[0][0])
     if index != len(lines):
         raise ValueError("invalid trailing atomic YAML content")
@@ -162,6 +185,7 @@ def atomic_memory_card(
     card_type: str,
     title: str,
     summary: str,
+    status: str,
     source_refs: list[dict[str, Any]],
     entities: list[str],
     topics: list[str],
@@ -170,12 +194,23 @@ def atomic_memory_card(
     salience: float,
     confidence: float,
     metadata: dict[str, Any],
+    visibility_scope: str,
+    session_id: str | None,
+    project_id: str | None,
+    placement_collection: str | None = None,
+    shelf: str | None = None,
+    storage_tier: str | None = None,
+    recall_count: int = 0,
+    last_recalled_at: str | None = None,
+    conflict_group: str | None = None,
+    supersedes_card_id: str | None = None,
+    superseded_by_card_id: str | None = None,
     created_at: str,
     updated_at: str,
     summary_hash: str,
 ) -> dict[str, Any]:
-    return {
-        "schema": "continuum.atomic_memory.v1",
+    payload = {
+        "schema": "continuum.atomic_memory.v2",
         "kind": "card",
         "card_id": card_id,
         "id": card_id,
@@ -183,7 +218,18 @@ def atomic_memory_card(
         "title": title,
         "summary": summary,
         "summary_hash": summary_hash,
-        "status": "pending_librarian_review",
+        "status": status,
+        "placement_collection": placement_collection,
+        "shelf": shelf,
+        "storage_tier": storage_tier,
+        "visibility_scope": visibility_scope,
+        "session_id": session_id,
+        "project_id": project_id,
+        "recall_count": int(recall_count),
+        "last_recalled_at": last_recalled_at,
+        "conflict_group": conflict_group,
+        "supersedes_card_id": supersedes_card_id,
+        "superseded_by_card_id": superseded_by_card_id,
         "source_refs": source_refs,
         "entities": entities,
         "topics": topics,
@@ -195,3 +241,6 @@ def atomic_memory_card(
         "created_at": created_at,
         "updated_at": updated_at,
     }
+    state_material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    payload["state_hash"] = hashlib.sha256(state_material.encode("utf-8")).hexdigest()
+    return payload

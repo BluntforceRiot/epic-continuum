@@ -1,7 +1,7 @@
 # Maintainability Hotspots
 
 This audit records the large workflow functions reviewers flagged during the
-release-readiness pass. They are not release blockers for `0.1.0` because the
+release-readiness pass. They are not release blockers for `0.2.0` because the
 current behavior is covered by regression tests and package smoke tests, but
 they are the first refactor targets after the release boundary.
 
@@ -43,4 +43,3 @@ rewrites. Broad refactors must keep:
   changes.
 - Operation receipts and proof packs backward-readable.
 - No new external dependencies for core workflows.
-

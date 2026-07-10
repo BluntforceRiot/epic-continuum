@@ -1,6 +1,6 @@
 {
   "name": "epic-continuum",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Epic Continuum persistent memory, Looking Glass context, and recovery packets for Claude Code.",
   "author": {
     "name": "Bluntforce / Epic Continuum"

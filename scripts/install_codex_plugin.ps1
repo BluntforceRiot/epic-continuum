@@ -1,5 +1,7 @@
+[CmdletBinding()]
 param(
-  [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
+  [string]$RepoRoot = "",
+  [Alias("ContinuumRoot")]
   [string]$Root = $(if ($env:CONTINUUM_ROOT) { $env:CONTINUUM_ROOT } else { Join-Path $HOME ".continuum" }),
   [string]$Python = $(if ($env:CONTINUUM_PYTHON) { $env:CONTINUUM_PYTHON } else { "python" }),
   [string]$StageRoot = $(if ($env:CONTINUUM_CODEX_MARKETPLACE_STAGE) { $env:CONTINUUM_CODEX_MARKETPLACE_STAGE } else { Join-Path $HOME ".cache\epic-continuum\codex-marketplace" }),
@@ -8,6 +10,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $RepoRoot) {
+  $ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+  if (-not $ScriptPath) {
+    throw "Unable to determine script path; pass -RepoRoot explicitly."
+  }
+  $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptPath)
+}
 
 $StageHelper = Join-Path $RepoRoot "scripts\stage_codex_plugin.py"
 $stageArgs = @(

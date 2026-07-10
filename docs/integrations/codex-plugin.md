@@ -58,6 +58,16 @@ the durable memory contract itself.
 Mutating MCP tools return their normal JSON payload plus an `_operation` object
 with the operation receipt and proof-pack paths.
 
+## Included Skills
+
+The plugin includes two Codex skills:
+
+- `continuum-memory` for persistent memory, crash recovery, context packets,
+  Cue Recall, shared project state, and ordinary review-relay use.
+- `pro-review-relay` for the private browser-only review loop where Codex
+  prepares one `review-capsule.zip`, a signed-in reviewer returns JSON, and
+  Continuum ingests the hash-bound result before Codex applies findings.
+
 ## Configurable Paths
 
 Epic Continuum should not assume a specific drive or username. Set
@@ -123,9 +133,12 @@ same packet is written to:
 - `continuum_ingest_file`
 - `continuum_compile_context`
 - `continuum_recover_thread`
+- `continuum_cue_recall`
+- `continuum_record_project_state`
 - `continuum_search`
 - `continuum_audit_search_index`
 - `continuum_rebuild_search_index`
+- `continuum_reindex_memory`
 - `continuum_audit`
 - `continuum_doctor`
 - `continuum_repair_permissions`
@@ -150,6 +163,19 @@ same packet is written to:
 - `continuum_recover_operations`
 - `continuum_recovery_drill`
 - `continuum_restore_drill`
+- `continuum_review_prepare`
+- `continuum_review_run`
+- `continuum_review_ingest`
+- `continuum_review_status`
+- `continuum_review_check_current`
+- `continuum_review_browser_attempt_start`
+
+`continuum_review_prepare` accepts the same narrow secret-scan exceptions as
+the CLI: `secret_allowlist_files` for UTF JSONL files containing exact
+source/line/type/secret-hash/line-hash fingerprints. The legacy
+`secret_allowlist_patterns` argument remains only for non-hashed false
+positives; hashed token and private-key findings require exact fingerprints.
+The public review capsule records only counts, not local allowlist file paths.
 
 ## MemPalace Import
 

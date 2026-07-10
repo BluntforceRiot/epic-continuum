@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epic-continuum.local/schemas/proof_archive_locator.schema.json",
+  "title": "Epic Continuum external proof archive locator",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "created_at",
+    "root_binding",
+    "archive_root",
+    "archive_manifest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "epic_continuum.proof_archive_locator.v1"
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_binding": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "archive_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "archive_manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

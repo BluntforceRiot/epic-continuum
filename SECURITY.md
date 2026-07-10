@@ -6,8 +6,8 @@ the configured Continuum root.
 
 ## Supported Version
 
-Security fixes target the current `0.2.x` line. The published `0.1.x` line
-remains supported for critical security fixes until `0.2.0` is published.
+Security fixes target the current `0.2.x` line. The published `0.1.x` line is
+retired and should be upgraded before reporting or applying a fix.
 
 ## Reporting A Vulnerability
 

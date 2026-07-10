@@ -6,10 +6,13 @@ same WAL through incompatible filesystem-locking implementations.
 
 The claim is stored at `config/writer-claim.json` and records its schema,
 runtime (`windows`, `wsl`, `linux`, or `macos`), normalized host name, and UTC
-claim timestamp. `status`, `writer-status`, `doctor`, and read-only root
-verification remain available from a different runtime. Strict verification
-automatically skips its mutating restore drill when the current runtime does not
-own the claim.
+claim timestamp. `status`, `writer-status`, and claim inspection remain
+available from a different runtime. WAL-aware reads of a catalog with committed
+live WAL frames are refused from an incompatible runtime, because even a
+read-only SQLite connection would participate in the shared WAL locking protocol.
+Use the owning runtime or an owner-created frozen snapshot for those reads.
+Strict verification automatically skips its mutating restore drill when the
+current runtime does not own the claim.
 
 New empty roots are claimed automatically during their first mutation. Existing
 unclaimed roots require an explicit choice:

@@ -158,7 +158,7 @@ continuum review-prepare \
 ```bash
 continuum review-prepare \
   --root ./.continuum-demo \
-  --subject ./epic-continuum-0.2.0.zip \
+  --subject ./epic-continuum-0.2.1.zip \
   --prompt "Do a harsh release-boundary review." \
   --transport manual \
   --secret-allowlist-file docs/review-fixture-secret-allowlist.jsonl

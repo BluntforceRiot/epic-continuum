@@ -191,6 +191,23 @@ class ReleaseHardeningTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(f"version: {version}", path.read_text(encoding="utf-8"))
+        claude_manifest = json.loads(
+            (
+                repo_root
+                / "integrations"
+                / "claude-code"
+                / "epic-continuum-claude-code"
+                / ".claude-plugin"
+                / "plugin.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(claude_manifest["version"], version)
+        codex_manifest = json.loads(
+            (repo_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(codex_manifest["version"].startswith(f"{version}+codex."))
 
     def test_powershell_installers_accept_continuum_root_alias_and_strict_binding(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

@@ -13,7 +13,7 @@
   <a href="pyproject.toml"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-79f0ff?style=flat-square&labelColor=05070d&logo=python&logoColor=79f0ff"></a>
   <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20CLI%20%7C%20Python-99a7ff?style=flat-square&labelColor=05070d"></a>
   <a href="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Release: 0.2.0" src="https://img.shields.io/badge/release-0.2.0-8df3ff?style=flat-square&labelColor=05070d"></a>
+  <a href="CHANGELOG.md"><img alt="Release: 0.2.1" src="https://img.shields.io/badge/release-0.2.1-8df3ff?style=flat-square&labelColor=05070d"></a>
 </p>
 
 <p align="center">

@@ -6,7 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .config import config_path, default_config, load_config, retention_policy
 from .operations import operation_lock
@@ -47,6 +47,11 @@ PENDING_JOB_STATUS = "pending"
 DEFAULT_BACKLOG_RECONCILE_LIMIT = 5000
 MAX_BACKLOG_RECONCILE_LIMIT = 10000
 DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
+# A single notification may represent an arbitrarily large per-session backlog
+# because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
+# than one window, but yield after a bounded amount of work and leave a durable
+# continuation for the same session.
+MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN = 64
 _WORKER_SERVICE_ROOTS: set[str] = set()
 _WORKER_SERVICE_ROOTS_GUARD = threading.Lock()
 
@@ -174,14 +179,23 @@ def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_s
     role_clause = ""
     if roles:
         placeholders = ",".join("?" for _ in roles)
-        role_clause = f" AND role IN ({placeholders})"
+        role_clause = f" AND pending_job.role IN ({placeholders})"
         params.extend(sorted(roles))
     row = conn.execute(
         f"""
-        SELECT *
-        FROM queue_jobs
-        WHERE status = ?{role_clause}
-        ORDER BY priority ASC, created_at ASC
+        SELECT pending_job.*
+        FROM queue_jobs AS pending_job
+        WHERE pending_job.status = ?{role_clause}
+          AND (
+              pending_job.dedupe_key IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                  FROM queue_jobs AS active_job
+                  WHERE active_job.status = '{ACTIVE_JOB_STATUS}'
+                    AND active_job.dedupe_key = pending_job.dedupe_key
+              )
+          )
+        ORDER BY pending_job.priority ASC, pending_job.created_at ASC
         LIMIT 1
         """,
         params,
@@ -764,6 +778,60 @@ def _last_segment_end(conn, session_id: str) -> int:
     return int(row["end_seq"] or 0)
 
 
+def _scroll_segment_backlog(conn, session_id: str, *, max_seq_limit: int | None = None) -> dict[str, int]:
+    row = conn.execute(
+        "SELECT coalesce(max(seq), 0) AS max_seq FROM scroll_events WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    max_seq = int(row["max_seq"] or 0)
+    if max_seq_limit is not None:
+        max_seq = min(max_seq, max(0, int(max_seq_limit)))
+    frontier = _last_segment_end(conn, session_id)
+    start_seq = frontier + 1
+    return {
+        "frontier": frontier,
+        "start_seq": start_seq,
+        "max_seq": max_seq,
+        "pending_events": max(0, max_seq - start_seq + 1),
+    }
+
+
+def _ensure_scribe_continuation(root: Path, *, session_id: str, threshold: int) -> dict[str, Any]:
+    """Atomically inspect the live frontier and retain one notification if due.
+
+    The transaction closes the only dangerous gap: work arriving before this
+    check is represented by the continuation created here, while work arriving
+    after the commit sees either that pending dedupe row or the currently running
+    job and creates/reuses a pending notification itself.
+    """
+
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        backlog = _scroll_segment_backlog(conn, session_id)
+        continuation_job_id: str | None = None
+        if backlog["pending_events"] >= threshold:
+            continuation_job_id = enqueue_job(
+                conn,
+                role="scribe",
+                job_type="scroll_event_ingested",
+                priority=100,
+                payload={
+                    "session_id": session_id,
+                    "seq": backlog["max_seq"],
+                    "reason": "scroll_segment_backlog_continuation",
+                },
+                dedupe_key=f"session:{session_id}",
+            )
+        conn.commit()
+        return {**backlog, "continuation_job_id": continuation_job_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _scroll_security_runs(conn, *, session_id: str, start_seq: int, end_seq: int) -> list[tuple[int, int]]:
     rows = conn.execute(
         """
@@ -797,46 +865,125 @@ def _scroll_security_runs(conn, *, session_id: str, start_seq: int, end_seq: int
     return runs
 
 
-def roll_due_scroll_segments(root: Path, *, session_id: str | None = None, force: bool = False) -> dict[str, Any]:
+def roll_due_scroll_segments(
+    root: Path,
+    *,
+    session_id: str | None = None,
+    force: bool = False,
+    heartbeat: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Roll eligible Scroll windows, renewing an owning worker lease as needed."""
     init_db(root)
     config = load_config(root)
     threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
     if session_id:
         session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
     rolled: list[dict[str, Any]] = []
+    batches_processed = 0
+    concurrent_progress = 0
+    continuations: list[dict[str, Any]] = []
     conn = connect(root)
     try:
         if session_id:
             sessions = [session_id]
         else:
-            sessions = [row["session_id"] for row in conn.execute("SELECT DISTINCT session_id FROM scroll_events")]
-        for current_session in sessions:
-            max_row = conn.execute(
-                "SELECT coalesce(max(seq), 0) AS max_seq FROM scroll_events WHERE session_id = ?",
-                (current_session,),
-            ).fetchone()
-            max_seq = int(max_row["max_seq"] or 0)
-            start = _last_segment_end(conn, current_session) + 1
-            pending = max_seq - start + 1
-            while pending > 0 and (force or pending >= threshold):
-                end = max_seq if force else min(max_seq, start + threshold - 1)
-                if end < start:
-                    break
-                runs = _scroll_security_runs(conn, session_id=current_session, start_seq=start, end_seq=end)
-                if not runs:
-                    break
-                conn.close()
-                for run_start, run_end in runs:
-                    result = roll_scroll_segment(root, session_id=current_session, start_seq=run_start, end_seq=run_end)
-                    rolled.append(result)
-                conn = connect(root)
-                start = runs[-1][1] + 1
-                pending = max_seq - start + 1
-                if not force:
-                    break
+            sessions = [
+                row["session_id"]
+                for row in conn.execute("SELECT DISTINCT session_id FROM scroll_events ORDER BY session_id")
+            ]
     finally:
         conn.close()
-    return {"ok": True, "rolled_count": len(rolled), "rolled": rolled}
+
+    # Preserve explicit force semantics by fixing each session's upper bound at
+    # invocation time. Non-forced work observes newly committed events but yields
+    # after MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN threshold windows.
+    force_targets: dict[str, int] = {}
+    if force:
+        conn = connect(root)
+        try:
+            for current_session in sessions:
+                force_targets[current_session] = _scroll_segment_backlog(conn, current_session)["max_seq"]
+        finally:
+            conn.close()
+
+    for current_session in sessions:
+        while force or batches_processed < MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN:
+            if heartbeat is not None and not heartbeat():
+                raise RuntimeError("worker lease lost during Scribe segmentation")
+            conn = connect(root)
+            try:
+                backlog = _scroll_segment_backlog(
+                    conn,
+                    current_session,
+                    max_seq_limit=force_targets.get(current_session) if force else None,
+                )
+                pending = backlog["pending_events"]
+                if pending <= 0 or (not force and pending < threshold):
+                    break
+                start = backlog["start_seq"]
+                end = backlog["max_seq"] if force else min(backlog["max_seq"], start + threshold - 1)
+                runs = _scroll_security_runs(
+                    conn,
+                    session_id=current_session,
+                    start_seq=start,
+                    end_seq=end,
+                )
+            finally:
+                conn.close()
+            if not runs:
+                break
+
+            batches_processed += 1
+            retry_from_fresh_frontier = False
+            for run_start, run_end in runs:
+                try:
+                    result = roll_scroll_segment(
+                        root,
+                        session_id=current_session,
+                        start_seq=run_start,
+                        end_seq=run_end,
+                    )
+                    if heartbeat is not None and not heartbeat():
+                        raise RuntimeError("worker lease lost during Scribe segmentation")
+                except ValueError:
+                    # Another valid Scribe can win between the backlog read and
+                    # the idempotent segment write. Only absorb the error when the
+                    # authoritative frontier proves that concurrent progress
+                    # covered at least the start of this exact run.
+                    conn = connect(root)
+                    try:
+                        latest_frontier = _last_segment_end(conn, current_session)
+                    finally:
+                        conn.close()
+                    if latest_frontier < run_start:
+                        raise
+                    concurrent_progress += 1
+                    retry_from_fresh_frontier = True
+                    break
+                else:
+                    rolled.append(result)
+            if retry_from_fresh_frontier:
+                continue
+
+        if not force:
+            continuation = _ensure_scribe_continuation(
+                root,
+                session_id=current_session,
+                threshold=threshold,
+            )
+            if continuation["continuation_job_id"] is not None:
+                continuations.append({"session_id": current_session, **continuation})
+
+    return {
+        "ok": True,
+        "rolled_count": len(rolled),
+        "rolled": rolled,
+        "batches_processed": batches_processed,
+        "batch_limit": None if force else MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN,
+        "drain_limited": bool(continuations),
+        "continuations": continuations,
+        "concurrent_progress": concurrent_progress,
+    }
 
 
 def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
@@ -1398,11 +1545,16 @@ def drain_card_sidecar_outbox(root: Path, *, limit: int = 50) -> dict[str, Any]:
     }
 
 
-def _process_job(root: Path, job: dict[str, Any]) -> dict[str, Any]:
+def _process_job(
+    root: Path,
+    job: dict[str, Any],
+    *,
+    heartbeat: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     payload = json_loads(job.get("payload_json"), {})
     job_type = job["job_type"]
     if job_type == "scroll_event_ingested":
-        return roll_due_scroll_segments(root, session_id=payload.get("session_id"))
+        return roll_due_scroll_segments(root, session_id=payload.get("session_id"), heartbeat=heartbeat)
     if job_type == "review_card_placement":
         return review_card_placement(root, card_id=str(payload["card_id"]))
     if job_type == "verify_book_integrity":
@@ -1442,7 +1594,26 @@ def run_worker_pass(
         if job is None:
             break
         try:
-            result = _process_job(root, job)
+            def renew_lease() -> bool:
+                lease_conn = connect(root)
+                try:
+                    renewed = _heartbeat_job(
+                        lease_conn,
+                        job["id"],
+                        lease_owner=worker_id,
+                        lease_seconds=lease_seconds,
+                    )
+                    lease_conn.commit()
+                    return renewed
+                finally:
+                    lease_conn.close()
+
+            if job["job_type"] == "scroll_event_ingested":
+                result = _process_job(root, job, heartbeat=renew_lease)
+            else:
+                # Preserve the small internal hook surface used by integrations
+                # and tests that replace non-Scribe job processors.
+                result = _process_job(root, job)
             job_ok = bool(result.get("ok", True))
             job_status = "skipped" if result.get("skipped") else ("succeeded" if job_ok else "failed")
             conn = connect(root)

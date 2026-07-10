@@ -1,7 +1,7 @@
 # Maintainability Hotspots
 
 This audit records the large workflow functions reviewers flagged during the
-release-readiness pass. They are not release blockers for `0.2.0` because the
+release-readiness pass. They are not release blockers for the `0.2.x` line because the
 current behavior is covered by regression tests and package smoke tests, but
 they are the first refactor targets after the release boundary.
 

@@ -60,8 +60,29 @@ def tree_fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():
         return digest.hexdigest()
+    catalog_path = root / "catalog" / "catalog.sqlite3"
+    if catalog_path.exists():
+        # A WAL-aware read-only SQLite connection may create empty -wal/-shm
+        # runtime sidecars.  Hash the logical catalog contents so those
+        # transport files are not mistaken for a durable mutation while an
+        # actual catalog write still changes the fingerprint.
+        conn = sqlite3.connect(f"{catalog_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            digest.update(b"catalog-logical\0")
+            for pragma in ("application_id", "user_version", "page_size", "auto_vacuum"):
+                digest.update(pragma.encode("ascii"))
+                digest.update(b"=")
+                digest.update(str(conn.execute(f"PRAGMA {pragma}").fetchone()[0]).encode("ascii"))
+                digest.update(b"\0")
+            for statement in conn.iterdump():
+                digest.update(statement.encode("utf-8"))
+                digest.update(b"\0")
+        finally:
+            conn.close()
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         rel = path.relative_to(root).as_posix()
+        if path == catalog_path or rel in {"catalog/catalog.sqlite3-wal", "catalog/catalog.sqlite3-shm"}:
+            continue
         digest.update(rel.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -1769,6 +1790,29 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             with closing(connect_catalog(root)) as conn:
                 alias_count = conn.execute("SELECT count(*) AS n FROM partition_aliases").fetchone()["n"]
             self.assertEqual(alias_count, 0)
+
+    def test_tree_fingerprint_keeps_archived_wal_named_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            evidence = root / "archive" / "evidence.sqlite3-wal"
+            evidence.parent.mkdir(parents=True)
+            evidence.write_bytes(b"first archived evidence")
+            before = tree_fingerprint(root)
+            evidence.write_bytes(b"changed archived evidence")
+            self.assertNotEqual(before, tree_fingerprint(root))
+
+    def test_tree_fingerprint_detects_sqlite_header_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            before = tree_fingerprint(root)
+            conn = sqlite3.connect(root / "catalog" / "catalog.sqlite3")
+            try:
+                conn.execute("PRAGMA application_id = 424242")
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertNotEqual(before, tree_fingerprint(root))
 
     def test_warn_mode_secret_agent_ids_use_durable_partition_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -115,6 +115,8 @@ def _lock_file_handle(handle: Any, *, timeout_seconds: float) -> None:
     if os.name == "nt":
         import msvcrt
 
+        locking = getattr(msvcrt, "locking")
+        lock_nonblocking = getattr(msvcrt, "LK_NBLCK")
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
@@ -124,7 +126,7 @@ def _lock_file_handle(handle: Any, *, timeout_seconds: float) -> None:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locking(handle.fileno(), lock_nonblocking, 1)
                 return
             except OSError:
                 if time.monotonic() >= deadline:
@@ -153,8 +155,10 @@ def _unlock_file_handle(handle: Any) -> None:
     if os.name == "nt":
         import msvcrt
 
+        locking = getattr(msvcrt, "locking")
+        lock_unlock = getattr(msvcrt, "LK_UNLCK")
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        locking(handle.fileno(), lock_unlock, 1)
     else:
         import fcntl
 

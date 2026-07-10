@@ -91,7 +91,9 @@ def detect_system_ram_bytes() -> tuple[int | None, str]:
 
         status = MemoryStatusEx()
         status.dwLength = ctypes.sizeof(MemoryStatusEx)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        windll = getattr(ctypes, "windll")
+        global_memory_status_ex = getattr(windll.kernel32, "GlobalMemoryStatusEx")
+        if global_memory_status_ex(ctypes.byref(status)):
             return int(status.ullTotalPhys), "GlobalMemoryStatusEx"
 
     if system == "linux":

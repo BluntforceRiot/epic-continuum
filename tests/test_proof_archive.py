@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import continuum.core.proof_archive as proof_archive_module
@@ -56,6 +59,70 @@ def _remove_directory_link(link: Path) -> None:
 
 
 class ProofArchiveTest(unittest.TestCase):
+    def test_macos_system_alias_allowlist_requires_direct_physical_target(self) -> None:
+        def directory_lstat(path: Path) -> SimpleNamespace:
+            self.assertIn(Path(path).as_posix(), {"/private", "/private/tmp", "/private/var"})
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755)
+
+        with (
+            patch.object(proof_archive_module.sys, "platform", "darwin"),
+            patch.object(
+                proof_archive_module.os,
+                "readlink",
+                side_effect=lambda path: {"/tmp": "private/tmp", "/var": "private/var"}[Path(path).as_posix()],
+            ),
+            patch.object(proof_archive_module.os, "lstat", side_effect=directory_lstat),
+        ):
+            self.assertTrue(proof_archive_module._allowed_platform_symlink(Path("/var"), "symlink"))
+            self.assertTrue(proof_archive_module._allowed_platform_symlink(Path("/tmp"), "symlink"))
+            self.assertFalse(proof_archive_module._allowed_platform_symlink(Path("/etc"), "symlink"))
+            self.assertFalse(proof_archive_module._allowed_platform_symlink(Path("/var"), "junction"))
+
+        with (
+            patch.object(proof_archive_module.sys, "platform", "darwin"),
+            patch.object(proof_archive_module.os, "readlink", return_value="intermediate/var"),
+        ):
+            self.assertFalse(proof_archive_module._allowed_platform_symlink(Path("/var"), "symlink"))
+
+        with (
+            patch.object(proof_archive_module.sys, "platform", "darwin"),
+            patch.object(proof_archive_module.os, "readlink", return_value="private/var"),
+            patch.object(
+                proof_archive_module.os,
+                "lstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFLNK | 0o777),
+            ),
+        ):
+            self.assertFalse(proof_archive_module._allowed_platform_symlink(Path("/var"), "symlink"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS system alias contract")
+    def test_standard_macos_temp_alias_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self._root(base)
+            archive = base / "external-archive"
+
+            plan = plan_legacy_catalog_archive(root, archive)
+
+            self.assertEqual(plan["candidate_count"], 0)
+            self.assertTrue(proof_archive_module._allowed_platform_symlink(Path("/var"), "symlink"))
+            self.assertTrue(proof_archive_module._allowed_platform_symlink(Path("/tmp"), "symlink"))
+            self.assertFalse(
+                proof_archive_module._allowed_platform_symlink(base / "arbitrary-link", "symlink")
+            )
+            with self.assertRaisesRegex(ProofArchiveError, "refusing symlink traversal"):
+                proof_archive_module._assert_no_link_components(Path("/etc"))
+            with self.assertRaisesRegex(ProofArchiveError, "must not overlap"):
+                plan_legacy_catalog_archive(root, root.resolve(strict=True) / "nested-archive")
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            base = Path(tmp)
+            root = self._root(base)
+
+            plan = plan_legacy_catalog_archive(root, base / "external-archive")
+
+            self.assertEqual(plan["candidate_count"], 0)
+
     def _root(self, base: Path) -> Path:
         root = base / "continuum-root"
         init_db(root)

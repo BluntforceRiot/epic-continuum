@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import sys
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -32,6 +33,10 @@ RELOCATION_LEDGER_NAME = "relocations.jsonl"
 ARCHIVE_LOCATOR_RELATIVE_PATH = Path("config/proof-archive.json")
 ARCHIVE_OBJECT_PREFIX = PurePosixPath("objects/sha256")
 _ARCHIVE_LOCK_OPERATION_ID = "proof_archive_relocations"
+_DARWIN_SYSTEM_SYMLINK_ALIASES = {
+    "/tmp": "private/tmp",
+    "/var": "private/var",
+}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -103,6 +108,24 @@ def _lexical_absolute(path: Path) -> Path:
     return Path(os.path.abspath(path))
 
 
+def _allowed_platform_symlink(path: Path, reason: str) -> bool:
+    """Allow only the two fixed macOS compatibility aliases."""
+    if reason != "symlink" or sys.platform != "darwin":
+        return False
+    expected_link = _DARWIN_SYSTEM_SYMLINK_ALIASES.get(path.as_posix())
+    if expected_link is None:
+        return False
+    try:
+        if os.readlink(path) != expected_link:
+            return False
+        for physical_directory in (Path("/private"), Path("/") / expected_link):
+            if not stat.S_ISDIR(os.lstat(physical_directory).st_mode):
+                return False
+        return True
+    except OSError:
+        return False
+
+
 def _assert_no_link_components(path: Path) -> Path:
     """Reject every existing symlink, junction, or reparse point in a path."""
     absolute = _lexical_absolute(path)
@@ -111,7 +134,7 @@ def _assert_no_link_components(path: Path) -> Path:
     for part in parts:
         current /= part
         reason = _link_like_reason(current)
-        if reason:
+        if reason and not _allowed_platform_symlink(current, reason):
             raise ProofArchiveError(f"refusing {reason} traversal: {current}")
     return absolute
 

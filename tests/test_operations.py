@@ -524,7 +524,7 @@ class OperationLedgerTest(unittest.TestCase):
             live_catalog = root / "catalog" / "catalog.sqlite3"
             ordinary_evidence = root / "archive" / "ordinary-evidence.txt"
             ordinary_evidence.parent.mkdir(parents=True, exist_ok=True)
-            ordinary_evidence.write_text("root-bound evidence\n", encoding="utf-8")
+            secure_write_text(ordinary_evidence, "root-bound evidence\n")
             started = start_operation(root, operation_type="relocated_proof", title="Relocated proof")
             finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
             proof = create_proof_pack(

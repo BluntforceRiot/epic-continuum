@@ -1677,7 +1677,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "git state changed during review preparation"):
                     create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
 
-    def test_subject_packaging_skips_symlink_escape(self) -> None:
+    def test_subject_packaging_refuses_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
             root = base / "continuum"
@@ -1691,12 +1691,11 @@ class ReviewBridgeTest(unittest.TestCase):
             except (OSError, NotImplementedError) as exc:
                 self.skipTest(f"symlink creation unavailable: {exc}")
 
-            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
-            manifest = json.loads(Path(job["subject_manifest_uri"]).read_text(encoding="utf-8"))
-            manifest_paths = {item["path"] for item in manifest["files"]}
-            self.assertNotIn("outside-secret.txt", manifest_paths)
-            with zipfile.ZipFile(job["subject_archive_uri"]) as zf:
-                self.assertNotIn("outside-secret.txt", zf.namelist())
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "strict review prep refuses incomplete coverage",
+            ):
+                create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
 
     def test_mcp_review_tools_are_registered_and_work(self) -> None:
         self.assertIn("continuum_review_prepare", TOOLS)

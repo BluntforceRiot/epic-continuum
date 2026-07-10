@@ -27,7 +27,7 @@ from .safety import (
     scan_value_for_secrets,
 )
 from .units import format_size, parse_size
-from .writer_claim import ensure_writer_claim, writer_claim_status
+from .writer_claim import WriterClaimError, ensure_writer_claim, writer_claim_status
 
 
 # Catalog schema version is intentionally independent from the package version.
@@ -150,7 +150,14 @@ def sqlite_file_uri(path: Path, **query: str | int | bool) -> str:
     return uri
 
 
-def sqlite_readonly_uri(path: Path, *, immutable: bool = True) -> str:
+def sqlite_readonly_uri(path: Path, *, immutable: bool = False) -> str:
+    """Return a read-only SQLite URI, optionally for a frozen database.
+
+    ``immutable=1`` tells SQLite that the database file cannot change.  That is
+    appropriate for frozen snapshots, but it also makes SQLite ignore a live
+    catalog's WAL and change detection.  Keep ordinary read-only connections
+    WAL-aware and require frozen-artifact callers to opt in explicitly.
+    """
     query: dict[str, str | int | bool] = {"mode": "ro"}
     if immutable:
         query["immutable"] = True
@@ -523,7 +530,8 @@ SNAPSHOT_DURABLE_TABLES = (
 
 
 def catalog_counts_from_db_file(db_path: Path, tables: tuple[str, ...] = SNAPSHOT_DURABLE_TABLES) -> dict[str, int]:
-    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
+    # This helper is only used with frozen snapshot/proof catalogs.
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path, immutable=True), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         existing_tables = {
@@ -1886,10 +1894,41 @@ def connect(root: Path) -> sqlite3.Connection:
     return conn
 
 
-def connect_existing(root: Path, *, immutable: bool = True) -> sqlite3.Connection:
+def _assert_live_wal_read_compatible(root: Path, db_path: Path, *, immutable: bool) -> None:
+    if immutable:
+        return
+    wal_path = db_path.with_name(f"{db_path.name}-wal")
+    try:
+        has_frames = wal_path.exists() and wal_path.stat().st_size > 32
+    except OSError:
+        has_frames = False
+    if not has_frames:
+        return
+    claim = writer_claim_status(root)
+    if claim.get("claimed") and not claim.get("compatible"):
+        owner = claim.get("claim") or {}
+        current = claim.get("current") or {}
+        raise WriterClaimError(
+            "live WAL read refused across an incompatible writer claim: "
+            f"{owner.get('runtime', 'unknown')}@{owner.get('host', 'unknown')} owns the catalog, "
+            f"current runtime is {current.get('runtime', 'unknown')}@{current.get('host', 'unknown')}; "
+            "run the read from the owning runtime or use a frozen snapshot"
+        )
+
+
+def connect_existing(root: Path, *, immutable: bool = False) -> sqlite3.Connection:
+    """Open an existing catalog read-only.
+
+    Live Continuum roots use WAL journaling, so the default must participate in
+    normal SQLite change detection.  ``immutable=True`` is reserved for callers
+    that have already frozen the catalog and can prove no writer can change it.
+    SQLite may create transient ``-wal``/``-shm`` sidecars for a WAL-aware read,
+    but the ``mode=ro`` URI keeps durable catalog content read-only.
+    """
     db_path = root / "catalog" / "catalog.sqlite3"
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
+    _assert_live_wal_read_compatible(root, db_path, immutable=immutable)
     conn = sqlite3.connect(sqlite_readonly_uri(db_path, immutable=immutable), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

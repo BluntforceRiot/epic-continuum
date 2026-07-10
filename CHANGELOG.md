@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.1 - 2026-07-10
+
+- Fixed live read-only catalog connections so status, search, recall, health,
+  verification, and recovery paths observe committed SQLite WAL data instead of
+  silently reading a stale main database file.
+- Fixed deduplicated Scribe notifications so one job drains every due Scroll
+  segment window, yields after a bounded amount of work, and leaves an atomic
+  same-session continuation when more eligible events remain.
+- Added per-segment Scribe lease renewal and ownership fencing so a slow,
+  high-boundary drain cannot be reclaimed and run concurrently by another worker.
+- Prevented a pending same-session queue generation from running concurrently
+  with the active generation that produced it.
+- Refused WAL-aware reads from an incompatible writer runtime when committed
+  live WAL frames are present; use the owning runtime or a frozen snapshot.
+- Added focused regressions for live WAL visibility, read-only enforcement,
+  complete and bounded Scribe draining, continuation lifecycle, queue ordering,
+  and logical no-mutation checks for read-only tools.
+- Kept the catalog capability schema at `0.2.0`; this patch requires no database
+  migration.
+
 ## 0.2.0 - 2026-07-09
 
 - Added Cue Recall for loose, associative recovery of buried ideas from vague

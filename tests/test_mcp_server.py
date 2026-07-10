@@ -49,8 +49,28 @@ def tree_fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():
         return digest.hexdigest()
+    catalog_path = root / "catalog" / "catalog.sqlite3"
+    if catalog_path.exists():
+        # Read-only access to a live WAL catalog may create empty SQLite
+        # runtime sidecars.  Compare the logical database instead of treating
+        # those files as durable state, while still detecting real SQL writes.
+        conn = sqlite3.connect(f"{catalog_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            digest.update(b"catalog-logical\0")
+            for pragma in ("application_id", "user_version", "page_size", "auto_vacuum"):
+                digest.update(pragma.encode("ascii"))
+                digest.update(b"=")
+                digest.update(str(conn.execute(f"PRAGMA {pragma}").fetchone()[0]).encode("ascii"))
+                digest.update(b"\0")
+            for statement in conn.iterdump():
+                digest.update(statement.encode("utf-8"))
+                digest.update(b"\0")
+        finally:
+            conn.close()
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         rel = path.relative_to(root).as_posix()
+        if path == catalog_path or rel in {"catalog/catalog.sqlite3-wal", "catalog/catalog.sqlite3-shm"}:
+            continue
         digest.update(rel.encode("utf-8"))
         digest.update(b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))

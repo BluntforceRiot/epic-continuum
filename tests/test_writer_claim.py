@@ -122,6 +122,22 @@ class WriterClaimTests(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["value"], "visible")
 
+    def test_incompatible_runtime_refuses_live_wal_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "wal-runtime-boundary"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                writer = connect(root)
+                try:
+                    writer.execute("PRAGMA wal_autocheckpoint = 0")
+                    writer.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('wal_boundary', 'owned')")
+                    writer.commit()
+                    with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WSL):
+                        with self.assertRaisesRegex(WriterClaimError, "live WAL read refused"):
+                            connect_existing(root)
+                finally:
+                    writer.close()
+
     def test_existing_unclaimed_root_requires_explicit_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "legacy"

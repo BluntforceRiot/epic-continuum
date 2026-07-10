@@ -1,6 +1,6 @@
 # Release Audit Summary
 
-This file curates the release-gate evidence for Epic Continuum `0.2.0` without
+This file curates the release-gate evidence for Epic Continuum `0.2.1` without
 shipping the full internal build-review history.
 
 ## Scope
@@ -65,9 +65,16 @@ Review hardening after the final private review pass added:
   redirection before copying source trees or writing disposable drill output,
   with restore-drill tree copies walked by Continuum's guarded copy loop rather
   than delegated to whole-tree `shutil.copytree`.
+- WAL-aware live read-only catalog access so committed data is never hidden in
+  SQLite's write-ahead log from status, retrieval, health, or recovery calls.
+- bounded complete Scribe backlog draining with durable continuation jobs and
+  same-session generation ordering, plus per-segment lease renewal and fencing.
+- incompatible-runtime live WAL refusal so Windows and WSL/Linux do not join the
+  same shared-memory locking protocol.
 
-The Python package version is `0.2.0`, and the catalog capability
-`SCHEMA_VERSION` is `0.2.0`. This cycle includes additive catalog migrations for
+The Python package version is `0.2.1`, and the catalog capability
+`SCHEMA_VERSION` remains `0.2.0`. The patch release adds no catalog migration.
+The 0.2 cycle includes additive catalog migrations for
 durable Scroll visibility fields, source-scoped graph edge contributions,
 partition aliases, snapshot integrity bindings, sidecar synchronization queues,
 and proof/bundle hardening. Existing roots are upgraded in place, with legacy

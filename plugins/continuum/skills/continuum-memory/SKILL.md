@@ -24,6 +24,7 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_roll_segment` to compact a known Scroll range into a Card.
 - `continuum_compile_context` to build a token-bounded Looking Glass context packet.
 - `continuum_recover_thread` to generate a crash-recovery packet.
+- `continuum_resume_latest` to discover and recover the newest durable project/session state when a thread id is unknown.
 - `continuum_cue_recall` to recover buried ideas from loose prompts when the user cannot remember exact wording.
 - `continuum_record_project_state` to leave a durable project checkpoint for other agents.
 - `continuum_ingest_file` to archive local files into the Library.
@@ -35,6 +36,8 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_tier_storage` to apply Archivist storage movement.
 - `continuum_prune_memory` to archive, summarize-only, or forget cards by topic.
 - `continuum_detect_conflicts` to find likely conflicting Cards.
+- `continuum_resolve_conflict` to promote the current Card or dismiss a false-positive conflict without deleting evidence.
+- `continuum_yarn_health` to check the optional local Qwythos/Yarn endpoint without sending memory.
 - `continuum_decay_routes` to apply Librarian route decay and synaptic pruning.
 - `continuum_run_evals` to run deterministic memory-quality evals.
 - `continuum_verify_root` to run strict root invariants.
@@ -65,9 +68,14 @@ python -m continuum <command> --root "$CONTINUUM_ROOT"
 ## Recovery Pattern
 
 When the user says a thread crashed or asks for a magic recovery command, call
-`continuum_recover_thread` with the best-known `session_id`. If the session id is
-unknown, inspect recent Epic Continuum status and ask one concise question only if the
-session cannot be inferred from the user's request or local files.
+`continuum_recover_thread` with a known stable `session_id`. If it is unknown,
+call `continuum_resume_latest` with the best-known project id instead of forcing
+the user to recover an internal thread id. Ask one concise question only if the
+requested project cannot be inferred and choosing the latest state would be unsafe.
+Respect the configured resume mode: `explicit` requires a supplied session or
+project, while `latest_project` requires a supplied or configured default
+project and must not silently fall back to unrelated global state. Never promote
+a superseded or unresolved contested Card as the current checkpoint.
 
 The recovery result includes:
 
@@ -77,6 +85,23 @@ The recovery result includes:
 
 Treat the Scroll as the ordered source of truth. Treat Cards as compact memory.
 Do not delete raw evidence because a Card, route, or summary is stale.
+
+Conflict review operates on the complete stable conflict group. Promote one
+current Card or dismiss the whole false-positive group; do not create partial
+pairwise resolutions or reverse an existing supersession into a cycle.
+
+## Optional Yarn Pattern
+
+Yarn/Qwythos is an advisory local-model layer, not memory authority. Use model
+assistance only when the user requests it or the personal profile enables it.
+Check `continuum_yarn_health` first when readiness is uncertain. A disabled,
+busy, low-headroom, offline, timed-out, mismatched, malformed, or unsafe model
+must fall back to the unchanged deterministic recovery packet.
+
+Never treat a Yarn briefing as a new fact or write it into Scroll/Cards unless
+the user independently confirms it. The briefing must remain labeled
+`non_authoritative_inference`, preserve its evidence citations, and never cause
+Continuum to start, stop, download, or reconfigure the local model server.
 
 ## Cue Recall Pattern
 

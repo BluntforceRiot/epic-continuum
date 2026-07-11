@@ -52,6 +52,39 @@ turning every context request into an unbounded session scan.
 The core compiler reports it, but treats the requested `token_budget` as the
 context packet budget so adapter-provided budgets remain predictable.
 
+## Personal Resume Profile
+
+`personal_profile.safe_context_ceiling` caps automatic recovery even when a
+caller requests a larger packet. `default_project_id` selects the preferred
+project for `latest_project` mode, and `assist_on_resume` controls whether the
+optional Yarn briefing is requested when a caller does not explicitly choose.
+`yarn-configure` sets the ceiling to the smaller of `context.max_token_budget`
+and the model's usable input window: `max_input_tokens - max_output_tokens -
+512`. The final 512 tokens are reserved for the briefing protocol, so the
+reported ceiling is also a request the adapter can accept.
+
+Resume modes are intentionally strict:
+
+- `latest` discovers the newest current durable checkpoint across the allowed
+  scope.
+- `latest_project` uses a supplied project or the configured default and refuses
+  an unscoped fallback when neither exists.
+- `explicit` requires a supplied session or project identifier.
+
+Use `continuum configure-profile` to change these fields. Supplied partition
+identifiers are canonicalized before lookup, while external secret-like labels
+remain redacted in receipts and discovery output.
+
+## Local Yarn Inference
+
+`local_inference` configures the optional Qwythos/llama.cpp advisory layer. It is
+disabled by default. The endpoint must use an exact `/v1` path; loopback is the
+default boundary, while a remote endpoint requires explicit opt-in and HTTPS.
+Model output never becomes memory authority and deterministic recovery remains
+available on every refusal or failure. See
+[Local Yarn/Qwythos with llama.cpp](integrations/local-llamacpp.md) for the
+recommended one-slot launch command and resource/deadline controls.
+
 ## Capture Policy
 
 `capture.mode` controls how eagerly adapters write the live conversation Scroll:

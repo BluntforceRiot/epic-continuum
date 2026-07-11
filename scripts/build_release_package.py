@@ -109,9 +109,9 @@ def project_version(repo_root: Path) -> str:
     return str(data["project"]["version"])
 
 
-def _git_tracked_tree_is_clean(repo_root: Path) -> bool | None:
+def _git_worktree_is_clean(repo_root: Path) -> bool | None:
     proc = subprocess.run(
-        ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=no"],
+        ["git", "-C", str(repo_root), "status", "--porcelain"],
         check=False,
         capture_output=True,
         text=True,
@@ -428,11 +428,12 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
     checksum_path = zip_path.with_suffix(zip_path.suffix + ".sha256")
     source = "git+working-tree" if not require_clean else "git"
     if require_clean:
-        clean = _git_tracked_tree_is_clean(repo_root)
+        clean = _git_worktree_is_clean(repo_root)
         if clean is False:
             raise RuntimeError(
-                "refusing to build a git-sourced release archive from tracked working-tree changes; "
-                "commit or stash changes first, or pass --allow-dirty for a development archive"
+                "refusing to build a git-sourced release archive from tracked working-tree changes "
+                "or non-ignored untracked files; commit, add, or stash changes first, or pass "
+                "--allow-dirty for a development archive"
             )
     members = _git_tracked_members(
         repo_root,
@@ -444,7 +445,7 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         source = "walk"
         members = _walk_members(repo_root, package_name)
     elif require_clean:
-        clean = _git_tracked_tree_is_clean(repo_root)
+        clean = _git_worktree_is_clean(repo_root)
         if clean is None:
             raise RuntimeError("unable to verify git working-tree cleanliness before release archive build")
     provenance = _provenance_payload(
@@ -481,7 +482,7 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         "package": str(zip_path),
         "sha256": digest,
         "checksum": str(checksum_path),
-        "members": len(members) + 2,
+        "members": len(members) + 3,
         "source": source,
     }
 
@@ -491,7 +492,11 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--version", default=None)
-    parser.add_argument("--allow-dirty", action="store_true", help="Allow tracked working-tree changes in a development archive.")
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow working-tree changes and intended untracked inputs in a development archive.",
+    )
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()

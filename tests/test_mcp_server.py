@@ -11,7 +11,16 @@ from unittest.mock import patch
 
 from continuum.core.config import default_config, write_config
 from continuum.core.operations import _proof_pack_hash
-from continuum.core.store import _backfill_partition_aliases, append_scroll_event, connect, ingest_file, init_db, recover_thread
+from continuum.core.store import (
+    MAX_RECENT_EVENT_LIMIT,
+    _backfill_partition_aliases,
+    append_scroll_event,
+    connect,
+    ingest_file,
+    init_db,
+    record_project_state,
+    recover_thread,
+)
 from continuum.mcp_server import TOOLS, dispatch
 
 
@@ -108,6 +117,9 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         names = {tool["name"] for tool in listed["result"]["tools"]}
         self.assertIn("continuum_append_event", names)
         self.assertIn("continuum_recover_thread", names)
+        self.assertIn("continuum_resume_latest", names)
+        self.assertIn("continuum_yarn_health", names)
+        self.assertIn("continuum_resolve_conflict", names)
         self.assertIn("continuum_optimize_config", names)
         self.assertIn("continuum_import_mempalace", names)
         self.assertIn("continuum_restore_drill", names)
@@ -128,6 +140,9 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertFalse(tools["continuum_status"]["annotations"]["openWorldHint"])
         self.assertFalse(tools["continuum_doctor"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_import_mempalace"]["annotations"]["openWorldHint"])
+        self.assertTrue(tools["continuum_resume_latest"]["annotations"]["openWorldHint"])
+        self.assertTrue(tools["continuum_yarn_health"]["annotations"]["openWorldHint"])
+        self.assertTrue(tools["continuum_yarn_health"]["annotations"]["readOnlyHint"])
         self.assertFalse(tools["continuum_repair_permissions"]["annotations"]["openWorldHint"])
         self.assertIn("continuum_list_operations", names)
         self.assertIn("continuum_operation_summary", names)
@@ -187,11 +202,24 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
 
     def test_project_and_reindex_mcp_schemas_match_supported_arguments(self) -> None:
         recover_props = TOOLS["continuum_recover_thread"][1]["properties"]
+        resume_props = TOOLS["continuum_resume_latest"][1]["properties"]
         compile_props = TOOLS["continuum_compile_context"][1]["properties"]
         search_props = TOOLS["continuum_search"][1]["properties"]
         reindex_props = TOOLS["continuum_reindex_memory"][1]["properties"]
 
         self.assertIn("project_id", recover_props)
+        self.assertNotIn("model_assist", recover_props)
+        self.assertIn("model_assist", resume_props)
+        self.assertEqual(recover_props["recent_event_limit"]["minimum"], 0)
+        self.assertEqual(resume_props["recent_event_limit"]["minimum"], 0)
+        self.assertEqual(
+            recover_props["recent_event_limit"]["maximum"],
+            MAX_RECENT_EVENT_LIMIT,
+        )
+        self.assertEqual(
+            resume_props["recent_event_limit"]["maximum"],
+            MAX_RECENT_EVENT_LIMIT,
+        )
         self.assertIn("project_id", compile_props)
         self.assertIn("session_id", search_props)
         self.assertIn("project_id", search_props)
@@ -220,6 +248,35 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertEqual(before, tree_fingerprint(root))
             for rel in ("catalog", "run", "exports", "snapshots"):
                 self.assertFalse((root / rel).exists(), rel)
+
+    def test_recovery_tools_reject_out_of_range_recent_event_limits_before_artifacts(self) -> None:
+        for tool_name, arguments in (
+            (
+                "continuum_recover_thread",
+                {"session_id": "bounded-session"},
+            ),
+            ("continuum_resume_latest", {}),
+        ):
+            for invalid_limit in (-1, MAX_RECENT_EVENT_LIMIT + 1):
+                with (
+                    self.subTest(tool=tool_name, recent_event_limit=invalid_limit),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp) / "continuum"
+                    with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                        result = call_tool_raw(
+                            tool_name,
+                            {
+                                "root": str(root),
+                                **arguments,
+                                "recent_event_limit": invalid_limit,
+                            },
+                        )
+
+                    self.assertTrue(result["isError"], result)
+                    payload = json.loads(result["content"][0]["text"])
+                    self.assertIn("recent_event_limit", payload["error"])
+                    self.assertFalse(root.exists())
 
     def test_mcp_secret_partition_warn_and_off_alias_without_crashing(self) -> None:
         for action in ("warn", "off"):
@@ -644,6 +701,45 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertIn("checks", result)
             self.assertFalse(config_path.exists())
             self.assertEqual(before, tree_fingerprint(root))
+
+    def test_read_only_yarn_health_does_not_initialize_missing_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing-continuum"
+
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                result = call_tool("continuum_yarn_health", {"root": str(root)})
+
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["reason"], "disabled")
+            self.assertFalse(root.exists())
+
+    def test_resume_model_assist_false_overrides_enabled_personal_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="mcp-resume-session",
+                agent_id="codex-sol",
+                project_id="mcp-resume-project",
+                objective="Verify explicit model consent",
+            )
+            config = default_config()
+            config["local_inference"]["enabled"] = True
+            config["personal_profile"]["assist_on_resume"] = True
+            write_config(root, config)
+
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch("continuum.core.local_model._http_json", side_effect=AssertionError("HTTP must remain disabled")),
+            ):
+                result = call_tool(
+                    "continuum_resume_latest",
+                    {"root": str(root), "project_id": "mcp-resume-project", "model_assist": False},
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(result["model_assist"]["used"])
+            self.assertEqual(result["model_assist"]["reason"], "not_requested")
 
     def test_read_only_mcp_tools_do_not_mutate_existing_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

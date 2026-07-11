@@ -116,6 +116,7 @@ jobs:
           python benchmarks/runners/continuitybench.py \
             --quick \
             --budgets 1000 \
+            --enforce-v03-gates \
             --output-dir "${RUNNER_TEMP}/continuitybench-ci"
           test -f "${RUNNER_TEMP}/continuitybench-ci/summary.json"
           test -f "${RUNNER_TEMP}/continuitybench-ci/cases.jsonl"

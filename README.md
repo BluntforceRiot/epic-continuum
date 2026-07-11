@@ -13,12 +13,12 @@
   <a href="pyproject.toml"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-79f0ff?style=flat-square&labelColor=05070d&logo=python&logoColor=79f0ff"></a>
   <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20CLI%20%7C%20Python-99a7ff?style=flat-square&labelColor=05070d"></a>
   <a href="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Release: 0.2.1" src="https://img.shields.io/badge/release-0.2.1-8df3ff?style=flat-square&labelColor=05070d"></a>
+  <a href="CHANGELOG.md"><img alt="Release: 0.3.0" src="https://img.shields.io/badge/release-0.3.0-8df3ff?style=flat-square&labelColor=05070d"></a>
 </p>
 
 <p align="center">
   <a href="#the-problem">Problem</a>
-  &middot; <a href="#whats-new-in-02">0.2 Update</a>
+  &middot; <a href="#whats-new-in-03">0.3 Update</a>
   &middot; <a href="#how-memory-works">Memory</a>
   &middot; <a href="#how-the-context-window-works">Context</a>
   &middot; <a href="#cue-recall">Cue Recall</a>
@@ -33,25 +33,31 @@
 > [!IMPORTANT]
 > Epic Continuum does not claim infinite context. It keeps durable memory outside the model, then rebuilds a bounded context packet for the work happening now.
 
-## What's New In 0.2
+## What's New In 0.3
 
-Epic Continuum 0.2 adds the operational controls needed to run one durable
-memory root safely over time:
+Epic Continuum 0.3 turns durable memory into a safer daily recovery system:
 
-- **Cue Recall** finds related memories from loose prompts without replacing
-  exact Scroll evidence.
-- **Shared project state** gives Codex, Hermes, Claude Code, and local agents
-  durable handoff checkpoints.
-- **Hash-bound review relay** freezes the review subject and rejects stale or
-  mismatched review results.
-- **Persistent workers** continuously process Scribe, Librarian, Archivist, and
-  sidecar work with pending-job deduplication, leases, and bounded backlog repair.
-- **Bounded proof storage** uses compact catalog-state witnesses for routine
-  operations while retaining explicit full snapshots for restore evidence.
-- **External proof archives** relocate eligible legacy catalog proof snapshots
-  through a root-bound, hash-chained ledger.
-- **Writer claims** prevent Windows, WSL, Linux, macOS, or another host from
-  concurrently mutating the same SQLite root.
+- **Automatic resume** discovers the newest durable project/session checkpoint;
+  an internal thread ID is optional.
+- **Looking Glass planner v2** balances Scroll, Cards, and Cue Recall, preserves
+  authority labels, excludes contested/superseded current candidates, and emits
+  an explainable selection trace under a hard token budget.
+- **Temporal memory review** can explicitly supersede an old Card or dismiss a
+  false-positive conflict while retaining historical evidence and audit records.
+- **Yarn/Qwythos local assistance** can produce citation-bound, non-authoritative
+  recovery briefings through a loopback llama.cpp endpoint. It is optional and
+  fails back to the deterministic packet.
+- **Homelab Guardian controls** enforce measurable resource headroom, a
+  process-local inference gate backed by the recommended one-slot server,
+  request/response limits, wall-clock deadlines, model identity, secret
+  redaction, circuit breaking, and a conservative context ceiling.
+- **Personal profiles** remember safe context, preferred project resume, and
+  whether Yarn should assist recovery.
+- **Expanded health telemetry** reports queue age, running-job heartbeat, Scroll
+  segmentation lag, sidecar backlog, snapshots, and live WAL state.
+
+The 0.2 foundations remain: Cue Recall, shared project state, hash-bound review,
+persistent workers, proof storage, external proof archives, and writer claims.
 
 The Scroll remains the ordered source of truth. Cards, graph routes, indexes,
 and sidecars are derived recall structures; proof packs, snapshots, and bundles
@@ -109,8 +115,8 @@ Instead, context reconstruction follows a repeatable pattern:
 
 1. The agent provides the current session, task, and optional query.
 2. By default, `compile_context` gathers recent Scroll events and matching Cards. When an agent explicitly asks for it with `include_cue_recall` / `--include-cue-recall`, the direct compiler can also add a budgeted `cue_recall_candidates` section from Cue Recall. Library search, operation receipts, proof artifacts, and bundles remain durable queryable evidence, but they are not silently inserted into every direct context packet.
-3. The direct compiler filters by visibility, project/session scope, textual relevance, recency, and Card salience. Trust and supersession metadata are preserved for recovery, review, and future planner work, but the current direct packet does not claim a full semantic planner.
-4. The Looking Glass planner assembles the most useful material into the configured token budget.
+3. The direct compiler filters by visibility, project/session scope, textual relevance, recency, and Card salience.
+4. Recovery uses `planner_profile=resume`: Looking Glass balances sources, excludes superseded or contested current Cards, labels authority, and records why each candidate was included or rejected.
 5. The model sees that packet, not the entire memory root.
 6. Durable memory stays outside the model and can be queried again later.
 
@@ -167,6 +173,56 @@ Agent: asks Continuum for recovery context.
 Continuum: returns recent events, Cards, open tasks, receipts, and relevant evidence.
 Agent: resumes from durable state instead of starting cold.
 ```
+
+### Resume Without Remembering A Thread ID
+
+The v0.3 resume path discovers the newest current project-state checkpoint,
+builds a bounded Looking Glass packet, and records the recovery as a guarded
+operation with a proof receipt:
+
+```powershell
+continuum resume --root "$HOME\.continuum"
+
+continuum configure-profile `
+  --root "$HOME\.continuum" `
+  --resume-mode latest_project `
+  --default-project-id epic-continuum `
+  --safe-context-ceiling 16384
+```
+
+`latest_project` refuses to drift into an unrelated project when no supplied or
+configured project exists. `explicit` mode requires a session or project ID.
+Superseded and unresolved contested Cards remain historical evidence but are not
+eligible to become the current resume checkpoint.
+
+### Resolve Temporal Memory Conflicts
+
+Conflict detection groups connected competing Cards into one stable review
+unit. Resolution promotes one current Card and preserves the others as
+historical evidence; dismissing clears a false-positive group without deleting
+anything. A bounded content fingerprint keeps periodic detection from recreating
+that exact dismissed conflict unless its membership or evidence changes.
+
+```powershell
+continuum detect-conflicts --root "$HOME\.continuum"
+continuum resolve-conflict --root "$HOME\.continuum" --card-id <winner-card-id>
+```
+
+### Optional Yarn / Qwythos Briefings
+
+Version 0.3 can use the Qwythos v3 GGUF through a local llama.cpp server. Yarn is
+an advisory layer over an already-scoped deterministic packet; it never writes
+model claims back into Scroll or Cards and it cannot replace recovery evidence.
+
+```powershell
+continuum yarn-configure --root "$HOME\.continuum" --enable
+continuum yarn-health --root "$HOME\.continuum"
+continuum resume --root "$HOME\.continuum" --model-assist
+```
+
+See [Local Yarn/Qwythos with llama.cpp](docs/integrations/local-llamacpp.md) for
+the recommended model alias, one-slot server command, context limits, and the
+RTX 5090-oriented 32K option.
 
 ## Cue Recall
 

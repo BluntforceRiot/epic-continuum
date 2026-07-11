@@ -1,6 +1,6 @@
 # Release Audit Summary
 
-This file curates the release-gate evidence for Epic Continuum `0.2.1` without
+This file curates the release-gate evidence for Epic Continuum `0.3.0` without
 shipping the full internal build-review history.
 
 ## Scope
@@ -17,11 +17,20 @@ The release gate focused on:
 
 ## Current Gate
 
-The core test suite passed on Windows during this package build and in prior
-Linux release-candidate review. Internal review notes also reported disposable
-Debian 12 and Debian 13 validation with the same passing test count as the local
-suite. The public source package intentionally keeps this as a summary rather
-than bundling the full local run logs.
+The core test suite passed on Windows during this package build. Earlier 0.2
+release-candidate work also exercised the durability foundation on disposable
+Debian 12 and Debian 13 systems. The public source package intentionally keeps
+this as a summary rather than bundling full local run logs; the repository CI
+matrix remains the cross-platform release gate for the final v0.3 commit.
+
+The final Windows v0.3 candidate passed 603 tests with 24 environment-gated
+skips. Ruff, mypy across 29 source files, compileall, fixture
+allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
+passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
+records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
+100 events, and five EricMemoryBench cases (80 records). Recovery, strict root
+verification, restore, pack, and bundle verification passed from clean wheel and
+source-distribution installs.
 
 Review hardening after the final private review pass added:
 
@@ -71,9 +80,23 @@ Review hardening after the final private review pass added:
   same-session generation ordering, plus per-segment lease renewal and fencing.
 - incompatible-runtime live WAL refusal so Windows and WSL/Linux do not join the
   same shared-memory locking protocol.
+- automatic latest-state discovery and source-balanced Looking Glass recovery
+  with explainable planner traces and hard context budgets;
+- explicit temporal conflict resolution that retains superseded evidence;
+- optional Yarn/Qwythos v3 recovery briefings behind loopback, model identity,
+  resource, concurrency, deadline, byte, redaction, citation, and circuit gates;
+- personal safe-context/resume profiles and expanded operational health telemetry.
+- adversarial follow-up hardening for persistent conflict dismissals, fair
+  bounded conflict scans, coherent orphan cleanup, one-way supersession lineage,
+  lifecycle authority, total-deadline enforcement, circuit isolation, and
+  outbound path/model-identifier privacy.
+- final functional follow-up fixes for recoverable-scope resume discovery,
+  configured Scroll fetch limits, sequential checkpoint stability, expired
+  worker leases, exact Yarn context ceilings, bounded recovery event requests,
+  and clean-build rejection of forgotten untracked release inputs.
 
-The Python package version is `0.2.1`, and the catalog capability
-`SCHEMA_VERSION` remains `0.2.0`. The patch release adds no catalog migration.
+The Python package version is `0.3.0`, and the catalog capability
+`SCHEMA_VERSION` remains `0.2.0`. This feature release adds no catalog migration.
 The 0.2 cycle includes additive catalog migrations for
 durable Scroll visibility fields, source-scoped graph edge contributions,
 partition aliases, snapshot integrity bindings, sidecar synchronization queues,

@@ -88,6 +88,28 @@ class AdapterKitTest(unittest.TestCase):
             with self.subTest(skill_tool=expected):
                 self.assertIn(expected, skill)
 
+    def test_claude_code_skill_mentions_v03_memory_workflows(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        skill = (
+            repo_root
+            / "integrations"
+            / "claude-code"
+            / "epic-continuum-claude-code"
+            / "skills"
+            / "continuum-memory"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        for expected in (
+            "continuum_resume_latest",
+            "continuum_memory_health",
+            "continuum_detect_conflicts",
+            "continuum_resolve_conflict",
+            "continuum_yarn_health",
+        ):
+            with self.subTest(skill_tool=expected):
+                self.assertIn(expected, skill)
+
     def test_adapter_metadata_cannot_self_promote_trust_exact_memory_or_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

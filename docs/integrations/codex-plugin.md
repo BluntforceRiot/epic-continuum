@@ -113,10 +113,10 @@ codex plugin add continuum@epic-continuum
 
 ## Recovery Command Pattern
 
-When a Codex or Hermes thread crashes, use the MCP tool
-`continuum_recover_thread` with the session id that was used while recording the
-Scroll. The returned `packet_text` is a ready-to-paste recovery packet, and the
-same packet is written to:
+When a Codex or Hermes thread crashes, use `continuum_recover_thread` with a
+known session id. When it is unknown, use `continuum_resume_latest` with the
+best-known project id. The returned `packet_text` is a ready-to-paste recovery
+packet, and the same packet is written to:
 
 ```text
 <continuum-root>\exports\thread_recovery\*.md
@@ -133,6 +133,7 @@ same packet is written to:
 - `continuum_ingest_file`
 - `continuum_compile_context`
 - `continuum_recover_thread`
+- `continuum_resume_latest`
 - `continuum_cue_recall`
 - `continuum_record_project_state`
 - `continuum_search`
@@ -145,9 +146,11 @@ same packet is written to:
 - `continuum_audit_secrets`
 - `continuum_run_workers`
 - `continuum_memory_health`
+- `continuum_yarn_health`
 - `continuum_tier_storage`
 - `continuum_prune_memory`
 - `continuum_detect_conflicts`
+- `continuum_resolve_conflict`
 - `continuum_decay_routes`
 - `continuum_run_evals`
 - `continuum_verify_proof_pack`

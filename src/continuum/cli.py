@@ -7,11 +7,27 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
-from .core.config import config_path, default_config, load_config, optimize_config, write_default_config
+from .core.config import (
+    config_path,
+    configure_personal_profile,
+    default_config,
+    load_config,
+    optimize_config,
+    validate_inference_base_url,
+    validate_inference_model_identifier,
+    validate_yarn_token_budgets,
+    write_default_config,
+)
 from .core.bundle import pack_root, verify_root_bundle
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace, progress_bar
+from .core.local_model import (
+    DEFAULT_YARN_BASE_URL,
+    DEFAULT_YARN_MODEL,
+    configure_yarn,
+    local_model_health,
+)
 from .core.operations import (
     OperationGuard,
     doctor,
@@ -55,6 +71,7 @@ from .core.store import (
     init_db,
     recover_thread,
     record_project_state,
+    resume_latest,
     rebuild_search_index,
     redact_legacy_secrets,
     reindex_memory,
@@ -66,6 +83,7 @@ from .core.store import (
     status,
     canonical_partition_identifier,
     validate_partition_identifier,
+    validate_recent_event_limit,
 )
 from .core.workers import (
     apply_storage_tiering,
@@ -74,6 +92,7 @@ from .core.workers import (
     memory_health,
     prune_memory,
     reconcile_worker_backlog,
+    resolve_conflict,
     run_worker_pass,
     serve_workers,
 )
@@ -225,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_context.add_argument("--project-id")
     p_context.add_argument("--include-cue-recall", action="store_true")
     p_context.add_argument("--cue-recall-limit", type=int, default=4, help="Cue Recall candidates to include when enabled; clamped to 1..20")
+    p_context.add_argument("--planner-profile", choices=["legacy", "resume"], default="legacy")
 
     p_search = sub.add_parser("search", help="Search Library chunks with FTS5 or LIKE fallback")
     p_search.add_argument("--root", required=True)
@@ -312,6 +332,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_health = sub.add_parser("memory-health", help="Report Epic Continuum capture, queue, storage, and learning health")
     p_health.add_argument("--root", required=True)
 
+    p_yarn_configure = sub.add_parser("yarn-configure", help="Configure the optional local Yarn/Qwythos inference profile")
+    p_yarn_configure.add_argument("--root", required=True)
+    p_yarn_configure.add_argument("--enable", action=argparse.BooleanOptionalAction, default=True)
+    p_yarn_configure.add_argument("--base-url", default=DEFAULT_YARN_BASE_URL)
+    p_yarn_configure.add_argument("--model", default=DEFAULT_YARN_MODEL)
+    p_yarn_configure.add_argument("--max-input-tokens", type=int, default=16384)
+    p_yarn_configure.add_argument("--max-output-tokens", type=int, default=768)
+    p_yarn_configure.add_argument("--timeout-seconds", type=int, default=90)
+    p_yarn_configure.add_argument("--allow-remote-endpoint", action="store_true")
+    p_yarn_configure.add_argument("--assist-on-resume", action=argparse.BooleanOptionalAction, default=True)
+
+    p_yarn_health = sub.add_parser("yarn-health", help="Probe the configured Yarn/Qwythos endpoint safely")
+    p_yarn_health.add_argument("--root", required=True)
+    p_yarn_health.add_argument("--no-probe", action="store_true")
+
+    p_personal = sub.add_parser("configure-profile", help="Configure personal resume and context safety defaults")
+    p_personal.add_argument("--root", required=True)
+    p_personal.add_argument("--name")
+    p_personal.add_argument("--safe-context-ceiling", type=int)
+    p_personal.add_argument("--resume-mode", choices=["latest", "latest_project", "explicit"])
+    p_personal.add_argument("--default-project-id")
+    p_personal.add_argument("--clear-default-project", action="store_true")
+    p_personal.add_argument("--assist-on-resume", action=argparse.BooleanOptionalAction, default=None)
+
     p_tier = sub.add_parser("tier-storage", help="Apply Archivist storage tiering policy")
     p_tier.add_argument("--root", required=True)
     p_tier.add_argument("--dry-run", action="store_true")
@@ -330,6 +374,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_conflicts.add_argument("--card-id")
     p_conflicts.add_argument("--limit", type=int, default=50)
 
+    p_resolve_conflict = sub.add_parser("resolve-conflict", help="Resolve a contested Card group")
+    p_resolve_conflict.add_argument("--root", required=True)
+    p_resolve_conflict.add_argument("--card-id", required=True, help="Card to promote, or any group Card when dismissing")
+    p_resolve_conflict.add_argument("--action", choices=["supersede", "dismiss"], default="supersede")
+    p_resolve_conflict.add_argument(
+        "--superseded-card-id",
+        action="append",
+        default=[],
+        help="Confirm each peer to supersede; repeat for the complete group (omit to supersede every peer; partial groups are rejected)",
+    )
+
     p_decay = sub.add_parser("decay-routes", help="Apply Librarian route decay and synaptic pruning")
     p_decay.add_argument("--root", required=True)
     p_decay.add_argument("--limit", type=int, default=200)
@@ -346,6 +401,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_recover.add_argument("--query")
     p_recover.add_argument("--token-budget", type=int, default=0)
     p_recover.add_argument("--recent-event-limit", type=int, default=24)
+
+    p_resume = sub.add_parser("resume", help="Resume the newest durable project/session state")
+    p_resume.add_argument("--root", required=True)
+    p_resume.add_argument("--session-id")
+    p_resume.add_argument("--project-id")
+    p_resume.add_argument("--query")
+    p_resume.add_argument("--token-budget", type=int, default=0)
+    p_resume.add_argument("--recent-event-limit", type=int, default=24)
+    p_resume.add_argument("--model-assist", action=argparse.BooleanOptionalAction, default=None)
 
     p_audit = sub.add_parser("audit", help="Run safety/status audit")
     p_audit.add_argument("--root", required=True)
@@ -729,6 +793,7 @@ def _main(argv: list[str] | None = None) -> int:
                 project_id=args.project_id,
                 include_cue_recall=args.include_cue_recall,
                 cue_recall_limit=args.cue_recall_limit,
+                planner_profile=args.planner_profile,
                 create=False,
             )
         )
@@ -736,6 +801,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "recover-thread":
         assert root is not None
+        validate_recent_event_limit(args.recent_event_limit)
         safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
         safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
         def action(operation: OperationGuard) -> dict[str, Any]:
@@ -763,6 +829,44 @@ def _main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+
+    if args.command == "resume":
+        assert root is not None
+        validate_recent_event_limit(args.recent_event_limit)
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
+        safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = resume_latest(
+                root,
+                session_id=args.session_id,
+                project_id=args.project_id,
+                query=args.query,
+                token_budget=args.token_budget,
+                recent_event_limit=args.recent_event_limit,
+                model_assist=args.model_assist,
+            )
+            if result.get("packet_uri"):
+                operation.cursor({"phase": "latest_state_resumed", "packet_uri": result["packet_uri"]})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_resume_latest",
+                title="Resume latest durable project state",
+                intent={
+                    "session_id": safe_session_id,
+                    "project_id": safe_project_id,
+                    "query": args.query,
+                    "model_assist": args.model_assist,
+                },
+                snapshot_policy="none",
+                snapshot_reason="resume packet is an export over existing evidence",
+                result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
+                action=action,
+            )
+        )
 
     if args.command == "search":
         assert root is not None
@@ -1018,6 +1122,84 @@ def _main(argv: list[str] | None = None) -> int:
         assert root is not None
         return emit_result(memory_health(root))
 
+    if args.command == "yarn-health":
+        assert root is not None
+        return emit_result(local_model_health(root, probe=not args.no_probe))
+
+    if args.command == "yarn-configure":
+        assert root is not None
+        validate_inference_base_url(args.base_url, allow_remote=args.allow_remote_endpoint)
+        args.model = validate_inference_model_identifier(args.model)
+        if scan_text_for_secrets(args.model, max_findings=1):
+            raise ValueError("--model must not contain secret-like text")
+        validate_yarn_token_budgets(args.max_input_tokens, args.max_output_tokens)
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = configure_yarn(
+                root,
+                enabled=args.enable,
+                base_url=args.base_url,
+                model=args.model,
+                max_input_tokens=args.max_input_tokens,
+                max_output_tokens=args.max_output_tokens,
+                timeout_seconds=args.timeout_seconds,
+                allow_remote_endpoint=args.allow_remote_endpoint,
+                assist_on_resume=args.assist_on_resume,
+            )
+            operation.cursor({"phase": "yarn_configured", "enabled": args.enable, "model": args.model})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_yarn_configure",
+                title="Configure local Yarn inference",
+                intent={"enabled": args.enable, "model": args.model, "base_url": args.base_url},
+                snapshot_policy="none",
+                snapshot_reason="configuration-only update",
+                touched_paths=[config_path(root)],
+                action=action,
+            )
+        )
+
+    if args.command == "configure-profile":
+        assert root is not None
+        if args.default_project_id:
+            prevalidate_cli_partition(root, "project_id", args.default_project_id)
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = configure_personal_profile(
+                root,
+                name=args.name,
+                safe_context_ceiling=args.safe_context_ceiling,
+                resume_mode=args.resume_mode,
+                default_project_id=args.default_project_id,
+                clear_default_project=args.clear_default_project,
+                assist_on_resume=args.assist_on_resume,
+            )
+            operation.cursor({"phase": "personal_profile_configured", "name": args.name})
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_configure_profile",
+                title="Configure personal Continuum profile",
+                intent={
+                    "name": args.name,
+                    "safe_context_ceiling": args.safe_context_ceiling,
+                    "resume_mode": args.resume_mode,
+                    "default_project_id": args.default_project_id,
+                    "clear_default_project": args.clear_default_project,
+                    "assist_on_resume": args.assist_on_resume,
+                },
+                snapshot_policy="none",
+                snapshot_reason="configuration-only update",
+                touched_paths=[config_path(root)],
+                action=action,
+            )
+        )
+
     if args.command == "tier-storage":
         assert root is not None
         if args.dry_run:
@@ -1082,6 +1264,43 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="auto",
                 snapshot_reason="conflict detection may annotate cards",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                action=action,
+            )
+        )
+
+    if args.command == "resolve-conflict":
+        assert root is not None
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = resolve_conflict(
+                root,
+                card_id=args.card_id,
+                action=args.action,
+                superseded_card_ids=args.superseded_card_id,
+            )
+            operation.cursor(
+                {
+                    "phase": "conflict_resolved",
+                    "card_id": args.card_id,
+                    "resolution": args.action,
+                    "resolved_peer_ids": result.get("resolved_peer_ids"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_resolve_conflict",
+                title="Resolve Epic Continuum card conflict",
+                intent={
+                    "card_id": args.card_id,
+                    "action": args.action,
+                    "superseded_card_ids": args.superseded_card_id,
+                },
+                snapshot_policy="auto",
+                snapshot_reason="conflict resolution changes temporal Card authority",
+                touched_paths=[root / "catalog" / "catalog.sqlite3", root / "catalog" / "cards"],
                 action=action,
             )
         )

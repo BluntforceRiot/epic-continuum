@@ -1,25 +1,27 @@
 # Epic Continuum Roadmap
 
-## Current 0.2 Focus: Shared State, Cue Recall, And Trust Boundaries
+## Current 0.3 Focus: Automatic Recovery, Temporal Truth, And Local Intelligence
 
-The 0.2 line delivers durable project state shared across agents, associative Cue Recall for buried ideas, exact-memory capture, and stricter release-boundary checks.
+The 0.3 line turns the 0.2 durability foundation into a daily recovery system.
 
-- Deepen Codex, Claude Code, Hermes, and local-agent capture around the same Continuum root.
-- Record project identity, repository, branch, changed files, test failures, decisions, avoided approaches, and next actions as durable state.
-- Maintain Cue Recall: vague prompts such as "that local-agent upgrade idea" should return ranked candidate idea clusters with evidence.
-- Preserve exact user prompts in the Scroll, protect explicit "remember this exactly" memories, and build a damped association graph over important terms, paths, tools, models, people, and concepts.
-- Downweight saturated/common terms, preserve rare distinctive ideas when they are connected to active projects or user emphasis, and decay weak/noisy routes rather than deleting raw evidence.
-- Explain recall results: show direct matches, associated terms, timeline anchors, evidence references, and uncertainty when multiple candidate memories are plausible.
-- Keep project/session/private visibility boring and strict across Scroll, Cards, Library references, jobs, recovery packets, and MCP schemas.
-- Backfill upgraded roots with `reindex-memory` so older Scroll events can participate in Cue Recall without duplicating graph weights.
+- Discover and resume the latest durable state without requiring a remembered thread ID.
+- Balance Scroll, Cards, and Cue Recall through an explainable bounded planner.
+- Resolve temporal Card conflicts without deleting historical evidence.
+- Provide a guarded, optional Qwythos v3 briefing layer through local llama.cpp.
+- Protect the workstation with conservative context, resource, concurrency, timeout,
+  identity, privacy, and deterministic-fallback gates.
+- Persist personal defaults for context safety and project-oriented resume.
+- Surface queue, worker, segmentation, sidecar, snapshot, and WAL health in one report.
 
-## Next Release Focus
+## Next Release Focus (0.4)
 
-- Deeper Looking Glass planning that can deliberately pull Library search, Cue Recall candidates, operation receipts, and project checkpoints into one budgeted context packet.
-- More scale testing for high-entropy tool output and long-running shared-agent projects.
-- Background Librarian/Scribe scheduling so indexing, decay, card review, and verification continue without an agent babysitting every pass.
-- Better human review tools for pruning by project, topic, time range, sensitivity, and confidence.
-- More adapter proofs for Codex, Claude Code, Hermes, and local OpenAI-compatible model servers.
+- Evaluate additional local-model tasks only where deterministic benchmarks prove
+  improvement: candidate reranking, proposed summaries, and review assistance.
+- Add scoped Library collections and a formal schema-migration ledger.
+- Add cross-root/export synchronization without multi-writer SQLite access.
+- Build a compact personal health/recovery dashboard and richer project profiles.
+- Expand adapter certification across Codex, Claude Code, Hermes, OpenClaw, and
+  OpenAI-compatible runtimes.
 
 ## Foundation Slice
 

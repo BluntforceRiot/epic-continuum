@@ -105,6 +105,11 @@ class TestContinuityBenchSmoke(unittest.TestCase):
             self.assertTrue(looking_glass)
             self.assertTrue(all(row["mrr"] is None for row in looking_glass))
             self.assertTrue(all(row["ndcg_at_10"] is None for row in looking_glass))
+            planner_v2 = [row for row in rows if row["mode"] == "looking_glass_v2"]
+            self.assertTrue(planner_v2)
+            self.assertTrue(all(row["looking_glass_raw"].get("planner_profile") == "resume" for row in planner_v2))
+            self.assertTrue(all(row["budget_respected"] for row in planner_v2))
+            self.assertTrue(all(not row["current_candidate_superseded_error"] for row in planner_v2))
 
     def test_output_dir_refuses_unmarked_existing_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

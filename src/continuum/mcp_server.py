@@ -13,6 +13,7 @@ from .core.config import config_path, default_config, load_config, optimize_conf
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace
+from .core.local_model import local_model_health
 from .core.safety import redact_text_secrets, scan_text_for_secrets
 from .core.operations import (
     OperationGuard,
@@ -40,6 +41,7 @@ from .core.review_bridge import (
     run_review_job,
 )
 from .core.store import (
+    MAX_RECENT_EVENT_LIMIT,
     append_scroll_event,
     audit,
     audit_search_index,
@@ -50,6 +52,7 @@ from .core.store import (
     init_db,
     recover_thread,
     record_project_state,
+    resume_latest,
     rebuild_search_index,
     redact_legacy_secrets,
     reindex_memory,
@@ -59,6 +62,7 @@ from .core.store import (
     source_file_reference,
     status,
     canonical_partition_identifier,
+    validate_recent_event_limit,
     validate_partition_identifier,
 )
 from .core.workers import (
@@ -67,6 +71,7 @@ from .core.workers import (
     detect_conflicts,
     memory_health,
     prune_memory,
+    resolve_conflict,
     run_worker_pass,
 )
 
@@ -471,6 +476,7 @@ def tool_compile_context(args: JSON) -> Any:
         project_id=project_id,
         include_cue_recall=optional_bool(args, "include_cue_recall"),
         cue_recall_limit=optional_int(args, "cue_recall_limit", 4),
+        planner_profile=optional_str(args, "planner_profile") or "legacy",
         create=False,
     )
 
@@ -479,6 +485,9 @@ def tool_recover_thread(args: JSON) -> Any:
     root = root_arg(args)
     session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
     project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
+    recent_event_limit = validate_recent_event_limit(
+        optional_int(args, "recent_event_limit", 24)
+    )
     safe_session_id = public_partition_label(session_id)
     safe_project_id = public_partition_label(project_id)
 
@@ -489,7 +498,7 @@ def tool_recover_thread(args: JSON) -> Any:
             project_id=project_id,
             query=optional_str(args, "query"),
             token_budget=optional_int(args, "token_budget", 0),
-            recent_event_limit=optional_int(args, "recent_event_limit", 24),
+            recent_event_limit=recent_event_limit,
         )
         operation.cursor({"phase": "thread_recovered", "session_id": safe_session_id, "packet_uri": result["packet_uri"]})
         return result
@@ -504,6 +513,49 @@ def tool_recover_thread(args: JSON) -> Any:
         result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
         action=action,
     )
+
+
+def tool_resume_latest(args: JSON) -> Any:
+    root = root_arg(args)
+    session_id = validate_public_partition_arg(root, "session_id", optional_str(args, "session_id"))
+    project_id = validate_public_partition_arg(root, "project_id", optional_str(args, "project_id"))
+    recent_event_limit = validate_recent_event_limit(
+        optional_int(args, "recent_event_limit", 24)
+    )
+    model_assist: bool | None = None
+    if "model_assist" in args:
+        if not isinstance(args["model_assist"], bool):
+            raise ValueError("model_assist must be a boolean")
+        model_assist = bool(args["model_assist"])
+
+    def action(operation: OperationGuard) -> JSON:
+        result = resume_latest(
+            root,
+            session_id=session_id,
+            project_id=project_id,
+            query=optional_str(args, "query"),
+            token_budget=optional_int(args, "token_budget", 0),
+            recent_event_limit=recent_event_limit,
+            model_assist=model_assist,
+        )
+        if result.get("packet_uri"):
+            operation.cursor({"phase": "latest_state_resumed", "packet_uri": result["packet_uri"]})
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_resume_latest",
+        title="Resume latest durable project state",
+        intent={"session_id": public_partition_label(session_id), "project_id": public_partition_label(project_id)},
+        snapshot_policy="none",
+        snapshot_reason="resume packet is an export over existing evidence",
+        result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
+        action=action,
+    )
+
+
+def tool_yarn_health(args: JSON) -> Any:
+    return local_model_health(root_arg(args), probe=optional_bool(args, "probe", True))
 
 
 def tool_search(args: JSON) -> Any:
@@ -830,6 +882,43 @@ def tool_detect_conflicts(args: JSON) -> Any:
         snapshot_policy="auto",
         snapshot_reason="conflict detection may annotate cards",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
+        action=action,
+    )
+
+
+def tool_resolve_conflict(args: JSON) -> Any:
+    root = root_arg(args)
+    card_id = require_str(args, "card_id")
+    resolution = optional_str(args, "action") or "supersede"
+    raw_peer_ids = args.get("superseded_card_ids") or []
+    if not isinstance(raw_peer_ids, list) or not all(isinstance(value, str) for value in raw_peer_ids):
+        raise ValueError("superseded_card_ids must be an array of strings")
+
+    def action(operation: OperationGuard) -> JSON:
+        result = resolve_conflict(
+            root,
+            card_id=card_id,
+            action=resolution,
+            superseded_card_ids=list(raw_peer_ids),
+        )
+        operation.cursor(
+            {
+                "phase": "conflict_resolved",
+                "card_id": card_id,
+                "resolution": resolution,
+                "resolved_peer_ids": result.get("resolved_peer_ids"),
+            }
+        )
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_resolve_conflict",
+        title="Resolve Epic Continuum card conflict",
+        intent={"card_id": card_id, "action": resolution, "superseded_card_ids": raw_peer_ids},
+        snapshot_policy="auto",
+        snapshot_reason="conflict resolution changes temporal Card authority",
+        touched_paths=[root / "catalog" / "catalog.sqlite3", root / "catalog" / "cards"],
         action=action,
     )
 
@@ -1348,6 +1437,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "card_scope": {"type": "string", "enum": ["session", "global", "session_then_global", "project"]},
                 "include_cue_recall": {"type": "boolean"},
                 "cue_recall_limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                "planner_profile": {"type": "string", "enum": ["legacy", "resume"]},
             },
             "additionalProperties": False,
         },
@@ -1364,11 +1454,45 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
-                "recent_event_limit": {"type": "integer"},
+                "recent_event_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_RECENT_EVENT_LIMIT,
+                },
             },
             "additionalProperties": False,
         },
         tool_recover_thread,
+    ),
+    "continuum_resume_latest": (
+        "Discover and resume the newest durable project/session state without requiring an internal thread ID.",
+        {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string"},
+                "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
+                "query": {"type": "string"},
+                "token_budget": {"type": "integer"},
+                "recent_event_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_RECENT_EVENT_LIMIT,
+                },
+                "model_assist": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        tool_resume_latest,
+    ),
+    "continuum_yarn_health": (
+        "Probe the configured local Yarn/Qwythos OpenAI-compatible endpoint without sending memory.",
+        {
+            "type": "object",
+            "properties": {"root": {"type": "string"}, "probe": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        tool_yarn_health,
     ),
     "continuum_search": (
         "Search Library chunks with SQLite FTS5 or LIKE fallback.",
@@ -1544,6 +1668,25 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "additionalProperties": False,
         },
         tool_detect_conflicts,
+    ),
+    "continuum_resolve_conflict": (
+        "Resolve a complete Card conflict group by superseding every peer or dismissing a false positive.",
+        {
+            "type": "object",
+            "required": ["card_id"],
+            "properties": {
+                "root": {"type": "string"},
+                "card_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["supersede", "dismiss"]},
+                "superseded_card_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional confirmation list containing every peer; partial groups are rejected.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        tool_resolve_conflict,
     ),
     "continuum_decay_routes": (
         "Apply Librarian route decay and synaptic pruning.",
@@ -1829,6 +1972,7 @@ READ_ONLY_TOOLS = {
     "continuum_audit",
     "continuum_audit_secrets",
     "continuum_memory_health",
+    "continuum_yarn_health",
     "continuum_verify_proof_pack",
     "continuum_replay_operation_log",
     "continuum_list_operations",
@@ -1861,6 +2005,8 @@ OPEN_WORLD_TOOLS = {
     "continuum_review_prepare",
     "continuum_review_run",
     "continuum_review_ingest",
+    "continuum_resume_latest",
+    "continuum_yarn_health",
 }
 
 

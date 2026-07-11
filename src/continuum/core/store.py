@@ -49,10 +49,19 @@ PARTITION_INTERNAL_PREFIXES = (
 )
 _INIT_DB_CACHE: set[str] = set()
 VALID_VISIBILITY_SCOPES = {"global", "session", "project", "private"}
+# One authority boundary for every Card consumer. A Card in any of these
+# lifecycle states remains durable evidence, but it is never current memory.
+NON_CURRENT_CARD_STATUSES = frozenset(
+    {"archived", "summary_only", "historical", "superseded", "pruned"}
+)
+_NON_CURRENT_CARD_STATUS_SQL = ", ".join(
+    f"'{status}'" for status in sorted(NON_CURRENT_CARD_STATUSES)
+)
 PARTITION_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+=/-]{0,127}$")
 PARTITION_IDENTIFIER_MARKDOWN_CHARS = set("`[]#\r\n\t")
 ASSOCIATION_COOCCURRENCE_DEFAULT_LIMIT = 12
 ASSOCIATION_COOCCURRENCE_HIGH_ENTROPY_LIMIT = 8
+MAX_RECENT_EVENT_LIMIT = 10_000
 ASSOCIATION_STOPWORDS = {
     "about",
     "after",
@@ -139,6 +148,26 @@ JSON_PARTITION_KEY_KINDS = {
     "agentid": "agent_id",
     "agent-id": "agent_id",
 }
+
+
+def _current_card_status_clause(column: str = "status") -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", column):
+        raise ValueError(f"unsafe Card status column: {column}")
+    return f"lower(coalesce({column}, '')) NOT IN ({_NON_CURRENT_CARD_STATUS_SQL})"
+
+
+def _current_card_authority_clause(table: str = "cards") -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        raise ValueError(f"unsafe Card table alias: {table}")
+    return (
+        f"{_current_card_status_clause(f'{table}.status')} "
+        f"AND coalesce({table}.conflict_group, '') = '' "
+        f"AND coalesce({table}.superseded_by_card_id, '') = '' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM cards AS authority_successor "
+        f"WHERE authority_successor.supersedes_card_id = {table}.id"
+        ")"
+    )
 
 
 def sqlite_file_uri(path: Path, **query: str | int | bool) -> str:
@@ -4854,18 +4883,22 @@ def reinforce_card_recall(
         return 0
     now = now or utc_now()
     updated = 0
+    updated_card_ids: list[str] = []
     for card_id in dict.fromkeys(card_ids):
-        conn.execute(
-            """
+        cursor = conn.execute(
+            f"""
             UPDATE cards
             SET recall_count = coalesce(recall_count, 0) + 1,
                 last_recalled_at = ?,
                 salience = min(1.0, salience + 0.02),
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND {_current_card_authority_clause()}
             """,
             (now, now, card_id),
         )
+        if int(cursor.rowcount or 0) != 1:
+            continue
+        updated_card_ids.append(card_id)
         row = conn.execute("SELECT id FROM graph_nodes WHERE card_id = ?", (card_id,)).fetchone()
         if row:
             edge_rows = conn.execute(
@@ -4900,7 +4933,7 @@ def reinforce_card_recall(
                 refresh_graph_edge_aggregate(conn, str(edge_row["edge_id"]), now=now)
         updated += 1
     if root is not None:
-        mark_card_sidecar_outbox(conn, list(dict.fromkeys(card_ids)), reason="card_recall_reinforced")
+        mark_card_sidecar_outbox(conn, updated_card_ids, reason="card_recall_reinforced")
     return updated
 
 
@@ -4930,6 +4963,257 @@ def _cue_recall_context_payload(item: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _compile_context_planner_v2(
+    root: Path,
+    *,
+    session_id: str,
+    token_budget: int,
+    query: str | None,
+    create: bool,
+    card_scope: str | None,
+    project_id: str | None,
+    cue_recall_limit: int,
+) -> dict[str, Any]:
+    """Build a deterministic, source-balanced resume packet with an explain trace."""
+
+    session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
+    project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
+    if create:
+        init_db(root)
+    elif not is_initialized(root):
+        return {
+            "ok": False,
+            "initialized": False,
+            "planner_profile": "resume",
+            "session_id": session_id,
+            "project_id": project_id,
+            "token_budget": max(0, token_budget),
+            "estimated_tokens": 0,
+            "remaining_budget": max(0, token_budget),
+            "section_count": 0,
+            "context_text": "",
+            "planner_trace": [],
+        }
+    config = _status_config(root, create=create)
+    if project_id and card_scope in {None, "global", "session_then_global"}:
+        card_scope = "project"
+    else:
+        card_scope = card_scope or str(config.get("context", {}).get("card_recall_scope", "session"))
+    if card_scope not in {"session", "global", "session_then_global", "project"}:
+        card_scope = "session"
+    max_budget = int(config["context"]["max_token_budget"])
+    configured_event_limit = int(
+        config["context"].get("scroll_event_fetch_limit", 500)
+    )
+    if token_budget <= 0:
+        token_budget = int(config["context"]["default_token_budget"])
+    usable_budget = min(int(token_budget), max_budget)
+    bounded_limit = max(1, min(int(cue_recall_limit), 20))
+    trace: list[dict[str, Any]] = []
+    candidates: dict[str, list[dict[str, Any]]] = {"recent_scroll": [], "current_cards": [], "cue_recall": []}
+    conn = connect(root) if create else connect_existing(root)
+    try:
+        recent_rows = _visible_scroll_rows(
+            conn,
+            session_id=session_id,
+            project_id=project_id,
+            limit=max(
+                1,
+                min(configured_event_limit, max(24, usable_budget // 10)),
+            ),
+        )
+        for row in recent_rows:
+            payload = {
+                "source": "scroll_event",
+                "authority": "non_authoritative_evidence",
+                "session_id": row["session_id"],
+                "seq": row["seq"],
+                "role": row["role"],
+                "event_type": row["event_type"],
+                "visibility_scope": row["visibility_scope"],
+                "project_id": row["project_id"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+            }
+            candidates["recent_scroll"].append(
+                {
+                    "id": f"scroll:{row['session_id']}:{row['seq']}",
+                    "payload": payload,
+                    "text": markdown_json_evidence(payload),
+                    "score": 0.55,
+                    "reason": "recent ordered evidence",
+                }
+            )
+        terms = extract_terms(query or project_id or session_id, limit=8)
+        scope_clause, scope_params = _card_scope_filter(card_scope, session_id, project_id=project_id)
+        matches = conn.execute(
+            f"""
+            SELECT id, card_type, title, summary, salience, confidence,
+                   visibility_scope, session_id, project_id, source_refs_json,
+                   conflict_group, superseded_by_card_id, updated_at
+            FROM cards
+            WHERE {_current_card_authority_clause()}
+              {scope_clause}
+            ORDER BY salience DESC, updated_at DESC
+            LIMIT 80
+            """,
+            tuple(scope_params),
+        ).fetchall()
+        for row in matches:
+            direct = sum(1 for term in terms if term.casefold() in f"{row['title']} {row['summary']}".casefold())
+            superseded = bool(row["superseded_by_card_id"])
+            contested = bool(row["conflict_group"])
+            payload = {
+                "source": "card",
+                "authority": "historical_or_contested" if superseded or contested else "non_authoritative_evidence",
+                "card_id": row["id"],
+                "card_type": row["card_type"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "salience": row["salience"],
+                "confidence": row["confidence"],
+                "visibility_scope": row["visibility_scope"],
+                "session_id": row["session_id"],
+                "project_id": row["project_id"],
+                "source_refs": json_loads(row["source_refs_json"], []),
+                "superseded_by_card_id": row["superseded_by_card_id"],
+                "conflict_group": row["conflict_group"],
+            }
+            candidate = {
+                "id": str(row["id"]),
+                "payload": payload,
+                "text": markdown_json_evidence(payload),
+                "score": float(row["salience"] or 0.0) + float(row["confidence"] or 0.0) + direct * 0.25,
+                "reason": "direct query/project match" if direct else "salience and confidence",
+                "superseded": superseded,
+                "contested": contested,
+            }
+            if superseded or contested:
+                trace.append({"id": candidate["id"], "source": "card", "included": False, "reason": "superseded_or_contested"})
+            else:
+                candidates["current_cards"].append(candidate)
+        candidates["current_cards"].sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+    finally:
+        conn.close()
+
+    if query:
+        cue_result = cue_recall(
+            root,
+            cue=query,
+            session_id=session_id,
+            project_id=project_id,
+            limit=bounded_limit,
+            max_associations=max(8, min(32, bounded_limit * 4)),
+            create=False,
+        )
+        for item in cue_result.get("results", []):
+            candidate_id = f"cue:{item.get('kind')}:{item.get('id')}"
+            if item.get("kind") == "card" and (
+                item.get("superseded_by_card_id") or item.get("conflict_group")
+            ):
+                trace.append(
+                    {
+                        "id": candidate_id,
+                        "source": "cue_recall",
+                        "included": False,
+                        "reason": "superseded_or_contested",
+                    }
+                )
+                continue
+            payload = _cue_recall_context_payload(item)
+            candidates["cue_recall"].append(
+                {
+                    "id": candidate_id,
+                    "payload": payload,
+                    "text": markdown_json_evidence(payload),
+                    "score": float(item.get("score") or 0.0),
+                    "reason": "; ".join(str(reason) for reason in item.get("reasons", [])[:2]) or "associative cue match",
+                }
+            )
+        candidates["cue_recall"].sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+
+    remaining = usable_budget
+    selected: dict[str, list[str]] = {source: [] for source in candidates}
+    sections: dict[str, list[str]] = {source: [] for source in candidates}
+    indexes = {source: 0 for source in candidates}
+    source_order = ["current_cards", "recent_scroll", "cue_recall"]
+    while remaining > 0 and any(indexes[source] < len(candidates[source]) for source in source_order):
+        progressed = False
+        for source in source_order:
+            if indexes[source] >= len(candidates[source]):
+                continue
+            candidate = candidates[source][indexes[source]]
+            indexes[source] += 1
+            header_cost = estimate_tokens(f"## {source}\n") if not sections[source] else 0
+            candidate_budget = max(0, remaining - header_cost)
+            cost = estimate_tokens(str(candidate["text"]))
+            if cost > candidate_budget:
+                truncated, was_truncated = markdown_json_evidence_for_budget(candidate["payload"], candidate_budget)
+                if not truncated:
+                    trace.append({"id": candidate["id"], "source": source, "included": False, "reason": "budget"})
+                    continue
+                candidate_text = truncated
+                included_cost = estimate_tokens(truncated)
+                if included_cost > candidate_budget:
+                    trace.append({"id": candidate["id"], "source": source, "included": False, "reason": "budget"})
+                    continue
+                trace.append({"id": candidate["id"], "source": source, "included": True, "reason": candidate["reason"], "truncated": was_truncated})
+            else:
+                candidate_text = str(candidate["text"])
+                included_cost = cost
+                trace.append({"id": candidate["id"], "source": source, "included": True, "reason": candidate["reason"], "truncated": False})
+            sections[source].append(candidate_text)
+            selected[source].append(str(candidate["id"]))
+            remaining -= header_cost + included_cost
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+
+    rendered_sections: list[dict[str, Any]] = []
+    def render_sections() -> str:
+        rendered_sections.clear()
+        for source in source_order:
+            if sections[source]:
+                rendered_sections.append({"kind": source, "text": "\n".join(sections[source]), "ids": selected[source]})
+        return "\n\n".join(f"## {section['kind']}\n{section['text']}" for section in rendered_sections)
+
+    context_text = render_sections()
+    while estimate_tokens(context_text) > usable_budget and any(sections.values()):
+        for source in reversed(source_order):
+            if sections[source]:
+                removed_id = selected[source].pop() if selected[source] else None
+                sections[source].pop()
+                trace.append(
+                    {
+                        "id": removed_id,
+                        "source": source,
+                        "included": False,
+                        "reason": "post_selection_budget_trim",
+                    }
+                )
+                break
+        context_text = render_sections()
+    remaining = max(0, usable_budget - estimate_tokens(context_text))
+    return {
+        "ok": True,
+        "initialized": True,
+        "planner_profile": "resume",
+        "session_id": session_id,
+        "project_id": project_id,
+        "token_budget": token_budget,
+        "usable_context_budget": usable_budget,
+        "estimated_tokens": estimate_tokens(context_text),
+        "remaining_budget": max(0, remaining),
+        "section_count": len(rendered_sections),
+        "sections": rendered_sections,
+        "planner_trace": trace,
+        "truncated": any(item.get("truncated") for item in trace),
+        "context_text": context_text,
+    }
+
+
 def compile_context(
     root: Path,
     *,
@@ -4941,7 +5225,19 @@ def compile_context(
     project_id: str | None = None,
     include_cue_recall: bool = False,
     cue_recall_limit: int = 4,
+    planner_profile: str = "legacy",
 ) -> dict[str, Any]:
+    if planner_profile == "resume":
+        return _compile_context_planner_v2(
+            root,
+            session_id=session_id,
+            token_budget=token_budget,
+            query=query,
+            create=create,
+            card_scope=card_scope,
+            project_id=project_id,
+            cue_recall_limit=cue_recall_limit,
+        )
     session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
     try:
@@ -5049,7 +5345,7 @@ def compile_context(
                     SELECT id, card_type, title, summary, salience, confidence,
                            visibility_scope, session_id, project_id, source_refs_json
                     FROM cards
-                    WHERE status != 'pruned'
+                    WHERE {_current_card_authority_clause()}
                       AND (title LIKE ? OR summary LIKE ? OR entities_json LIKE ? OR topics_json LIKE ?)
                       {scope_clause}
                     ORDER BY salience DESC, updated_at DESC
@@ -5453,6 +5749,20 @@ def _visible_scroll_clause(*, session_id: str | None = None, project_id: str | N
     return "(" + " OR ".join(clauses) + ")", params
 
 
+def validate_recent_event_limit(value: int) -> int:
+    """Validate a bounded recovery-scroll request limit."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_RECENT_EVENT_LIMIT
+    ):
+        raise ValueError(
+            f"recent_event_limit must be between 0 and {MAX_RECENT_EVENT_LIMIT}"
+        )
+    return value
+
+
 def _visible_scroll_rows(
     conn: sqlite3.Connection,
     *,
@@ -5460,6 +5770,7 @@ def _visible_scroll_rows(
     limit: int,
     project_id: str | None = None,
 ) -> list[sqlite3.Row]:
+    limit = validate_recent_event_limit(limit)
     visible_clause, visible_params = _visible_scroll_clause(session_id=session_id, project_id=project_id)
     return conn.execute(
         f"""
@@ -5534,7 +5845,7 @@ def _queue_job_visible(
     if card_ids:
         for card_id in card_ids:
             card_row = conn.execute(
-                "SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ? AND status != 'pruned'",
+                f"SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ? AND {_current_card_authority_clause()}",
                 (card_id,),
             ).fetchone()
             if card_row is not None and _card_row_visible(card_row, session_id=session_id, project_id=project_id):
@@ -5602,7 +5913,7 @@ def _graph_source_ref_visible(
 ) -> bool:
     if card_id := ref.get("card_id"):
         row = conn.execute(
-            "SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ? AND status != 'pruned'",
+            f"SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ? AND {_current_card_authority_clause()}",
             (str(card_id),),
         ).fetchone()
         if row is not None and _card_row_visible(row, session_id=session_id, project_id=project_id):
@@ -5915,7 +6226,7 @@ def cue_recall(
             seen_terms.add(related_term)
 
         visible_card_clause, visible_card_params = _visible_card_clause(session_id=session_id, project_id=project_id)
-        card_scope_clause = f"status != 'pruned' AND {visible_card_clause}"
+        card_scope_clause = f"{_current_card_authority_clause()} AND {visible_card_clause}"
         for term in expanded_terms:
             rows = conn.execute(
                 f"""
@@ -6047,11 +6358,12 @@ def cue_recall(
         for item in candidate_scores.values():
             if item.get("kind") == "card":
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT id, card_type, title, summary, salience, confidence, session_id, project_id,
-                           source_refs_json, entities_json, topics_json, metadata_json, visibility_scope
+                           source_refs_json, entities_json, topics_json, metadata_json, visibility_scope,
+                           conflict_group, superseded_by_card_id
                     FROM cards
-                    WHERE id = ? AND status != 'pruned'
+                    WHERE id = ? AND {_current_card_authority_clause()}
                     """,
                     (item.get("id"),),
                 ).fetchone()
@@ -6065,6 +6377,8 @@ def cue_recall(
                         "source_refs": json_loads(row["source_refs_json"], []),
                         "session_id": row["session_id"],
                         "project_id": row["project_id"],
+                        "conflict_group": row["conflict_group"],
+                        "superseded_by_card_id": row["superseded_by_card_id"],
                     }
                 )
             elif item.get("kind") == "scroll_event":
@@ -6304,7 +6618,9 @@ def recover_thread(
     query: str | None = None,
     token_budget: int = 0,
     recent_event_limit: int = 24,
+    planner_profile: str = "legacy",
 ) -> dict[str, Any]:
+    recent_event_limit = validate_recent_event_limit(recent_event_limit)
     init_db(root)
     lookup_session_id = str(canonical_partition_identifier(root, "recovery session_id", session_id, lookup=True) or "")
     lookup_project_id = canonical_partition_identifier(root, "recovery project_id", project_id, lookup=True)
@@ -6318,6 +6634,7 @@ def recover_thread(
         query=query or lookup_project_id or lookup_session_id,
         card_scope="project" if lookup_project_id else "session",
         project_id=lookup_project_id,
+        planner_profile=planner_profile,
     )
     conn = connect(root)
     try:
@@ -6347,7 +6664,7 @@ def recover_thread(
                 SELECT id, card_type, title, summary, location_uri, decisions_json, open_tasks_json,
                        source_refs_json, updated_at
                 FROM cards
-                WHERE status != 'pruned'
+                WHERE {_current_card_authority_clause()}
                   AND {visible_card_clause}
                   AND ({" OR ".join(card_match_clauses)})
                 ORDER BY salience DESC, updated_at DESC
@@ -6549,6 +6866,208 @@ def recover_thread(
         }
     finally:
         conn.close()
+
+
+def resume_latest(
+    root: Path,
+    *,
+    session_id: str | None = None,
+    project_id: str | None = None,
+    query: str | None = None,
+    token_budget: int = 0,
+    recent_event_limit: int = 24,
+    model_assist: bool | None = None,
+) -> dict[str, Any]:
+    """Discover the newest project/session checkpoint and build its recovery packet.
+
+    This is the v0.3 daily path: callers may provide a known session or project,
+    but do not need to know an internal thread identifier to resume the latest
+    durable state. Discovery is read-only; packet generation remains delegated to
+    ``recover_thread`` so it retains the existing audit and evidence guarantees.
+    """
+
+    recent_event_limit = validate_recent_event_limit(recent_event_limit)
+    if not is_initialized(root):
+        return {"ok": False, "initialized": False, "root": str(root), "reason": "catalog_missing"}
+    config = load_config(root)
+    personal_profile = dict(config.get("personal_profile", {}))
+    resume_mode = str(personal_profile.get("resume_mode", "latest"))
+    supplied_session = bool(str(session_id or "").strip())
+    supplied_project = bool(str(project_id or "").strip())
+    if not supplied_session and not supplied_project:
+        if resume_mode == "explicit":
+            return {
+                "ok": False,
+                "initialized": True,
+                "root": str(root),
+                "reason": "explicit_resume_requires_scope",
+                "resume_mode": resume_mode,
+                "session_id": None,
+                "project_id": None,
+            }
+        if resume_mode == "latest_project":
+            project_id = str(personal_profile.get("default_project_id") or "").strip() or None
+            if project_id is None:
+                return {
+                    "ok": False,
+                    "initialized": True,
+                    "root": str(root),
+                    "reason": "latest_project_requires_default_project",
+                    "resume_mode": resume_mode,
+                    "session_id": None,
+                    "project_id": None,
+                }
+            supplied_project = True
+    requested_session = str(
+        canonical_partition_identifier(root, "session_id", session_id if supplied_session else None, lookup=True) or ""
+    )
+    requested_project = str(
+        canonical_partition_identifier(root, "project_id", project_id if supplied_project else None, lookup=True) or ""
+    )
+    safe_context_ceiling = max(256, int(personal_profile.get("safe_context_ceiling", 32768)))
+    requested_token_budget = int(token_budget)
+    effective_token_budget = min(
+        requested_token_budget if requested_token_budget > 0 else int(config["context"]["default_token_budget"]),
+        safe_context_ceiling,
+    )
+    conn = connect_existing(root)
+    try:
+        card_params: list[Any] = []
+        card_clauses = [
+            "card_type = 'project_state'",
+            "coalesce(session_id, '') != ''",
+            "(visibility_scope = 'session' OR "
+            "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+        ]
+        if requested_session:
+            card_clauses.append("session_id = ?")
+            card_params.append(requested_session)
+        if requested_project:
+            card_clauses.append("project_id = ?")
+            card_params.append(requested_project)
+        current_card_clauses = [
+            *card_clauses,
+            _current_card_authority_clause("cards"),
+        ]
+        state_row = conn.execute(
+            f"""
+            SELECT session_id, project_id, created_at AS checkpoint_at, id
+            FROM cards
+            WHERE {' AND '.join(current_card_clauses)}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            tuple(card_params),
+        ).fetchone()
+        discovery_source = "project_state_card"
+        if state_row is None:
+            stale_state_exists = conn.execute(
+                f"SELECT 1 FROM cards WHERE {' AND '.join(card_clauses)} LIMIT 1",
+                tuple(card_params),
+            ).fetchone()
+            if stale_state_exists is not None:
+                return {
+                    "ok": False,
+                    "initialized": True,
+                    "root": str(root),
+                    "reason": "no_current_project_state",
+                    "resume_mode": resume_mode,
+                    "session_id": requested_session or None,
+                    "project_id": requested_project or None,
+                }
+            event_clauses = [
+                "coalesce(session_id, '') != ''",
+                "(visibility_scope = 'session' OR "
+                "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+            ]
+            event_params: list[Any] = []
+            if requested_session:
+                event_clauses.append("session_id = ?")
+                event_params.append(requested_session)
+            if requested_project:
+                event_clauses.append("project_id = ?")
+                event_params.append(requested_project)
+            state_row = conn.execute(
+                f"""
+                SELECT session_id, project_id, created_at AS checkpoint_at, id
+                FROM scroll_events
+                WHERE {' AND '.join(event_clauses)}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                tuple(event_params),
+            ).fetchone()
+            discovery_source = "scroll_event"
+        if state_row is None:
+            return {
+                "ok": False,
+                "initialized": True,
+                "root": str(root),
+                "reason": "no_resume_state",
+                "session_id": requested_session or None,
+                "project_id": requested_project or None,
+            }
+        discovered_session = str(state_row["session_id"] or requested_session)
+        discovered_project = str(state_row["project_id"] or requested_project) or None
+        discovery = {
+            "source": discovery_source,
+            "session_id": discovered_session,
+            "project_id": discovered_project,
+            "checkpoint_at": state_row["checkpoint_at"],
+            "updated_at": state_row["checkpoint_at"],
+            "requested_session_id": requested_session or None,
+            "requested_project_id": requested_project or None,
+        }
+    finally:
+        conn.close()
+
+    result = recover_thread(
+        root,
+        session_id=discovered_session,
+        project_id=discovered_project,
+        query=query or discovered_project or discovered_session,
+        token_budget=effective_token_budget,
+        recent_event_limit=recent_event_limit,
+        planner_profile="resume",
+    )
+    result["ok"] = True
+    result["resume_profile"] = resume_mode
+    result["discovery"] = discovery
+    result["personal_profile"] = {
+        "name": personal_profile.get("name", "default"),
+        "resume_mode": personal_profile.get("resume_mode", "latest"),
+        "requested_token_budget": requested_token_budget,
+        "effective_token_budget": effective_token_budget,
+        "safe_context_ceiling": safe_context_ceiling,
+    }
+    use_model_assist = (
+        bool(model_assist)
+        if model_assist is not None
+        else bool(personal_profile.get("assist_on_resume", False))
+    )
+    if use_model_assist:
+        from .local_model import assist_resume
+
+        result["model_assist"] = assist_resume(
+            root,
+            context_text=str((result.get("context") or {}).get("context_text") or ""),
+            session_id=discovered_session,
+            project_id=discovered_project,
+            evidence_ids=[
+                str(item_id)
+                for section in (result.get("context") or {}).get("sections", [])
+                if isinstance(section, dict)
+                for item_id in section.get("ids", [])
+            ],
+        )
+    else:
+        result["model_assist"] = {
+            "ok": True,
+            "used": False,
+            "reason": "not_requested",
+            "fallback": "deterministic",
+        }
+    return result
 
 
 def audit(root: Path, *, create: bool = True) -> dict[str, Any]:

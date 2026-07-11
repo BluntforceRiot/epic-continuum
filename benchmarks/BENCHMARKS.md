@@ -35,9 +35,12 @@ The runner evaluates:
 - `scroll_cards`;
 - `scroll_cards_library`;
 - `full_transcript`;
-- `looking_glass`.
+- `looking_glass` and `looking_glass_v2`.
 
-The `looking_glass` mode calls the production `compile_context` API. The combined modes use production persisted Scroll, Card, and Library data with deterministic ranking in the benchmark runner.
+Both Looking Glass modes call the production `compile_context` API. The v2 mode
+selects the new source-balanced resume planner and emits its inclusion/exclusion
+trace. The combined modes use production persisted Scroll, Card, and Library
+data with deterministic ranking in the benchmark runner.
 
 ## FaultBench
 
@@ -185,6 +188,7 @@ ranked list of independent hits.
 | `forbidden_evidence_rate` | EricMemoryBench fraction of forbidden evidence labels present in the bounded context packet | Whether the model would actually use it |
 | `context_contains_superseded_evidence` | EricMemoryBench diagnostic list of historical evidence labels that remain visible in the bounded context packet | Staleness by itself; append-only memory may preserve old evidence |
 | `superseded_error_rate` | EricMemoryBench deterministic current-answer supersession error rate. It stays `0.0` unless the deterministic evaluator can prove the current selection used old evidence as authoritative | Whether historical evidence was merely retained |
+| `current_candidate_superseded_error_rate` | ContinuityBench planner-v2 rate where forbidden historical evidence was promoted into the `current_cards` section | Whether the same text remains visible as labeled Scroll history |
 | `context_tokens_used` / `context_tokens_used_mean` | Estimated context tokens | Exact tokenizer count |
 | `budget_respected_rate` | Whether contexts fit configured budget | Native model safety |
 | `evidence_density` / `evidence_density_mean` | Required evidence-token estimate divided by total context-token estimate | Human readability |
@@ -207,6 +211,9 @@ Environment metadata is intentionally runner-specific. ContinuityBench records t
 ## Known Weaknesses
 
 - Synthetic evidence tags make deterministic scoring possible but simpler than real project text.
+- ContinuityBench's older packet-wide `superseded_error_rate` also flags labeled
+  historical Scroll evidence. Use `current_candidate_superseded_error_rate` to
+  measure planner-v2 temporal promotion errors.
 - `compile_context` currently emphasizes recent Scroll events and matching Cards; Library expansion is measured separately and in combined benchmark modes.
 - No LLM answer-generation score is included in quick mode.
 - No paid API is called.
@@ -246,7 +253,7 @@ Recommended future runners:
 ## Reproduction
 
 ```bash
-python benchmarks/runners/continuitybench.py --quick --output-dir "${TMPDIR:-/tmp}/continuitybench-local-quick"
+python benchmarks/runners/continuitybench.py --quick --enforce-v03-gates --output-dir "${TMPDIR:-/tmp}/continuitybench-local-quick"
 ```
 
 Set `PYTHONPATH=src` when running from an environment that has not installed the package.

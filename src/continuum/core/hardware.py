@@ -117,6 +117,39 @@ def detect_system_ram_bytes() -> tuple[int | None, str]:
     return None, "unknown"
 
 
+def detect_available_system_ram_bytes() -> tuple[int | None, str]:
+    override = os.getenv("CONTINUUM_AVAILABLE_SYSTEM_RAM")
+    if override:
+        return parse_size(override), "CONTINUUM_AVAILABLE_SYSTEM_RAM"
+    system = platform.system().lower()
+    if system == "windows":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(MemoryStatusEx)
+        windll = getattr(ctypes, "windll")
+        if getattr(windll.kernel32, "GlobalMemoryStatusEx")(ctypes.byref(status)):
+            return int(status.ullAvailPhys), "GlobalMemoryStatusEx"
+    if system == "linux":
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * KB, "/proc/meminfo"
+    return None, "unavailable"
+
+
 def _parse_memory_tokens(text: str) -> list[int]:
     values: list[int] = []
     for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([KMGT]i?B|B)\b", text, flags=re.IGNORECASE):
@@ -213,6 +246,30 @@ def detect_vram_bytes() -> tuple[int | None, str]:
             return value, source
         reasons.append(source)
     return None, "; ".join(reasons)
+
+
+def detect_free_vram_bytes() -> tuple[int | None, str]:
+    override = os.getenv("CONTINUUM_FREE_VRAM")
+    if override:
+        return parse_size(override), "CONTINUUM_FREE_VRAM"
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None, "nvidia-smi unavailable"
+    values: list[int] = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split()
+        if parts and parts[0].isdigit():
+            values.append(int(parts[0]) * MB)
+    if proc.returncode == 0 and values:
+        return max(values), "nvidia-smi max_free_gpu_memory"
+    return None, "nvidia-smi unavailable"
 
 
 def detect_hardware(root: Path) -> dict[str, Any]:

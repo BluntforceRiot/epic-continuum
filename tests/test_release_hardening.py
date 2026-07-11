@@ -338,10 +338,23 @@ version = "9.9.9"
             )
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
             with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
+                archive_members = zf.namelist()
                 provenance_bytes = zf.read("epic-continuum-9.9.9/RELEASE_PROVENANCE.json")
                 package_provenance_bytes = zf.read("epic-continuum-9.9.9/src/continuum/assets/RELEASE_PROVENANCE.json")
                 provenance = json.loads(provenance_bytes)
+            reported_members = int(
+                next(
+                    line.split(":", 1)[1].strip()
+                    for line in allowed.stdout.splitlines()
+                    if line.startswith("members:")
+                )
+            )
             self.assertEqual(package_provenance_bytes, provenance_bytes)
+            self.assertEqual(reported_members, len(archive_members))
+            self.assertEqual(
+                provenance["member_count_with_root_and_provenance"],
+                len(archive_members),
+            )
             self.assertTrue(provenance["allow_dirty"])
             self.assertTrue(provenance["git_dirty"])
             self.assertGreater(provenance["git_status_short_count"], 0)
@@ -453,6 +466,71 @@ version = "9.9.9"
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
             with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
                 self.assertIn("epic-continuum-9.9.9/docs/cue-recall.md", set(zf.namelist()))
+
+    def test_release_builder_clean_archive_refuses_nonignored_untracked_files(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for untracked-path release builder smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            allowed_out = base / "allowed-dist"
+            blocked_out = base / "blocked-dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "epic-continuum-memory"
+version = "9.9.9"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text("tracked\n", encoding="utf-8")
+            (repo / ".gitignore").write_text("docs/ignored.md\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "add", "pyproject.toml", "README.md", ".gitignore"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+
+            docs = repo / "docs"
+            docs.mkdir()
+            (docs / "ignored.md").write_text("ignored output\n", encoding="utf-8")
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+
+            ignored = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(allowed_out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(ignored.returncode, 0, ignored.stdout + ignored.stderr)
+            with zipfile.ZipFile(allowed_out / "epic-continuum-9.9.9.zip") as zf:
+                self.assertNotIn("epic-continuum-9.9.9/docs/ignored.md", set(zf.namelist()))
+
+            (docs / "cue-recall.md").write_text("# Cue Recall\n", encoding="utf-8")
+            blocked = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(blocked_out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+            self.assertIn("non-ignored untracked files", blocked.stderr)
+            self.assertFalse((blocked_out / "epic-continuum-9.9.9.zip").exists())
 
     def test_generated_release_provenance_survives_rebuilt_wheel_and_sdist(self) -> None:
         if importlib.util.find_spec("build.__main__") is None:

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0 - 2026-07-10
+
+- Added automatic latest-state resume discovery for the CLI and MCP surface,
+  with strict personal resume modes, canonical partition lookup, immutable
+  checkpoint ordering, guarded CLI recovery receipts, and discovery limited to
+  project/session state that the recovery packet can actually render.
+- Kept local Yarn briefing budgets coherent by reserving usable context after
+  output and protocol overhead, rejecting non-integral token settings, and made
+  recovery recent-event limits explicitly bounded across the core API, CLI,
+  and MCP surface.
+- Added the Looking Glass planner profile with source balancing, authority labels,
+  complete non-current/contested lineage exclusion, ordered and configuration-
+  bounded Scroll evidence, and explainable planner traces.
+- Expanded memory health telemetry with queue age, segmentation lag, running-job
+  heartbeat and lease validity, sidecar backlog, snapshot, and WAL diagnostics.
+- Added planner-aware ContinuityBench coverage and recovery-focused regression tests.
+- Added stable connected temporal conflict groups and acyclic whole-group
+  resolution. Current Cards can supersede historical peers, while bounded,
+  content-sensitive dismissal receipts prevent periodic detection from undoing
+  a reviewed false positive. Sequential same-agent project checkpoints remain
+  resumable while cross-agent disagreements remain reviewable.
+- Added an optional Yarn/Qwythos v3 adapter for a loopback llama.cpp server,
+  including schema- and hash-bound cited briefings, strict model identity,
+  measurable resource headroom, process-local concurrency plus a recommended
+  one-slot server, wall-clock deadline, bounded JSON, pseudonymous outbound
+  identifiers, path/secret redaction, and root-scoped circuit gates.
+- Added personal resume profiles with safe context ceilings, default project
+  selection, and opt-in model-assisted recovery.
+- Made final source-archive builds require a fully clean Git worktree, including
+  non-ignored untracked files, so new release inputs cannot be omitted silently.
+- Kept the catalog capability schema at `0.2.0`; these features are additive and do not
+  require a destructive migration or downgrade of existing catalogs.
+
 ## 0.2.1 - 2026-07-10
 
 - Fixed live read-only catalog connections so status, search, recall, health,

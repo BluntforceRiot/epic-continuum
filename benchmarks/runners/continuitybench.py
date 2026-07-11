@@ -55,6 +55,7 @@ MODES = [
     "scroll_cards_library",
     "full_transcript",
     "looking_glass",
+    "looking_glass_v2",
 ]
 TOKEN_RE = re.compile(r"[A-Za-z0-9:_-]+")
 
@@ -367,7 +368,13 @@ def assemble_context(candidates: list[dict[str, Any]], budget: int) -> tuple[str
     return "\n\n".join(lines), selected
 
 
-def looking_glass_context(root: Path, case: dict[str, Any], budget: int) -> tuple[str, list[dict[str, Any]], float, dict[str, Any]]:
+def looking_glass_context(
+    root: Path,
+    case: dict[str, Any],
+    budget: int,
+    *,
+    planner_profile: str = "legacy",
+) -> tuple[str, list[dict[str, Any]], float, dict[str, Any]]:
     started = time.perf_counter()
     result = compile_context(
         root,
@@ -376,6 +383,7 @@ def looking_glass_context(root: Path, case: dict[str, Any], budget: int) -> tupl
         query=case["query"],
         create=False,
         card_scope="session",
+        planner_profile=planner_profile,
     )
     elapsed = time.perf_counter() - started
     text = result.get("context_text", "")
@@ -424,8 +432,14 @@ def ndcg_at_10(selected: list[dict[str, Any]], required: list[str]) -> float | N
 
 
 def evaluate_case(root: Path, case: dict[str, Any], mode: str, budget: int) -> dict[str, Any]:
-    if mode == "looking_glass":
-        context_text, selected, latency, raw_result = looking_glass_context(root, case, budget)
+    if mode in {"looking_glass", "looking_glass_v2"}:
+        planner_profile = "resume" if mode == "looking_glass_v2" else "legacy"
+        context_text, selected, latency, raw_result = looking_glass_context(
+            root,
+            case,
+            budget,
+            planner_profile=planner_profile,
+        )
         retrieval_latency = 0.0
         compilation_latency = latency
     else:
@@ -439,6 +453,14 @@ def evaluate_case(root: Path, case: dict[str, Any], mode: str, budget: int) -> d
     forbidden = list(case.get("forbidden_evidence", []))
     required_in_context = [token for token in required if token in context_text]
     forbidden_in_context = [token for token in forbidden if token in context_text]
+    current_candidate_text = ""
+    if raw_result.get("planner_profile") == "resume":
+        current_candidate_text = "\n".join(
+            str(section.get("text") or "")
+            for section in raw_result.get("sections", [])
+            if isinstance(section, dict) and section.get("kind") == "current_cards"
+        )
+    forbidden_in_current_candidates = [token for token in forbidden if token in current_candidate_text]
 
     def recall_at(k: int) -> float:
         if not required:
@@ -479,10 +501,12 @@ def evaluate_case(root: Path, case: dict[str, Any], mode: str, budget: int) -> d
         "selected_count": len(selected),
         "selected_ids": [candidate["id"] for candidate in selected[:10]],
         "superseded_error": bool(forbidden_in_context),
+        "current_candidate_superseded_error": bool(forbidden_in_current_candidates),
+        "forbidden_evidence_in_current_candidates": forbidden_in_current_candidates,
         "useful_evidence_density": 0.0 if total_tokens == 0 else required_evidence_tokens / total_tokens,
         "looking_glass_raw": {
             key: raw_result.get(key)
-            for key in ("token_budget", "estimated_tokens", "remaining_budget", "section_count", "truncated")
+            for key in ("token_budget", "estimated_tokens", "remaining_budget", "section_count", "truncated", "planner_profile")
             if key in raw_result
         },
     }
@@ -510,6 +534,9 @@ def aggregate(rows_: list[dict[str, Any]]) -> dict[str, Any]:
                 "ndcg_at_10": mean_present(items, "ndcg_at_10"),
                 "rank_metric_case_count": sum(1 for item in items if item.get("rank_metrics_applicable")),
                 "superseded_error_rate": mean(1.0 if item["superseded_error"] else 0.0 for item in items),
+                "current_candidate_superseded_error_rate": mean(
+                    1.0 if item["current_candidate_superseded_error"] else 0.0 for item in items
+                ),
                 "irrelevant_context_rate": mean(item["irrelevant_context_rate"] for item in items),
                 "budget_respected_rate": mean(1.0 if item["budget_respected"] else 0.0 for item in items),
                 "useful_evidence_density": mean(item["useful_evidence_density"] for item in items),
@@ -537,6 +564,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quick", action="store_true", help="Run the deterministic quick suite. This is currently the default suite.")
     parser.add_argument("--cache-state", choices=("cold", "warm"), default="cold", help="Record whether the run is intended as a cold-cache or warm-cache benchmark.")
     parser.add_argument("--keep-root", action="store_true", help="Keep the disposable benchmark Continuum root under the output directory.")
+    parser.add_argument(
+        "--enforce-v03-gates",
+        action="store_true",
+        help="Fail when planner v2 exceeds a budget or promotes forbidden evidence as a current Card candidate.",
+    )
     args = parser.parse_args(argv)
 
     fixture = args.fixture.resolve()
@@ -578,8 +610,27 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output_dir / "summary.json", summary)
     append_jsonl(output_dir / "cases.jsonl", rows_out)
     (output_dir / "commands.txt").write_text(command + "\n", encoding="utf-8")
-    print(json.dumps({"ok": True, "output_dir": str(output_dir), "case_count": len(cases), "record_count": len(rows_out)}, sort_keys=True))
-    return 0
+    gate_failures = [
+        {"case_id": row["case_id"], "budget": row["budget"], "budget_respected": row["budget_respected"],
+         "current_candidate_superseded_error": row["current_candidate_superseded_error"]}
+        for row in rows_out
+        if row["mode"] == "looking_glass_v2"
+        and (not row["budget_respected"] or row["current_candidate_superseded_error"])
+    ]
+    ok = not (args.enforce_v03_gates and gate_failures)
+    print(
+        json.dumps(
+            {
+                "ok": ok,
+                "output_dir": str(output_dir),
+                "case_count": len(cases),
+                "record_count": len(rows_out),
+                "gate_failures": gate_failures,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

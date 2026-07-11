@@ -6,8 +6,9 @@ the configured Continuum root.
 
 ## Supported Version
 
-Security fixes target the current `0.2.x` line. The published `0.1.x` line is
-retired and should be upgraded before reporting or applying a fix.
+Security fixes target the current `0.3.x` line. Critical fixes are backported to
+`0.2.x` when practical. The published `0.1.x` line is retired and should be
+upgraded before reporting or applying a fix.
 
 ## Reporting A Vulnerability
 
@@ -49,3 +50,16 @@ persistence.
 Packaged adapter bootstrap failures also omit raw exception messages and tracebacks.
 Internal configurable paths are root-confined, and operation-derived filenames are
 validated as portable single components before filesystem access.
+
+## Optional Local-Model Boundary
+
+Yarn/Qwythos assistance is disabled by default and never replaces deterministic
+recovery evidence. Its default endpoint must be a literal loopback address at
+the exact `/v1` path. A remote endpoint requires explicit opt-in and HTTPS.
+Continuum refuses redirects, compressed responses, model-identity mismatches,
+oversized or deeply nested JSON, invalid citations, tool calls, and requests that
+exceed the total wall-clock deadline. Outbound context and identifiers are
+secret/path-sanitized, and raw prompts or model responses are not persisted by
+the adapter. If authentication is needed, provide it through the
+`CONTINUUM_LOCAL_MODEL_API_KEY` environment variable rather than a URL or config
+file.

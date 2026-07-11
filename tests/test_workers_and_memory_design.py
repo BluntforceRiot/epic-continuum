@@ -34,6 +34,7 @@ from continuum.core.workers import (
     drain_card_sidecar_outbox,
     memory_health,
     prune_memory,
+    resolve_conflict,
     run_worker_pass,
     verify_book_integrity,
     verify_segment_integrity,
@@ -42,6 +43,102 @@ from continuum.integrations.common import record_turn
 
 
 class EpicContinuumWorkerDesignTest(unittest.TestCase):
+    def test_conflict_resolution_marks_temporal_authority_and_syncs_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                previous = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Yarn Context Ceiling",
+                    summary="Use a one million token default.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="temporal-a",
+                    project_id="continuum",
+                )
+                current = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Yarn Context Ceiling",
+                    summary="Do not use a one million token default; cap it safely.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="temporal-b",
+                    project_id="continuum",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, [previous, current])
+            detected = detect_conflicts(root, card_id=current)
+            self.assertEqual(detected["conflict_count"], 1)
+
+            result = resolve_conflict(root, card_id=current, action="supersede")
+
+            self.assertTrue(result["ok"], result)
+            conn = connect_existing(root)
+            try:
+                rows = {
+                    row["id"]: dict(row)
+                    for row in conn.execute(
+                        "SELECT id, conflict_group, supersedes_card_id, superseded_by_card_id FROM cards WHERE id IN (?, ?)",
+                        (previous, current),
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIsNone(rows[current]["conflict_group"])
+            self.assertEqual(rows[current]["supersedes_card_id"], previous)
+            self.assertEqual(rows[previous]["superseded_by_card_id"], current)
+            self.assertEqual(audit(root)["stale_card_sidecars"], 0)
+
+    def test_conflict_resolution_can_dismiss_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                first = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Shared Route",
+                    summary="Use the shared route.",
+                    source_refs=[],
+                    session_id="dismiss-session",
+                )
+                second = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Shared Route",
+                    summary="Do not use the shared route.",
+                    source_refs=[],
+                    session_id="dismiss-session",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            detect_conflicts(root, card_id=first)
+
+            result = resolve_conflict(root, card_id=first, action="dismiss")
+
+            self.assertEqual(result["action"], "dismiss")
+            conn = connect_existing(root)
+            try:
+                values = [
+                    row["conflict_group"]
+                    for row in conn.execute("SELECT conflict_group FROM cards WHERE id IN (?, ?)", (first, second))
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(values, [None, None])
+
     def test_conflict_detection_respects_project_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

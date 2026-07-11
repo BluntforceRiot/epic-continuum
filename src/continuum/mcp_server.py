@@ -887,12 +887,15 @@ def tool_detect_conflicts(args: JSON) -> Any:
 
 
 def tool_resolve_conflict(args: JSON) -> Any:
+    if "superseded_card_ids" not in args:
+        raw_peer_ids = []
+    else:
+        raw_peer_ids = args["superseded_card_ids"]
+    if not isinstance(raw_peer_ids, list) or not all(isinstance(value, str) for value in raw_peer_ids):
+        raise ValueError("superseded_card_ids must be an array of strings")
     root = root_arg(args)
     card_id = require_str(args, "card_id")
     resolution = optional_str(args, "action") or "supersede"
-    raw_peer_ids = args.get("superseded_card_ids") or []
-    if not isinstance(raw_peer_ids, list) or not all(isinstance(value, str) for value in raw_peer_ids):
-        raise ValueError("superseded_card_ids must be an array of strings")
 
     def action(operation: OperationGuard) -> JSON:
         result = resolve_conflict(

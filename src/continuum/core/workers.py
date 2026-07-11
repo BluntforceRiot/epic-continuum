@@ -1390,6 +1390,11 @@ def _conflict_signature(card: Any) -> dict[str, Any]:
     }
 
 
+def _conflict_card_types_compatible(left_type: str, right_type: str) -> bool:
+    card_types = {str(left_type).casefold().strip(), str(right_type).casefold().strip()}
+    return "project_state" not in card_types or len(card_types) == 1
+
+
 def _conflict_component_fingerprint(by_id: dict[str, Any], member_ids: list[str]) -> str:
     material = [
         {
@@ -1491,6 +1496,8 @@ def _conflict_adjacency(cards: list[Any]) -> dict[str, set[str]]:
     for left_id, right_id in sorted(potential_pairs):
         left = signatures[left_id]
         right = signatures[right_id]
+        if not _conflict_card_types_compatible(left["card_type"], right["card_type"]):
+            continue
         # Sequential project-state Cards from one agent are ordered checkpoints,
         # not competing claims. Cross-agent checkpoints may still disagree and
         # must remain eligible for conflict detection. Any durable group
@@ -1549,7 +1556,18 @@ def _clear_orphan_conflict_groups(
             _conflict_boundary(by_id[card_id])
             for card_id in current_members
         }
-        if len(current_members) < 2 or len(current_boundaries) > 1:
+        current_card_types = {
+            str(by_id[card_id]["card_type"] or "").casefold().strip()
+            for card_id in current_members
+        }
+        incompatible_project_state_group = (
+            "project_state" in current_card_types and len(current_card_types) > 1
+        )
+        if (
+            len(current_members) < 2
+            or len(current_boundaries) > 1
+            or incompatible_project_state_group
+        ):
             clear_ids.extend(current_members)
             cleared_groups.add(group)
         for card_id in dict.fromkeys(clear_ids):
@@ -1849,6 +1867,18 @@ def resolve_conflict(
         resolved_peer_ids = peer_ids
         if not peer_ids:
             raise ValueError(f"conflict group has no peers: {conflict_group}")
+        member_card_types = {
+            str(row["card_type"] or "").casefold().strip()
+            for row in [winner, *peers]
+        }
+        if (
+            action == "supersede"
+            and "project_state" in member_card_types
+            and len(member_card_types) > 1
+        ):
+            raise ValueError(
+                "project_state conflict groups cannot include non-project_state cards"
+            )
 
         now = utc_now()
         dismissal_fingerprint: str | None = None
@@ -2333,6 +2363,14 @@ def memory_health(root: Path) -> dict[str, Any]:
         oldest_pending_job = conn.execute(
             "SELECT min(created_at) AS ts FROM queue_jobs WHERE status = 'pending'"
         ).fetchone()["ts"]
+        invalid_pending_job_timestamps = 0
+        for timestamp_row in conn.execute(
+            "SELECT created_at FROM queue_jobs WHERE status = 'pending'"
+        ):
+            try:
+                _parse_utc_timestamp(timestamp_row["created_at"])
+            except (TypeError, ValueError, OverflowError):
+                invalid_pending_job_timestamps += 1
         latest_running_job_heartbeat = conn.execute(
             "SELECT max(heartbeat_at) AS ts FROM queue_jobs WHERE status = 'running'"
         ).fetchone()["ts"]
@@ -2389,10 +2427,20 @@ def memory_health(root: Path) -> dict[str, Any]:
                 return None
 
         queue_age = age_seconds(oldest_pending_job)
+        queue_timestamp_valid = (
+            invalid_pending_job_timestamps == 0
+            and (pending_jobs == 0 or queue_age is not None)
+        )
         checks = [
             {"name": "capture_configured", "ok": bool(config.get("capture", {}).get("mode"))},
             {"name": "queue_backlog_reasonable", "ok": pending_jobs < 1000, "pending_jobs": pending_jobs},
-            {"name": "queue_age_reasonable", "ok": queue_age is None or queue_age < 86400, "oldest_pending_job_age_seconds": queue_age},
+            {
+                "name": "queue_age_reasonable",
+                "ok": queue_timestamp_valid and (queue_age is None or queue_age < 86400),
+                "oldest_pending_job_age_seconds": queue_age,
+                "timestamp_valid": queue_timestamp_valid,
+                "invalid_pending_job_timestamps": invalid_pending_job_timestamps,
+            },
             {"name": "no_failed_jobs", "ok": failed_jobs == 0, "failed_jobs": failed_jobs},
             {
                 "name": "running_jobs_current",
@@ -2415,6 +2463,8 @@ def memory_health(root: Path) -> dict[str, Any]:
             "pruned_graph_edges": pruned_edges,
             "oldest_pending_job_at": oldest_pending_job,
             "oldest_pending_job_age_seconds": queue_age,
+            "oldest_pending_job_timestamp_valid": queue_timestamp_valid,
+            "invalid_pending_job_timestamps": invalid_pending_job_timestamps,
             "latest_running_job_heartbeat_at": latest_running_job_heartbeat,
             "running_jobs": running_jobs,
             "stale_running_jobs": stale_running_jobs,

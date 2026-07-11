@@ -58,10 +58,17 @@ context packet budget so adapter-provided budgets remain predictable.
 caller requests a larger packet. `default_project_id` selects the preferred
 project for `latest_project` mode, and `assist_on_resume` controls whether the
 optional Yarn briefing is requested when a caller does not explicitly choose.
-`yarn-configure` sets the ceiling to the smaller of `context.max_token_budget`
-and the model's usable input window: `max_input_tokens - max_output_tokens -
-512`. The final 512 tokens are reserved for the briefing protocol, so the
-reported ceiling is also a request the adapter can accept.
+`yarn-configure` derives the ceiling from `context.max_token_budget`, the model's
+input window after its output allowance, and the 256 KiB request limit. The
+calculation includes the serialized briefing schema and a bounded evidence-ID
+list. It sizes against an escape-heavy representative generated JSON/Markdown
+block through both serialization layers; smaller model windows also reduce the
+alias limit below 100 when needed to preserve usable context. The adapter then
+rechecks the transformed context and exact serialized request before every call.
+If input at or below the advertised ceiling expands past either serialized
+limit, it trims the evidence with an explicit notice to the largest exact fit.
+Input above the configured ceiling, or a request whose fixed envelope cannot
+fit, falls back deterministically.
 
 Resume modes are intentionally strict:
 

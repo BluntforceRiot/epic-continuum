@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.cli import main as cli_main
+from continuum.core.config import load_config, write_config
 from continuum.core.operations import list_operations
 from continuum.core.store import (
     MAX_RECENT_EVENT_LIMIT,
@@ -72,6 +73,80 @@ class ResumeCliTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("usable context", result["error"])
             self.assertFalse(root.exists())
+
+    def test_yarn_configure_rejects_invalid_timeout_before_operation_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = cli_main(
+                    [
+                        "yarn-configure",
+                        "--root",
+                        str(root),
+                        "--timeout-seconds",
+                        "0",
+                    ]
+                )
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 1, result)
+            self.assertIn("timeout_seconds", result["error"])
+            self.assertFalse(root.exists())
+
+    def test_yarn_no_enable_preserves_omitted_custom_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first_output = io.StringIO()
+            with redirect_stdout(first_output):
+                first_code = cli_main(
+                    [
+                        "yarn-configure",
+                        "--root",
+                        str(root),
+                        "--enable",
+                        "--base-url",
+                        "https://models.example.com/v1",
+                        "--model",
+                        "custom-yarn-alias",
+                        "--max-input-tokens",
+                        "32768",
+                        "--max-output-tokens",
+                        "1024",
+                        "--timeout-seconds",
+                        "120",
+                        "--allow-remote-endpoint",
+                    ]
+                )
+            self.assertEqual(first_code, 0, first_output.getvalue())
+            before = load_config(root)
+            before["personal_profile"]["safe_context_ceiling"] = 12000
+            write_config(root, before)
+            before = load_config(root)
+
+            second_output = io.StringIO()
+            with redirect_stdout(second_output):
+                second_code = cli_main(
+                    ["yarn-configure", "--root", str(root), "--no-enable"]
+                )
+            self.assertEqual(second_code, 0, second_output.getvalue())
+            after = load_config(root)
+
+            for key in (
+                "base_url",
+                "model",
+                "max_input_tokens",
+                "max_output_tokens",
+                "timeout_seconds",
+                "allow_remote_endpoint",
+            ):
+                self.assertEqual(after["local_inference"][key], before["local_inference"][key])
+            self.assertEqual(
+                after["personal_profile"]["safe_context_ceiling"],
+                before["personal_profile"]["safe_context_ceiling"],
+            )
+            self.assertFalse(after["local_inference"]["enabled"])
+            self.assertFalse(after["personal_profile"]["assist_on_resume"])
 
     def test_core_recovery_apis_reject_limits_above_maximum_before_artifacts(
         self,

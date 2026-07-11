@@ -44,6 +44,36 @@ class EpicContinuumConfigTest(unittest.TestCase):
             self.assertEqual(config["epic_continuity"]["catalog_proof_mode"], "state_manifest")
             self.assertTrue((root / "config" / "continuum.config.json").exists())
 
+    def test_legacy_config_inherits_a_ceiling_bounded_by_its_context_maximum(self) -> None:
+        for max_budget in (16000, 100):
+            with self.subTest(max_budget=max_budget), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                legacy = default_config()
+                legacy.pop("personal_profile")
+                legacy["context"]["default_token_budget"] = min(3000, max_budget)
+                legacy["context"]["max_token_budget"] = max_budget
+                path = root / "config" / "continuum.config.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(legacy), encoding="utf-8")
+
+                loaded = load_config(root)
+
+                self.assertEqual(loaded["context"]["max_token_budget"], max_budget)
+                self.assertEqual(loaded["personal_profile"]["safe_context_ceiling"], max_budget)
+
+    def test_explicit_personal_ceiling_above_context_maximum_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["context"]["max_token_budget"] = 16000
+            config["personal_profile"]["safe_context_ceiling"] = 32768
+            path = root / "config" / "continuum.config.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(config), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "safe_context_ceiling"):
+                load_config(root)
+
     def test_capture_policy_can_disable_automatic_adapter_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -832,6 +862,25 @@ class EpicContinuumConfigTest(unittest.TestCase):
             self.assertTrue(result["wrote"])
             self.assertEqual(written["hardware"], result["recommended_config"]["hardware"])
             self.assertEqual(written["context"], result["recommended_config"]["context"])
+
+    def test_optimize_config_clamps_personal_ceiling_with_low_vram_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            inventory = {
+                "vram": {"bytes": 4 * 1024**3, "source": "test"},
+                "system_ram": {"bytes": 16 * 1024**3, "source": "test"},
+                "drive": {"free_bytes": 100 * 1024**3, "source": "test"},
+            }
+
+            result = optimize_config(root, inventory=inventory, profile="balanced", write=True)
+            written = load_config(root)
+
+            self.assertEqual(result["recommended_config"]["context"]["max_token_budget"], 32000)
+            self.assertEqual(
+                result["recommended_config"]["personal_profile"]["safe_context_ceiling"],
+                32000,
+            )
+            self.assertEqual(written["personal_profile"]["safe_context_ceiling"], 32000)
 
     def test_enqueue_job_redacts_secret_payloads_at_durable_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

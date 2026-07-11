@@ -13,9 +13,6 @@ from .core.config import (
     default_config,
     load_config,
     optimize_config,
-    validate_inference_base_url,
-    validate_inference_model_identifier,
-    validate_yarn_token_budgets,
     write_default_config,
 )
 from .core.bundle import pack_root, verify_root_bundle
@@ -23,10 +20,9 @@ from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace, progress_bar
 from .core.local_model import (
-    DEFAULT_YARN_BASE_URL,
-    DEFAULT_YARN_MODEL,
     configure_yarn,
     local_model_health,
+    resolve_yarn_configuration,
 )
 from .core.operations import (
     OperationGuard,
@@ -335,13 +331,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_yarn_configure = sub.add_parser("yarn-configure", help="Configure the optional local Yarn/Qwythos inference profile")
     p_yarn_configure.add_argument("--root", required=True)
     p_yarn_configure.add_argument("--enable", action=argparse.BooleanOptionalAction, default=True)
-    p_yarn_configure.add_argument("--base-url", default=DEFAULT_YARN_BASE_URL)
-    p_yarn_configure.add_argument("--model", default=DEFAULT_YARN_MODEL)
-    p_yarn_configure.add_argument("--max-input-tokens", type=int, default=16384)
-    p_yarn_configure.add_argument("--max-output-tokens", type=int, default=768)
-    p_yarn_configure.add_argument("--timeout-seconds", type=int, default=90)
-    p_yarn_configure.add_argument("--allow-remote-endpoint", action="store_true")
-    p_yarn_configure.add_argument("--assist-on-resume", action=argparse.BooleanOptionalAction, default=True)
+    p_yarn_configure.add_argument("--base-url")
+    p_yarn_configure.add_argument("--model")
+    p_yarn_configure.add_argument("--max-input-tokens", type=int)
+    p_yarn_configure.add_argument("--max-output-tokens", type=int)
+    p_yarn_configure.add_argument("--timeout-seconds", type=int)
+    p_yarn_configure.add_argument(
+        "--allow-remote-endpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    p_yarn_configure.add_argument("--assist-on-resume", action=argparse.BooleanOptionalAction, default=None)
 
     p_yarn_health = sub.add_parser("yarn-health", help="Probe the configured Yarn/Qwythos endpoint safely")
     p_yarn_health.add_argument("--root", required=True)
@@ -1128,11 +1128,15 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "yarn-configure":
         assert root is not None
-        validate_inference_base_url(args.base_url, allow_remote=args.allow_remote_endpoint)
-        args.model = validate_inference_model_identifier(args.model)
-        if scan_text_for_secrets(args.model, max_findings=1):
-            raise ValueError("--model must not contain secret-like text")
-        validate_yarn_token_budgets(args.max_input_tokens, args.max_output_tokens)
+        resolved = resolve_yarn_configuration(
+            root,
+            base_url=args.base_url,
+            model=args.model,
+            max_input_tokens=args.max_input_tokens,
+            max_output_tokens=args.max_output_tokens,
+            timeout_seconds=args.timeout_seconds,
+            allow_remote_endpoint=args.allow_remote_endpoint,
+        )
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = configure_yarn(
@@ -1146,7 +1150,7 @@ def _main(argv: list[str] | None = None) -> int:
                 allow_remote_endpoint=args.allow_remote_endpoint,
                 assist_on_resume=args.assist_on_resume,
             )
-            operation.cursor({"phase": "yarn_configured", "enabled": args.enable, "model": args.model})
+            operation.cursor({"phase": "yarn_configured", "enabled": args.enable, "model": resolved["model"]})
             return result
 
         return emit_result(
@@ -1154,7 +1158,7 @@ def _main(argv: list[str] | None = None) -> int:
                 root,
                 operation_type="cli_yarn_configure",
                 title="Configure local Yarn inference",
-                intent={"enabled": args.enable, "model": args.model, "base_url": args.base_url},
+                intent={"enabled": args.enable, "model": resolved["model"], "base_url": resolved["base_url"]},
                 snapshot_policy="none",
                 snapshot_reason="configuration-only update",
                 touched_paths=[config_path(root)],

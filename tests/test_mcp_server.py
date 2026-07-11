@@ -278,6 +278,25 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     self.assertIn("recent_event_limit", payload["error"])
                     self.assertFalse(root.exists())
 
+    def test_resolve_conflict_rejects_explicit_null_or_non_array_peers(self) -> None:
+        for invalid in (None, False, 0, "", {}):
+            with self.subTest(value=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                    result = call_tool_raw(
+                        "continuum_resolve_conflict",
+                        {
+                            "root": str(root),
+                            "card_id": "winner-card",
+                            "superseded_card_ids": invalid,
+                        },
+                    )
+
+                self.assertTrue(result["isError"], result)
+                payload = json.loads(result["content"][0]["text"])
+                self.assertIn("must be an array of strings", payload["error"])
+                self.assertFalse(root.exists())
+
     def test_mcp_secret_partition_warn_and_off_alias_without_crashing(self) -> None:
         for action in ("warn", "off"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:

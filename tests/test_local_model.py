@@ -11,7 +11,6 @@ from unittest import mock
 
 from continuum.core import local_model
 from continuum.core.config import (
-    YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS,
     load_config,
     validate_config,
     validate_inference_base_url,
@@ -250,9 +249,10 @@ class LocalModelTests(unittest.TestCase):
             self.assertEqual(config["local_inference"]["model"], DEFAULT_YARN_MODEL)
             self.assertEqual(
                 config["personal_profile"]["safe_context_ceiling"],
-                config["local_inference"]["max_input_tokens"]
-                - config["local_inference"]["max_output_tokens"]
-                - YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS,
+                local_model._automatic_safe_context_ceiling(
+                    config["local_inference"],
+                    context_maximum=config["context"]["max_token_budget"],
+                ),
             )
             self.assertTrue(config["personal_profile"]["assist_on_resume"])
 
@@ -263,10 +263,264 @@ class LocalModelTests(unittest.TestCase):
             )
             self.assertEqual(
                 raised_config["personal_profile"]["safe_context_ceiling"],
-                raised_config["local_inference"]["max_input_tokens"]
-                - raised_config["local_inference"]["max_output_tokens"]
-                - YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS,
+                local_model._automatic_safe_context_ceiling(
+                    raised_config["local_inference"],
+                    context_maximum=raised_config["context"]["max_token_budget"],
+                ),
             )
+
+    def test_automatic_ceiling_accounts_for_input_and_transport_overhead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, max_input_tokens=128000)
+            config = load_config(root)
+            settings = config["local_inference"]
+            ceiling = config["personal_profile"]["safe_context_ceiling"]
+            evidence_id_limit = local_model._automatic_yarn_evidence_id_limit(
+                settings
+            )
+            evidence_ids = [
+                f"evidence-{index}" for index in range(evidence_id_limit)
+            ]
+
+            payload, _aliases = local_model._build_resume_request_payload(
+                settings,
+                safe_context=local_model._representative_serialized_markdown_context(
+                    ceiling
+                ),
+                session_id="session",
+                project_id="project",
+                evidence_ids=evidence_ids,
+                request_id="0" * 32,
+                context_sha256="0" * 64,
+                max_output_tokens=settings["max_output_tokens"],
+            )
+            request_bytes, estimated_input_tokens = local_model._request_metrics(payload)
+
+            self.assertLessEqual(request_bytes, local_model.MAX_HTTP_REQUEST_BYTES)
+            self.assertLessEqual(
+                estimated_input_tokens,
+                settings["max_input_tokens"] - settings["max_output_tokens"],
+            )
+            self.assertLess(ceiling, 128000 - settings["max_output_tokens"])
+
+            oversized_payload, _aliases = local_model._build_resume_request_payload(
+                settings,
+                safe_context=local_model._representative_serialized_markdown_context(
+                    ceiling + 1
+                ),
+                session_id="session",
+                project_id="project",
+                evidence_ids=evidence_ids,
+                request_id="0" * 32,
+                context_sha256="0" * 64,
+                max_output_tokens=settings["max_output_tokens"],
+            )
+            oversized_bytes, oversized_tokens = local_model._request_metrics(
+                oversized_payload
+            )
+            self.assertTrue(
+                oversized_bytes > local_model.MAX_HTTP_REQUEST_BYTES
+                or oversized_tokens
+                > settings["max_input_tokens"] - settings["max_output_tokens"]
+            )
+
+    def test_small_yarn_window_adapts_evidence_alias_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = load_config(Path(tmp) / "continuum")["local_inference"]
+            settings["max_input_tokens"] = 3000
+
+            evidence_id_limit = local_model._automatic_yarn_evidence_id_limit(
+                settings
+            )
+            ceiling = local_model._automatic_safe_context_ceiling(
+                settings,
+                context_maximum=128000,
+            )
+
+            self.assertGreater(evidence_id_limit, 0)
+            self.assertLess(evidence_id_limit, local_model.MAX_YARN_EVIDENCE_IDS)
+            self.assertGreaterEqual(ceiling, 256)
+            self.assertTrue(
+                local_model._representative_request_fits(
+                    settings,
+                    context_tokens=ceiling,
+                    evidence_id_count=evidence_id_limit,
+                    max_input_tokens=settings["max_input_tokens"],
+                    max_output_tokens=settings["max_output_tokens"],
+                )
+            )
+
+    def test_advertised_ceiling_accepts_generated_json_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, base_url=base_url)
+            config = load_config(root)
+            settings = config["local_inference"]
+            ceiling = config["personal_profile"]["safe_context_ceiling"]
+            evidence_id_limit = local_model._automatic_yarn_evidence_id_limit(
+                settings
+            )
+
+            with mock.patch(
+                "continuum.core.local_model._resource_guard",
+                return_value=SAFE_RESOURCES,
+            ):
+                result = assist_resume(
+                    root,
+                    context_text=local_model._representative_serialized_markdown_context(
+                        ceiling
+                    ),
+                    session_id="ceiling-session",
+                    project_id="ceiling-project",
+                    evidence_ids=[
+                        f"evidence-{index}"
+                        for index in range(evidence_id_limit)
+                    ],
+                )
+
+            self.assertTrue(result["used"], result)
+            self.assertEqual(result["evidence_id_limit"], evidence_id_limit)
+            self.assertEqual(result["evidence_ids_omitted"], 0)
+
+    def test_at_ceiling_escape_dense_context_is_trimmed_to_exact_request_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, base_url=base_url)
+            config = load_config(root)
+            settings = config["local_inference"]
+            ceiling = config["personal_profile"]["safe_context_ceiling"]
+            escaped_json_block = (
+                "## recent_scroll\n```json\n{\"content\":\""
+                + ('\\\\"' * 32)
+                + "\"}\n```\n"
+            )
+            dense_context = (
+                escaped_json_block
+                * (((ceiling * 4) // len(escaped_json_block)) + 1)
+            )[: ceiling * 4]
+
+            with mock.patch(
+                "continuum.core.local_model._resource_guard",
+                return_value=SAFE_RESOURCES,
+            ):
+                result = assist_resume(
+                    root,
+                    context_text=dense_context,
+                    session_id="dense-session",
+                    project_id="dense-project",
+                    evidence_ids=["dense-evidence"],
+                )
+
+            self.assertTrue(result["used"], result)
+            self.assertTrue(result["input_truncated"], result)
+            self.assertGreater(result["input_chars_omitted"], 0)
+            self.assertEqual(result["original_estimated_tokens"], ceiling)
+            self.assertLessEqual(
+                result["estimated_input_tokens"],
+                settings["max_input_tokens"] - settings["max_output_tokens"],
+            )
+            self.assertLessEqual(
+                result["request_bytes"],
+                local_model.MAX_HTTP_REQUEST_BYTES,
+            )
+            self.assertIsNotNone(_ModelHandler.last_request)
+
+    def test_large_window_escape_dense_context_is_trimmed_to_transport_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+            root = Path(tmp) / "continuum"
+            configure_yarn(
+                root,
+                enabled=True,
+                base_url=base_url,
+                max_input_tokens=128000,
+            )
+            config = load_config(root)
+            ceiling = config["personal_profile"]["safe_context_ceiling"]
+            dense_context = ('\\\\"' * ((ceiling * 2) + 1))[: ceiling * 4]
+
+            with mock.patch(
+                "continuum.core.local_model._resource_guard",
+                return_value=SAFE_RESOURCES,
+            ):
+                result = assist_resume(
+                    root,
+                    context_text=dense_context,
+                    session_id="large-dense-session",
+                    project_id="large-dense-project",
+                    evidence_ids=["large-dense-evidence"],
+                )
+
+            self.assertTrue(result["used"], result)
+            self.assertTrue(result["input_truncated"], result)
+            self.assertGreater(result["input_chars_omitted"], 0)
+            self.assertLessEqual(
+                result["request_bytes"],
+                local_model.MAX_HTTP_REQUEST_BYTES,
+            )
+
+    def test_resume_schema_allows_an_empty_evidence_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True)
+            settings = load_config(root)["local_inference"]
+
+            payload, aliases = local_model._build_resume_request_payload(
+                settings,
+                safe_context="bounded context",
+                session_id="session",
+                project_id=None,
+                evidence_ids=[],
+                request_id="0" * 32,
+                context_sha256="0" * 64,
+                max_output_tokens=settings["max_output_tokens"],
+            )
+
+            citations = payload["response_format"]["json_schema"]["schema"]["properties"]["citations"]
+            self.assertEqual(aliases, {})
+            self.assertEqual(citations["items"], {"type": "string"})
+            self.assertEqual(citations["maxItems"], 0)
+
+    def test_assist_checks_transformed_context_and_request_bytes_before_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, max_input_tokens=4096)
+            raw_context = "/a\n" * 2000
+
+            with mock.patch("continuum.core.local_model._http_json") as http_json:
+                transformed = assist_resume(
+                    root,
+                    context_text=raw_context,
+                    session_id="session",
+                    project_id=None,
+                )
+
+            self.assertFalse(transformed["used"])
+            self.assertEqual(transformed["reason"], "input_budget_exceeded")
+            self.assertGreater(transformed["estimated_tokens"], (len(raw_context) + 3) // 4)
+            http_json.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, max_input_tokens=128000)
+
+            with mock.patch("continuum.core.local_model._http_json") as http_json:
+                oversized = assist_resume(
+                    root,
+                    context_text="x" * 300000,
+                    session_id="session",
+                    project_id=None,
+                )
+
+            self.assertFalse(oversized["used"])
+            self.assertEqual(oversized["reason"], "input_budget_exceeded")
+            self.assertEqual(oversized["detail"], "serialized_request_byte_budget_exceeded")
+            self.assertGreater(oversized["request_bytes"], local_model.MAX_HTTP_REQUEST_BYTES)
+            http_json.assert_not_called()
 
     def test_yarn_token_budgets_reject_boolean_and_fractional_values(self) -> None:
         cases = (
@@ -322,11 +576,11 @@ class LocalModelTests(unittest.TestCase):
                 root,
                 enabled=True,
                 base_url=base_url,
-                max_input_tokens=1536,
+                max_input_tokens=4096,
                 max_output_tokens=768,
             )
             config = load_config(root)
-            self.assertEqual(config["personal_profile"]["safe_context_ceiling"], 256)
+            self.assertGreaterEqual(config["personal_profile"]["safe_context_ceiling"], 256)
             with mock.patch(
                 "continuum.core.local_model._resource_guard",
                 return_value=SAFE_RESOURCES,
@@ -417,6 +671,43 @@ class LocalModelTests(unittest.TestCase):
             self.assertEqual(result["authority"], "non_authoritative_inference")
             self.assertEqual(result["briefing"]["confidence"], "high")
             self.assertIsNotNone(_ModelHandler.last_request)
+
+    def test_resume_briefing_bounds_outbound_evidence_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, base_url=base_url)
+            evidence_ids = [
+                f"evidence-{index}"
+                for index in range(local_model.MAX_YARN_EVIDENCE_IDS + 50)
+            ]
+            with mock.patch(
+                "continuum.core.local_model._resource_guard",
+                return_value=SAFE_RESOURCES,
+            ):
+                result = assist_resume(
+                    root,
+                    context_text="Bound the evidence aliases.",
+                    session_id="session-a",
+                    project_id="project-a",
+                    evidence_ids=evidence_ids,
+                )
+
+            self.assertTrue(result["used"], result)
+            self.assertEqual(result["evidence_ids_omitted"], 50)
+            request = _ModelHandler.last_request
+            self.assertIsNotNone(request)
+            assert request is not None
+            messages = request.get("messages")
+            assert isinstance(messages, list)
+            user_message = messages[1]
+            assert isinstance(user_message, dict)
+            content = user_message.get("content")
+            assert isinstance(content, str)
+            user_payload = json.loads(content)
+            self.assertEqual(
+                len(user_payload["allowed_evidence_ids"]),
+                local_model.MAX_YARN_EVIDENCE_IDS,
+            )
 
     def test_resource_guard_refuses_inference_before_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

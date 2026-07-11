@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import os
 import tarfile
 import tempfile
@@ -11,7 +12,9 @@ from setuptools import setup
 from setuptools.command.sdist import sdist as _sdist
 
 
-DEFAULT_SOURCE_DATE_EPOCH = 0
+# ZIP-based wheels cannot represent timestamps before 1980-01-01. Use that
+# boundary as the deterministic fallback for every distribution format.
+DEFAULT_SOURCE_DATE_EPOCH = 315532800
 MAX_GZIP_MTIME = (1 << 32) - 1
 PAX_TIME_HEADERS = ("mtime", "atime", "ctime")
 
@@ -35,15 +38,30 @@ def _normalized_mode(member: tarfile.TarInfo) -> int:
 
 
 def _source_date_epoch() -> int:
-    """Return SOURCE_DATE_EPOCH, falling back deterministically to the Unix epoch."""
+    """Resolve an explicit or release-provenance distribution build epoch."""
     raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
     try:
-        epoch = int(raw_epoch) if raw_epoch is not None else DEFAULT_SOURCE_DATE_EPOCH
+        epoch = int(raw_epoch) if raw_epoch is not None else None
     except ValueError:
+        epoch = None
+    if epoch is not None and 0 <= epoch <= MAX_GZIP_MTIME:
+        return epoch
+
+    provenance_path = (
+        Path(__file__).resolve().parent
+        / "src"
+        / "continuum"
+        / "assets"
+        / "RELEASE_PROVENANCE.json"
+    )
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        embedded_epoch = int(provenance["source_date_epoch"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return DEFAULT_SOURCE_DATE_EPOCH
-    if not 0 <= epoch <= MAX_GZIP_MTIME:
+    if not 0 <= embedded_epoch <= MAX_GZIP_MTIME:
         return DEFAULT_SOURCE_DATE_EPOCH
-    return epoch
+    return embedded_epoch
 
 
 def _copy_normalized_members(source: tarfile.TarFile, target: tarfile.TarFile, *, epoch: int) -> None:
@@ -85,6 +103,9 @@ def _normalize_tar_modes(path: Path, *, gzipped: bool) -> None:
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+
+os.environ["SOURCE_DATE_EPOCH"] = str(_source_date_epoch())
 
 
 setup(cmdclass={"sdist": NormalizedSdist})

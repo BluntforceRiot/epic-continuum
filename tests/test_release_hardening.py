@@ -98,6 +98,45 @@ class ReleaseHardeningTest(unittest.TestCase):
         with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "999999999999999999999999999"}):
             self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
 
+    def test_source_tree_version_precedes_unrelated_installed_distribution(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        init_path = repo_root / "src" / "continuum" / "__init__.py"
+        expected = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+            "version"
+        ]
+        spec = importlib.util.spec_from_file_location("continuum_version_under_test", init_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+
+        with patch("importlib.metadata.version", return_value="0.2.1") as installed_version:
+            spec.loader.exec_module(module)
+
+        self.assertEqual(module.__version__, expected)
+        installed_version.assert_not_called()
+
+    def test_vendored_install_ignores_unrelated_host_pyproject_version(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Path(tmp) / "host-app"
+            package = host / "vendor" / "continuum"
+            package.mkdir(parents=True)
+            shutil.copyfile(repo_root / "src" / "continuum" / "__init__.py", package / "__init__.py")
+            (host / "pyproject.toml").write_text(
+                '[project]\nname = "unrelated-host-app"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            spec = importlib.util.spec_from_file_location("vendored_continuum_version", package / "__init__.py")
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+
+            with patch("importlib.metadata.version", return_value="0.3.0") as installed_version:
+                spec.loader.exec_module(module)
+
+            self.assertEqual(module.__version__, "0.3.0")
+            installed_version.assert_called_once_with("epic-continuum-memory")
+
     def test_release_builder_includes_readme_linked_operational_docs(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "build_release_package.py"
@@ -114,6 +153,18 @@ class ReleaseHardeningTest(unittest.TestCase):
         ):
             with self.subTest(relative_path=relative_path):
                 self.assertTrue(module.should_include(repo_root / relative_path, repo_root))
+
+    def test_release_builder_rejects_duplicate_archive_names(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location("build_release_package_duplicate_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with self.assertRaisesRegex(RuntimeError, "duplicate member names"):
+            module._assert_unique_arcnames(["epic-continuum/a", "epic-continuum/a"])
 
     def test_sdist_tar_modes_are_normalized(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -362,6 +413,197 @@ version = "9.9.9"
             self.assertNotIn("git_status_short", provenance)
             self.assertIn("member_manifest_sha256", provenance)
 
+    def test_release_builder_requires_git_for_clean_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            (repo / "README.md").write_text("plain source tree\n", encoding="utf-8")
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+
+            blocked = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+            self.assertIn("unable to verify a Git worktree", blocked.stderr)
+            self.assertFalse((out / "epic-continuum-9.9.9.zip").exists())
+
+            allowed = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo),
+                    "--out-dir",
+                    str(out),
+                    "--allow-dirty",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as zf:
+                provenance = json.loads(zf.read("epic-continuum-9.9.9/RELEASE_PROVENANCE.json"))
+            self.assertEqual(provenance["source"], "walk")
+            self.assertTrue(provenance["allow_dirty"])
+            self.assertIsNone(provenance["git_commit"])
+            self.assertIsNone(provenance["git_dirty"])
+            self.assertIsNone(provenance["git_status_short_count"])
+
+    def test_release_builder_clean_mode_requires_head_and_tracked_enumeration(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location("build_release_package_git_preflight_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            source.mkdir()
+            (source / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(module, "_git_worktree_is_clean", return_value=True),
+                patch.object(module, "_git_output", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "resolve Git HEAD"),
+            ):
+                module.build_release(source, base / "missing-head", "9.9.9")
+
+            with (
+                patch.object(module, "_git_worktree_is_clean", return_value=True),
+                patch.object(module, "_git_output", return_value="a" * 40),
+                patch.object(module, "_git_tracked_members", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "enumerate Git-tracked files"),
+            ):
+                module.build_release(source, base / "missing-index", "9.9.9")
+
+            with (
+                patch.object(module, "_git_worktree_is_clean", side_effect=[True, False]),
+                patch.object(module, "_git_output", return_value="a" * 40),
+                patch.object(module, "_git_tracked_members", return_value=[]),
+                self.assertRaisesRegex(RuntimeError, "changed during release archive preparation"),
+            ):
+                module.build_release(source, base / "changed-during-build", "9.9.9")
+
+    def test_release_builder_refuses_source_mutation_during_archive_write(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for release snapshot smoke")
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location("build_release_package_snapshot_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            out = base / "dist"
+            source.mkdir()
+            (source / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            readme = source / "README.md"
+            readme.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=source, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+
+            original_write_member = module.write_member
+            mutated = False
+
+            def mutate_during_write(
+                zf,
+                arcname,
+                data,
+                *,
+                mode,
+                source_date_epoch=None,
+            ):
+                nonlocal mutated
+                if not mutated and arcname.endswith("/README.md"):
+                    self.assertEqual(data, b"before\n")
+                    readme.write_text("after\n", encoding="utf-8")
+                    mutated = True
+                return original_write_member(
+                    zf,
+                    arcname,
+                    data,
+                    mode=mode,
+                    source_date_epoch=source_date_epoch,
+                )
+
+            with (
+                patch.object(module, "write_member", side_effect=mutate_during_write),
+                self.assertRaisesRegex(RuntimeError, "changed during release archive preparation"),
+            ):
+                module.build_release(source, out, "9.9.9")
+
+            self.assertTrue(mutated)
+            self.assertFalse((out / "epic-continuum-9.9.9.zip").exists())
+            self.assertFalse((out / "epic-continuum-9.9.9.zip.sha256").exists())
+
+    def test_release_builder_rejects_version_override_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            out = base / "dist"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo),
+                    "--out-dir",
+                    str(out),
+                    "--version",
+                    "9.9.8",
+                    "--allow-dirty",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("does not match pyproject.toml version", result.stderr)
+            self.assertFalse((out / "epic-continuum-9.9.8.zip").exists())
+
     def test_release_builder_dirty_archive_skips_deleted_tracked_paths(self) -> None:
         if not shutil.which("git"):
             self.skipTest("git is required for deleted-path release builder smoke")
@@ -522,6 +764,11 @@ version = "9.9.9"
             with zipfile.ZipFile(allowed_out / "epic-continuum-9.9.9.zip") as zf:
                 self.assertNotIn("epic-continuum-9.9.9/docs/ignored.md", set(zf.namelist()))
 
+            subprocess.run(
+                ["git", "config", "status.showUntrackedFiles", "no"],
+                cwd=repo,
+                check=True,
+            )
             (docs / "cue-recall.md").write_text("# Cue Recall\n", encoding="utf-8")
             blocked = subprocess.run(
                 [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(blocked_out)],
@@ -539,47 +786,127 @@ version = "9.9.9"
         repo_root = Path(__file__).resolve().parents[1]
         version = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
         script = repo_root / "scripts" / "build_release_package.py"
+        epoch = "1700000000"
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             out = base / "release"
+            env = os.environ.copy()
+            env["SOURCE_DATE_EPOCH"] = epoch
             release = subprocess.run(
                 [sys.executable, str(script), "--repo-root", str(repo_root), "--out-dir", str(out), "--allow-dirty"],
                 text=True,
                 capture_output=True,
+                env=env,
             )
             self.assertEqual(release.returncode, 0, release.stdout + release.stderr)
 
             zip_path = out / f"epic-continuum-{version}.zip"
             with zipfile.ZipFile(zip_path) as zf:
-                self.assertFalse(any(".egg-info/" in name for name in zf.namelist()))
+                names = zf.namelist()
+                self.assertEqual(len(names), len(set(names)))
+                self.assertFalse(any(".egg-info/" in name for name in names))
                 root_provenance = zf.read(f"epic-continuum-{version}/RELEASE_PROVENANCE.json")
+                provenance_payload = json.loads(root_provenance)
+                self.assertEqual(provenance_payload["source_date_epoch"], int(epoch))
+                self.assertEqual(
+                    provenance_payload["distribution_build_toolchain"],
+                    {
+                        "build": "1.2.2.post1",
+                        "pip": "25.1.1",
+                        "python": "3.13.5",
+                        "setuptools": "80.9.0",
+                        "twine": "6.1.0",
+                        "wheel": "0.45.1",
+                    },
+                )
                 package_provenance = zf.read(
                     f"epic-continuum-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
                 )
-                zf.extractall(base / "extract")
+                for build_number in range(2):
+                    zf.extractall(base / f"extract-{build_number}")
             self.assertEqual(package_provenance, root_provenance)
 
-            release_root = base / "extract" / f"epic-continuum-{version}"
-            build_out = base / "built"
-            built = subprocess.run(
-                [sys.executable, "-m", "build", "--sdist", "--wheel", "--outdir", str(build_out)],
-                cwd=release_root,
+            release_root = base / "extract-0" / f"epic-continuum-{version}"
+            rebuilt_out = base / "rebuilt-release"
+            rebuilt = subprocess.run(
+                [
+                    sys.executable,
+                    str(release_root / "scripts" / "build_release_package.py"),
+                    "--repo-root",
+                    str(release_root),
+                    "--out-dir",
+                    str(rebuilt_out),
+                    "--allow-dirty",
+                ],
                 text=True,
                 capture_output=True,
+                env=env,
             )
-            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            self.assertEqual(rebuilt.returncode, 0, rebuilt.stdout + rebuilt.stderr)
+            with zipfile.ZipFile(rebuilt_out / f"epic-continuum-{version}.zip") as rebuilt_zip:
+                rebuilt_names = rebuilt_zip.namelist()
+                self.assertEqual(len(rebuilt_names), len(set(rebuilt_names)))
+                self.assertEqual(
+                    rebuilt_names.count(
+                        f"epic-continuum-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+                    ),
+                    1,
+                )
 
-            wheel_path = next(build_out.glob("*.whl"))
-            with zipfile.ZipFile(wheel_path) as wheel:
-                self.assertEqual(wheel.read("continuum/assets/RELEASE_PROVENANCE.json"), root_provenance)
+            artifact_payloads: list[dict[str, bytes]] = []
+            for build_number in range(2):
+                current_root = base / f"extract-{build_number}" / f"epic-continuum-{version}"
+                build_out = base / f"built-{build_number}"
+                build_env = env.copy()
+                if build_number == 1:
+                    build_env.pop("SOURCE_DATE_EPOCH", None)
+                built = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "build",
+                        "--sdist",
+                        "--wheel",
+                        "--no-isolation",
+                        "--outdir",
+                        str(build_out),
+                    ],
+                    cwd=current_root,
+                    text=True,
+                    capture_output=True,
+                    env=build_env,
+                )
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
 
-            sdist_path = next(build_out.glob("*.tar.gz"))
-            with tarfile.open(sdist_path, "r:gz") as sdist:
-                member_name = f"epic_continuum_memory-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
-                extracted = sdist.extractfile(member_name)
-                self.assertIsNotNone(extracted)
-                assert extracted is not None
-                self.assertEqual(extracted.read(), root_provenance)
+                wheel_path = next(build_out.glob("*.whl"))
+                with zipfile.ZipFile(wheel_path) as wheel:
+                    self.assertEqual(wheel.read("continuum/assets/RELEASE_PROVENANCE.json"), root_provenance)
+
+                sdist_path = next(build_out.glob("*.tar.gz"))
+                with tarfile.open(sdist_path, "r:gz") as sdist:
+                    member_name = f"epic_continuum_memory-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+                    extracted = sdist.extractfile(member_name)
+                    self.assertIsNotNone(extracted)
+                    assert extracted is not None
+                    self.assertEqual(extracted.read(), root_provenance)
+
+                artifact_payloads.append({path.name: path.read_bytes() for path in build_out.iterdir()})
+
+            self.assertEqual(artifact_payloads[0], artifact_payloads[1])
+
+            workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            )
+            for pin in (
+                'python-version: "3.13.5"',
+                '"pip==25.1.1"',
+                '"setuptools==80.9.0"',
+                '"wheel==0.45.1"',
+                '"build==1.2.2.post1"',
+                '"twine==6.1.0"',
+                "env -u SOURCE_DATE_EPOCH python -m build",
+            ):
+                self.assertIn(pin, workflow)
 
     def test_release_builder_walk_fallback_rejects_source_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -602,7 +929,15 @@ version = "9.9.9"
 
             script = Path(__file__).resolve().parents[1] / "scripts" / "build_release_package.py"
             result = subprocess.run(
-                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo),
+                    "--out-dir",
+                    str(out),
+                    "--allow-dirty",
+                ],
                 text=True,
                 capture_output=True,
             )
@@ -621,7 +956,15 @@ version = "9.9.9"
             except (OSError, NotImplementedError) as exc:
                 self.skipTest(f"directory symlink creation unavailable: {exc}")
             directory_result = subprocess.run(
-                [sys.executable, str(script), "--repo-root", str(repo), "--out-dir", str(out)],
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo),
+                    "--out-dir",
+                    str(out),
+                    "--allow-dirty",
+                ],
                 text=True,
                 capture_output=True,
             )

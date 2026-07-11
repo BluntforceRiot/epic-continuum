@@ -230,6 +230,25 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def merge_user_config(user_config: dict[str, Any]) -> dict[str, Any]:
+    """Merge persisted config while preserving legacy context ceilings.
+
+    Before personal profiles existed, a root could legitimately set
+    ``context.max_token_budget`` below the new 32K profile default. Only clamp
+    the injected default; an explicitly persisted ceiling is validated as-is.
+    """
+    config = deep_merge(default_config(), user_config)
+    user_profile = user_config.get("personal_profile")
+    explicit_ceiling = isinstance(user_profile, dict) and "safe_context_ceiling" in user_profile
+    profile = config.get("personal_profile")
+    context = config.get("context")
+    if not explicit_ceiling and isinstance(profile, dict) and isinstance(context, dict):
+        max_budget = int(context.get("max_token_budget", 0))
+        injected_ceiling = int(profile.get("safe_context_ceiling", max_budget))
+        profile["safe_context_ceiling"] = min(injected_ceiling, max_budget)
+    return config
+
+
 def default_config() -> dict[str, Any]:
     return json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -270,7 +289,9 @@ def write_default_config(root: Path) -> Path:
 def load_config(root: Path) -> dict[str, Any]:
     path = write_default_config(root)
     user_config = json.loads(path.read_text(encoding="utf-8"))
-    config = deep_merge(default_config(), user_config)
+    if not isinstance(user_config, dict):
+        raise ValueError("Continuum configuration must be a JSON object")
+    config = merge_user_config(user_config)
     validate_config(config)
     validate_config_root_paths(root, config)
     return config
@@ -293,6 +314,12 @@ def optimize_config(
     )
     recommendation = recommend_config(current, detected, profile=profile)
     optimized = deep_merge(current, recommendation["overrides"])
+    personal_profile = dict(optimized.get("personal_profile", {}))
+    personal_profile["safe_context_ceiling"] = min(
+        int(personal_profile.get("safe_context_ceiling", 32768)),
+        int(optimized["context"]["max_token_budget"]),
+    )
+    optimized["personal_profile"] = personal_profile
     validate_config(optimized)
     path = config_path(root)
     if write:
@@ -492,9 +519,11 @@ def validate_config(config: dict[str, Any]) -> None:
     if not profile_name or len(profile_name) > 128:
         raise ValueError("personal_profile.name must be 1-128 characters")
     safe_context_ceiling = int(personal_profile.get("safe_context_ceiling", 32768))
-    if safe_context_ceiling < 256 or safe_context_ceiling > max_budget:
+    minimum_safe_context_ceiling = min(256, max_budget)
+    if safe_context_ceiling < minimum_safe_context_ceiling or safe_context_ceiling > max_budget:
         raise ValueError(
-            "personal_profile.safe_context_ceiling must be between 256 and context.max_token_budget"
+            "personal_profile.safe_context_ceiling must be between "
+            f"{minimum_safe_context_ceiling} and context.max_token_budget"
         )
     if personal_profile.get("resume_mode", "latest") not in {
         "latest",

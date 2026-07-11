@@ -30,6 +30,21 @@
   selection, and opt-in model-assisted recovery.
 - Made final source-archive builds require a fully clean Git worktree, including
   non-ignored untracked files, so new release inputs cannot be omitted silently.
+- Bounded the complete daily resume packet, not only its Looking Glass section,
+  preserved actionable task/decision/job/book details, and fail closed if a
+  selected checkpoint is no longer the exact newest state while the packet is
+  assembled. Tiny budgets now return valid compact envelopes or a clean error;
+  unscoped fallback skips stale checkpoint partitions.
+- Isolated project-state checkpoints from derived-card conflict groups and made
+  malformed pending-job timestamps an explicit unhealthy queue condition.
+- Sized Yarn briefings from the transformed, fully serialized request under both
+  token and transport limits, exact-fit trimmed unusually escape-dense input,
+  bounded evidence aliases, preserved omitted CLI settings, and kept legacy
+  low-budget profiles upgrade-compatible.
+- Made CI wheel and source-distribution artifacts reproducible builds of the
+  provenance-bearing release archive, with duplicate-member, version-parity,
+  clean-source, and mid-build worktree-change checks plus an embedded build
+  epoch and pinned distribution-toolchain recipe.
 - Kept the catalog capability schema at `0.2.0`; these features are additive and do not
   require a destructive migration or downgrade of existing catalogs.
 

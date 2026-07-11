@@ -137,6 +137,46 @@ class WorkerHealthContractTest(unittest.TestCase):
             )
             self.assertFalse(running_check["ok"])
 
+    def test_malformed_pending_job_timestamp_makes_memory_health_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                pending_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="malformed_pending_health",
+                    priority=100,
+                    payload={},
+                )
+                enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="valid_pending_health",
+                    priority=100,
+                    payload={},
+                )
+                conn.execute(
+                    "UPDATE queue_jobs SET created_at = '2451545' WHERE id = ?",
+                    (pending_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = memory_health(root)
+
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["oldest_pending_job_timestamp_valid"])
+            self.assertEqual(result["invalid_pending_job_timestamps"], 1)
+            queue_check = next(
+                check for check in result["checks"] if check["name"] == "queue_age_reasonable"
+            )
+            self.assertFalse(queue_check["ok"])
+            self.assertFalse(queue_check["timestamp_valid"])
+            self.assertEqual(queue_check["invalid_pending_job_timestamps"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

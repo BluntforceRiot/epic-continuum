@@ -59,9 +59,15 @@ continuum resume --root "$HOME\.continuum" --model-assist
 ```
 
 With the default 16K input window and 768-token output allowance,
-`yarn-configure` records a 15,104-token safe context ceiling. Continuum reserves
-the remaining 1,280 tokens for output and briefing protocol overhead instead of
-advertising context the adapter would later refuse.
+`yarn-configure` records a 9,080-token safe context ceiling. Continuum reserves
+the balance for output, the serialized briefing schema, up to 100 bounded
+evidence aliases, and representative quote/backslash expansion when generated
+JSON/Markdown passes through both serialization layers. Smaller windows reduce
+the alias limit when needed; larger windows are also capped by the unchanged
+256 KiB request limit. The exact transformed request is still checked, and
+unusually expansion-heavy input at or below the ceiling is trimmed with an
+explicit notice to the largest exact fit. Input above the configured ceiling,
+or a fixed request envelope that cannot fit, falls back deterministically.
 
 `yarn-configure` also enables personal resume assistance. Disable it without
 removing the profile:
@@ -76,11 +82,12 @@ Or control personal behavior separately:
 continuum configure-profile `
   --root "$HOME\.continuum" `
   --name homelab `
-  --safe-context-ceiling 16384 `
   --resume-mode latest_project `
   --default-project-id epic-continuum `
   --assist-on-resume
 ```
+
+Leave the Yarn-derived safe ceiling in place unless you are lowering it.
 
 ## Safety boundary
 

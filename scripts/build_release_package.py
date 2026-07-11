@@ -14,6 +14,16 @@ from pathlib import Path
 
 
 DEFAULT_ZIP_DT = (1980, 1, 1, 0, 0, 0)
+DEFAULT_SOURCE_DATE_EPOCH = 315532800
+MAX_SOURCE_DATE_EPOCH = (1 << 32) - 1
+REPRODUCIBLE_DISTRIBUTION_TOOLCHAIN = {
+    "python": "3.13.5",
+    "pip": "25.1.1",
+    "setuptools": "80.9.0",
+    "wheel": "0.45.1",
+    "build": "1.2.2.post1",
+    "twine": "6.1.0",
+}
 
 EXCLUDED_PARTS = {
     ".git",
@@ -72,6 +82,14 @@ INCLUDE_TOP_LEVEL = {
     "setup.py",
 }
 
+GENERATED_PROVENANCE_PATHS = {
+    "RELEASE_PROVENANCE.json",
+    "src/continuum/assets/RELEASE_PROVENANCE.json",
+}
+
+
+ReleaseMember = tuple[Path, str, int, str | None]
+SnapshotMember = tuple[str, int, bytes | None]
 
 
 def _is_link_like(path: Path) -> bool:
@@ -110,15 +128,10 @@ def project_version(repo_root: Path) -> str:
 
 
 def _git_worktree_is_clean(repo_root: Path) -> bool | None:
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "status", "--porcelain"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
+    status = _git_status_short(repo_root)
+    if status is None:
         return None
-    return proc.stdout.strip() == ""
+    return not status
 
 
 def _git_output(repo_root: Path, args: list[str], *, text: bool = True) -> str | None:
@@ -134,18 +147,62 @@ def _git_output(repo_root: Path, args: list[str], *, text: bool = True) -> str |
 
 
 def _git_status_short(repo_root: Path) -> list[str] | None:
-    output = _git_output(repo_root, ["status", "--porcelain"])
+    output = _git_output(
+        repo_root,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
     if output is None:
         return None
     return [line for line in output.splitlines() if line]
 
 
-def reproducible_zip_dt() -> tuple[int, int, int, int, int, int]:
+def _parse_source_date_epoch(value: object) -> int | None:
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= epoch <= MAX_SOURCE_DATE_EPOCH:
+        return None
+    return epoch
+
+
+def _release_source_date_epoch(repo_root: Path, git_commit: str | None) -> int:
     raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
-    if not raw_epoch:
+    if raw_epoch is not None:
+        parsed_epoch = _parse_source_date_epoch(raw_epoch)
+        return DEFAULT_SOURCE_DATE_EPOCH if parsed_epoch is None else parsed_epoch
+    if git_commit:
+        commit_epoch = _git_output(repo_root, ["show", "-s", "--format=%ct", git_commit])
+        parsed_commit_epoch = _parse_source_date_epoch(commit_epoch)
+        if parsed_commit_epoch is not None:
+            return parsed_commit_epoch
+    for provenance_path in (
+        repo_root / "RELEASE_PROVENANCE.json",
+        repo_root / "src" / "continuum" / "assets" / "RELEASE_PROVENANCE.json",
+    ):
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        parsed_provenance_epoch = _parse_source_date_epoch(provenance.get("source_date_epoch"))
+        if parsed_provenance_epoch is not None:
+            return parsed_provenance_epoch
+    return DEFAULT_SOURCE_DATE_EPOCH
+
+
+def reproducible_zip_dt(source_date_epoch: int | None = None) -> tuple[int, int, int, int, int, int]:
+    epoch = source_date_epoch
+    if epoch is None:
+        epoch = _parse_source_date_epoch(os.environ.get("SOURCE_DATE_EPOCH"))
+    if epoch is None:
         return DEFAULT_ZIP_DT
     try:
-        timestamp = dt.datetime.fromtimestamp(int(raw_epoch), tz=dt.UTC)
+        timestamp = dt.datetime.fromtimestamp(epoch, tz=dt.UTC)
     except (OSError, OverflowError, ValueError):
         return DEFAULT_ZIP_DT
     return (
@@ -162,6 +219,8 @@ def should_include(path: Path, repo_root: Path) -> bool:
     rel = path.relative_to(repo_root)
     parts = rel.parts
     if not parts:
+        return False
+    if rel.as_posix() in GENERATED_PROVENANCE_PATHS:
         return False
     if parts[0] not in INCLUDE_TOP_LEVEL:
         return False
@@ -207,36 +266,46 @@ def zip_mode(path: Path) -> int:
     return 0o100644
 
 
-def write_member(zf: zipfile.ZipFile, source: Path, arcname: str, *, mode: int | None = None) -> None:
-    if _is_link_like(source):
-        raise RuntimeError(f"refusing to package symlink, junction, or reparse point: {source}")
-    info = zipfile.ZipInfo(arcname, reproducible_zip_dt())
+def write_member(
+    zf: zipfile.ZipFile,
+    arcname: str,
+    data: bytes | None,
+    *,
+    mode: int,
+    source_date_epoch: int | None = None,
+) -> None:
+    info = zipfile.ZipInfo(arcname, reproducible_zip_dt(source_date_epoch))
     info.create_system = 3
-    info.external_attr = (mode if mode is not None else zip_mode(source)) << 16
+    info.external_attr = mode << 16
     info.compress_type = zipfile.ZIP_DEFLATED
-    data = b"" if source.is_dir() else source.read_bytes()
-    zf.writestr(info, data)
+    zf.writestr(info, b"" if data is None else data)
 
 
-def write_bytes_member(zf: zipfile.ZipFile, arcname: str, data: bytes, *, mode: int = 0o100644) -> None:
-    info = zipfile.ZipInfo(arcname, reproducible_zip_dt())
+def write_bytes_member(
+    zf: zipfile.ZipFile,
+    arcname: str,
+    data: bytes,
+    *,
+    mode: int = 0o100644,
+    source_date_epoch: int | None = None,
+) -> None:
+    info = zipfile.ZipInfo(arcname, reproducible_zip_dt(source_date_epoch))
     info.create_system = 3
     info.external_attr = mode << 16
     info.compress_type = zipfile.ZIP_DEFLATED
     zf.writestr(info, data)
 
 
-def _member_manifest_rows(members: list[tuple[Path, str, int]]) -> list[dict[str, object]]:
+def _member_manifest_rows(members: list[SnapshotMember]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for source, arcname, mode in members:
+    for arcname, mode, data in members:
         row: dict[str, object] = {
             "path": arcname,
             "mode": f"{mode:o}",
         }
-        if arcname.endswith("/"):
+        if data is None:
             row["kind"] = "directory"
         else:
-            data = source.read_bytes()
             row["kind"] = "file"
             row["size"] = len(data)
             row["sha256"] = hashlib.sha256(data).hexdigest()
@@ -248,18 +317,31 @@ def _stable_json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def _assert_unique_arcnames(arcnames: list[str]) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for arcname in arcnames:
+        if arcname in seen:
+            duplicates.add(arcname)
+        seen.add(arcname)
+    if duplicates:
+        rendered = ", ".join(sorted(duplicates))
+        raise RuntimeError(f"refusing to build release archive with duplicate member names: {rendered}")
+
+
 def _provenance_payload(
-    repo_root: Path,
     package_name: str,
     version: str,
     source: str,
-    members: list[tuple[Path, str, int]],
+    members: list[SnapshotMember],
     *,
     require_clean: bool,
+    git_commit: str | None,
+    status_short: list[str] | None,
+    source_date_epoch: int,
 ) -> dict[str, object]:
     manifest_rows = _member_manifest_rows(members)
     manifest_bytes = _stable_json_bytes(manifest_rows)
-    status_short = _git_status_short(repo_root)
     status_blob = "\n".join(status_short or []).encode("utf-8")
     return {
         "schema": "epic-continuum.release_provenance.v1",
@@ -268,10 +350,12 @@ def _provenance_payload(
         "builder": "scripts/build_release_package.py",
         "source": source,
         "allow_dirty": not require_clean,
-        "git_commit": _git_output(repo_root, ["rev-parse", "HEAD"]),
-        "git_dirty": bool(status_short),
-        "git_status_short_count": len(status_short or []),
+        "git_commit": git_commit,
+        "git_dirty": None if status_short is None else bool(status_short),
+        "git_status_short_count": None if status_short is None else len(status_short),
         "git_status_short_sha256": hashlib.sha256(status_blob).hexdigest() if status_short else None,
+        "source_date_epoch": source_date_epoch,
+        "distribution_build_toolchain": dict(REPRODUCIBLE_DISTRIBUTION_TOOLCHAIN),
         "member_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "member_count_without_root_or_provenance": len(members),
         "member_count_with_root_and_provenance": len(members) + 3,
@@ -288,7 +372,7 @@ def _git_tracked_members(
     *,
     allow_missing: bool = False,
     include_untracked: bool = False,
-) -> list[tuple[Path, str, int]] | None:
+) -> list[ReleaseMember] | None:
     proc = subprocess.run(
         ["git", "-C", str(repo_root), "ls-files", "--stage", "-z"],
         check=False,
@@ -297,16 +381,17 @@ def _git_tracked_members(
     if proc.returncode != 0:
         return None
 
-    members_by_arcname: dict[str, tuple[Path, str, int]] = {}
+    members_by_arcname: dict[str, ReleaseMember] = {}
     directory_arcnames: set[str] = set()
     for raw_record in proc.stdout.split(b"\0"):
         if not raw_record:
             continue
         try:
             raw_header, raw_path = raw_record.split(b"\t", 1)
-            raw_mode = raw_header.split(maxsplit=1)[0]
+            raw_mode, raw_object_id, _raw_stage = raw_header.split()
             rel = Path(raw_path.decode("utf-8"))
             mode = int(raw_mode.decode("ascii"), 8)
+            object_id = raw_object_id.decode("ascii")
         except (IndexError, UnicodeDecodeError, ValueError):
             raise RuntimeError(f"unable to parse git ls-files record: {raw_record!r}") from None
         path = repo_root / rel
@@ -324,7 +409,12 @@ def _git_tracked_members(
         if not stat.S_ISREG(path.lstat().st_mode):
             raise FileNotFoundError(str(path))
         rel_posix = rel.as_posix()
-        members_by_arcname[f"{package_name}/{rel_posix}"] = (path, f"{package_name}/{rel_posix}", mode)
+        members_by_arcname[f"{package_name}/{rel_posix}"] = (
+            path,
+            f"{package_name}/{rel_posix}",
+            mode,
+            object_id,
+        )
         parent = rel.parent
         while parent != Path("."):
             parent_path = repo_root / parent
@@ -356,7 +446,12 @@ def _git_tracked_members(
                 continue
             _assert_confined_source(path, repo_root)
             rel_posix = rel.as_posix()
-            members_by_arcname[f"{package_name}/{rel_posix}"] = (path, f"{package_name}/{rel_posix}", zip_mode(path))
+            members_by_arcname[f"{package_name}/{rel_posix}"] = (
+                path,
+                f"{package_name}/{rel_posix}",
+                zip_mode(path),
+                None,
+            )
             parent = rel.parent
             while parent != Path("."):
                 parent_path = repo_root / parent
@@ -366,13 +461,13 @@ def _git_tracked_members(
 
     for arcname in directory_arcnames:
         rel = arcname.removeprefix(f"{package_name}/").rstrip("/")
-        members_by_arcname[arcname] = (repo_root / rel, arcname, 0o40755)
+        members_by_arcname[arcname] = (repo_root / rel, arcname, 0o40755, None)
 
     return sorted(members_by_arcname.values(), key=lambda item: item[1])
 
 
-def _walk_members(repo_root: Path, package_name: str) -> list[tuple[Path, str, int]]:
-    members: list[tuple[Path, str, int]] = []
+def _walk_members(repo_root: Path, package_name: str) -> list[ReleaseMember]:
+    members: list[ReleaseMember] = []
     for current_root, dir_names, file_names in os.walk(repo_root, followlinks=False):
         current = Path(current_root)
         rel_current = current.relative_to(repo_root)
@@ -401,7 +496,7 @@ def _walk_members(repo_root: Path, package_name: str) -> list[tuple[Path, str, i
             path = current / dir_name
             if should_include(path, repo_root):
                 rel = path.relative_to(repo_root).as_posix()
-                members.append((path, f"{package_name}/{rel}/", zip_mode(path)))
+                members.append((path, f"{package_name}/{rel}/", zip_mode(path), None))
 
         for file_name in sorted(file_names):
             path = current / file_name
@@ -415,26 +510,91 @@ def _walk_members(repo_root: Path, package_name: str) -> list[tuple[Path, str, i
             if should_include(path, repo_root):
                 _assert_confined_source(path, repo_root)
                 rel = path.relative_to(repo_root).as_posix()
-                members.append((path, f"{package_name}/{rel}", zip_mode(path)))
+                members.append((path, f"{package_name}/{rel}", zip_mode(path), None))
     return sorted(members, key=lambda item: item[1])
+
+
+def _git_blob(repo_root: Path, object_id: str) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "blob", object_id],
+        check=False,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"unable to read Git blob {object_id} for release snapshot")
+    return proc.stdout
+
+
+def _snapshot_members(
+    repo_root: Path,
+    members: list[ReleaseMember],
+    *,
+    use_git_objects: bool,
+) -> list[SnapshotMember]:
+    snapshot: list[SnapshotMember] = []
+    for source, arcname, mode, object_id in members:
+        if arcname.endswith("/"):
+            snapshot.append((arcname, mode, None))
+            continue
+        if use_git_objects:
+            if object_id is None:
+                raise RuntimeError(f"tracked release member has no Git object ID: {arcname}")
+            data = _git_blob(repo_root, object_id)
+        else:
+            if _is_link_like(source):
+                raise RuntimeError(
+                    f"refusing to package symlink, junction, or reparse point: {source}"
+                )
+            data = source.read_bytes()
+        snapshot.append((arcname, mode, data))
+    return snapshot
+
+
+def _assert_clean_source_unchanged(repo_root: Path, expected_commit: str) -> None:
+    if _git_output(repo_root, ["rev-parse", "HEAD"]) != expected_commit:
+        raise RuntimeError(
+            "Git HEAD changed during release archive preparation; refusing to build a mixed-snapshot release archive"
+        )
+    clean = _git_worktree_is_clean(repo_root)
+    if clean is None:
+        raise RuntimeError("unable to verify git working-tree cleanliness during release archive preparation")
+    if clean is False:
+        raise RuntimeError(
+            "git working tree changed during release archive preparation; "
+            "refusing to build a mixed-snapshot release archive"
+        )
 
 
 def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean: bool = True) -> dict[str, object]:
     if _is_link_like(repo_root):
         raise RuntimeError(f"refusing to package a linked repository root: {repo_root}")
+    configured_version = project_version(repo_root)
+    if version != configured_version:
+        raise ValueError(
+            f"release version {version!r} does not match pyproject.toml version {configured_version!r}"
+        )
     package_name = f"epic-continuum-{version}"
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"{package_name}.zip"
     checksum_path = zip_path.with_suffix(zip_path.suffix + ".sha256")
     source = "git+working-tree" if not require_clean else "git"
+    git_commit = _git_output(repo_root, ["rev-parse", "HEAD"])
+    source_date_epoch = _release_source_date_epoch(repo_root, git_commit)
     if require_clean:
         clean = _git_worktree_is_clean(repo_root)
+        if clean is None:
+            raise RuntimeError(
+                "unable to verify a Git worktree for a clean release archive; "
+                "use --allow-dirty only for a development archive"
+            )
         if clean is False:
             raise RuntimeError(
                 "refusing to build a git-sourced release archive from tracked working-tree changes "
                 "or non-ignored untracked files; commit, add, or stash changes first, or pass "
                 "--allow-dirty for a development archive"
             )
+        if not git_commit:
+            raise RuntimeError("unable to resolve Git HEAD for a clean release archive")
     members = _git_tracked_members(
         repo_root,
         package_name,
@@ -442,39 +602,81 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         include_untracked=not require_clean,
     )
     if members is None:
+        if require_clean:
+            raise RuntimeError("unable to enumerate Git-tracked files for a clean release archive")
         source = "walk"
         members = _walk_members(repo_root, package_name)
-    elif require_clean:
-        clean = _git_worktree_is_clean(repo_root)
-        if clean is None:
-            raise RuntimeError("unable to verify git working-tree cleanliness before release archive build")
+    snapshot = _snapshot_members(repo_root, members, use_git_objects=require_clean)
+    if require_clean:
+        assert git_commit is not None
+        _assert_clean_source_unchanged(repo_root, git_commit)
+        status_short: list[str] | None = []
+    else:
+        status_short = _git_status_short(repo_root)
     provenance = _provenance_payload(
-        repo_root,
         package_name,
         version,
         source,
-        members,
+        snapshot,
         require_clean=require_clean,
+        git_commit=git_commit,
+        status_short=status_short,
+        source_date_epoch=source_date_epoch,
     )
     provenance_arcname = f"{package_name}/RELEASE_PROVENANCE.json"
     package_provenance_arcname = f"{package_name}/src/continuum/assets/RELEASE_PROVENANCE.json"
+    _assert_unique_arcnames(
+        [
+            f"{package_name}/",
+            *(arcname for arcname, _, _ in snapshot),
+            provenance_arcname,
+            package_provenance_arcname,
+        ]
+    )
 
     if zip_path.exists():
         zip_path.unlink()
     if checksum_path.exists():
         checksum_path.unlink()
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        root_info = zipfile.ZipInfo(f"{package_name}/", reproducible_zip_dt())
-        root_info.create_system = 3
-        root_info.external_attr = 0o40755 << 16
-        root_info.compress_type = zipfile.ZIP_STORED
-        zf.writestr(root_info, b"")
-        for member_source, arcname, mode in members:
-            write_member(zf, member_source, arcname, mode=mode)
-        provenance_bytes = _stable_json_bytes(provenance)
-        write_bytes_member(zf, provenance_arcname, provenance_bytes)
-        write_bytes_member(zf, package_provenance_arcname, provenance_bytes)
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            root_info = zipfile.ZipInfo(
+                f"{package_name}/",
+                reproducible_zip_dt(source_date_epoch),
+            )
+            root_info.create_system = 3
+            root_info.external_attr = 0o40755 << 16
+            root_info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(root_info, b"")
+            for arcname, mode, data in snapshot:
+                write_member(
+                    zf,
+                    arcname,
+                    data,
+                    mode=mode,
+                    source_date_epoch=source_date_epoch,
+                )
+            provenance_bytes = _stable_json_bytes(provenance)
+            write_bytes_member(
+                zf,
+                provenance_arcname,
+                provenance_bytes,
+                source_date_epoch=source_date_epoch,
+            )
+            write_bytes_member(
+                zf,
+                package_provenance_arcname,
+                provenance_bytes,
+                source_date_epoch=source_date_epoch,
+            )
+        if require_clean:
+            assert git_commit is not None
+            _assert_clean_source_unchanged(repo_root, git_commit)
+    except Exception:
+        if zip_path.exists():
+            zip_path.unlink()
+        raise
 
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     checksum_path.write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8", newline="\n")
@@ -482,7 +684,7 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
         "package": str(zip_path),
         "sha256": digest,
         "checksum": str(checksum_path),
-        "members": len(members) + 3,
+        "members": len(snapshot) + 3,
         "source": source,
     }
 
@@ -491,7 +693,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build the Epic Continuum public release ZIP.")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--version", default=None)
+    parser.add_argument("--version", default=None, help="Release version; must match pyproject.toml exactly.")
     parser.add_argument(
         "--allow-dirty",
         action="store_true",

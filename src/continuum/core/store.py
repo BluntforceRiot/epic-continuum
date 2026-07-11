@@ -12,7 +12,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
@@ -6610,6 +6610,280 @@ def record_project_state(
         conn.close()
 
 
+class ResumeCheckpointChangedError(RuntimeError):
+    """Raised when the exact latest resume selection changes after discovery."""
+
+
+class ResumePacketBudgetError(ValueError):
+    """Raised when even the compact recovery envelope cannot fit."""
+
+    def __init__(self, *, token_budget: int, minimum_tokens: int) -> None:
+        self.token_budget = int(token_budget)
+        self.minimum_tokens = int(minimum_tokens)
+        super().__init__(
+            "resume packet token budget is too small for a structurally complete "
+            f"recovery envelope: {self.token_budget} < {self.minimum_tokens}"
+        )
+
+
+def _discover_resume_state(
+    conn: sqlite3.Connection,
+    *,
+    requested_session: str,
+    requested_project: str,
+) -> dict[str, Any]:
+    """Select one latest resumable row under a stable catalog snapshot."""
+
+    scoped_resume = bool(requested_session or requested_project)
+    card_params: list[Any] = []
+    card_clauses = [
+        "card_type = 'project_state'",
+        "coalesce(session_id, '') != ''",
+        "(visibility_scope = 'session' OR "
+        "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+    ]
+    if requested_session:
+        card_clauses.append("session_id = ?")
+        card_params.append(requested_session)
+    if requested_project:
+        card_clauses.append("project_id = ?")
+        card_params.append(requested_project)
+    state_row = conn.execute(
+        f"""
+        SELECT session_id, project_id, created_at AS checkpoint_at, id
+        FROM cards
+        WHERE {' AND '.join([*card_clauses, _current_card_authority_clause('cards')])}
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        tuple(card_params),
+    ).fetchone()
+    stale_state_exists = False
+    discovery_source = "project_state_card"
+    if state_row is None:
+        stale_state_exists = (
+            conn.execute(
+                f"SELECT 1 FROM cards WHERE {' AND '.join(card_clauses)} LIMIT 1",
+                tuple(card_params),
+            ).fetchone()
+            is not None
+        )
+        if not (stale_state_exists and scoped_resume):
+            event_clauses = [
+                "coalesce(session_id, '') != ''",
+                "(visibility_scope = 'session' OR "
+                "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+            ]
+            event_params: list[Any] = []
+            if requested_session:
+                event_clauses.append("session_id = ?")
+                event_params.append(requested_session)
+            if requested_project:
+                event_clauses.append("project_id = ?")
+                event_params.append(requested_project)
+            if not scoped_resume:
+                event_clauses.append(
+                    f"""
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM cards AS stale_state
+                        WHERE stale_state.card_type = 'project_state'
+                          AND coalesce(stale_state.session_id, '') != ''
+                          AND (
+                                stale_state.visibility_scope = 'session'
+                             OR (
+                                    stale_state.visibility_scope = 'project'
+                                AND coalesce(stale_state.project_id, '') != ''
+                             )
+                          )
+                          AND NOT ({_current_card_authority_clause('stale_state')})
+                          AND (
+                                (
+                                    stale_state.visibility_scope = 'project'
+                                    AND stale_state.project_id = scroll_events.project_id
+                                )
+                             OR (
+                                    stale_state.visibility_scope = 'session'
+                                    AND stale_state.session_id = scroll_events.session_id
+                                )
+                          )
+                    )
+                    """
+                )
+            state_row = conn.execute(
+                f"""
+                SELECT session_id, project_id, created_at AS checkpoint_at, id
+                FROM scroll_events
+                WHERE {' AND '.join(event_clauses)}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                tuple(event_params),
+            ).fetchone()
+            discovery_source = "scroll_event"
+    return {
+        "source": discovery_source,
+        "state": dict(state_row) if state_row is not None else None,
+        "stale_state_exists": stale_state_exists,
+    }
+
+
+def _stabilize_packet_estimate(
+    renderer: Callable[[int], str],
+) -> tuple[str, int]:
+    estimated_tokens = 0
+    packet_text = ""
+    for _ in range(16):
+        packet_text = renderer(estimated_tokens)
+        measured = estimate_tokens(packet_text)
+        if measured == estimated_tokens:
+            return packet_text, measured
+        estimated_tokens = measured
+    packet_text = renderer(estimated_tokens)
+    return packet_text, estimate_tokens(packet_text)
+
+
+def _render_compact_resume_recovery_packet(
+    *,
+    recovery_id: str,
+    session_id: str,
+    project_id: str | None,
+    packet_token_budget: int,
+    packet_estimated_tokens: int,
+) -> str:
+    metadata = {
+        "source": "recovery_metadata",
+        "authority": "non_authoritative_evidence",
+        "recovery_id": recovery_id,
+        "session_id": session_id,
+        "project_id": project_id,
+        "packet_token_budget": packet_token_budget,
+        "packet_estimated_tokens": packet_estimated_tokens,
+        "packet_truncated": True,
+    }
+    return markdown_evidence_block(json_dumps(metadata), language="json") + "\n"
+
+
+def _render_resume_operational_details(
+    details: dict[str, list[Any]],
+    *,
+    token_budget: int,
+) -> tuple[str, bool]:
+    """Fit prioritized actionable recovery details into one valid JSON block."""
+
+    total_count = sum(len(values) for values in details.values())
+    if total_count == 0 or token_budget <= 0:
+        return "", total_count > 0
+    payload: dict[str, Any] = {
+        "source": "operational_recovery_details",
+        "authority": "non_authoritative_evidence",
+    }
+
+    def render(value: dict[str, Any]) -> str:
+        return markdown_evidence_block(json_dumps(value), language="json")
+
+    if estimate_tokens(render(payload)) > token_budget:
+        return "", True
+
+    priority = ("open_tasks", "decisions", "pending_jobs", "recent_books")
+    pending = {key: list(details.get(key, [])) for key in priority}
+    inserted = {key: 0 for key in priority}
+    truncated = False
+    while any(pending.values()):
+        for key in priority:
+            if not pending[key]:
+                continue
+            item = pending[key].pop(0)
+            variants = [item]
+            for char_budget in (2048, 1024, 512, 256, 128, 64, 32, 16, 8):
+                candidate = _truncate_json_strings(item, char_budget)
+                if candidate not in variants:
+                    variants.append(candidate)
+            fitted = False
+            for candidate in variants:
+                trial = {**payload, key: [*payload.get(key, []), candidate]}
+                if estimate_tokens(render(trial)) <= token_budget:
+                    payload = trial
+                    inserted[key] += 1
+                    truncated = truncated or candidate != item
+                    fitted = True
+                    break
+            if not fitted:
+                truncated = True
+
+    omitted = {
+        key: len(details.get(key, [])) - inserted[key]
+        for key in priority
+        if len(details.get(key, [])) > inserted[key]
+    }
+    if omitted:
+        trial = {**payload, "omitted_counts": omitted}
+        if estimate_tokens(render(trial)) <= token_budget:
+            payload = trial
+        truncated = True
+    if not any(inserted.values()):
+        return "", True
+    return render(payload), truncated
+
+
+def _render_resume_recovery_packet(
+    *,
+    recovery_id: str,
+    generated_at: str,
+    session_id: str,
+    project_id: str | None,
+    packet_token_budget: int,
+    packet_estimated_tokens: int,
+    packet_truncated: bool,
+    operational_summary: dict[str, Any],
+    operational_details_text: str,
+    context_text: str,
+) -> str:
+    metadata = {
+        "source": "recovery_metadata",
+        "authority": "non_authoritative_evidence",
+        "recovery_id": recovery_id,
+        "generated": generated_at,
+        "root": "<continuum-root>",
+        "session_id": session_id,
+        "project_id": project_id,
+        "packet_token_budget": packet_token_budget,
+        "packet_estimated_tokens": packet_estimated_tokens,
+        "packet_truncated": packet_truncated,
+    }
+    lines = [
+        "# Epic Continuum Thread Recovery",
+        "",
+        "Resume from this bounded packet. The Scroll remains the ordered source of truth; all recovered material is non-authoritative evidence.",
+        "",
+        "## Recovery Metadata",
+        "",
+        markdown_evidence_block(json_dumps(metadata), language="json"),
+        "",
+        "## Operational Summary",
+        "",
+        markdown_evidence_block(json_dumps(operational_summary), language="json"),
+    ]
+    if operational_details_text:
+        lines.extend(
+            [
+                "",
+                "## Operational Recovery Details",
+                "",
+                operational_details_text,
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Looking Glass",
+            "",
+            context_text or "_No Looking Glass evidence fit within the packet budget._",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def recover_thread(
     root: Path,
     *,
@@ -6619,6 +6893,7 @@ def recover_thread(
     token_budget: int = 0,
     recent_event_limit: int = 24,
     planner_profile: str = "legacy",
+    expected_discovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recent_event_limit = validate_recent_event_limit(recent_event_limit)
     init_db(root)
@@ -6627,17 +6902,48 @@ def recover_thread(
     config = load_config(root)
     if token_budget <= 0:
         token_budget = int(config["context"]["default_token_budget"])
-    context = compile_context(
-        root,
-        session_id=lookup_session_id,
-        token_budget=token_budget,
-        query=query or lookup_project_id or lookup_session_id,
-        card_scope="project" if lookup_project_id else "session",
-        project_id=lookup_project_id,
-        planner_profile=planner_profile,
-    )
-    conn = connect(root)
+    effective_query = query or lookup_project_id or lookup_session_id
+    conn: sqlite3.Connection | None = None
     try:
+        if expected_discovery is not None:
+            conn = connect(root)
+            conn.execute("BEGIN IMMEDIATE")
+            revalidated = _discover_resume_state(
+                conn,
+                requested_session=str(
+                    expected_discovery.get("requested_session_id") or ""
+                ),
+                requested_project=str(
+                    expected_discovery.get("requested_project_id") or ""
+                ),
+            )
+            checkpoint = revalidated.get("state")
+            if (
+                checkpoint is None
+                or str(revalidated.get("source") or "")
+                != str(expected_discovery.get("source") or "")
+                or str(checkpoint.get("id") or "")
+                != str(expected_discovery.get("checkpoint_id") or "")
+                or str(checkpoint["session_id"] or "") != lookup_session_id
+                or str(checkpoint["project_id"] or "") != str(lookup_project_id or "")
+            ):
+                raise ResumeCheckpointChangedError(
+                    "resume checkpoint changed after discovery: "
+                    f"{expected_discovery.get('checkpoint_id')}"
+                )
+
+        context = compile_context(
+            root,
+            session_id=lookup_session_id,
+            token_budget=token_budget,
+            query=effective_query,
+            create=expected_discovery is None,
+            card_scope="project" if lookup_project_id else "session",
+            project_id=lookup_project_id,
+            planner_profile=planner_profile,
+        )
+        if conn is None:
+            conn = connect(root)
         metadata_needle = f'"session_id":"{lookup_session_id}"'
         recent_events = [
             dict(row)
@@ -6673,6 +6979,34 @@ def recover_thread(
                 (*visible_card_params, *card_match_params),
             )
         ]
+        if (
+            expected_discovery is not None
+            and expected_discovery.get("source") == "project_state_card"
+        ):
+            checkpoint_id = str(expected_discovery.get("checkpoint_id") or "")
+            checkpoint_card = conn.execute(
+                f"""
+                SELECT id, card_type, title, summary, location_uri,
+                       decisions_json, open_tasks_json, source_refs_json, updated_at
+                FROM cards
+                WHERE id = ?
+                  AND {_current_card_authority_clause()}
+                  AND {visible_card_clause}
+                """,
+                (checkpoint_id, *visible_card_params),
+            ).fetchone()
+            if checkpoint_card is None:
+                raise ResumeCheckpointChangedError(
+                    f"resume checkpoint disappeared during recovery: {checkpoint_id}"
+                )
+            cards = [
+                dict(checkpoint_card),
+                *[
+                    card
+                    for card in cards
+                    if str(card["id"]) != checkpoint_id
+                ][:11],
+            ]
         decisions: list[str] = []
         open_tasks: list[str] = []
         for card in cards:
@@ -6711,6 +7045,7 @@ def recover_thread(
 
         now = utc_now()
         recovery_id = unique_id("recovery")
+        render_legacy_details = planner_profile != "resume"
         lines = [
             "# Epic Continuum Thread Recovery",
             "",
@@ -6742,14 +7077,18 @@ def recover_thread(
                 {
                     "source": "looking_glass_context",
                     "authority": "non_authoritative_evidence",
-                    "context_text": context["context_text"] or "No context compiled.",
+                    "context_text": (
+                        context["context_text"]
+                        if render_legacy_details and context["context_text"]
+                        else "No context compiled."
+                    ),
                 }
             ),
             "",
             "## Recent Scroll",
             "",
         ]
-        if recent_events:
+        if render_legacy_details and recent_events:
             lines.append(
                 markdown_json_evidence(
                     [
@@ -6768,7 +7107,7 @@ def recover_thread(
         else:
             lines.append("_No Scroll events found for this session._")
         lines.extend(["", "## Recalled Cards", ""])
-        if cards:
+        if render_legacy_details and cards:
             lines.append(
                 markdown_json_evidence(
                     [
@@ -6788,17 +7127,17 @@ def recover_thread(
         else:
             lines.append("_No Cards matched this session yet._")
         lines.extend(["", "## Decisions", ""])
-        if decisions:
+        if render_legacy_details and decisions:
             lines.append(markdown_json_evidence([{"decision": item, "authority": "non_authoritative_evidence"} for item in decisions]))
         else:
             lines.append("_No explicit decisions listed._")
         lines.extend(["", "## Open Tasks", ""])
-        if open_tasks:
+        if render_legacy_details and open_tasks:
             lines.append(markdown_json_evidence([{"task": item, "authority": "non_authoritative_evidence"} for item in open_tasks]))
         else:
             lines.append("_No explicit open tasks listed._")
         lines.extend(["", "## Pending Jobs", ""])
-        if pending_jobs:
+        if render_legacy_details and pending_jobs:
             lines.append(
                 markdown_json_evidence(
                     [
@@ -6817,7 +7156,7 @@ def recover_thread(
         else:
             lines.append("_No pending jobs._")
         lines.extend(["", "## Recent Books", ""])
-        if recent_books:
+        if render_legacy_details and recent_books:
             lines.append(
                 markdown_json_evidence(
                     [
@@ -6836,7 +7175,237 @@ def recover_thread(
         else:
             lines.append("_No active books found._")
         packet_text = "\n".join(lines).rstrip() + "\n"
+        packet_token_budget: int | None = None
+        packet_truncated = False
+        packet_estimated_tokens = estimate_tokens(packet_text)
+        if planner_profile == "resume":
+            packet_token_budget = max(0, int(token_budget))
+            operational_summary = {
+                "recent_event_count": len(recent_events),
+                "card_count": len(cards),
+                "decision_count": len(decisions),
+                "open_task_count": len(open_tasks),
+                "pending_job_count": len(pending_jobs),
+                "book_count": len(recent_books),
+            }
+            unique_open_tasks = list(
+                dict.fromkeys(str(item) for item in open_tasks if str(item).strip())
+            )
+            unique_decisions = list(
+                dict.fromkeys(str(item) for item in decisions if str(item).strip())
+            )
+            detail_source_truncated = (
+                len(unique_open_tasks) > 100 or len(unique_decisions) > 100
+            )
+            operational_details: dict[str, list[Any]] = {
+                "open_tasks": unique_open_tasks[:100],
+                "decisions": unique_decisions[:100],
+                "pending_jobs": [
+                    {
+                        "role": job["role"],
+                        "job_type": job["job_type"],
+                        "priority": job["priority"],
+                        "related_card_ids": json_loads(
+                            job.get("related_card_ids_json"), []
+                        ),
+                        "payload": redact_value_secrets(
+                            json_loads(job.get("payload_json"), {})
+                        ),
+                        "created_at": job["created_at"],
+                    }
+                    for job in pending_jobs
+                ],
+                "recent_books": [
+                    {
+                        "id": book["id"],
+                        "title": book["title"],
+                        "storage_tier": book["storage_tier"],
+                        "reader_uri": book["reader_uri"],
+                        "updated_at": book["updated_at"],
+                    }
+                    for book in recent_books
+                ],
+            }
+            base_packet, base_packet_tokens = _stabilize_packet_estimate(
+                lambda estimated: _render_resume_recovery_packet(
+                    recovery_id=recovery_id,
+                    generated_at=now,
+                    session_id=lookup_session_id,
+                    project_id=lookup_project_id,
+                    packet_token_budget=packet_token_budget,
+                    packet_estimated_tokens=estimated,
+                    packet_truncated=True,
+                    operational_summary=operational_summary,
+                    operational_details_text="",
+                    context_text="",
+                )
+            )
+            original_context_text = str(context.get("context_text") or "")
+            operational_details_text = ""
+            details_truncated = detail_source_truncated or any(
+                operational_details.values()
+            )
+            if base_packet_tokens <= packet_token_budget:
+                available_budget = max(
+                    0,
+                    packet_token_budget - base_packet_tokens - 8,
+                )
+                details_header_tokens = estimate_tokens(
+                    "\n\n## Operational Recovery Details\n\n"
+                )
+                has_details = any(operational_details.values())
+                if has_details:
+                    details_budget = max(
+                        0,
+                        (
+                            available_budget
+                            if not original_context_text
+                            else available_budget // 2
+                        )
+                        - details_header_tokens,
+                    )
+                    operational_details_text, rendered_details_truncated = (
+                        _render_resume_operational_details(
+                            operational_details,
+                            token_budget=details_budget,
+                        )
+                    )
+                    details_truncated = (
+                        detail_source_truncated or rendered_details_truncated
+                    )
+                details_section_tokens = (
+                    details_header_tokens
+                    + estimate_tokens(operational_details_text)
+                    if operational_details_text
+                    else 0
+                )
+                context_budget = max(
+                    0,
+                    available_budget - details_section_tokens,
+                )
+            else:
+                context_budget = 0
 
+            if base_packet_tokens <= packet_token_budget and estimate_tokens(
+                original_context_text
+            ) > context_budget:
+                if context_budget > 0:
+                    context = compile_context(
+                        root,
+                        session_id=lookup_session_id,
+                        token_budget=context_budget,
+                        query=effective_query,
+                        create=False,
+                        card_scope="project" if lookup_project_id else "session",
+                        project_id=lookup_project_id,
+                        planner_profile="resume",
+                    )
+                else:
+                    context = {
+                        **context,
+                        "token_budget": 0,
+                        "usable_context_budget": 0,
+                        "estimated_tokens": 0,
+                        "remaining_budget": 0,
+                        "section_count": 0,
+                        "sections": [],
+                        "planner_trace": [],
+                        "truncated": bool(original_context_text),
+                        "context_text": "",
+                    }
+            packet_truncated = details_truncated or bool(context.get("truncated")) or (
+                str(context.get("context_text") or "") != original_context_text
+            )
+
+            if base_packet_tokens <= packet_token_budget:
+                packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
+                    lambda estimated: _render_resume_recovery_packet(
+                        recovery_id=recovery_id,
+                        generated_at=now,
+                        session_id=lookup_session_id,
+                        project_id=lookup_project_id,
+                        packet_token_budget=packet_token_budget,
+                        packet_estimated_tokens=estimated,
+                        packet_truncated=packet_truncated,
+                        operational_summary=operational_summary,
+                        operational_details_text=operational_details_text,
+                        context_text=str(context.get("context_text") or ""),
+                    )
+                )
+            else:
+                packet_text = base_packet
+                packet_estimated_tokens = base_packet_tokens
+
+            if packet_estimated_tokens > packet_token_budget:
+                packet_truncated = True
+                context = {
+                    **context,
+                    "token_budget": 0,
+                    "usable_context_budget": 0,
+                    "estimated_tokens": 0,
+                    "remaining_budget": 0,
+                    "section_count": 0,
+                    "sections": [],
+                    "planner_trace": [],
+                    "truncated": bool(original_context_text),
+                    "context_text": "",
+                }
+                details_budget = max(
+                    0,
+                    packet_token_budget
+                    - base_packet_tokens
+                    - estimate_tokens("\n\n## Operational Recovery Details\n\n")
+                    - 8,
+                )
+                operational_details_text, _details_were_truncated = (
+                    _render_resume_operational_details(
+                        operational_details,
+                        token_budget=details_budget,
+                    )
+                )
+                packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
+                    lambda estimated: _render_resume_recovery_packet(
+                        recovery_id=recovery_id,
+                        generated_at=now,
+                        session_id=lookup_session_id,
+                        project_id=lookup_project_id,
+                        packet_token_budget=packet_token_budget,
+                        packet_estimated_tokens=estimated,
+                        packet_truncated=True,
+                        operational_summary=operational_summary,
+                        operational_details_text=operational_details_text,
+                        context_text="",
+                    )
+                )
+
+            if packet_estimated_tokens > packet_token_budget:
+                operational_details_text = ""
+                context = {
+                    **context,
+                    "token_budget": 0,
+                    "usable_context_budget": 0,
+                    "estimated_tokens": 0,
+                    "remaining_budget": 0,
+                    "section_count": 0,
+                    "sections": [],
+                    "planner_trace": [],
+                    "truncated": True,
+                    "context_text": "",
+                }
+                packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
+                    lambda estimated: _render_compact_resume_recovery_packet(
+                        recovery_id=recovery_id,
+                        session_id=lookup_session_id,
+                        project_id=lookup_project_id,
+                        packet_token_budget=packet_token_budget,
+                        packet_estimated_tokens=estimated,
+                    )
+                )
+                if packet_estimated_tokens > packet_token_budget:
+                    raise ResumePacketBudgetError(
+                        token_budget=packet_token_budget,
+                        minimum_tokens=packet_estimated_tokens,
+                    )
         safe_session = safe_external_name(lookup_session_id, limit=80)
         packet_path = root / "exports" / "thread_recovery" / f"{safe_session}_{recovery_id}.md"
         secure_mkdir(packet_path.parent)
@@ -6857,6 +7426,9 @@ def recover_thread(
             "project_id_redacted": lookup_project_id != project_id,
             "packet_uri": str(packet_path),
             "packet_hash": content_hash(packet_text),
+            "packet_estimated_tokens": packet_estimated_tokens,
+            "packet_token_budget": packet_token_budget,
+            "packet_truncated": packet_truncated,
             "context": context,
             "recent_event_count": len(recent_events),
             "card_count": len(cards),
@@ -6864,8 +7436,13 @@ def recover_thread(
             "book_count": len(recent_books),
             "packet_text": packet_text,
         }
+    except Exception:
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def resume_latest(
@@ -6924,7 +7501,7 @@ def resume_latest(
     requested_project = str(
         canonical_partition_identifier(root, "project_id", project_id if supplied_project else None, lookup=True) or ""
     )
-    safe_context_ceiling = max(256, int(personal_profile.get("safe_context_ceiling", 32768)))
+    safe_context_ceiling = int(personal_profile.get("safe_context_ceiling", 32768))
     requested_token_budget = int(token_budget)
     effective_token_budget = min(
         requested_token_budget if requested_token_budget > 0 else int(config["context"]["default_token_budget"]),
@@ -6932,104 +7509,77 @@ def resume_latest(
     )
     conn = connect_existing(root)
     try:
-        card_params: list[Any] = []
-        card_clauses = [
-            "card_type = 'project_state'",
-            "coalesce(session_id, '') != ''",
-            "(visibility_scope = 'session' OR "
-            "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
-        ]
-        if requested_session:
-            card_clauses.append("session_id = ?")
-            card_params.append(requested_session)
-        if requested_project:
-            card_clauses.append("project_id = ?")
-            card_params.append(requested_project)
-        current_card_clauses = [
-            *card_clauses,
-            _current_card_authority_clause("cards"),
-        ]
-        state_row = conn.execute(
-            f"""
-            SELECT session_id, project_id, created_at AS checkpoint_at, id
-            FROM cards
-            WHERE {' AND '.join(current_card_clauses)}
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT 1
-            """,
-            tuple(card_params),
-        ).fetchone()
-        discovery_source = "project_state_card"
-        if state_row is None:
-            stale_state_exists = conn.execute(
-                f"SELECT 1 FROM cards WHERE {' AND '.join(card_clauses)} LIMIT 1",
-                tuple(card_params),
-            ).fetchone()
-            if stale_state_exists is not None:
-                return {
-                    "ok": False,
-                    "initialized": True,
-                    "root": str(root),
-                    "reason": "no_current_project_state",
-                    "resume_mode": resume_mode,
-                    "session_id": requested_session or None,
-                    "project_id": requested_project or None,
-                }
-            event_clauses = [
-                "coalesce(session_id, '') != ''",
-                "(visibility_scope = 'session' OR "
-                "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
-            ]
-            event_params: list[Any] = []
-            if requested_session:
-                event_clauses.append("session_id = ?")
-                event_params.append(requested_session)
-            if requested_project:
-                event_clauses.append("project_id = ?")
-                event_params.append(requested_project)
-            state_row = conn.execute(
-                f"""
-                SELECT session_id, project_id, created_at AS checkpoint_at, id
-                FROM scroll_events
-                WHERE {' AND '.join(event_clauses)}
-                ORDER BY created_at DESC, rowid DESC
-                LIMIT 1
-                """,
-                tuple(event_params),
-            ).fetchone()
-            discovery_source = "scroll_event"
+        conn.execute("BEGIN")
+        selected = _discover_resume_state(
+            conn,
+            requested_session=requested_session,
+            requested_project=requested_project,
+        )
+        state_row = selected.get("state")
         if state_row is None:
             return {
                 "ok": False,
                 "initialized": True,
                 "root": str(root),
-                "reason": "no_resume_state",
+                "reason": (
+                    "no_current_project_state"
+                    if selected.get("stale_state_exists")
+                    else "no_resume_state"
+                ),
+                "resume_mode": resume_mode,
                 "session_id": requested_session or None,
                 "project_id": requested_project or None,
             }
         discovered_session = str(state_row["session_id"] or requested_session)
         discovered_project = str(state_row["project_id"] or requested_project) or None
         discovery = {
-            "source": discovery_source,
+            "source": selected["source"],
             "session_id": discovered_session,
             "project_id": discovered_project,
             "checkpoint_at": state_row["checkpoint_at"],
             "updated_at": state_row["checkpoint_at"],
             "requested_session_id": requested_session or None,
             "requested_project_id": requested_project or None,
+            "checkpoint_id": str(state_row["id"]),
         }
     finally:
         conn.close()
 
-    result = recover_thread(
-        root,
-        session_id=discovered_session,
-        project_id=discovered_project,
-        query=query or discovered_project or discovered_session,
-        token_budget=effective_token_budget,
-        recent_event_limit=recent_event_limit,
-        planner_profile="resume",
-    )
+    try:
+        result = recover_thread(
+            root,
+            session_id=discovered_session,
+            project_id=discovered_project,
+            query=query or discovered_project or discovered_session,
+            token_budget=effective_token_budget,
+            recent_event_limit=recent_event_limit,
+            planner_profile="resume",
+            expected_discovery=discovery,
+        )
+    except ResumeCheckpointChangedError:
+        return {
+            "ok": False,
+            "initialized": True,
+            "root": str(root),
+            "reason": "checkpoint_changed_during_resume",
+            "resume_mode": resume_mode,
+            "session_id": discovered_session,
+            "project_id": discovered_project,
+            "discovery": discovery,
+        }
+    except ResumePacketBudgetError as exc:
+        return {
+            "ok": False,
+            "initialized": True,
+            "root": str(root),
+            "reason": "packet_budget_too_small",
+            "resume_mode": resume_mode,
+            "session_id": discovered_session,
+            "project_id": discovered_project,
+            "packet_token_budget": exc.token_budget,
+            "minimum_packet_tokens": exc.minimum_tokens,
+            "discovery": discovery,
+        }
     result["ok"] = True
     result["resume_profile"] = resume_mode
     result["discovery"] = discovery

@@ -14,8 +14,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import (
-    YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS,
+    MIN_YARN_USABLE_CONTEXT_TOKENS,
     load_config,
+    merge_user_config,
     validate_inference_base_url,
     validate_inference_model_identifier,
     validate_yarn_token_budgets,
@@ -32,6 +33,18 @@ DEFAULT_YARN_BASE_URL = "http://127.0.0.1:8080/v1"
 MAX_HTTP_RESPONSE_BYTES = 128 * 1024
 MAX_HTTP_REQUEST_BYTES = 256 * 1024
 MAX_JSON_NESTING = 64
+MAX_YARN_EVIDENCE_IDS = 100
+YARN_INPUT_TRUNCATION_NOTICE = (
+    "\n\n[Continuum Yarn input truncated to fit serialized request limits.]"
+)
+
+
+def _estimate_tokens(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def _serialize_request_payload(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
 
 
 class LocalModelError(RuntimeError):
@@ -44,11 +57,11 @@ _CIRCUIT_LOCK = threading.Lock()
 _INFERENCE_GATE = threading.BoundedSemaphore(1)
 
 
-def _settings(root: Path) -> dict[str, Any]:
-    from .config import config_path, deep_merge, default_config, validate_config
+def _configuration(root: Path) -> dict[str, Any]:
+    from .config import config_path, validate_config
 
     path = config_path(root)
-    config = default_config()
+    user_config: dict[str, Any] = {}
     if path.exists():
         try:
             user_config = json.loads(path.read_text(encoding="utf-8"))
@@ -58,8 +71,13 @@ def _settings(root: Path) -> dict[str, Any]:
             ) from exc
         if not isinstance(user_config, dict):
             raise LocalModelError("Continuum configuration must be a JSON object")
-        config = deep_merge(config, user_config)
+    config = merge_user_config(user_config)
     validate_config(config)
+    return config
+
+
+def _settings(root: Path) -> dict[str, Any]:
+    config = _configuration(root)
     return dict(config.get("local_inference", {}))
 
 
@@ -116,53 +134,142 @@ def _pseudonymous_outbound_id(request_id: str, kind: str, value: str) -> str:
     return f"{kind}_{digest[:24]}"
 
 
+def _integral_timeout(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("local_inference.timeout_seconds must be an integer")
+    if isinstance(value, int):
+        timeout = value
+    elif isinstance(value, float) and value.is_integer():
+        timeout = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        digits = text[1:] if text.startswith(("+", "-")) else text
+        if not digits.isdigit():
+            raise ValueError("local_inference.timeout_seconds must be an integer")
+        timeout = int(text)
+    else:
+        raise ValueError("local_inference.timeout_seconds must be an integer")
+    if timeout < 1 or timeout > 3600:
+        raise ValueError("local_inference.timeout_seconds must be between 1 and 3600")
+    return timeout
+
+
+def resolve_yarn_configuration(
+    root: Path,
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+    max_input_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    timeout_seconds: int | None = None,
+    allow_remote_endpoint: bool | None = None,
+) -> dict[str, Any]:
+    """Resolve optional Yarn overrides without creating or changing a root."""
+    settings = _settings(root)
+    if allow_remote_endpoint is not None and not isinstance(allow_remote_endpoint, bool):
+        raise ValueError("local_inference.allow_remote_endpoint must be true or false")
+    resolved_remote = (
+        bool(settings.get("allow_remote_endpoint", False))
+        if allow_remote_endpoint is None
+        else allow_remote_endpoint
+    )
+    resolved_base_url = validate_inference_base_url(
+        settings.get("base_url", DEFAULT_YARN_BASE_URL) if base_url is None else base_url,
+        allow_remote=resolved_remote,
+    )
+    resolved_model = validate_inference_model_identifier(
+        settings.get("model", DEFAULT_YARN_MODEL) if model is None else model
+    )
+    if scan_text_for_secrets(resolved_model, max_findings=1):
+        raise ValueError("Yarn model alias must not contain secret-like text")
+    resolved_input, resolved_output = validate_yarn_token_budgets(
+        settings.get("max_input_tokens", 16384) if max_input_tokens is None else max_input_tokens,
+        settings.get("max_output_tokens", 768) if max_output_tokens is None else max_output_tokens,
+    )
+    resolved_timeout = _integral_timeout(
+        settings.get("timeout_seconds", 90) if timeout_seconds is None else timeout_seconds
+    )
+    return {
+        "base_url": resolved_base_url,
+        "model": resolved_model,
+        "max_input_tokens": resolved_input,
+        "max_output_tokens": resolved_output,
+        "timeout_seconds": resolved_timeout,
+        "allow_remote_endpoint": resolved_remote,
+    }
+
+
 def configure_yarn(
     root: Path,
     *,
     enabled: bool,
-    base_url: str = DEFAULT_YARN_BASE_URL,
-    model: str = DEFAULT_YARN_MODEL,
-    max_input_tokens: int = 16384,
-    max_output_tokens: int = 768,
-    timeout_seconds: int = 90,
-    allow_remote_endpoint: bool = False,
-    assist_on_resume: bool = True,
+    base_url: str | None = None,
+    model: str | None = None,
+    max_input_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    timeout_seconds: int | None = None,
+    allow_remote_endpoint: bool | None = None,
+    assist_on_resume: bool | None = None,
 ) -> dict[str, Any]:
-    validated_base_url = validate_inference_base_url(
-        base_url, allow_remote=allow_remote_endpoint
+    configuration_changed = any(
+        value is not None
+        for value in (
+            base_url,
+            model,
+            max_input_tokens,
+            max_output_tokens,
+            timeout_seconds,
+            allow_remote_endpoint,
+        )
     )
-    model = validate_inference_model_identifier(model)
-    if scan_text_for_secrets(model, max_findings=1):
-        raise ValueError("Yarn model alias must not contain secret-like text")
-    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
-        max_input_tokens,
-        max_output_tokens,
+    resolved = resolve_yarn_configuration(
+        root,
+        base_url=base_url,
+        model=model,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        timeout_seconds=timeout_seconds,
+        allow_remote_endpoint=allow_remote_endpoint,
     )
+    preview = _configuration(root)
+    context_maximum = int(
+        dict(preview.get("context", {})).get("max_token_budget", resolved["max_input_tokens"])
+    )
+    prospective_settings = {
+        **dict(preview.get("local_inference", {})),
+        **resolved,
+        "enabled": bool(enabled),
+        "profile": "yarn-qwythos-v3",
+        "provider": "openai_compatible",
+    }
+    if not enabled and not configuration_changed:
+        safe_context_ceiling = int(
+            dict(preview.get("personal_profile", {})).get("safe_context_ceiling", context_maximum)
+        )
+    else:
+        safe_context_ceiling = _automatic_safe_context_ceiling(
+            prospective_settings,
+            context_maximum=context_maximum,
+        )
+        if safe_context_ceiling < MIN_YARN_USABLE_CONTEXT_TOKENS:
+            raise ValueError(
+                "local_inference token and transport budgets must leave at least "
+                f"{MIN_YARN_USABLE_CONTEXT_TOKENS} usable context tokens after "
+                "serialized Yarn request overhead"
+            )
     config = load_config(root)
     config["local_inference"] = {
         **dict(config.get("local_inference", {})),
         "enabled": bool(enabled),
         "profile": "yarn-qwythos-v3",
         "provider": "openai_compatible",
-        "base_url": validated_base_url,
-        "model": model,
-        "max_input_tokens": max_input_tokens,
-        "max_output_tokens": max_output_tokens,
-        "timeout_seconds": int(timeout_seconds),
-        "allow_remote_endpoint": bool(allow_remote_endpoint),
+        **resolved,
     }
     personal_profile = dict(config.get("personal_profile", {}))
-    personal_profile["assist_on_resume"] = bool(enabled and assist_on_resume)
-    context_maximum = int(
-        dict(config.get("context", {})).get("max_token_budget", max_input_tokens)
+    personal_profile["assist_on_resume"] = bool(
+        enabled and (True if assist_on_resume is None else assist_on_resume)
     )
-    usable_input_tokens = (
-        max_input_tokens - max_output_tokens - YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS
-    )
-    personal_profile["safe_context_ceiling"] = min(
-        usable_input_tokens,
-        context_maximum,
-    )
+    personal_profile["safe_context_ceiling"] = safe_context_ceiling
     config["personal_profile"] = personal_profile
     write_config(root, config)
     return {
@@ -234,9 +341,7 @@ def _http_json(
     data: bytes | None = None
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
     if payload is not None:
-        data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        data = _serialize_request_payload(payload)
         if len(data) > MAX_HTTP_REQUEST_BYTES:
             raise LocalModelError("local model request exceeds the byte safety ceiling")
         headers["Content-Type"] = "application/json"
@@ -646,82 +751,36 @@ def _validate_resume_briefing(
     return result
 
 
-def assist_resume(
-    root: Path,
+def _bounded_evidence_ids(
+    evidence_ids: list[str] | None,
     *,
-    context_text: str,
+    limit: int = MAX_YARN_EVIDENCE_IDS,
+) -> list[str]:
+    bounded_limit = max(0, min(int(limit), MAX_YARN_EVIDENCE_IDS))
+    return list(dict.fromkeys(str(value) for value in (evidence_ids or [])))[
+        :bounded_limit
+    ]
+
+
+def _build_resume_request_payload(
+    settings: dict[str, Any],
+    *,
+    safe_context: str,
     session_id: str,
     project_id: str | None,
-    evidence_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    settings = _settings(root)
-    if not bool(settings.get("enabled", False)):
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "disabled",
-            "fallback": "deterministic",
-        }
-    available, cooldown = _circuit_status(root, settings)
-    if not available:
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "circuit_open",
-            "retry_after_seconds": cooldown,
-            "fallback": "deterministic",
-        }
-    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
-        settings.get("max_input_tokens", 32768),
-        settings.get("max_output_tokens", 768),
-    )
-    usable_input_tokens = (
-        max_input_tokens - max_output_tokens - YARN_BRIEFING_PROTOCOL_RESERVE_TOKENS
-    )
-    estimated_tokens = (len(context_text) + 3) // 4
-    if estimated_tokens > usable_input_tokens:
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "input_budget_exceeded",
-            "estimated_tokens": estimated_tokens,
-            "max_input_tokens": max_input_tokens,
-            "usable_input_tokens": usable_input_tokens,
-            "fallback": "deterministic",
-        }
-    safe_context = _portable_model_text(root, context_text)
-    safe_context = (
-        redact_text_secrets(safe_context)
-        if bool(settings.get("redact_secrets", True))
-        else safe_context
-    )
-    if scan_text_for_secrets(safe_context, max_findings=1):
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "outbound_secret_detected",
-            "fallback": "deterministic",
-        }
-    gate_acquired = _INFERENCE_GATE.acquire(
-        timeout=max(0, int(settings.get("queue_wait_seconds", 2)))
-    )
-    if not gate_acquired:
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "inference_busy",
-            "fallback": "deterministic",
-        }
-    context_sha256 = hashlib.sha256(safe_context.encode("utf-8")).hexdigest()
-    request_id = secrets.token_hex(16)
-    unique_evidence_ids = list(
-        dict.fromkeys(str(value) for value in (evidence_ids or []))
-    )
+    evidence_ids: list[str],
+    request_id: str,
+    context_sha256: str,
+    max_output_tokens: int,
+) -> tuple[dict[str, Any], dict[str, str]]:
     evidence_aliases: dict[str, str] = {}
-    for index, evidence_id in enumerate(unique_evidence_ids, start=1):
+    for index, evidence_id in enumerate(evidence_ids, start=1):
         alias = _pseudonymous_outbound_id(request_id, f"evidence_{index}", evidence_id)
         evidence_aliases[alias] = evidence_id
     outbound_evidence_ids = list(evidence_aliases)
+    citation_items: dict[str, Any] = {"type": "string"}
+    if outbound_evidence_ids:
+        citation_items["enum"] = outbound_evidence_ids
     system_prompt = (
         "You are Yarn, an optional non-authoritative briefing layer for Epic Continuum. "
         "Use only the supplied evidence. Never invent facts, IDs, decisions, or tasks. "
@@ -761,12 +820,9 @@ def assist_resume(
             "model_id": {"type": "string", "const": str(settings["model"])},
             "citations": {
                 "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": outbound_evidence_ids,
-                },
+                "items": citation_items,
                 "uniqueItems": True,
-                "maxItems": 100,
+                "maxItems": len(outbound_evidence_ids),
             },
             "summary": {"type": "string", "maxLength": 4000},
             "decisions": {
@@ -788,31 +844,341 @@ def assist_resume(
         },
         "additionalProperties": False,
     }
-    request_payload = {
-        "model": settings["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
-        ],
-        "temperature": float(settings.get("temperature", 0.6)),
-        "top_p": float(settings.get("top_p", 0.95)),
-        "top_k": int(settings.get("top_k", 20)),
-        "repeat_penalty": float(settings.get("repeat_penalty", 1.05)),
-        "max_tokens": max_output_tokens,
-        "n": 1,
-        "stream": False,
-        "seed": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "parse_tool_calls": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "continuum_resume_briefing",
-                "strict": True,
-                "schema": briefing_schema,
+    return (
+        {
+            "model": settings["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
+            ],
+            "temperature": float(settings.get("temperature", 0.6)),
+            "top_p": float(settings.get("top_p", 0.95)),
+            "top_k": int(settings.get("top_k", 20)),
+            "repeat_penalty": float(settings.get("repeat_penalty", 1.05)),
+            "max_tokens": max_output_tokens,
+            "n": 1,
+            "stream": False,
+            "seed": 0,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "parse_tool_calls": False,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "continuum_resume_briefing",
+                    "strict": True,
+                    "schema": briefing_schema,
+                },
             },
         },
-    }
+        evidence_aliases,
+    )
+
+
+def _request_metrics(payload: dict[str, Any]) -> tuple[int, int]:
+    serialized = _serialize_request_payload(payload)
+    return len(serialized), _estimate_tokens(serialized.decode("ascii"))
+
+
+def _representative_serialized_markdown_context(context_tokens: int) -> str:
+    """Return representative escape-heavy generated Looking Glass evidence."""
+    token_count = max(0, int(context_tokens))
+    if token_count == 0:
+        return ""
+    target_chars = token_count * 4
+    representative_block = (
+        "## recent_scroll\n"
+        "```json\n"
+        '{"authority":"non_authoritative_evidence",'
+        '"content":"Decision: preserve value\\\\with\\\\slashes and '
+        '\\"quoted\\" JSON.",'
+        '"created_at":"2026-07-10T12:34:56+00:00",'
+        '"event_type":"message","project_id":"project","role":"user",'
+        '"seq":1,"session_id":"session","source":"scroll_event",'
+        '"visibility_scope":"project"}\n'
+        "```\n"
+    )
+    repeat_count = (target_chars + len(representative_block) - 1) // len(
+        representative_block
+    )
+    return (representative_block * repeat_count)[:target_chars]
+
+
+def _representative_evidence_ids(count: int) -> list[str]:
+    return [f"evidence-{index}" for index in range(max(0, int(count)))]
+
+
+def _representative_request_fits(
+    settings: dict[str, Any],
+    *,
+    context_tokens: int,
+    evidence_id_count: int,
+    max_input_tokens: int,
+    max_output_tokens: int,
+) -> bool:
+    payload, _aliases = _build_resume_request_payload(
+        settings,
+        safe_context=_representative_serialized_markdown_context(context_tokens),
+        session_id="session",
+        project_id="project",
+        evidence_ids=_representative_evidence_ids(evidence_id_count),
+        request_id="0" * 32,
+        context_sha256="0" * 64,
+        max_output_tokens=max_output_tokens,
+    )
+    request_bytes, estimated_input_tokens = _request_metrics(payload)
+    return (
+        request_bytes <= MAX_HTTP_REQUEST_BYTES
+        and estimated_input_tokens <= max_input_tokens - max_output_tokens
+    )
+
+
+def _automatic_yarn_evidence_id_limit(settings: dict[str, Any]) -> int:
+    """Return the largest alias count that preserves the minimum safe context."""
+    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
+        settings.get("max_input_tokens", 16384),
+        settings.get("max_output_tokens", 768),
+    )
+    low = 0
+    high = MAX_YARN_EVIDENCE_IDS
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if _representative_request_fits(
+            settings,
+            context_tokens=MIN_YARN_USABLE_CONTEXT_TOKENS,
+            evidence_id_count=candidate,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+        ):
+            low = candidate
+        else:
+            high = candidate - 1
+    return low
+
+
+def _automatic_safe_context_ceiling(
+    settings: dict[str, Any],
+    *,
+    context_maximum: int,
+) -> int:
+    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
+        settings.get("max_input_tokens", 16384),
+        settings.get("max_output_tokens", 768),
+    )
+    input_allowance = max_input_tokens - max_output_tokens
+    upper = max(
+        0,
+        min(context_maximum, input_allowance, MAX_HTTP_REQUEST_BYTES // 4),
+    )
+    evidence_id_limit = _automatic_yarn_evidence_id_limit(settings)
+
+    def fits(context_tokens: int) -> bool:
+        return _representative_request_fits(
+            settings,
+            context_tokens=context_tokens,
+            evidence_id_count=evidence_id_limit,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+        )
+
+    low = 0
+    high = upper
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if fits(candidate):
+            low = candidate
+        else:
+            high = candidate - 1
+    return low
+
+
+def assist_resume(
+    root: Path,
+    *,
+    context_text: str,
+    session_id: str,
+    project_id: str | None,
+    evidence_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    config = _configuration(root)
+    settings = dict(config.get("local_inference", {}))
+    safe_context_ceiling = int(
+        dict(config.get("personal_profile", {})).get(
+            "safe_context_ceiling",
+            config["context"]["max_token_budget"],
+        )
+    )
+    if not bool(settings.get("enabled", False)):
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "disabled",
+            "fallback": "deterministic",
+        }
+    available, cooldown = _circuit_status(root, settings)
+    if not available:
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "circuit_open",
+            "retry_after_seconds": cooldown,
+            "fallback": "deterministic",
+        }
+    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
+        settings.get("max_input_tokens", 32768),
+        settings.get("max_output_tokens", 768),
+    )
+    requested_estimated_tokens = _estimate_tokens(str(context_text))
+    safe_context = _portable_model_text(root, context_text)
+    safe_context = (
+        redact_text_secrets(safe_context)
+        if bool(settings.get("redact_secrets", True))
+        else safe_context
+    )
+    if scan_text_for_secrets(safe_context, max_findings=1):
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "outbound_secret_detected",
+            "fallback": "deterministic",
+        }
+    original_safe_context = safe_context
+    original_estimated_tokens = _estimate_tokens(safe_context)
+    unique_evidence_ids = list(dict.fromkeys(str(value) for value in (evidence_ids or [])))
+    evidence_id_limit = _automatic_yarn_evidence_id_limit(settings)
+    bounded_evidence_ids = _bounded_evidence_ids(
+        unique_evidence_ids,
+        limit=evidence_id_limit,
+    )
+    request_id = secrets.token_hex(16)
+    input_token_allowance = max_input_tokens - max_output_tokens
+
+    def prepare_request(
+        candidate_context: str,
+    ) -> tuple[dict[str, Any], dict[str, str], str, int, int]:
+        candidate_hash = hashlib.sha256(candidate_context.encode("utf-8")).hexdigest()
+        candidate_payload, candidate_aliases = _build_resume_request_payload(
+            settings,
+            safe_context=candidate_context,
+            session_id=session_id,
+            project_id=project_id,
+            evidence_ids=bounded_evidence_ids,
+            request_id=request_id,
+            context_sha256=candidate_hash,
+            max_output_tokens=max_output_tokens,
+        )
+        candidate_bytes, candidate_tokens = _request_metrics(candidate_payload)
+        return (
+            candidate_payload,
+            candidate_aliases,
+            candidate_hash,
+            candidate_bytes,
+            candidate_tokens,
+        )
+
+    request_payload, evidence_aliases, context_sha256, request_bytes, estimated_input_tokens = (
+        prepare_request(safe_context)
+    )
+    input_truncated = False
+    input_chars_omitted = 0
+    exceeds_serialized_budget = (
+        estimated_input_tokens > input_token_allowance
+        or request_bytes > MAX_HTTP_REQUEST_BYTES
+    )
+    if (
+        exceeds_serialized_budget
+        and requested_estimated_tokens <= safe_context_ceiling
+        and original_safe_context
+    ):
+        low = 0
+        high = len(original_safe_context) - 1
+        best: tuple[
+            str,
+            int,
+            dict[str, Any],
+            dict[str, str],
+            str,
+            int,
+            int,
+        ] | None = None
+        while low <= high:
+            prefix_length = (low + high) // 2
+            candidate_context = (
+                original_safe_context[:prefix_length]
+                + YARN_INPUT_TRUNCATION_NOTICE
+            )
+            (
+                candidate_payload,
+                candidate_aliases,
+                candidate_hash,
+                candidate_bytes,
+                candidate_tokens,
+            ) = prepare_request(candidate_context)
+            if (
+                candidate_tokens <= input_token_allowance
+                and candidate_bytes <= MAX_HTTP_REQUEST_BYTES
+            ):
+                best = (
+                    candidate_context,
+                    prefix_length,
+                    candidate_payload,
+                    candidate_aliases,
+                    candidate_hash,
+                    candidate_bytes,
+                    candidate_tokens,
+                )
+                low = prefix_length + 1
+            else:
+                high = prefix_length - 1
+        if best is not None:
+            (
+                safe_context,
+                retained_chars,
+                request_payload,
+                evidence_aliases,
+                context_sha256,
+                request_bytes,
+                estimated_input_tokens,
+            ) = best
+            input_truncated = True
+            input_chars_omitted = len(original_safe_context) - retained_chars
+            exceeds_serialized_budget = False
+
+    outbound_evidence_ids = list(evidence_aliases)
+    if requested_estimated_tokens > safe_context_ceiling or exceeds_serialized_budget:
+        if request_bytes > MAX_HTTP_REQUEST_BYTES:
+            detail = "serialized_request_byte_budget_exceeded"
+        elif estimated_input_tokens > input_token_allowance:
+            detail = "serialized_input_token_budget_exceeded"
+        else:
+            detail = "configured_safe_context_ceiling_exceeded"
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "input_budget_exceeded",
+            "detail": detail,
+            "estimated_tokens": original_estimated_tokens,
+            "estimated_input_tokens": estimated_input_tokens,
+            "safe_context_ceiling": safe_context_ceiling,
+            "max_input_tokens": max_input_tokens,
+            "max_output_tokens": max_output_tokens,
+            "usable_input_tokens": input_token_allowance,
+            "request_bytes": request_bytes,
+            "max_request_bytes": MAX_HTTP_REQUEST_BYTES,
+            "evidence_id_count": len(bounded_evidence_ids),
+            "evidence_id_limit": evidence_id_limit,
+            "evidence_ids_omitted": len(unique_evidence_ids) - len(bounded_evidence_ids),
+            "fallback": "deterministic",
+        }
+    gate_acquired = _INFERENCE_GATE.acquire(
+        timeout=max(0, int(settings.get("queue_wait_seconds", 2)))
+    )
+    if not gate_acquired:
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "inference_busy",
+            "fallback": "deterministic",
+        }
     try:
         health = local_model_health(root, probe=True)
         if not health.get("ready"):
@@ -874,6 +1240,15 @@ def assist_resume(
             "model": response_model,
             "authority": "non_authoritative_inference",
             "briefing": briefing,
+            "input_truncated": input_truncated,
+            "input_chars_omitted": input_chars_omitted,
+            "original_estimated_tokens": requested_estimated_tokens,
+            "transformed_estimated_tokens": original_estimated_tokens,
+            "sent_estimated_tokens": _estimate_tokens(safe_context),
+            "estimated_input_tokens": estimated_input_tokens,
+            "request_bytes": request_bytes,
+            "evidence_id_limit": evidence_id_limit,
+            "evidence_ids_omitted": len(unique_evidence_ids) - len(bounded_evidence_ids),
             "fallback": None,
         }
     except (LocalModelError, RecursionError) as exc:

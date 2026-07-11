@@ -56,23 +56,125 @@ jobs:
 
   package-smoke:
     name: Build, install, and bundle smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.13"
+          python-version: "3.13.5"
       - name: Install build tooling
-        run: python -m pip install --upgrade pip setuptools wheel build
-      - name: Build wheel and source distribution
+        run: >-
+          python -m pip install
+          "pip==25.1.1"
+          "setuptools==80.9.0"
+          "wheel==0.45.1"
+          "build==1.2.2.post1"
+          "twine==6.1.0"
+      - name: Set reproducible build epoch
         shell: bash
         run: |
-          rm -rf dist build src/*.egg-info
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Build public release archive
+        shell: bash
+        run: |
+          rm -rf dist
           mkdir -p dist
-          python -m pip wheel . -w dist --no-deps --no-build-isolation
-          python -c "import setuptools.build_meta as backend; backend.build_sdist('dist')"
+          python scripts/build_release_package.py --out-dir dist
+          python - <<'PY'
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          prefix = f"epic-continuum-{version}/"
+          archive = Path(f"dist/epic-continuum-{version}.zip")
+          with zipfile.ZipFile(archive) as zf:
+              names = zf.namelist()
+              assert len(names) == len(set(names)), "release ZIP contains duplicate member names"
+              assert all(name.startswith(prefix) for name in names)
+              assert f"{prefix}docs/GITHUB_PUBLICATION_DRAFT.md" not in names
+              assert not any("/benchmarks/results/" in name for name in names)
+              for linked in (
+                  "docs/how-memory-works.md",
+                  "docs/context-window.md",
+                  "docs/cue-recall.md",
+                  "docs/recovery-and-continuity.md",
+                  "docs/evidence-and-proof.md",
+                  "docs/shared-agent-state.md",
+                  "docs/worker-operations.md",
+                  "docs/writer-claims.md",
+                  "benchmarks/BENCHMARKS.md",
+                  "benchmarks/README.md",
+                  "benchmarks/datasets/README.md",
+                  "benchmarks/fixtures/continuitybench_cases.json",
+                  "benchmarks/runners/_common.py",
+                  "benchmarks/runners/continuitybench.py",
+                  "benchmarks/runners/faultbench.py",
+                  "benchmarks/runners/scale_bench.py",
+              ):
+                  assert f"{prefix}{linked}" in names, linked
+              for name in (
+                  f"{prefix}scripts/install_codex_plugin.sh",
+                  f"{prefix}scripts/install_hermes_adapter.sh",
+              ):
+                  mode = (zf.getinfo(name).external_attr >> 16) & 0o777
+                  assert mode == 0o755, (name, oct(mode))
+              name = f"{prefix}scripts/build_release_package.py"
+              mode = (zf.getinfo(name).external_attr >> 16) & 0o777
+              assert mode == 0o644, (name, oct(mode))
+          PY
+      - name: Build canonical reproducible wheel and source distribution
+        shell: bash
+        run: |
+          version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          archive="dist/epic-continuum-${version}.zip"
+          source_a="${RUNNER_TEMP}/continuum-release-source-a"
+          source_b="${RUNNER_TEMP}/continuum-release-source-b"
+          out_a="${RUNNER_TEMP}/continuum-release-dist-a"
+          out_b="${RUNNER_TEMP}/continuum-release-dist-b"
+          rm -rf "$source_a" "$source_b" "$out_a" "$out_b"
+          mkdir -p "$source_a" "$source_b" "$out_a" "$out_b"
+          python -m zipfile -e "$archive" "$source_a"
+          python -m zipfile -e "$archive" "$source_b"
+          python -m build --sdist --wheel --no-isolation --outdir "$out_a" "$source_a/epic-continuum-${version}"
+          env -u SOURCE_DATE_EPOCH python -m build --sdist --wheel --no-isolation --outdir "$out_b" "$source_b/epic-continuum-${version}"
+          for artifact in "$out_a"/*; do
+            cmp "$artifact" "$out_b/$(basename "$artifact")"
+          done
+          cp "$out_a"/*.whl "$out_a"/*.tar.gz dist/
+          python -m twine check dist/*.whl dist/*.tar.gz
+          python - <<'PY'
+          import tarfile
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          release_path = Path(f"dist/epic-continuum-{version}.zip")
+          with zipfile.ZipFile(release_path) as release:
+              root_provenance = release.read(f"epic-continuum-{version}/RELEASE_PROVENANCE.json")
+              package_provenance = release.read(
+                  f"epic-continuum-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+              )
+          assert package_provenance == root_provenance
+
+          wheel_path = next(Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel_path) as wheel:
+              assert wheel.read("continuum/assets/RELEASE_PROVENANCE.json") == root_provenance
+
+          sdist_path = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist_path, "r:gz") as sdist:
+              member = sdist.extractfile(
+                  f"epic_continuum_memory-{version}/src/continuum/assets/RELEASE_PROVENANCE.json"
+              )
+              assert member is not None
+              assert member.read() == root_provenance
+          PY
+      - name: Write distribution checksums
+        shell: bash
+        run: sha256sum dist/*.whl dist/*.tar.gz dist/*.zip > dist/SHA256SUMS
       - name: Clean wheel install and CLI handoff smoke
         shell: bash
         run: |
@@ -121,9 +223,6 @@ jobs:
           test -f "${RUNNER_TEMP}/continuitybench-ci/summary.json"
           test -f "${RUNNER_TEMP}/continuitybench-ci/cases.jsonl"
           test -f "${RUNNER_TEMP}/continuitybench-ci/environment.json"
-      - name: Write distribution checksums
-        shell: bash
-        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
       - name: Verify Git modes and line endings
         shell: bash
         run: |
@@ -176,52 +275,6 @@ jobs:
           else
             echo "pwsh not available; PowerShell wrapper smoke skipped"
           fi
-      - name: Build public release archive
-        shell: bash
-        run: |
-          python scripts/build_release_package.py --out-dir dist
-          python - <<'PY'
-          import tomllib
-          import zipfile
-          from pathlib import Path
-
-          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-          prefix = f"epic-continuum-{version}/"
-          archive = Path(f"dist/epic-continuum-{version}.zip")
-          with zipfile.ZipFile(archive) as zf:
-              names = zf.namelist()
-              assert all(name.startswith(prefix) for name in names)
-              assert f"{prefix}docs/GITHUB_PUBLICATION_DRAFT.md" not in names
-              assert not any("/benchmarks/results/" in name for name in names)
-              for linked in (
-                  "docs/how-memory-works.md",
-                  "docs/context-window.md",
-                  "docs/cue-recall.md",
-                  "docs/recovery-and-continuity.md",
-                  "docs/evidence-and-proof.md",
-                  "docs/shared-agent-state.md",
-                  "docs/worker-operations.md",
-                  "docs/writer-claims.md",
-                  "benchmarks/BENCHMARKS.md",
-                  "benchmarks/README.md",
-                  "benchmarks/datasets/README.md",
-                  "benchmarks/fixtures/continuitybench_cases.json",
-                  "benchmarks/runners/_common.py",
-                  "benchmarks/runners/continuitybench.py",
-                  "benchmarks/runners/faultbench.py",
-                  "benchmarks/runners/scale_bench.py",
-              ):
-                  assert f"{prefix}{linked}" in names, linked
-              for name in (
-                  f"{prefix}scripts/install_codex_plugin.sh",
-                  f"{prefix}scripts/install_hermes_adapter.sh",
-              ):
-                  mode = (zf.getinfo(name).external_attr >> 16) & 0o777
-                  assert mode == 0o755, (name, oct(mode))
-              name = f"{prefix}scripts/build_release_package.py"
-              mode = (zf.getinfo(name).external_attr >> 16) & 0o777
-              assert mode == 0o644, (name, oct(mode))
-          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: epic-continuum-distributions

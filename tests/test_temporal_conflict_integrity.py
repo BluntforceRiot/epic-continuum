@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from continuum.core.store import audit, connect, create_card, init_db
+from continuum.core.store import audit, connect, create_card, init_db, record_project_state
 from continuum.core.workers import detect_conflicts, resolve_conflict
 
 
@@ -419,6 +419,64 @@ class TemporalConflictIntegrityTest(unittest.TestCase):
             self.assertEqual(len(detect_audits), 1)
             self.assertEqual(detect_audits[0]["target_id"], result_group)
             self.assertEqual(set(json.loads(detect_audits[0]["payload_json"])["card_ids"]), {alpha, alpha_peer})
+
+    def test_mixed_type_group_cannot_supersede_project_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="mixed-type-session",
+                agent_id="codex-sol",
+                project_id="mixed-type-project",
+                objective="Keep the checkpoint current",
+            )
+            conn = connect(root)
+            try:
+                decision = _create_decision(
+                    conn,
+                    root=root,
+                    title="Mixed Type Route",
+                    summary="Use a derived decision instead of the checkpoint.",
+                    session_id="mixed-type-session",
+                    project_id="mixed-type-project",
+                )
+                conn.execute(
+                    "UPDATE cards SET conflict_group = 'mixed-type-group' WHERE id IN (?, ?)",
+                    (state["card_id"], decision),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            before = _card_rows(root, [state["card_id"], decision])
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "project_state conflict groups cannot include non-project_state",
+            ):
+                resolve_conflict(root, card_id=decision, action="supersede")
+
+            self.assertEqual(
+                _card_rows(root, [state["card_id"], decision]),
+                before,
+            )
+            dismissed = resolve_conflict(root, card_id=decision, action="dismiss")
+            self.assertTrue(dismissed["ok"], dismissed)
+            rows = _card_rows(root, [state["card_id"], decision])
+            self.assertTrue(
+                all(row["conflict_group"] is None for row in rows.values())
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET conflict_group = 'legacy-mixed-type-group' WHERE id IN (?, ?)",
+                    (state["card_id"], decision),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            cleaned = detect_conflicts(root, card_id=state["card_id"])
+            self.assertEqual(cleaned["conflict_count"], 0, cleaned)
+            self.assertEqual(cleaned["orphan_groups_cleared"], 1, cleaned)
 
     def test_same_created_at_predecessor_uses_rowid_not_hash_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

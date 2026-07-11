@@ -23,7 +23,7 @@ Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The final Windows v0.3 candidate passed 603 tests with 24 environment-gated
+The final Windows v0.3 candidate passed 636 tests with 24 environment-gated
 skips. Ruff, mypy across 29 source files, compileall, fixture
 allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
 passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
@@ -94,6 +94,11 @@ Review hardening after the final private review pass added:
   configured Scroll fetch limits, sequential checkpoint stability, expired
   worker leases, exact Yarn context ceilings, bounded recovery event requests,
   and clean-build rejection of forgotten untracked release inputs.
+- blind integration follow-up fixes for checkpoint-consistent bounded resume
+  packets that preserve actionable details, exact latest-state revalidation,
+  project-state conflict isolation, serialized Yarn request sizing and
+  configuration preservation, malformed queue timestamps, immutable Git-blob
+  release snapshots, and provenance-bound reproducible distribution builds.
 
 The Python package version is `0.3.0`, and the catalog capability
 `SCHEMA_VERSION` remains `0.2.0`. This feature release adds no catalog migration.

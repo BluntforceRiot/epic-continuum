@@ -139,7 +139,7 @@ _CIRCUITS: dict[_CircuitKey, dict[str, float | int]] = {}
 _CIRCUIT_LOCK = threading.Lock()
 _INFERENCE_GATE = threading.BoundedSemaphore(1)
 _LOCAL_STAGE_RUNNER_GUARD = threading.Lock()
-_LOCAL_STAGE_RUNNER: _LocalStageRunner | None = _LocalStageRunner()
+_LOCAL_STAGE_RUNNER: _LocalStageRunner | None = None
 
 
 def _local_stage_runner() -> _LocalStageRunner:

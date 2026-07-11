@@ -14,6 +14,20 @@ from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace
 from .core.local_model import local_model_health
+from .core.project_state import (
+    MAX_PROJECT_STATE_BRANCH_BYTES,
+    MAX_PROJECT_STATE_CHANGED_FILE_BYTES,
+    MAX_PROJECT_STATE_CHANGED_FILES,
+    MAX_PROJECT_STATE_COMMIT_BYTES,
+    MAX_PROJECT_STATE_DECISIONS,
+    MAX_PROJECT_STATE_ITEM_BYTES,
+    MAX_PROJECT_STATE_METADATA_CONTAINER_MEMBERS,
+    MAX_PROJECT_STATE_NOTES_BYTES,
+    MAX_PROJECT_STATE_OBJECTIVE_BYTES,
+    MAX_PROJECT_STATE_OPEN_TASKS,
+    MAX_PROJECT_STATE_REPO_PATH_BYTES,
+    validate_project_state_input,
+)
 from .core.safety import redact_text_secrets, scan_text_for_secrets
 from .core.operations import (
     OperationGuard,
@@ -80,6 +94,8 @@ JSON = dict[str, Any]
 ToolHandler = Callable[[JSON], Any]
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION,)
+MAX_MCP_REQUEST_BYTES = 256 * 1024
+MAX_MCP_JSON_DEPTH = 64
 
 
 def default_root() -> Path:
@@ -589,24 +605,35 @@ def tool_cue_recall(args: JSON) -> Any:
 
 def tool_record_project_state(args: JSON) -> Any:
     root = root_arg(args)
-    session_id = str(validate_public_partition_arg(root, "session_id", require_str(args, "session_id")))
-    agent_id = str(validate_public_partition_arg(root, "agent_id", require_str(args, "agent_id")))
-    project_id = str(validate_public_partition_arg(root, "project_id", require_str(args, "project_id")))
+    raw_session_id = require_str(args, "session_id")
+    raw_agent_id = require_str(args, "agent_id")
+    raw_project_id = require_str(args, "project_id")
+    dirty_value = args.get("dirty")
+    validated = validate_project_state_input(
+        session_id=raw_session_id,
+        agent_id=raw_agent_id,
+        project_id=raw_project_id,
+        objective=optional_str(args, "objective"),
+        repo_path=optional_str(args, "repo_path"),
+        branch=optional_str(args, "branch"),
+        commit=optional_str(args, "commit"),
+        dirty=dirty_value,
+        changed_files=args.get("changed_files"),
+        decisions=args.get("decisions"),
+        open_tasks=args.get("open_tasks"),
+        notes=optional_str(args, "notes"),
+        metadata=public_metadata(args),
+    )
+    session_id = str(
+        validate_public_partition_arg(root, "session_id", raw_session_id)
+    )
+    agent_id = str(validate_public_partition_arg(root, "agent_id", raw_agent_id))
+    project_id = str(
+        validate_public_partition_arg(root, "project_id", raw_project_id)
+    )
     safe_session_id = public_partition_label(session_id)
     safe_agent_id = public_partition_label(agent_id)
     safe_project_id = public_partition_label(project_id)
-    dirty_value = args.get("dirty")
-    if dirty_value is not None and not isinstance(dirty_value, bool):
-        raise ValueError("dirty must be a boolean when provided")
-    changed_files = args.get("changed_files") or []
-    decisions = args.get("decisions") or []
-    open_tasks = args.get("open_tasks") or []
-    if not isinstance(changed_files, list) or not all(isinstance(item, str) for item in changed_files):
-        raise ValueError("changed_files must be a list of strings")
-    if not isinstance(decisions, list) or not all(isinstance(item, str) for item in decisions):
-        raise ValueError("decisions must be a list of strings")
-    if not isinstance(open_tasks, list) or not all(isinstance(item, str) for item in open_tasks):
-        raise ValueError("open_tasks must be a list of strings")
 
     def action(operation: OperationGuard) -> JSON:
         result = record_project_state(
@@ -614,16 +641,16 @@ def tool_record_project_state(args: JSON) -> Any:
             session_id=session_id,
             agent_id=agent_id,
             project_id=project_id,
-            objective=optional_str(args, "objective"),
-            repo_path=optional_str(args, "repo_path"),
-            branch=optional_str(args, "branch"),
-            commit=optional_str(args, "commit"),
+            objective=validated["objective"],
+            repo_path=validated["repo_path"],
+            branch=validated["branch"],
+            commit=validated["commit"],
             dirty=dirty_value,
-            changed_files=changed_files,
-            decisions=decisions,
-            open_tasks=open_tasks,
-            notes=optional_str(args, "notes"),
-            metadata=public_metadata(args, disable_exact_memory=True),
+            changed_files=validated["changed_files"],
+            decisions=validated["decisions"],
+            open_tasks=validated["open_tasks"],
+            notes=validated["notes"],
+            metadata=validated["metadata"],
         )
         operation.cursor({"phase": "project_state_recorded", "card_id": result.get("card_id"), "project_id": safe_project_id})
         return result
@@ -1537,19 +1564,37 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["session_id", "agent_id", "project_id"],
             "properties": {
                 "root": {"type": "string"},
-                "session_id": {"type": "string"},
-                "agent_id": {"type": "string"},
-                "project_id": {"type": "string"},
+                # Runtime validation below retains the exact UTF-8 byte limits.
+                # Exporting all maxLength hints makes llama.cpp expand a GBNF
+                # grammar that its parser rejects before model inference starts.
+                "session_id": {"type": "string", "minLength": 1},
+                "agent_id": {"type": "string", "minLength": 1},
+                "project_id": {"type": "string", "minLength": 1},
                 "objective": {"type": "string"},
                 "repo_path": {"type": "string"},
                 "branch": {"type": "string"},
                 "commit": {"type": "string"},
                 "dirty": {"type": "boolean"},
-                "changed_files": {"type": "array", "items": {"type": "string"}},
-                "decisions": {"type": "array", "items": {"type": "string"}},
-                "open_tasks": {"type": "array", "items": {"type": "string"}},
+                "changed_files": {
+                    "type": "array",
+                    "maxItems": MAX_PROJECT_STATE_CHANGED_FILES,
+                    "items": {"type": "string"},
+                },
+                "decisions": {
+                    "type": "array",
+                    "maxItems": MAX_PROJECT_STATE_DECISIONS,
+                    "items": {"type": "string"},
+                },
+                "open_tasks": {
+                    "type": "array",
+                    "maxItems": MAX_PROJECT_STATE_OPEN_TASKS,
+                    "items": {"type": "string"},
+                },
                 "notes": {"type": "string"},
-                "metadata": {"type": "object"},
+                "metadata": {
+                    "type": "object",
+                    "maxProperties": MAX_PROJECT_STATE_METADATA_CONTAINER_MEMBERS,
+                },
             },
             "additionalProperties": False,
         },
@@ -2102,18 +2147,75 @@ def dispatch(request: JSON) -> JSON | None:
     return rpc_error(request_id, -32601, f"method not found: {method}")
 
 
+def _bounded_request_lines(stream: Any) -> Any:
+    """Yield one bounded UTF-8 request line and recover at the next frame."""
+
+    reader = getattr(stream, "buffer", stream)
+    binary = isinstance(reader.readline(0), bytes)
+    empty = b"" if binary else ""
+    newline = b"\n" if binary else "\n"
+    while True:
+        chunk = reader.readline(MAX_MCP_REQUEST_BYTES + 1)
+        if chunk == empty:
+            return
+        oversized = len(chunk) > MAX_MCP_REQUEST_BYTES
+        if not chunk.endswith(newline) and len(chunk) == MAX_MCP_REQUEST_BYTES + 1:
+            oversized = True
+            while chunk != empty and not chunk.endswith(newline):
+                chunk = reader.readline(MAX_MCP_REQUEST_BYTES + 1)
+        if oversized:
+            yield None, f"request exceeds maximum of {MAX_MCP_REQUEST_BYTES} bytes"
+            continue
+        if binary:
+            try:
+                line = chunk.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                yield None, "request is not valid UTF-8"
+                continue
+        else:
+            line = chunk
+            if len(line.encode("utf-8")) > MAX_MCP_REQUEST_BYTES:
+                yield None, f"request exceeds maximum of {MAX_MCP_REQUEST_BYTES} bytes"
+                continue
+        yield line, None
+
+
+def _request_json_depth_error(value: Any) -> str | None:
+    """Return an error for pathologically nested parsed request JSON."""
+
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_MCP_JSON_DEPTH:
+            return f"request JSON exceeds maximum depth of {MAX_MCP_JSON_DEPTH}"
+        if isinstance(current, dict):
+            stack.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            stack.extend((child, depth + 1) for child in current)
+    return None
+
+
 def serve() -> int:
-    for line in sys.stdin:
+    for line, frame_error in _bounded_request_lines(sys.stdin):
+        if frame_error is not None:
+            frame_response = rpc_error(None, -32700, frame_error)
+            sys.stdout.write(json.dumps(frame_response, ensure_ascii=True, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+            continue
+        assert line is not None
         line = line.strip()
         if not line:
             continue
         response: JSON | None
         try:
             request = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
             response = rpc_error(None, -32700, "parse error", str(exc))
         else:
-            if not isinstance(request, dict):
+            depth_error = _request_json_depth_error(request)
+            if depth_error is not None:
+                response = rpc_error(None, -32600, depth_error)
+            elif not isinstance(request, dict):
                 response = rpc_error(None, -32600, "request must be an object")
             else:
                 response = dispatch(request)

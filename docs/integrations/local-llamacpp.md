@@ -100,7 +100,8 @@ Leave the Yarn-derived safe ceiling in place unless you are lowering it.
   loading, input redaction and sizing, gate waiting, resource checks, both
   preflight requests, completion transfer, parsing, and validation; per-stage
   waits receive only the remaining budget. Local deadline stages use one fixed
-  runner so repeated timeouts do not grow a pool of abandoned threads. RAM/VRAM
+  runner, constructed on first Yarn use, so CLI/MCP imports remain thread-free
+  and repeated timeouts do not grow a pool of abandoned threads. RAM/VRAM
   minimums are enforced when the host can measure them; unavailable measurements
   are reported as advisory rather than guessed safe.
 - A process-local gate permits one inference per Continuum process. Keep

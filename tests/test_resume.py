@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -991,6 +993,7 @@ class ResumeLatestTests(unittest.TestCase):
             "scope_mismatch",
             "content_mismatch",
             "content_hash_mismatch",
+            "non_project_large",
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "continuum"
@@ -1032,10 +1035,19 @@ class ResumeLatestTests(unittest.TestCase):
                             "UPDATE scroll_events SET content = ? WHERE id = ?",
                             ("MUTATED-SOURCE-CONTENT", state["event_id"]),
                         )
-                    else:
+                    elif mutation == "content_hash_mismatch":
                         conn.execute(
                             "UPDATE scroll_events SET content_hash = ? WHERE id = ?",
                             ("0" * 64, state["event_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE scroll_events
+                            SET event_type = 'message', content = ?
+                            WHERE id = ?
+                            """,
+                            ("x" * 100_000, state["event_id"]),
                         )
                     conn.commit()
                 finally:
@@ -1049,7 +1061,7 @@ class ResumeLatestTests(unittest.TestCase):
                 )
 
                 self.assertFalse(result["ok"], result)
-                self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+                self.assertEqual(result["reason"], "invalid_project_state_checkpoint")
                 self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_resume_fails_closed_when_project_state_structured_payload_is_mutated(
@@ -1100,7 +1112,7 @@ class ResumeLatestTests(unittest.TestCase):
             )
 
             self.assertFalse(result["ok"], result)
-            self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+            self.assertEqual(result["reason"], "invalid_project_state_checkpoint")
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_project_state_payload_marker_ignores_earlier_user_text_collision(
@@ -1180,9 +1192,9 @@ class ResumeLatestTests(unittest.TestCase):
             )
 
             self.assertFalse(result["ok"], result)
-            self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+            self.assertEqual(result["reason"], "invalid_project_state_checkpoint")
             self.assertEqual(
-                result["discovery"]["checkpoint_id"],
+                result["invalid_checkpoint"]["checkpoint_id"],
                 new_state["card_id"],
             )
             self.assertFalse((root / "exports" / "thread_recovery").exists())
@@ -1662,6 +1674,342 @@ class ResumeLatestTests(unittest.TestCase):
             detected = detect_conflicts(root)
 
             self.assertEqual(detected["conflict_count"], 1, detected)
+
+    def test_same_agent_project_state_supersession_keeps_one_operational_head_and_raw_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="checkpoint-one",
+                agent_id="codex-sol",
+                project_id="checkpoint-project",
+                objective="OLD_OBJECTIVE_9QQ",
+                decisions=["OLD_DECISION_9QQ"],
+                open_tasks=["OLD_TASK_9QQ"],
+            )
+            second = record_project_state(
+                root,
+                session_id="checkpoint-two",
+                agent_id="codex-sol",
+                project_id="checkpoint-project",
+                objective="MIDDLE_OBJECTIVE_4RR",
+                decisions=["MIDDLE_DECISION_4RR"],
+                open_tasks=["MIDDLE_TASK_4RR"],
+            )
+            third = record_project_state(
+                root,
+                session_id="checkpoint-three",
+                agent_id="codex-sol",
+                project_id="checkpoint-project",
+                objective="NEW_OBJECTIVE_7VV",
+                decisions=["NEW_DECISION_7VV"],
+                open_tasks=["NEW_TASK_7VV"],
+            )
+
+            workers = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=10,
+                maintenance=False,
+            )
+            resumed = resume_latest(
+                root,
+                project_id="checkpoint-project",
+                token_budget=5000,
+                model_assist=False,
+            )
+
+            self.assertTrue(workers["ok"], workers)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["discovery"]["checkpoint_id"], third["card_id"])
+            self.assertEqual(second["supersedes_card_id"], first["card_id"])
+            self.assertEqual(third["supersedes_card_id"], second["card_id"])
+            for marker in (
+                "OLD_OBJECTIVE_9QQ",
+                "OLD_DECISION_9QQ",
+                "OLD_TASK_9QQ",
+                "MIDDLE_OBJECTIVE_4RR",
+                "MIDDLE_DECISION_4RR",
+                "MIDDLE_TASK_4RR",
+            ):
+                self.assertNotIn(marker, resumed["packet_text"])
+            self.assertIn("NEW_OBJECTIVE_7VV", resumed["packet_text"])
+            self.assertIn("NEW_DECISION_7VV", resumed["packet_text"])
+            self.assertIn("NEW_TASK_7VV", resumed["packet_text"])
+
+            conn = connect(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, decisions_json, open_tasks_json,
+                               supersedes_card_id, superseded_by_card_id,
+                               conflict_group
+                        FROM cards
+                        WHERE id IN (?, ?, ?)
+                        """,
+                        (first["card_id"], second["card_id"], third["card_id"]),
+                    )
+                }
+                current_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT id
+                        FROM cards
+                        WHERE card_type = 'project_state'
+                          AND {store_module._current_card_authority_clause('cards')}
+                        """
+                    )
+                ]
+            finally:
+                conn.close()
+
+            self.assertEqual(current_ids, [third["card_id"]])
+            self.assertEqual(rows[first["card_id"]]["superseded_by_card_id"], second["card_id"])
+            self.assertIsNone(rows[first["card_id"]]["supersedes_card_id"])
+            self.assertEqual(rows[second["card_id"]]["supersedes_card_id"], first["card_id"])
+            self.assertEqual(rows[second["card_id"]]["superseded_by_card_id"], third["card_id"])
+            self.assertEqual(rows[third["card_id"]]["supersedes_card_id"], second["card_id"])
+            self.assertIsNone(rows[third["card_id"]]["superseded_by_card_id"])
+            self.assertEqual(
+                json.loads(rows[first["card_id"]]["decisions_json"]),
+                ["OLD_DECISION_9QQ"],
+            )
+
+            historical = compile_context(
+                root,
+                session_id="checkpoint-one",
+                project_id="checkpoint-project",
+                token_budget=5000,
+                planner_profile="legacy",
+                create=False,
+            )
+            self.assertIn("OLD_OBJECTIVE_9QQ", historical["context_text"])
+            self.assertIn("OLD_DECISION_9QQ", historical["context_text"])
+            self.assertIn("OLD_TASK_9QQ", historical["context_text"])
+
+    def test_concurrent_same_agent_checkpoints_form_one_serialized_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            seed = record_project_state(
+                root,
+                session_id="concurrent-seed",
+                agent_id="codex-sol",
+                project_id="concurrent-project",
+                objective="Seed checkpoint",
+            )
+            writer_count = 8
+            barrier = threading.Barrier(writer_count)
+
+            def write_checkpoint(index: int) -> dict[str, object]:
+                barrier.wait()
+                return record_project_state(
+                    root,
+                    session_id=f"concurrent-session-{index}",
+                    agent_id="codex-sol",
+                    project_id="concurrent-project",
+                    objective=f"Concurrent checkpoint {index}",
+                    decisions=[f"concurrent-decision-{index}"],
+                    open_tasks=[f"concurrent-task-{index}"],
+                )
+
+            with ThreadPoolExecutor(max_workers=writer_count) as executor:
+                results = list(executor.map(write_checkpoint, range(writer_count)))
+
+            workers = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=20,
+                maintenance=False,
+            )
+            self.assertTrue(workers["ok"], workers)
+            self.assertEqual(len({str(result["card_id"]) for result in results}), writer_count)
+
+            conn = connect(root)
+            try:
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT rowid AS card_rowid, id, supersedes_card_id,
+                               superseded_by_card_id, conflict_group
+                        FROM cards
+                        WHERE card_type = 'project_state'
+                          AND project_id = 'concurrent-project'
+                        ORDER BY card_rowid
+                        """
+                    )
+                ]
+                head_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT id
+                        FROM cards
+                        WHERE card_type = 'project_state'
+                          AND project_id = 'concurrent-project'
+                          AND {store_module._current_card_authority_clause('cards')}
+                        """
+                    )
+                ]
+            finally:
+                conn.close()
+
+            self.assertEqual(len(rows), writer_count + 1)
+            self.assertEqual(head_ids, [rows[-1]["id"]])
+            by_id = {str(row["id"]): row for row in rows}
+            self.assertIn(seed["card_id"], by_id)
+            for row in rows[:-1]:
+                successor_id = str(row["superseded_by_card_id"] or "")
+                self.assertIn(successor_id, by_id)
+                self.assertEqual(by_id[successor_id]["supersedes_card_id"], row["id"])
+                self.assertIsNone(row["conflict_group"])
+            self.assertIsNone(rows[-1]["superseded_by_card_id"])
+            self.assertIsNone(rows[-1]["conflict_group"])
+
+            detected = detect_conflicts(root)
+            self.assertEqual(detected["conflict_count"], 0, detected)
+
+    def test_identical_project_state_calls_create_distinct_acyclic_checkpoints(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            values = {
+                "session_id": "identical-session",
+                "agent_id": "identical-agent",
+                "project_id": "identical-project",
+                "objective": "IDENTICAL_CHECKPOINT_OBJECTIVE",
+                "decisions": ["IDENTICAL_CHECKPOINT_DECISION"],
+                "open_tasks": ["IDENTICAL_CHECKPOINT_TASK"],
+            }
+            first = record_project_state(root, **values)
+            second = record_project_state(root, **values)
+
+            self.assertNotEqual(first["event_id"], second["event_id"])
+            self.assertNotEqual(first["card_id"], second["card_id"])
+            self.assertEqual(second["supersedes_card_id"], first["card_id"])
+            conn = connect(root)
+            try:
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, supersedes_card_id, superseded_by_card_id
+                        FROM cards WHERE card_type = 'project_state' ORDER BY rowid
+                        """
+                    )
+                ]
+                current_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT id FROM cards
+                        WHERE card_type = 'project_state'
+                          AND {store_module._current_card_authority_clause('cards')}
+                        """
+                    )
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(current_ids, [second["card_id"]])
+            self.assertTrue(
+                all(
+                    row["id"] != row["supersedes_card_id"]
+                    and row["id"] != row["superseded_by_card_id"]
+                    for row in rows
+                )
+            )
+            resumed = resume_latest(
+                root,
+                project_id="identical-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                second["card_id"],
+            )
+
+    def test_repeated_older_payload_appends_new_head_without_reversing_chain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            repeated_values = {
+                "session_id": "aba-session",
+                "agent_id": "aba-agent",
+                "project_id": "aba-project",
+                "objective": "ABA_OBJECTIVE_A",
+                "decisions": ["ABA_DECISION_A"],
+                "open_tasks": ["ABA_TASK_A"],
+            }
+            first = record_project_state(root, **repeated_values)
+            middle = record_project_state(
+                root,
+                session_id="aba-session",
+                agent_id="aba-agent",
+                project_id="aba-project",
+                objective="ABA_OBJECTIVE_B",
+                decisions=["ABA_DECISION_B"],
+                open_tasks=["ABA_TASK_B"],
+            )
+            third = record_project_state(root, **repeated_values)
+
+            self.assertNotEqual(first["event_id"], third["event_id"])
+            self.assertNotEqual(first["card_id"], third["card_id"])
+            self.assertEqual(middle["supersedes_card_id"], first["card_id"])
+            self.assertEqual(third["supersedes_card_id"], middle["card_id"])
+            conn = connect(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, supersedes_card_id, superseded_by_card_id
+                        FROM cards WHERE card_type = 'project_state'
+                        """
+                    )
+                }
+                current_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT id FROM cards
+                        WHERE card_type = 'project_state'
+                          AND {store_module._current_card_authority_clause('cards')}
+                        """
+                    )
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(current_ids, [third["card_id"]])
+            cursor: str | None = third["card_id"]
+            visited: list[str] = []
+            while cursor:
+                self.assertNotIn(cursor, visited)
+                visited.append(cursor)
+                cursor = rows[cursor]["supersedes_card_id"]
+            self.assertEqual(
+                visited,
+                [third["card_id"], middle["card_id"], first["card_id"]],
+            )
+            resumed = resume_latest(
+                root,
+                project_id="aba-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["discovery"]["checkpoint_id"], third["card_id"])
+            self.assertNotIn("ABA_OBJECTIVE_B", resumed["packet_text"])
+            self.assertNotIn("ABA_DECISION_B", resumed["packet_text"])
+            self.assertNotIn("ABA_TASK_B", resumed["packet_text"])
 
     def test_librarian_does_not_contest_project_state_with_derived_scroll_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

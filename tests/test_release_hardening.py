@@ -780,7 +780,10 @@ version = "9.9.9"
             self.assertFalse((blocked_out / "epic-continuum-9.9.9.zip").exists())
 
     def test_generated_release_provenance_survives_rebuilt_wheel_and_sdist(self) -> None:
-        if importlib.util.find_spec("build.__main__") is None:
+        if (
+            importlib.util.find_spec("build") is None
+            or importlib.util.find_spec("build.__main__") is None
+        ):
             self.skipTest("python -m build is required for release-source package smoke")
 
         repo_root = Path(__file__).resolve().parents[1]

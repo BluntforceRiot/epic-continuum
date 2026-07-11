@@ -38,7 +38,8 @@
 Epic Continuum 0.3 turns durable memory into a safer daily recovery system:
 
 - **Automatic resume** discovers the newest durable project/session checkpoint;
-  an internal thread ID is optional.
+  an internal thread ID is optional, and only the newest same-agent checkpoint
+  remains current.
 - **Looking Glass planner v2** balances Scroll, Cards, and Cue Recall, preserves
   authority labels, excludes contested/superseded current candidates, and emits
   an explainable selection trace under a hard token budget.
@@ -193,7 +194,9 @@ continuum configure-profile `
 `latest_project` refuses to drift into an unrelated project when no supplied or
 configured project exists. `explicit` mode requires a session or project ID.
 Superseded and unresolved contested Cards remain historical evidence but are not
-eligible to become the current resume checkpoint.
+eligible to become the current resume checkpoint. Same-agent project checkpoints
+form one temporal chain, so an older task list cannot re-enter the operational
+packet merely because it remains preserved in the Scroll.
 
 ### Resolve Temporal Memory Conflicts
 
@@ -267,7 +270,7 @@ continuum record-project-state \
   --open-task "Have another agent review the package"
 ```
 
-Another agent can later recover that state through Cue Recall, `recover-thread --project-id`, or a bounded Looking Glass packet. This is the core design claim: agents should share durable local project state instead of trapping memory inside separate chats.
+Another agent can later recover that state through Cue Recall, `recover-thread --project-id`, or a bounded Looking Glass packet. A newer project-scoped checkpoint from the same agent supersedes its older checkpoint even across sessions; session/private checkpoints stay session-bound, and other agents keep independent current heads. This is the core design claim: agents should share durable local project state instead of trapping memory inside separate chats.
 
 ## Review Relay
 
@@ -394,6 +397,17 @@ Inspect and then repair a legacy worker backlog:
 continuum reconcile-workers --root ./.continuum-demo
 continuum reconcile-workers --root ./.continuum-demo --apply
 ```
+
+Preview and quarantine an invalid legacy project-state head before resuming its
+predecessor:
+
+```bash
+continuum repair-project-state-checkpoints --root ./.continuum-demo --project-id epic-continuum
+continuum repair-project-state-checkpoints --root ./.continuum-demo --project-id epic-continuum --apply
+```
+
+See [Recovery And Continuity](docs/recovery-and-continuity.md) for the failure
+and repair behavior.
 
 Reconciliation is dry-run by default. Applied reconciliation preserves queue
 evidence, marks redundant pending notifications as skipped with an audit reason,

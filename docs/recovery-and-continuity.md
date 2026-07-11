@@ -67,6 +67,12 @@ open-task arrays in the immutable source event. Resume recomputes that digest
 before accepting the selected Card; legacy checkpoints without the marker remain
 readable, while a marked checkpoint with divergent structured state fails closed.
 
+Same-agent project-scoped checkpoints form one atomic temporal chain across
+sessions. Only the newest head is operational; its predecessors remain
+historical evidence and are excluded from recent Scroll and Cue Recall sections
+of a resume packet. Session/private chains remain session-bound, and different
+agents keep independent current heads.
+
 Recovery packets only include evidence visible to the requested session/project
 scope. Pending queue jobs are included only when their referenced Card, segment,
 or Scroll event is visible to that same scope; jobs with incomplete provenance
@@ -89,6 +95,31 @@ window is selected. After the mandatory checkpoint is reserved, the optional
 source with the strongest direct query relevance is considered first. This keeps
 a buried Cue Recall or Card match from being crowded out solely by source order
 when the remaining context budget is tight.
+
+## Invalid Checkpoint Repair
+
+Current releases bound project-state size and structure before accepting a new
+checkpoint. A legacy or externally damaged latest head that violates those
+limits or its source-binding integrity checks returns
+`invalid_project_state_checkpoint`, writes no recovery packet, and does not
+silently fall back to an older state.
+
+Preview the affected heads, then apply the quarantine when the result is
+correct:
+
+```bash
+continuum repair-project-state-checkpoints \
+  --root ./.continuum-demo \
+  --project-id epic-continuum
+
+continuum repair-project-state-checkpoints \
+  --root ./.continuum-demo \
+  --project-id epic-continuum \
+  --apply
+```
+
+Apply mode preserves the invalid Card as historical evidence and restores only
+a reciprocal, same-authority predecessor. Run it again while `has_more` is true.
 
 ## Upgrade Backfill
 

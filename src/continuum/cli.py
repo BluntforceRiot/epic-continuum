@@ -24,6 +24,7 @@ from .core.local_model import (
     local_model_health,
     resolve_yarn_configuration,
 )
+from .core.project_state import validate_project_state_input
 from .core.operations import (
     OperationGuard,
     doctor,
@@ -67,6 +68,7 @@ from .core.store import (
     init_db,
     recover_thread,
     record_project_state,
+    repair_invalid_project_state_checkpoints,
     resume_latest,
     rebuild_search_index,
     redact_legacy_secrets,
@@ -410,6 +412,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("--token-budget", type=int, default=0)
     p_resume.add_argument("--recent-event-limit", type=int, default=24)
     p_resume.add_argument("--model-assist", action=argparse.BooleanOptionalAction, default=None)
+
+    p_repair_state = sub.add_parser(
+        "repair-project-state-checkpoints",
+        help="Find or quarantine invalid current project-state checkpoints",
+    )
+    p_repair_state.add_argument("--root", required=True)
+    p_repair_state.add_argument("--project-id")
+    p_repair_state.add_argument("--session-id")
+    p_repair_state.add_argument("--limit", type=int, default=100)
+    p_repair_state.add_argument("--apply", action="store_true")
 
     p_audit = sub.add_parser("audit", help="Run safety/status audit")
     p_audit.add_argument("--root", required=True)
@@ -868,6 +880,54 @@ def _main(argv: list[str] | None = None) -> int:
             )
         )
 
+    if args.command == "repair-project-state-checkpoints":
+        assert root is not None
+        safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
+        safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
+        if not args.apply:
+            return emit_result(
+                repair_invalid_project_state_checkpoints(
+                    root,
+                    session_id=args.session_id,
+                    project_id=args.project_id,
+                    limit=args.limit,
+                    dry_run=True,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = repair_invalid_project_state_checkpoints(
+                root,
+                session_id=args.session_id,
+                project_id=args.project_id,
+                limit=args.limit,
+                dry_run=False,
+            )
+            operation.cursor(
+                {
+                    "phase": "invalid_project_state_quarantined",
+                    "quarantined_count": result.get("quarantined_count"),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_repair_project_state_checkpoints",
+                title="Repair invalid project-state checkpoints",
+                intent={
+                    "session_id": safe_session_id,
+                    "project_id": safe_project_id,
+                    "limit": args.limit,
+                },
+                snapshot_policy="auto",
+                snapshot_reason="checkpoint quarantine changes Card authority pointers",
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                action=action,
+            )
+        )
+
     if args.command == "search":
         assert root is not None
         if args.session_id:
@@ -915,6 +975,21 @@ def _main(argv: list[str] | None = None) -> int:
             dirty = False
         else:
             dirty = None
+        validated_state = validate_project_state_input(
+            session_id=args.session_id,
+            agent_id=args.agent_id,
+            project_id=args.project_id,
+            objective=args.objective,
+            repo_path=args.repo_path,
+            branch=args.branch,
+            commit=args.commit,
+            dirty=dirty,
+            changed_files=args.changed_file,
+            decisions=args.decision,
+            open_tasks=args.open_task,
+            notes=args.notes,
+            metadata=None,
+        )
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = record_project_state(
@@ -922,15 +997,15 @@ def _main(argv: list[str] | None = None) -> int:
                 session_id=args.session_id,
                 agent_id=args.agent_id,
                 project_id=args.project_id,
-                objective=args.objective,
-                repo_path=args.repo_path,
-                branch=args.branch,
-                commit=args.commit,
+                objective=validated_state["objective"],
+                repo_path=validated_state["repo_path"],
+                branch=validated_state["branch"],
+                commit=validated_state["commit"],
                 dirty=dirty,
-                changed_files=args.changed_file,
-                decisions=args.decision,
-                open_tasks=args.open_task,
-                notes=args.notes,
+                changed_files=validated_state["changed_files"],
+                decisions=validated_state["decisions"],
+                open_tasks=validated_state["open_tasks"],
+                notes=validated_state["notes"],
             )
             operation.cursor({"phase": "project_state_recorded", "card_id": result.get("card_id"), "project_id": safe_project_id})
             return result

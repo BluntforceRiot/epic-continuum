@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sqlite3
 import tempfile
@@ -21,7 +22,8 @@ from continuum.core.store import (
     record_project_state,
     recover_thread,
 )
-from continuum.mcp_server import TOOLS, dispatch
+import continuum.mcp_server as mcp_server_module
+from continuum.mcp_server import MAX_MCP_REQUEST_BYTES, TOOLS, dispatch
 
 
 def call_tool(name: str, arguments: dict) -> dict:
@@ -88,6 +90,183 @@ def tree_fingerprint(root: Path) -> str:
 
 
 class EpicContinuumMcpServerTest(unittest.TestCase):
+    def test_stdio_rejects_oversized_frame_before_parsing_and_recovers(self) -> None:
+        oversized = "x" * (MAX_MCP_REQUEST_BYTES + 1) + "\n"
+        valid = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "initialize",
+                "params": {},
+            }
+        )
+        stdin = io.StringIO(oversized + valid + "\n")
+        stdout = io.StringIO()
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["error"]["code"], -32700)
+        self.assertIn("request exceeds maximum", responses[0]["error"]["message"])
+        self.assertEqual(responses[1]["id"], 7)
+        self.assertEqual(
+            responses[1]["result"]["protocolVersion"],
+            mcp_server_module.PROTOCOL_VERSION,
+        )
+
+    def test_stdio_rejects_over_nested_json_and_recovers(self) -> None:
+        depth = mcp_server_module.MAX_MCP_JSON_DEPTH + 1
+        nested = "[" * depth + "0" + "]" * depth
+        valid = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "initialize",
+                "params": {},
+            }
+        )
+        stdin = io.StringIO(nested + "\n" + valid + "\n")
+        stdout = io.StringIO()
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["error"]["code"], -32600)
+        self.assertEqual(responses[1]["id"], 8)
+        self.assertEqual(
+            responses[1]["result"]["protocolVersion"],
+            mcp_server_module.PROTOCOL_VERSION,
+        )
+
+    def test_parsed_request_json_has_an_explicit_depth_limit(self) -> None:
+        value: object = 0
+        for _ in range(mcp_server_module.MAX_MCP_JSON_DEPTH + 1):
+            value = [value]
+
+        error = mcp_server_module._request_json_depth_error(value)
+
+        self.assertIsNotNone(error)
+        self.assertIn("maximum depth", str(error))
+
+    def test_stdio_recovers_after_parser_recursion_error(self) -> None:
+        first = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "initialize"})
+        second = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "initialize",
+                "params": {},
+            }
+        )
+        stdin = io.StringIO(first + "\n" + second + "\n")
+        stdout = io.StringIO()
+        real_loads = json.loads
+        call_count = 0
+
+        def controlled_loads(payload: str) -> object:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RecursionError("synthetic parser depth failure")
+            return real_loads(payload)
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+            patch.object(mcp_server_module.json, "loads", side_effect=controlled_loads),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [real_loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["error"]["code"], -32700)
+        self.assertEqual(responses[1]["id"], 10)
+
+    def test_project_state_limits_reject_before_operation_or_root_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                response = call_tool_raw(
+                    "continuum_record_project_state",
+                    {
+                        "root": str(root),
+                        "session_id": "bounded-session",
+                        "agent_id": "bounded-agent",
+                        "project_id": "bounded-project",
+                        "open_tasks": ["x" * 2000 for _ in range(70)],
+                    },
+                )
+
+            self.assertTrue(response["isError"], response)
+            payload = json.loads(response["content"][0]["text"])
+            self.assertIn("open_tasks exceeds maximum", payload["error"])
+            self.assertFalse(root.exists())
+
+        schema = TOOLS["continuum_record_project_state"][1]
+        properties = schema["properties"]
+        self.assertEqual(properties["open_tasks"]["maxItems"], 64)
+        self.assertNotIn("maxLength", json.dumps(schema, sort_keys=True))
+        self.assertIn("maxProperties", properties["metadata"])
+
+    def test_mcp_project_state_metadata_schema_boundary_is_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            metadata = {f"property_{index}": index for index in range(64)}
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                recorded = call_tool(
+                    "continuum_record_project_state",
+                    {
+                        "root": str(root),
+                        "session_id": "mcp-metadata-session",
+                        "agent_id": "mcp-metadata-agent",
+                        "project_id": "mcp-metadata-project",
+                        "metadata": metadata,
+                    },
+                )
+                resumed = call_tool(
+                    "continuum_resume_latest",
+                    {
+                        "root": str(root),
+                        "project_id": "mcp-metadata-project",
+                        "token_budget": 8192,
+                        "model_assist": False,
+                    },
+                )
+            self.assertTrue(recorded["ok"], recorded)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                recorded["card_id"],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                response = call_tool_raw(
+                    "continuum_record_project_state",
+                    {
+                        "root": str(root),
+                        "session_id": "mcp-metadata-overflow-session",
+                        "agent_id": "mcp-metadata-overflow-agent",
+                        "project_id": "mcp-metadata-overflow-project",
+                        "metadata": {
+                            f"property_{index}": index for index in range(65)
+                        },
+                    },
+                )
+            self.assertTrue(response["isError"], response)
+            self.assertFalse(root.exists())
+
     def test_initialize_and_list_tools(self) -> None:
         response = dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 

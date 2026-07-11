@@ -1053,7 +1053,7 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                 card_id = create_card(
                     conn,
                     root=root,
-                    card_type="project_state",
+                    card_type="concept",
                     title="Alpha graph route target",
                     summary="This Card is reached only through a synthetic association route.",
                     source_refs=[],

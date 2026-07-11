@@ -35,7 +35,11 @@ codex mcp add continuum --env PYTHONPATH="$REPO_ROOT/src" --env CONTINUUM_ROOT="
 
 Equivalent `~/.codex/config.toml` MCP entries are also fine when you manage
 Codex configuration directly. The server currently supports MCP protocol
-`2025-11-25`.
+`2025-11-25`. Stdio request frames are limited to 256 KiB; an oversized or
+invalid UTF-8 frame returns a parse error and the server resumes at the next
+newline-delimited request. `continuum_record_project_state` mirrors the core
+checkpoint field, item-count, and metadata limits described in
+[Shared Agent State](../shared-agent-state.md).
 
 MCP roots and file inputs are restricted by default to `CONTINUUM_ROOT` plus
 paths listed in `CONTINUUM_ALLOWED_ROOTS`. Add the repo, workspace, or evidence

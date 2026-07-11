@@ -22,6 +22,25 @@ An agent can write a project-state checkpoint containing:
 
 The checkpoint is written to the Scroll as an ordered event and to a project-scoped Card for recall. The Constellation links the project, agent, event, and Card so Cue Recall and context compilation can find it later.
 
+## Authority And Limits
+
+Project-scoped checkpoints from one agent form a single temporal chain across
+sessions. Recording a new checkpoint atomically makes every older same-agent
+head historical, while preserving those Cards and Scroll events as evidence.
+Session/private checkpoints supersede only within the same session. Checkpoints
+from different agents retain independent current heads so disagreement remains
+visible instead of being silently overwritten.
+
+One checkpoint is limited to 12 KiB of canonical serialized state so every
+accepted checkpoint, including escape-dense content, fits the supported
+8,192-token recovery boundary without discarding its raw Scroll evidence.
+Objectives are limited to 4 KiB, notes and metadata to 8 KiB each, repository
+paths to 4 KiB, branches to 512 bytes, and commits to 256 bytes. Decisions and
+open tasks allow up to 64 entries each at 2 KiB per item; changed files allow up
+to 256 entries at 1 KiB each. Metadata is bounded to eight levels, 64 members
+per container, and 128 total members. Limits are measured as UTF-8 bytes by the
+core even when a client schema expresses the same ceiling as string length.
+
 ## CLI Example
 
 ```bash

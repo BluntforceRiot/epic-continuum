@@ -18,6 +18,14 @@ from urllib.parse import urlencode
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
 from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
 from .permissions import secure_copy_file, secure_copytree, secure_mkdir, secure_sqlite_files, secure_write_text
+from .project_state import (
+    MAX_PROJECT_STATE_NOTES_BYTES,
+    MAX_PROJECT_STATE_TITLE_BYTES,
+    MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+    MAX_STORED_PROJECT_STATE_BYTES,
+    stored_project_state_limit_error,
+    validate_project_state_input,
+)
 from .safety import (
     is_ignored_path,
     redact_text_secrets,
@@ -525,6 +533,37 @@ def canonical_partition_identifier(root: Path, kind: str, value: str | None, *, 
         if lookup and text and not any(char in PARTITION_IDENTIFIER_MARKDOWN_CHARS for char in text):
             return text
         raise
+
+
+def _prevalidate_external_partition_identifier(
+    root: Path,
+    kind: str,
+    value: str,
+) -> None:
+    """Reject invalid core identifiers without creating root state.
+
+    Secret-like values still follow the configured alias policy; ordinary
+    values must satisfy the public 1-128 character partition contract.
+    """
+
+    if not value or len(value) > 128:
+        raise ValueError(
+            f"invalid {kind}: expected 1-128 characters from letters, digits, "
+            "underscore, dot, colon, at, plus, equals, slash, or hyphen"
+        )
+    if any(char in PARTITION_IDENTIFIER_MARKDOWN_CHARS for char in value):
+        raise ValueError(
+            f"invalid {kind}: partition identifiers must not contain control "
+            "or Markdown delimiter characters"
+        )
+    if value.startswith(PARTITION_INTERNAL_PREFIXES):
+        validate_partition_identifier(kind, value)
+        return
+    if scan_text_for_secrets(value, max_findings=1):
+        if _secret_action(root) == "block":
+            raise ValueError(f"secret scan blocked {kind} before partition lookup")
+        return
+    validate_partition_identifier(kind, value)
 
 
 def content_hash(text: str) -> str:
@@ -1055,7 +1094,7 @@ def json_loads(value: str | None, fallback: Any) -> Any:
         return fallback
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return fallback
 
 
@@ -4235,6 +4274,8 @@ def append_scroll_event(
     role: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    transaction_effect: Callable[[sqlite3.Connection, dict[str, Any]], None]
+    | None = None,
 ) -> dict[str, Any]:
     last_error: sqlite3.OperationalError | None = None
     for attempt in range(SQLITE_WRITE_RETRY_ATTEMPTS):
@@ -4246,6 +4287,7 @@ def append_scroll_event(
                 role=role,
                 content=content,
                 metadata=metadata,
+                transaction_effect=transaction_effect,
             )
         except sqlite3.OperationalError as exc:
             if not _is_retryable_sqlite_write_error(exc) or attempt >= SQLITE_WRITE_RETRY_ATTEMPTS - 1:
@@ -4264,6 +4306,8 @@ def _append_scroll_event_once(
     role: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    transaction_effect: Callable[[sqlite3.Connection, dict[str, Any]], None]
+    | None = None,
 ) -> dict[str, Any]:
     init_db(root)
     session_id, event_type, role, content, metadata = _apply_scroll_secret_policy(
@@ -4306,7 +4350,10 @@ def _append_scroll_event_once(
         config = load_config(root)
         dedup_window = int(config.get("capture", {}).get("dedup_window_seconds", 0))
         digest = content_hash(content)
-        if dedup_window > 0:
+        # Each project-state call is an explicit temporal checkpoint. Reusing a
+        # prior Scroll event would also reuse its stable Card ID and can reverse
+        # or self-link the checkpoint authority chain.
+        if dedup_window > 0 and event_type != "project_state":
             cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=dedup_window)).replace(microsecond=0).isoformat()
             candidates = conn.execute(
                 """
@@ -4390,10 +4437,7 @@ def _append_scroll_event_once(
                         **({"project_id": current_project_id} if current_project_id else {}),
                     },
                 )
-                conn.commit()
-                if exact_card_id is not None:
-                    sync_card_sidecars_after_commit(root, [exact_card_id])
-                return {
+                result = {
                     "event_id": existing["id"],
                     "session_id": session_id,
                     "seq": int(existing["seq"]),
@@ -4401,6 +4445,12 @@ def _append_scroll_event_once(
                     "deduplicated": True,
                     "exact_card_id": exact_card_id,
                 }
+                if transaction_effect is not None:
+                    transaction_effect(conn, result)
+                conn.commit()
+                if exact_card_id is not None:
+                    sync_card_sidecars_after_commit(root, [exact_card_id])
+                return result
         row = conn.execute(
             "SELECT coalesce(max(seq), 0) + 1 AS next_seq FROM scroll_events WHERE session_id = ?",
             (session_id,),
@@ -4481,10 +4531,7 @@ def _append_scroll_event_once(
                 "visibility_scope": metadata.get("visibility_scope", "global"),
             },
         )
-        conn.commit()
-        if exact_card_id is not None:
-            sync_card_sidecars_after_commit(root, [exact_card_id])
-        return {
+        result = {
             "event_id": event_id,
             "session_id": session_id,
             "seq": seq,
@@ -4493,6 +4540,12 @@ def _append_scroll_event_once(
             "association_terms": [term["term"] for term in association_terms],
             "exact_card_id": exact_card_id,
         }
+        if transaction_effect is not None:
+            transaction_effect(conn, result)
+        conn.commit()
+        if exact_card_id is not None:
+            sync_card_sidecars_after_commit(root, [exact_card_id])
+        return result
     finally:
         conn.close()
 
@@ -5279,6 +5332,8 @@ def _project_state_source_event(
     checkpoint_visibility_scope: str,
     capability_session_id: str | None,
     capability_project_id: str | None,
+    max_content_bytes: int | None = None,
+    allow_private_exact_boundary: bool = False,
 ) -> sqlite3.Row | None:
     """Resolve one lossless project-state source under the caller's capability."""
 
@@ -5298,24 +5353,44 @@ def _project_state_source_event(
                 reference_seq = None
 
         if reference_event_id:
+            content_limit_clause = (
+                " AND length(CAST(content AS BLOB)) <= ?"
+                if max_content_bytes is not None
+                else ""
+            )
             source_row = conn.execute(
-                """
+                f"""
                 SELECT id, session_id, seq, role, event_type, content,
                        content_hash, visibility_scope, project_id, created_at
                 FROM scroll_events
                 WHERE id = ?
+                {content_limit_clause}
                 """,
-                (reference_event_id,),
+                (
+                    (reference_event_id, max_content_bytes)
+                    if max_content_bytes is not None
+                    else (reference_event_id,)
+                ),
             ).fetchone()
         elif reference_session_id and reference_seq is not None:
+            content_limit_clause = (
+                " AND length(CAST(content AS BLOB)) <= ?"
+                if max_content_bytes is not None
+                else ""
+            )
             source_row = conn.execute(
-                """
+                f"""
                 SELECT id, session_id, seq, role, event_type, content,
                        content_hash, visibility_scope, project_id, created_at
                 FROM scroll_events
                 WHERE session_id = ? AND seq = ?
+                {content_limit_clause}
                 """,
-                (reference_session_id, reference_seq),
+                (
+                    (reference_session_id, reference_seq, max_content_bytes)
+                    if max_content_bytes is not None
+                    else (reference_session_id, reference_seq)
+                ),
             ).fetchone()
         else:
             continue
@@ -5355,7 +5430,13 @@ def _project_state_source_event(
             continue
         if reference_seq is not None and int(source_row["seq"]) != reference_seq:
             continue
-        if not _metadata_scope_visible(
+        private_internal_match = (
+            allow_private_exact_boundary
+            and checkpoint_visibility_scope == "private"
+            and str(source_row["session_id"] or "") == checkpoint_session_id
+            and source_project_id == expected_source_project_id
+        )
+        if not private_internal_match and not _metadata_scope_visible(
             {
                 "visibility_scope": source_row["visibility_scope"],
                 "project_id": source_row["project_id"],
@@ -5543,10 +5624,47 @@ def _compile_context_planner_v2(
     candidates: dict[str, list[dict[str, Any]]] = {"recent_scroll": [], "current_cards": [], "cue_recall": []}
     mandatory_candidate: dict[str, Any] | None = None
     mandatory_source: str | None = None
+    operational_current_card_ids: set[str] = set()
+    operational_project_state_card_ids: set[str] = set()
+    operational_project_state_event_ids: set[str] = set()
+    operational_project_state_legacy_refs: set[tuple[str, int]] = set()
     conn = connect(root) if create else connect_existing(root)
     try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
         terms = extract_terms(query or project_id or session_id, limit=8)
         query_terms = extract_terms(query or "", limit=8)
+        operational_visibility_session = (
+            (capability_session_id or None)
+            if capability_was_supplied
+            else session_id
+        )
+        operational_visibility_project = (
+            capability_project_id if capability_was_supplied else project_id
+        )
+        operational_project_state_card_ids = (
+            _valid_visible_current_project_state_ids(
+                conn,
+                session_id=operational_visibility_session,
+                project_id=operational_visibility_project,
+            )
+        )
+        (
+            operational_project_state_event_ids,
+            operational_project_state_legacy_refs,
+        ) = _current_project_state_source_references(
+            conn,
+            session_id=operational_visibility_session,
+            project_id=operational_visibility_project,
+            valid_card_ids=operational_project_state_card_ids,
+        )
+        operational_current_card_ids = _operational_visible_current_card_ids(
+            conn,
+            session_id=operational_visibility_session,
+            project_id=operational_visibility_project,
+            valid_project_state_card_ids=operational_project_state_card_ids,
+            valid_project_state_event_ids=operational_project_state_event_ids,
+        )
         recent_rows = _visible_scroll_rows(
             conn,
             session_id=session_id,
@@ -5563,6 +5681,8 @@ def _compile_context_planner_v2(
                 1,
                 min(configured_event_limit, max(24, usable_budget // 10)),
             ),
+            current_project_states_only=True,
+            valid_project_state_card_ids=operational_project_state_card_ids,
         )
         for row in recent_rows:
             direct = sum(
@@ -5621,6 +5741,17 @@ def _compile_context_planner_v2(
             ") > 0 THEN 1 ELSE 0 END"
             for _term in terms
         ) or "0"
+        if operational_current_card_ids:
+            operational_card_placeholders = ", ".join(
+                "?" for _ in operational_current_card_ids
+            )
+            project_state_gate = (
+                f"AND id IN ({operational_card_placeholders})"
+            )
+            project_state_gate_params = sorted(operational_current_card_ids)
+        else:
+            project_state_gate = "AND 0"
+            project_state_gate_params = []
         matches = conn.execute(
             f"""
             SELECT *
@@ -5631,6 +5762,7 @@ def _compile_context_planner_v2(
                        ({direct_match_sql}) AS direct_match_count
                 FROM cards
                 WHERE {_current_card_authority_clause()}
+                  {project_state_gate}
                   {scope_clause}
             ) AS ranked_cards
             ORDER BY (
@@ -5639,7 +5771,11 @@ def _compile_context_planner_v2(
             ) DESC, updated_at DESC, id
             LIMIT 80
             """,
-            (*[str(term).lower() for term in terms], *scope_params),
+            (
+                *[str(term).lower() for term in terms],
+                *project_state_gate_params,
+                *scope_params,
+            ),
         ).fetchall()
         for row in matches:
             direct = int(row["direct_match_count"] or 0)
@@ -5936,6 +6072,15 @@ def _compile_context_planner_v2(
             create=False,
         )
         for item in cue_result.get("results", []):
+            raw_item_seq = item.get("seq")
+            try:
+                item_seq = (
+                    -1
+                    if isinstance(raw_item_seq, bool)
+                    else int(raw_item_seq)
+                )
+            except (TypeError, ValueError):
+                item_seq = -1
             if mandatory_checkpoint is not None and str(item.get("id") or "") == str(
                 mandatory_checkpoint.get("checkpoint_id") or ""
             ):
@@ -5950,6 +6095,39 @@ def _compile_context_planner_v2(
                         "source": "cue_recall",
                         "included": False,
                         "reason": "superseded_or_contested",
+                    }
+                )
+                continue
+            if (
+                item.get("kind") == "card"
+                and str(item.get("id") or "") not in operational_current_card_ids
+            ):
+                trace.append(
+                    {
+                        "id": candidate_id,
+                        "source": "cue_recall",
+                        "included": False,
+                        "reason": "nonoperational_card_source",
+                    }
+                )
+                continue
+            if (
+                item.get("kind") == "scroll_event"
+                and str(item.get("event_type") or "") == "project_state"
+                and str(item.get("id") or "")
+                not in operational_project_state_event_ids
+                and (
+                    str(item.get("session_id") or ""),
+                    item_seq,
+                )
+                not in operational_project_state_legacy_refs
+            ):
+                trace.append(
+                    {
+                        "id": candidate_id,
+                        "source": "cue_recall",
+                        "included": False,
+                        "reason": "historical_project_state",
                     }
                 )
                 continue
@@ -6758,6 +6936,261 @@ def validate_recent_event_limit(value: int) -> int:
     return value
 
 
+def _current_project_state_source_references(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None,
+    project_id: str | None,
+    valid_card_ids: set[str] | None = None,
+) -> tuple[set[str], set[tuple[str, int]]]:
+    """Return source-event keys for current visible project-state Cards."""
+
+    if valid_card_ids is None:
+        valid_card_ids = _valid_visible_current_project_state_ids(
+            conn,
+            session_id=session_id,
+            project_id=project_id,
+        )
+    if not valid_card_ids:
+        return set(), set()
+    placeholders = ", ".join("?" for _ in valid_card_ids)
+    cards = conn.execute(
+        f"""
+        SELECT source_refs_json
+        FROM cards
+        WHERE id IN ({placeholders})
+          AND card_type = 'project_state'
+          AND length(CAST(source_refs_json AS BLOB)) <= ?
+        """,
+        (*sorted(valid_card_ids), MAX_STORED_PROJECT_STATE_BYTES),
+    )
+    authoritative_event_ids: set[str] = set()
+    authoritative_legacy_refs: set[tuple[str, int]] = set()
+    for card in cards:
+        source_refs = json_loads(card["source_refs_json"], [])
+        if not isinstance(source_refs, list):
+            continue
+        for reference in source_refs:
+            if not isinstance(reference, dict):
+                continue
+            event_id = str(reference.get("event_id") or "")
+            if event_id:
+                authoritative_event_ids.add(event_id)
+                continue
+            reference_session = str(reference.get("session_id") or "")
+            raw_seq = reference.get("seq")
+            if (
+                not reference_session
+                or raw_seq is None
+                or isinstance(raw_seq, bool)
+            ):
+                continue
+            try:
+                reference_seq = int(raw_seq)
+            except (TypeError, ValueError):
+                continue
+            authoritative_legacy_refs.add((reference_session, reference_seq))
+            event_row = conn.execute(
+                """
+                SELECT id FROM scroll_events
+                WHERE session_id = ? AND seq = ? AND event_type = 'project_state'
+                """,
+                (reference_session, reference_seq),
+            ).fetchone()
+            if event_row is not None:
+                authoritative_event_ids.add(str(event_row["id"]))
+    return authoritative_event_ids, authoritative_legacy_refs
+
+
+def _card_sources_are_operational(
+    conn: sqlite3.Connection,
+    *,
+    card_id: str,
+    source_refs_bytes_by_card_id: dict[str, int],
+    eligible_non_project_card_ids: set[str],
+    valid_project_state_card_ids: set[str],
+    valid_project_state_event_ids: set[str],
+    memo: dict[str, bool],
+    visiting: set[str],
+    event_id_cache: dict[str, tuple[str, str] | None],
+    event_coordinate_cache: dict[tuple[str, int], tuple[str, str] | None],
+    depth: int = 0,
+) -> bool:
+    """Reject derived Cards that transitively depend on stale project state."""
+
+    cached = memo.get(card_id)
+    if cached is not None:
+        return cached
+    # A deliberately conservative depth bound also makes cycles fail closed.
+    if card_id in visiting or depth >= 64:
+        return False
+    source_refs_bytes = source_refs_bytes_by_card_id.get(card_id)
+    if source_refs_bytes is None:
+        memo[card_id] = False
+        return False
+    if source_refs_bytes > MAX_STORED_PROJECT_STATE_BYTES:
+        memo[card_id] = False
+        return False
+    source_row = conn.execute(
+        """
+        SELECT source_refs_json FROM cards
+        WHERE id = ? AND length(CAST(source_refs_json AS BLOB)) <= ?
+        """,
+        (card_id, MAX_STORED_PROJECT_STATE_BYTES),
+    ).fetchone()
+    if source_row is None:
+        memo[card_id] = False
+        return False
+    source_refs = json_loads(source_row["source_refs_json"], [])
+    if not isinstance(source_refs, list) or len(source_refs) > 256:
+        memo[card_id] = False
+        return False
+    visiting.add(card_id)
+    operational = True
+    for reference in source_refs:
+        if not isinstance(reference, dict):
+            operational = False
+            break
+        if reference.get("card_id"):
+            source_card_id = str(reference["card_id"])
+            if source_card_id in valid_project_state_card_ids:
+                pass
+            elif source_card_id not in eligible_non_project_card_ids:
+                operational = False
+                break
+            elif not _card_sources_are_operational(
+                conn,
+                card_id=source_card_id,
+                source_refs_bytes_by_card_id=source_refs_bytes_by_card_id,
+                eligible_non_project_card_ids=eligible_non_project_card_ids,
+                valid_project_state_card_ids=valid_project_state_card_ids,
+                valid_project_state_event_ids=valid_project_state_event_ids,
+                memo=memo,
+                visiting=visiting,
+                event_id_cache=event_id_cache,
+                event_coordinate_cache=event_coordinate_cache,
+                depth=depth + 1,
+            ):
+                operational = False
+                break
+        event_row = None
+        if reference.get("event_id"):
+            source_event_id = str(reference["event_id"])
+            if source_event_id not in event_id_cache:
+                fetched_event = conn.execute(
+                    "SELECT id, event_type FROM scroll_events WHERE id = ?",
+                    (source_event_id,),
+                ).fetchone()
+                event_id_cache[source_event_id] = (
+                    None
+                    if fetched_event is None
+                    else (
+                        str(fetched_event["id"]),
+                        str(fetched_event["event_type"] or ""),
+                    )
+                )
+            event_row = event_id_cache[source_event_id]
+        elif reference.get("session_id") and reference.get("seq") is not None:
+            raw_seq = reference.get("seq")
+            try:
+                reference_seq = (
+                    None
+                    if raw_seq is None or isinstance(raw_seq, bool)
+                    else int(raw_seq)
+                )
+            except (TypeError, ValueError):
+                reference_seq = None
+            if reference_seq is not None:
+                coordinate = (str(reference["session_id"]), reference_seq)
+                if coordinate not in event_coordinate_cache:
+                    fetched_event = conn.execute(
+                        """
+                        SELECT id, event_type FROM scroll_events
+                        WHERE session_id = ? AND seq = ?
+                        """,
+                        coordinate,
+                    ).fetchone()
+                    event_coordinate_cache[coordinate] = (
+                        None
+                        if fetched_event is None
+                        else (
+                            str(fetched_event["id"]),
+                            str(fetched_event["event_type"] or ""),
+                        )
+                    )
+                event_row = event_coordinate_cache[coordinate]
+        if (
+            event_row is not None
+            and event_row[1] == "project_state"
+            and event_row[0] not in valid_project_state_event_ids
+        ):
+            operational = False
+            break
+    visiting.discard(card_id)
+    memo[card_id] = operational
+    return operational
+
+
+def _operational_visible_current_card_ids(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None,
+    project_id: str | None,
+    valid_project_state_card_ids: set[str],
+    valid_project_state_event_ids: set[str],
+) -> set[str]:
+    """Return visible current Cards whose project-state dependencies are current."""
+
+    visible_clause, visible_params = _visible_card_clause(
+        session_id=session_id,
+        project_id=project_id,
+    )
+    rows = conn.execute(
+        f"""
+        SELECT id, card_type,
+               length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+        FROM cards
+        WHERE {_current_card_authority_clause('cards')}
+          AND {visible_clause}
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (*visible_params, MAX_RECENT_EVENT_LIMIT),
+    ).fetchall()
+    operational = set(valid_project_state_card_ids)
+    eligible_non_project_card_ids = {
+        str(row["id"])
+        for row in rows
+        if str(row["card_type"] or "") != "project_state"
+    }
+    source_refs_bytes_by_card_id = {
+        str(row["id"]): int(row["source_refs_bytes"] or 0)
+        for row in rows
+        if str(row["card_type"] or "") != "project_state"
+    }
+    memo: dict[str, bool] = {}
+    event_id_cache: dict[str, tuple[str, str] | None] = {}
+    event_coordinate_cache: dict[tuple[str, int], tuple[str, str] | None] = {}
+    for row in rows:
+        row_id = str(row["id"])
+        if str(row["card_type"] or "") == "project_state":
+            continue
+        if _card_sources_are_operational(
+            conn,
+            card_id=row_id,
+            source_refs_bytes_by_card_id=source_refs_bytes_by_card_id,
+            eligible_non_project_card_ids=eligible_non_project_card_ids,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+            memo=memo,
+            visiting=set(),
+            event_id_cache=event_id_cache,
+            event_coordinate_cache=event_coordinate_cache,
+        ):
+            operational.add(row_id)
+    return operational
+
+
 def _visible_scroll_rows(
     conn: sqlite3.Connection,
     *,
@@ -6765,8 +7198,12 @@ def _visible_scroll_rows(
     limit: int,
     project_id: str | None = None,
     visibility_capability: dict[str, Any] | None = None,
+    current_project_states_only: bool = False,
+    valid_project_state_card_ids: set[str] | None = None,
 ) -> list[sqlite3.Row]:
     limit = validate_recent_event_limit(limit)
+    if limit == 0:
+        return []
     visible_session_id: str | None
     visible_project_id: str | None
     if visibility_capability is None:
@@ -6791,17 +7228,70 @@ def _visible_scroll_rows(
         boundary_clause = visible_clause
         boundary_params = tuple(visible_params)
         ordering = "created_at DESC, rowid DESC"
-    return conn.execute(
+    if not current_project_states_only:
+        return conn.execute(
+            f"""
+            SELECT id, session_id, seq, role, event_type, content, token_estimate,
+                   visibility_scope, project_id, metadata_json, created_at
+            FROM scroll_events
+            WHERE {boundary_clause}
+            ORDER BY {ordering}
+            LIMIT ?
+            """,
+            (*boundary_params, limit),
+        ).fetchall()
+
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    rows = conn.execute(
         f"""
-        SELECT id, session_id, seq, role, event_type, content, token_estimate,
-               visibility_scope, project_id, metadata_json, created_at
+        SELECT id, session_id, seq, event_type
         FROM scroll_events
         WHERE {boundary_clause}
         ORDER BY {ordering}
         LIMIT ?
         """,
-        (*boundary_params, limit),
+        (*boundary_params, MAX_RECENT_EVENT_LIMIT),
     ).fetchall()
+
+    (
+        authoritative_event_ids,
+        authoritative_legacy_refs,
+    ) = _current_project_state_source_references(
+        conn,
+        session_id=visible_session_id,
+        project_id=visible_project_id,
+        valid_card_ids=valid_project_state_card_ids,
+    )
+
+    operational_ids = [
+        str(row["id"])
+        for row in rows
+        if str(row["event_type"] or "") != "project_state"
+        or str(row["id"] or "") in authoritative_event_ids
+        or (str(row["session_id"] or ""), int(row["seq"]))
+        in authoritative_legacy_refs
+    ][:limit]
+    if not operational_ids:
+        return []
+    placeholders = ", ".join("?" for _ in operational_ids)
+    payload_rows = {
+        str(row["id"]): row
+        for row in conn.execute(
+            f"""
+            SELECT id, session_id, seq, role, event_type, content, token_estimate,
+                   visibility_scope, project_id, metadata_json, created_at
+            FROM scroll_events
+            WHERE id IN ({placeholders})
+            """,
+            tuple(operational_ids),
+        )
+    }
+    return [
+        payload_rows[event_id]
+        for event_id in operational_ids
+        if event_id in payload_rows
+    ]
 
 
 def _event_payload_visible(
@@ -6856,10 +7346,51 @@ def _queue_job_visible(
     *,
     session_id: str | None,
     project_id: str | None = None,
+    operational_card_ids: set[str] | None = None,
+    valid_project_state_event_ids: set[str] | None = None,
 ) -> bool:
     payload = json_loads(row["payload_json"], {})
     related_card_ids = [str(item) for item in json_loads(row["related_card_ids_json"], []) if item]
     card_ids = _job_card_ids(conn, payload, related_card_ids)
+    if operational_card_ids is not None:
+        for card_id in card_ids:
+            card_exists = conn.execute(
+                "SELECT 1 FROM cards WHERE id = ?",
+                (card_id,),
+            ).fetchone()
+            if card_exists is not None and card_id not in operational_card_ids:
+                return False
+    if valid_project_state_event_ids is not None:
+        event_row = None
+        if payload.get("event_id"):
+            event_row = conn.execute(
+                "SELECT id, event_type FROM scroll_events WHERE id = ?",
+                (str(payload["event_id"]),),
+            ).fetchone()
+        elif payload.get("session_id") and payload.get("seq") is not None:
+            raw_seq = payload.get("seq")
+            try:
+                payload_seq = (
+                    None
+                    if raw_seq is None or isinstance(raw_seq, bool)
+                    else int(raw_seq)
+                )
+            except (TypeError, ValueError):
+                payload_seq = None
+            if payload_seq is not None:
+                event_row = conn.execute(
+                    """
+                    SELECT id, event_type FROM scroll_events
+                    WHERE session_id = ? AND seq = ?
+                    """,
+                    (str(payload["session_id"]), payload_seq),
+                ).fetchone()
+        if (
+            event_row is not None
+            and str(event_row["event_type"] or "") == "project_state"
+            and str(event_row["id"]) not in valid_project_state_event_ids
+        ):
+            return False
     if card_ids:
         for card_id in card_ids:
             card_row = conn.execute(
@@ -6910,6 +7441,9 @@ def _graph_source_refs_visible(
     *,
     session_id: str | None = None,
     project_id: str | None = None,
+    valid_project_state_card_ids: set[str] | None = None,
+    valid_project_state_event_ids: set[str] | None = None,
+    operational_card_ids: set[str] | None = None,
 ) -> bool:
     refs = json_loads(source_refs_json, [])
     if not refs:
@@ -6917,7 +7451,15 @@ def _graph_source_refs_visible(
     for ref in refs:
         if not isinstance(ref, dict):
             continue
-        if _graph_source_ref_visible(conn, ref, session_id=session_id, project_id=project_id):
+        if _graph_source_ref_visible(
+            conn,
+            ref,
+            session_id=session_id,
+            project_id=project_id,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+            operational_card_ids=operational_card_ids,
+        ):
             return True
     return False
 
@@ -6928,20 +7470,43 @@ def _graph_source_ref_visible(
     *,
     session_id: str | None = None,
     project_id: str | None = None,
+    valid_project_state_card_ids: set[str] | None = None,
+    valid_project_state_event_ids: set[str] | None = None,
+    operational_card_ids: set[str] | None = None,
 ) -> bool:
     if card_id := ref.get("card_id"):
         row = conn.execute(
-            f"SELECT visibility_scope, session_id, project_id FROM cards WHERE id = ? AND {_current_card_authority_clause()}",
+            f"SELECT card_type, visibility_scope, session_id, project_id FROM cards WHERE id = ? AND {_current_card_authority_clause()}",
             (str(card_id),),
         ).fetchone()
-        if row is not None and _card_row_visible(row, session_id=session_id, project_id=project_id):
+        if (
+            row is not None
+            and (
+                operational_card_ids is None
+                or str(card_id) in operational_card_ids
+            )
+            and (
+                str(row["card_type"] or "") != "project_state"
+                or valid_project_state_card_ids is None
+                or str(card_id) in valid_project_state_card_ids
+            )
+            and _card_row_visible(
+                row,
+                session_id=session_id,
+                project_id=project_id,
+            )
+        ):
             return True
     if event_id := ref.get("event_id"):
         row = conn.execute(
-            "SELECT session_id, visibility_scope, project_id FROM scroll_events WHERE id = ?",
+            "SELECT session_id, event_type, visibility_scope, project_id FROM scroll_events WHERE id = ?",
             (str(event_id),),
         ).fetchone()
-        if row is not None:
+        if row is not None and (
+            str(row["event_type"] or "") != "project_state"
+            or valid_project_state_event_ids is None
+            or str(event_id) in valid_project_state_event_ids
+        ):
             metadata = {"visibility_scope": row["visibility_scope"], "project_id": row["project_id"]}
             if _metadata_scope_visible(
                 metadata,
@@ -6963,6 +7528,9 @@ def _graph_visible_edge_stats(
     session_id: str | None = None,
     project_id: str | None = None,
     source_scan_limit: int = 64,
+    valid_project_state_card_ids: set[str] | None = None,
+    valid_project_state_event_ids: set[str] | None = None,
+    operational_card_ids: set[str] | None = None,
 ) -> tuple[float, float]:
     rows = conn.execute(
         """
@@ -6980,12 +7548,23 @@ def _graph_visible_edge_stats(
             source_refs_json,
             session_id=session_id,
             project_id=project_id,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+            operational_card_ids=operational_card_ids,
         ) else (0.0, 0.0)
     visible_weight = 0.0
     visible_confidence = 0.0
     for row in rows:
         ref = json_loads(row["source_ref_json"], {})
-        if isinstance(ref, dict) and _graph_source_ref_visible(conn, ref, session_id=session_id, project_id=project_id):
+        if isinstance(ref, dict) and _graph_source_ref_visible(
+            conn,
+            ref,
+            session_id=session_id,
+            project_id=project_id,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+            operational_card_ids=operational_card_ids,
+        ):
             visible_weight += float(row["weight"] or 0.0)
             visible_confidence = max(visible_confidence, float(row["confidence"] or 0.0))
     return min(1.0, visible_weight), visible_confidence
@@ -6999,6 +7578,9 @@ def _graph_node_has_visible_sources(
     project_id: str | None = None,
     edge_scan_limit: int = 64,
     source_scan_limit: int = 16,
+    valid_project_state_card_ids: set[str] | None = None,
+    valid_project_state_event_ids: set[str] | None = None,
+    operational_card_ids: set[str] | None = None,
 ) -> bool:
     session_like = f'%"{session_id}"%' if session_id else ""
     project_like = f'%"{project_id}"%' if project_id else ""
@@ -7029,6 +7611,9 @@ def _graph_node_has_visible_sources(
             session_id=session_id,
             project_id=project_id,
             source_scan_limit=source_scan_limit,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+            operational_card_ids=operational_card_ids,
         )
         if visible_weight > 0 and visible_confidence > 0:
             return True
@@ -7076,6 +7661,29 @@ def cue_recall(
     source_scan_limit_per_edge = max(8, min(64, association_limit * 4))
     conn = connect(root) if create else connect_existing(root)
     try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        valid_project_state_card_ids = _valid_visible_current_project_state_ids(
+            conn,
+            session_id=session_id,
+            project_id=project_id,
+        )
+        (
+            valid_project_state_event_ids,
+            _valid_project_state_legacy_refs,
+        ) = _current_project_state_source_references(
+            conn,
+            session_id=session_id,
+            project_id=project_id,
+            valid_card_ids=valid_project_state_card_ids,
+        )
+        operational_current_card_ids = _operational_visible_current_card_ids(
+            conn,
+            session_id=session_id,
+            project_id=project_id,
+            valid_project_state_card_ids=valid_project_state_card_ids,
+            valid_project_state_event_ids=valid_project_state_event_ids,
+        )
         seed_nodes: dict[str, float] = {}
         remaining_seed_probe_budget = visible_seed_scan_limit
         for term in terms:
@@ -7099,6 +7707,9 @@ def cue_recall(
                     project_id=project_id,
                     edge_scan_limit=visible_seed_scan_limit,
                     source_scan_limit=source_scan_limit_per_edge,
+                    valid_project_state_card_ids=valid_project_state_card_ids,
+                    valid_project_state_event_ids=valid_project_state_event_ids,
+                    operational_card_ids=operational_current_card_ids,
                 ):
                     seed_nodes[exact_id] = max(seed_nodes.get(exact_id, 0.0), importance)
             if remaining_seed_probe_budget <= 0:
@@ -7124,6 +7735,9 @@ def cue_recall(
                     project_id=project_id,
                     edge_scan_limit=visible_seed_scan_limit,
                     source_scan_limit=source_scan_limit_per_edge,
+                    valid_project_state_card_ids=valid_project_state_card_ids,
+                    valid_project_state_event_ids=valid_project_state_event_ids,
+                    operational_card_ids=operational_current_card_ids,
                 ):
                     continue
                 seed_nodes[row_id] = max(seed_nodes.get(row_id, 0.0), importance * 0.7)
@@ -7173,6 +7787,9 @@ def cue_recall(
                     session_id=session_id,
                     project_id=project_id,
                     source_scan_limit=source_scan_limit_per_edge,
+                    valid_project_state_card_ids=valid_project_state_card_ids,
+                    valid_project_state_event_ids=valid_project_state_event_ids,
+                    operational_card_ids=operational_current_card_ids,
                 )
                 if visible_weight <= 0 or visible_confidence <= 0:
                     continue
@@ -7245,6 +7862,15 @@ def cue_recall(
 
         visible_card_clause, visible_card_params = _visible_card_clause(session_id=session_id, project_id=project_id)
         card_scope_clause = f"{_current_card_authority_clause()} AND {visible_card_clause}"
+        if operational_current_card_ids:
+            valid_card_placeholders = ", ".join(
+                "?" for _ in operational_current_card_ids
+            )
+            project_state_card_gate = f"AND id IN ({valid_card_placeholders})"
+            project_state_card_params = sorted(operational_current_card_ids)
+        else:
+            project_state_card_gate = "AND 0"
+            project_state_card_params = []
         for term in expanded_terms:
             rows = conn.execute(
                 f"""
@@ -7252,11 +7878,19 @@ def cue_recall(
                        source_refs_json, entities_json, topics_json, metadata_json
                 FROM cards
                 WHERE {card_scope_clause}
+                  {project_state_card_gate}
                   AND (title LIKE ? OR summary LIKE ? OR entities_json LIKE ? OR topics_json LIKE ?)
                 ORDER BY salience DESC, updated_at DESC
                 LIMIT 16
                 """,
-                (*visible_card_params, f"%{term['term']}%", f"%{term['term']}%", f"%{term['term']}%", f"%{term['term']}%"),
+                (
+                    *visible_card_params,
+                    *project_state_card_params,
+                    f"%{term['term']}%",
+                    f"%{term['term']}%",
+                    f"%{term['term']}%",
+                    f"%{term['term']}%",
+                ),
             ).fetchall()
             for row in rows:
                 key = f"card:{row['id']}"
@@ -7294,6 +7928,18 @@ def cue_recall(
                 )
 
         event_scope_clause, event_scope_params = _visible_scroll_clause(session_id=session_id, project_id=project_id)
+        if valid_project_state_event_ids:
+            valid_event_placeholders = ", ".join(
+                "?" for _ in valid_project_state_event_ids
+            )
+            project_state_event_gate = (
+                "AND (event_type != 'project_state' "
+                f"OR id IN ({valid_event_placeholders}))"
+            )
+            project_state_event_params = sorted(valid_project_state_event_ids)
+        else:
+            project_state_event_gate = "AND event_type != 'project_state'"
+            project_state_event_params = []
         for term in expanded_terms:
             for row in conn.execute(
                 f"""
@@ -7301,11 +7947,16 @@ def cue_recall(
                        visibility_scope, project_id, created_at
                 FROM scroll_events
                 WHERE {event_scope_clause}
+                  {project_state_event_gate}
                   AND content LIKE ?
                 ORDER BY seq DESC
                 LIMIT 12
                 """,
-                (*event_scope_params, f"%{term['term']}%"),
+                (
+                    *event_scope_params,
+                    *project_state_event_params,
+                    f"%{term['term']}%",
+                ),
             ):
                 key = f"event:{row['id']}"
                 item = candidate_scores.setdefault(
@@ -7375,6 +8026,17 @@ def cue_recall(
         results: list[dict[str, Any]] = []
         for item in candidate_scores.values():
             if item.get("kind") == "card":
+                card_type_row = conn.execute(
+                    f"""
+                    SELECT card_type FROM cards
+                    WHERE id = ? AND {_current_card_authority_clause()}
+                    """,
+                    (item.get("id"),),
+                ).fetchone()
+                if card_type_row is None or (
+                    str(item.get("id") or "") not in operational_current_card_ids
+                ):
+                    continue
                 row = conn.execute(
                     f"""
                     SELECT id, card_type, title, summary, salience, confidence, session_id, project_id,
@@ -7400,6 +8062,16 @@ def cue_recall(
                     }
                 )
             elif item.get("kind") == "scroll_event":
+                event_type_row = conn.execute(
+                    "SELECT event_type FROM scroll_events WHERE id = ?",
+                    (item.get("id"),),
+                ).fetchone()
+                if event_type_row is None or (
+                    str(event_type_row["event_type"] or "") == "project_state"
+                    and str(item.get("id") or "")
+                    not in valid_project_state_event_ids
+                ):
+                    continue
                 row = conn.execute(
                     """
                     SELECT id, session_id, seq, role, event_type, content, metadata_json, created_at
@@ -7451,6 +8123,73 @@ def cue_recall(
         conn.close()
 
 
+def _current_project_state_authority_heads(
+    conn: sqlite3.Connection,
+    *,
+    visibility_scope: str,
+    session_id: str,
+    project_id: str,
+    agent_id: str,
+) -> list[sqlite3.Row]:
+    """Return current heads for one canonical project-state authority boundary.
+
+    Project-visible checkpoints follow an agent across sessions. Session/private
+    checkpoints remain isolated to their session. Selecting all current heads
+    also lets the next checkpoint repair a legacy accidental fork atomically.
+    """
+
+    clauses = [
+        "card_type = 'project_state'",
+        "visibility_scope = ?",
+        "coalesce(project_id, '') = ?",
+        _current_card_authority_clause("cards"),
+    ]
+    params: list[Any] = [visibility_scope, project_id]
+    if visibility_scope in {"session", "private"}:
+        clauses.append("coalesce(session_id, '') = ?")
+        params.append(session_id)
+    rows = conn.execute(
+        f"""
+        SELECT rowid AS card_rowid, id, created_at, supersedes_card_id,
+               session_id, project_id, visibility_scope,
+               length(CAST(title AS BLOB)) AS title_bytes,
+               length(CAST(summary AS BLOB)) AS summary_bytes,
+               length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+               length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+               length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+               length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+        FROM cards
+        WHERE {' AND '.join(clauses)}
+        ORDER BY created_at ASC, card_rowid ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    authority_heads: list[sqlite3.Row] = []
+    for row in rows:
+        authority_agent_id = _project_state_repair_agent_id(conn, row)
+        if not authority_agent_id:
+            raise ValueError(
+                "current project-state authority is invalid; repair required: "
+                f"{row['id']}: project-state agent evidence is invalid"
+            )
+        # Another agent's authority is independent. Its integrity may still be
+        # repaired, but it cannot block this agent from advancing its own head.
+        if authority_agent_id != agent_id:
+            continue
+        integrity_error = _project_state_card_integrity_error(
+            conn,
+            str(row["id"]),
+            size_row=row,
+        )
+        if integrity_error is not None:
+            raise ValueError(
+                "current project-state authority is invalid; repair required: "
+                f"{row['id']}: {integrity_error}"
+            )
+        authority_heads.append(row)
+    return authority_heads
+
+
 def record_project_state(
     root: Path,
     *,
@@ -7469,14 +8208,48 @@ def record_project_state(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a durable project-state checkpoint shared by multiple agents."""
+    validated_input = validate_project_state_input(
+        session_id=session_id,
+        agent_id=agent_id,
+        project_id=project_id,
+        objective=objective,
+        repo_path=repo_path,
+        branch=branch,
+        commit=commit,
+        dirty=dirty,
+        changed_files=changed_files,
+        decisions=decisions,
+        open_tasks=open_tasks,
+        notes=notes,
+        metadata=metadata,
+    )
+    objective = validated_input["objective"]
+    repo_path = validated_input["repo_path"]
+    branch = validated_input["branch"]
+    commit = validated_input["commit"]
+    dirty = validated_input["dirty"]
+    changed_files = validated_input["changed_files"]
+    decisions = validated_input["decisions"]
+    open_tasks = validated_input["open_tasks"]
+    notes = validated_input["notes"]
+    metadata = validated_input["metadata"]
+    # Reject structurally oversized input before creating any root state, then
+    # initialize the alias table before canonicalizing secret-like identifiers.
+    for partition_kind, partition_value in (
+        ("session_id", session_id),
+        ("agent_id", agent_id),
+        ("project_id", project_id),
+    ):
+        _prevalidate_external_partition_identifier(
+            root,
+            partition_kind,
+            str(partition_value),
+        )
     init_db(root)
     session_id = str(canonical_partition_identifier(root, "session_id", session_id) or "")
     project_id = str(canonical_partition_identifier(root, "project_id", project_id) or "")
     agent_id = str(canonical_partition_identifier(root, "agent_id", agent_id) or "")
-    changed_files = changed_files or []
-    open_tasks = open_tasks or []
-    decisions = decisions or []
-    state_metadata = dict(metadata or {})
+    state_metadata = dict(metadata)
     state_metadata.update(
         {
             "agent_id": agent_id,
@@ -7487,6 +8260,7 @@ def record_project_state(
             "changed_files": changed_files,
             "source_type": "project_state",
             "trust_level": "agent_reported_local_evidence",
+            "continuum_disable_exact_memory": True,
             "visibility_scope": normalize_visibility_scope(
                 str(state_metadata.get("visibility_scope") or "project"),
                 default="project",
@@ -7539,6 +8313,11 @@ def record_project_state(
         default="project",
         field="project state card visibility_scope",
     )
+    effective_visibility_scope = (
+        "project"
+        if safe_project_id and safe_visibility_scope == "global"
+        else safe_visibility_scope
+    )
     safe_decisions = enforce_value_secret_policy(root, decisions, scope="project state decisions")
     safe_open_tasks = enforce_value_secret_policy(root, open_tasks, scope="project state open_tasks")
     safe_changed_files = enforce_value_secret_policy(root, changed_files, scope="project state changed_files")
@@ -7557,19 +8336,45 @@ def record_project_state(
     safe_metadata["state_payload_hash"] = state_payload_hash
     if isinstance(safe_changed_files, list):
         safe_metadata["changed_files"] = safe_changed_files
-
-    event = append_scroll_event(
-        root,
+    # Validate the final persisted shape, including Continuum-owned fields.
+    # The caller-facing metadata contract remains 64/128 members; this pass
+    # uses only the small explicit reserve for bounded system enrichment.
+    validate_project_state_input(
         session_id=safe_session_id,
-        event_type="project_state",
-        role=safe_role,
-        content=safe_content,
+        agent_id=safe_agent_id,
+        project_id=safe_project_id,
+        objective=objective,
+        repo_path=None,
+        branch=branch,
+        commit=commit,
+        dirty=dirty,
+        changed_files=safe_changed_files,
+        decisions=safe_decisions,
+        open_tasks=safe_open_tasks,
+        notes=notes,
         metadata=safe_metadata,
+        metadata_is_enriched=True,
     )
+    if len(safe_content.encode("utf-8")) > MAX_STORED_PROJECT_STATE_BYTES:
+        raise ValueError(
+            "project state content exceeds maximum of "
+            f"{MAX_STORED_PROJECT_STATE_BYTES} UTF-8 bytes"
+        )
 
-    conn = connect(root)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    committed_state: dict[str, Any] = {}
+    affected_card_ids: list[str] = []
+
+    def persist_project_state(
+        conn: sqlite3.Connection,
+        event: dict[str, Any],
+    ) -> None:
+        previous_heads = _current_project_state_authority_heads(
+            conn,
+            visibility_scope=effective_visibility_scope,
+            session_id=safe_session_id,
+            project_id=safe_project_id,
+            agent_id=safe_agent_id,
+        )
         summary = summarize_text(safe_content, limit=900)
         card_id = create_card(
             conn,
@@ -7583,12 +8388,84 @@ def record_project_state(
             decisions=safe_decisions,
             open_tasks=safe_open_tasks,
             metadata=safe_metadata,
-            visibility_scope=safe_visibility_scope,
+            visibility_scope=effective_visibility_scope,
             session_id=safe_session_id,
             project_id=safe_project_id,
             salience=0.9,
             confidence=0.8,
         )
+        integrity_error = _project_state_card_integrity_error(conn, card_id)
+        if integrity_error is not None:
+            raise ValueError(
+                "new project-state checkpoint failed integrity validation: "
+                f"{integrity_error}"
+            )
+        replayed_head = next(
+            (row for row in previous_heads if str(row["id"]) == card_id),
+            None,
+        )
+        previous_heads = [
+            row for row in previous_heads if str(row["id"]) != card_id
+        ]
+        superseded_card_ids = [str(row["id"]) for row in previous_heads]
+        supersedes_card_id = (
+            str(replayed_head["supersedes_card_id"] or "") or None
+            if replayed_head is not None
+            else None
+        )
+        if previous_heads:
+            direct_predecessor = max(
+                previous_heads,
+                key=lambda row: (
+                    str(row["created_at"] or ""),
+                    int(row["card_rowid"]),
+                ),
+            )
+            supersedes_card_id = str(direct_predecessor["id"])
+            now = utc_now()
+            placeholders = ", ".join("?" for _ in superseded_card_ids)
+            conn.execute(
+                f"""
+                UPDATE cards
+                SET superseded_by_card_id = ?, updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (card_id, now, *superseded_card_ids),
+            )
+            conn.execute(
+                """
+                UPDATE cards
+                SET supersedes_card_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (supersedes_card_id, now, card_id),
+            )
+            mark_card_sidecar_outbox(
+                conn,
+                [*superseded_card_ids, card_id],
+                reason="project_state_superseded",
+            )
+            audit_event(
+                conn,
+                action="project_state_superseded",
+                target_type="card",
+                target_id=card_id,
+                actor=safe_agent_id,
+                payload={
+                    "authority": {
+                        "visibility_scope": effective_visibility_scope,
+                        "session_id": (
+                            safe_session_id
+                            if effective_visibility_scope in {"session", "private"}
+                            else None
+                        ),
+                        "project_id": safe_project_id,
+                        "agent_id": safe_agent_id,
+                    },
+                    "direct_predecessor_card_id": supersedes_card_id,
+                    "superseded_card_ids": superseded_card_ids,
+                },
+            )
         project_node = upsert_graph_node(conn, kind="project", label=safe_project_id, metadata={"project_id": safe_project_id})
         agent_node = upsert_graph_node(conn, kind="agent", label=safe_agent_id, metadata={"agent_id": safe_agent_id})
         card_node = upsert_graph_node(conn, kind="card", label=f"{safe_project_id} state {safe_agent_id}", card_id=card_id)
@@ -7620,25 +8497,40 @@ def record_project_state(
                 "event_id": event["event_id"],
                 "session_id": safe_session_id,
                 "project_id": safe_project_id,
-                "visibility_scope": safe_visibility_scope,
+                "visibility_scope": effective_visibility_scope,
             },
             related_card_ids=[card_id],
             dedupe_key=f"card:{card_id}",
         )
-        conn.commit()
-        sync_card_sidecars_after_commit(root, [card_id])
-        return {
-            "ok": True,
-            "event_id": event["event_id"],
-            "seq": event["seq"],
-            "card_id": card_id,
-            "librarian_job_id": librarian_job_id,
-            "project_id": safe_project_id,
-            "agent_id": safe_agent_id,
-            "repo_ref": repo_ref,
-        }
-    finally:
-        conn.close()
+        affected_card_ids.extend([*superseded_card_ids, card_id])
+        committed_state.update(
+            {
+                "ok": True,
+                "event_id": event["event_id"],
+                "seq": event["seq"],
+                "card_id": card_id,
+                "librarian_job_id": librarian_job_id,
+                "project_id": safe_project_id,
+                "agent_id": safe_agent_id,
+                "repo_ref": repo_ref,
+                "supersedes_card_id": supersedes_card_id,
+                "superseded_card_ids": superseded_card_ids,
+            }
+        )
+
+    append_scroll_event(
+        root,
+        session_id=safe_session_id,
+        event_type="project_state",
+        role=safe_role,
+        content=safe_content,
+        metadata=safe_metadata,
+        transaction_effect=persist_project_state,
+    )
+    if not committed_state:
+        raise RuntimeError("project-state transaction committed without Card state")
+    sync_card_sidecars_after_commit(root, affected_card_ids)
+    return committed_state
 
 
 class ResumeCheckpointChangedError(RuntimeError):
@@ -7683,6 +8575,595 @@ class ResumeCheckpointDidNotFitError(ValueError):
             "resume token budget is too small to retain the selected checkpoint: "
             f"{self.token_budget} < {required}"
         )
+
+
+def _project_state_card_limit_error(
+    conn: sqlite3.Connection,
+    card_id: str,
+    *,
+    size_row: sqlite3.Row | None = None,
+) -> str | None:
+    if size_row is None:
+        size_row = conn.execute(
+            """
+            SELECT session_id, project_id, visibility_scope,
+                   length(CAST(title AS BLOB)) AS title_bytes,
+                   length(CAST(summary AS BLOB)) AS summary_bytes,
+                   length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+                   length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+                   length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+                   length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+            FROM cards WHERE id = ? AND card_type = 'project_state'
+            """,
+            (card_id,),
+        ).fetchone()
+    if size_row is None:
+        return "project-state Card is missing"
+    field_limits = {
+        "title_bytes": MAX_PROJECT_STATE_TITLE_BYTES,
+        "summary_bytes": MAX_PROJECT_STATE_NOTES_BYTES,
+        "decisions_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+        "open_tasks_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+        "metadata_bytes": MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+        "source_refs_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+    }
+    for field, maximum in field_limits.items():
+        if int(size_row[field] or 0) > maximum:
+            return f"{field.removesuffix('_bytes')} exceeds stored checkpoint limit"
+    row = conn.execute(
+        """
+        SELECT summary, decisions_json, open_tasks_json, metadata_json,
+               source_refs_json
+        FROM cards WHERE id = ? AND card_type = 'project_state'
+        """,
+        (card_id,),
+    ).fetchone()
+    if row is None:
+        return "project-state Card is missing"
+    try:
+        decisions = json.loads(str(row["decisions_json"] or "[]"))
+        open_tasks = json.loads(str(row["open_tasks_json"] or "[]"))
+        metadata = json.loads(str(row["metadata_json"] or "{}"))
+        source_refs = json.loads(str(row["source_refs_json"] or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return "project-state Card contains malformed JSON"
+    if not isinstance(source_refs, list) or len(source_refs) != 1:
+        return "project-state Card source_refs must contain exactly one reference"
+    reference = source_refs[0]
+    if not isinstance(reference, dict):
+        return "project-state Card source reference must be an object"
+    reference_keys = frozenset(reference)
+    modern_keys = {"event_id", "session_id", "seq"}
+    legacy_keys = {"session_id", "seq"}
+    if reference_keys not in {frozenset(modern_keys), frozenset(legacy_keys)}:
+        return "project-state Card source reference has invalid fields"
+    reference_event_id = str(reference.get("event_id") or "")
+    reference_session_id = reference.get("session_id")
+    reference_seq = reference.get("seq")
+    try:
+        reference_session_bytes = (
+            len(reference_session_id.encode("utf-8"))
+            if isinstance(reference_session_id, str)
+            else 0
+        )
+        reference_event_bytes = (
+            len(reference_event_id.encode("utf-8"))
+            if isinstance(reference.get("event_id"), str)
+            else 0
+        )
+    except UnicodeEncodeError:
+        return "project-state Card source reference has invalid values"
+    if (
+        not isinstance(reference_session_id, str)
+        or not reference_session_id
+        or reference_session_bytes > 128
+        or isinstance(reference_seq, bool)
+        or not isinstance(reference_seq, int)
+        or reference_seq < 1
+        or reference_seq > (2**63 - 1)
+        or (
+            "event_id" in reference
+            and (
+                not isinstance(reference.get("event_id"), str)
+                or not reference_event_id
+                or reference_event_bytes > 256
+            )
+        )
+    ):
+        return "project-state Card source reference has invalid values"
+    source_where = "id = ?" if reference_event_id else "session_id = ? AND seq = ?"
+    source_params: tuple[Any, ...] = (
+        (reference_event_id,)
+        if reference_event_id
+        else (reference_session_id, reference_seq)
+    )
+    source_size = conn.execute(
+        f"""
+        SELECT length(CAST(content AS BLOB)) AS content_bytes
+        FROM scroll_events
+        WHERE {source_where} AND event_type = 'project_state'
+        """,
+        source_params,
+    ).fetchone()
+    if (
+        source_size is not None
+        and int(source_size["content_bytes"] or 0)
+        > MAX_STORED_PROJECT_STATE_BYTES
+    ):
+        return "source_content exceeds stored checkpoint limit"
+    source_row = conn.execute(
+        f"""
+        SELECT content
+        FROM scroll_events
+        WHERE {source_where} AND event_type = 'project_state'
+          AND length(CAST(content AS BLOB)) <= ?
+        """,
+        (*source_params, MAX_STORED_PROJECT_STATE_BYTES),
+    ).fetchone()
+    source_content = (
+        str(source_row["content"] or "") if source_row is not None else None
+    )
+    return stored_project_state_limit_error(
+        summary=row["summary"],
+        decisions=decisions,
+        open_tasks=open_tasks,
+        metadata=metadata,
+        source_content=source_content,
+    )
+
+
+def _project_state_card_integrity_error(
+    conn: sqlite3.Connection,
+    card_id: str,
+    *,
+    size_row: sqlite3.Row | None = None,
+) -> str | None:
+    """Validate one bounded project-state Card and its lossless Scroll source."""
+
+    limit_error = _project_state_card_limit_error(
+        conn,
+        card_id,
+        size_row=size_row,
+    )
+    if limit_error is not None:
+        return limit_error
+    row = conn.execute(
+        """
+        SELECT id, card_type, title, summary, source_refs_json, metadata_json,
+               decisions_json, open_tasks_json, visibility_scope,
+               session_id, project_id
+        FROM cards
+        WHERE id = ? AND card_type = 'project_state'
+        """,
+        (card_id,),
+    ).fetchone()
+    if row is None:
+        return "project-state Card is missing"
+    source_refs = json_loads(row["source_refs_json"], [])
+    decisions = json_loads(row["decisions_json"], [])
+    open_tasks = json_loads(row["open_tasks_json"], [])
+    card_metadata = json_loads(row["metadata_json"], None)
+    card_agent_id = (
+        card_metadata.get("agent_id")
+        if isinstance(card_metadata, dict)
+        else None
+    )
+    if not isinstance(card_agent_id, str) or not card_agent_id:
+        return "project-state Card agent metadata is invalid"
+    try:
+        visibility_scope = normalize_visibility_scope(
+            str(row["visibility_scope"] or ""),
+            field="project-state Card visibility_scope",
+        )
+    except ValueError:
+        return "project-state Card has invalid visibility_scope"
+    source_event = _project_state_source_event(
+        conn,
+        source_refs=source_refs,
+        checkpoint_session_id=str(row["session_id"] or ""),
+        checkpoint_project_id=str(row["project_id"] or ""),
+        checkpoint_visibility_scope=visibility_scope,
+        capability_session_id=(
+            str(row["session_id"] or "") or None
+            if visibility_scope == "session"
+            else None
+        ),
+        capability_project_id=(
+            str(row["project_id"] or "") or None
+            if visibility_scope == "project"
+            else None
+        ),
+        max_content_bytes=MAX_STORED_PROJECT_STATE_BYTES,
+        allow_private_exact_boundary=True,
+    )
+    if source_event is None:
+        return "project-state Card source event binding is invalid"
+    source_metadata_row = conn.execute(
+        """
+        SELECT metadata_json FROM scroll_events
+        WHERE id = ? AND length(CAST(metadata_json AS BLOB)) <= ?
+        """,
+        (str(source_event["id"]), MAX_STORED_PROJECT_STATE_BYTES),
+    ).fetchone()
+    source_metadata = (
+        json_loads(source_metadata_row["metadata_json"], None)
+        if source_metadata_row is not None
+        else None
+    )
+    source_agent_id = (
+        source_metadata.get("agent_id")
+        if isinstance(source_metadata, dict)
+        else None
+    )
+    source_lines = str(source_event["content"] or "").splitlines()
+    if (
+        not isinstance(source_agent_id, str)
+        or source_agent_id != card_agent_id
+        or len(source_lines) < 2
+        or source_lines[1] != f"Agent: {card_agent_id}"
+    ):
+        return "project-state Card agent binding is invalid"
+    canonical_source_refs = _canonical_project_state_source_refs(
+        source_refs,
+        source_event,
+    )
+    if canonical_source_refs is None:
+        return "project-state Card source reference is invalid"
+    expected_card_id = stable_id(
+        "card",
+        visibility_scope,
+        str(row["session_id"] or ""),
+        str(row["project_id"] or ""),
+        str(row["card_type"] or ""),
+        str(row["title"] or ""),
+        content_hash(str(row["summary"] or "")),
+        json_dumps(canonical_source_refs),
+    )
+    if (
+        str(row["summary"] or "")
+        != summarize_text(str(source_event["content"] or ""), limit=900)
+        or expected_card_id != card_id
+        or not _project_state_event_binds_payload(
+            str(source_event["content"] or ""),
+            decisions=decisions,
+            open_tasks=open_tasks,
+        )
+    ):
+        return "project-state Card payload integrity is invalid"
+    return None
+
+
+def _valid_visible_current_project_state_ids(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None,
+    project_id: str | None,
+) -> set[str]:
+    """Return fully validated current project-state IDs in one visibility union."""
+
+    visible_clause, visible_params = _visible_card_clause(
+        session_id=session_id,
+        project_id=project_id,
+    )
+    rows = conn.execute(
+        f"""
+        SELECT id,
+               length(CAST(title AS BLOB)) AS title_bytes,
+               length(CAST(summary AS BLOB)) AS summary_bytes,
+               length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+               length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+               length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+               length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+        FROM cards
+        WHERE card_type = 'project_state'
+          AND {_current_card_authority_clause('cards')}
+          AND {visible_clause}
+        """,
+        tuple(visible_params),
+    ).fetchall()
+    return {
+        str(row["id"])
+        for row in rows
+        if _project_state_card_integrity_error(
+            conn,
+            str(row["id"]),
+            size_row=row,
+        )
+        is None
+    }
+
+
+def _project_state_repair_agent_id(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> str | None:
+    """Recover one checkpoint agent without evaluating untrusted JSON in SQL.
+
+    Modern Cards and their bound Scroll source both carry the canonical agent
+    identifier. Requiring agreement when both survive keeps predecessor repair
+    conservative; a malformed Card may fall back to its integrity-checked Scroll
+    event, while ambiguous or conflicting evidence restores no predecessor.
+    """
+
+    metadata_bytes = int(row["metadata_bytes"] or 0)
+    source_refs_bytes = int(row["source_refs_bytes"] or 0)
+    card_metadata: Any = {}
+    if metadata_bytes <= MAX_STORED_PROJECT_STATE_METADATA_BYTES:
+        metadata_row = conn.execute(
+            """
+            SELECT metadata_json FROM cards
+            WHERE id = ? AND card_type = 'project_state'
+              AND length(CAST(metadata_json AS BLOB)) <= ?
+            """,
+            (str(row["id"]), MAX_STORED_PROJECT_STATE_METADATA_BYTES),
+        ).fetchone()
+        if metadata_row is not None:
+            card_metadata = json_loads(metadata_row["metadata_json"], {})
+    card_agent_id = (
+        str(card_metadata.get("agent_id") or "")
+        if isinstance(card_metadata, dict)
+        else ""
+    )
+    try:
+        visibility_scope = normalize_visibility_scope(
+            str(row["visibility_scope"] or ""),
+            field="project-state repair visibility_scope",
+        )
+    except ValueError:
+        return None
+    source_refs: Any = []
+    if source_refs_bytes <= MAX_STORED_PROJECT_STATE_BYTES:
+        source_refs_row = conn.execute(
+            """
+            SELECT source_refs_json FROM cards
+            WHERE id = ? AND card_type = 'project_state'
+              AND length(CAST(source_refs_json AS BLOB)) <= ?
+            """,
+            (str(row["id"]), MAX_STORED_PROJECT_STATE_BYTES),
+        ).fetchone()
+        if source_refs_row is not None:
+            source_refs = json_loads(source_refs_row["source_refs_json"], [])
+    source_event = None
+    if (
+        isinstance(source_refs, list)
+        and len(source_refs) == 1
+        and isinstance(source_refs[0], dict)
+    ):
+        reference = source_refs[0]
+        reference_event_id = str(reference.get("event_id") or "")
+        reference_session_id = str(reference.get("session_id") or "")
+        raw_reference_seq = reference.get("seq")
+        try:
+            reference_seq = (
+                None
+                if raw_reference_seq is None
+                or isinstance(raw_reference_seq, bool)
+                else int(raw_reference_seq)
+            )
+        except (TypeError, ValueError):
+            reference_seq = None
+        source_size_row = None
+        if reference_event_id:
+            source_size_row = conn.execute(
+                """
+                SELECT length(CAST(content AS BLOB)) AS content_bytes,
+                       length(CAST(metadata_json AS BLOB)) AS metadata_bytes
+                FROM scroll_events
+                WHERE id = ? AND event_type = 'project_state'
+                """,
+                (reference_event_id,),
+            ).fetchone()
+        elif reference_session_id and reference_seq is not None:
+            source_size_row = conn.execute(
+                """
+                SELECT length(CAST(content AS BLOB)) AS content_bytes,
+                       length(CAST(metadata_json AS BLOB)) AS metadata_bytes
+                FROM scroll_events
+                WHERE session_id = ? AND seq = ? AND event_type = 'project_state'
+                """,
+                (reference_session_id, reference_seq),
+            ).fetchone()
+        if (
+            source_size_row is not None
+            and int(source_size_row["content_bytes"] or 0)
+            <= MAX_STORED_PROJECT_STATE_BYTES
+            and int(source_size_row["metadata_bytes"] or 0)
+            <= MAX_STORED_PROJECT_STATE_BYTES
+        ):
+            source_event = _project_state_source_event(
+                conn,
+                source_refs=source_refs,
+                checkpoint_session_id=str(row["session_id"] or ""),
+                checkpoint_project_id=str(row["project_id"] or ""),
+                checkpoint_visibility_scope=visibility_scope,
+                capability_session_id=(
+                    str(row["session_id"] or "") or None
+                    if visibility_scope == "session"
+                    else None
+                ),
+                capability_project_id=(
+                    str(row["project_id"] or "") or None
+                    if visibility_scope == "project"
+                    else None
+                ),
+                max_content_bytes=MAX_STORED_PROJECT_STATE_BYTES,
+                allow_private_exact_boundary=True,
+            )
+    source_agent_id = ""
+    if source_event is not None:
+        source_metadata_row = conn.execute(
+            """
+            SELECT metadata_json
+            FROM scroll_events
+            WHERE id = ? AND length(CAST(metadata_json AS BLOB)) <= ?
+            """,
+            (str(source_event["id"]), MAX_STORED_PROJECT_STATE_BYTES),
+        ).fetchone()
+        if source_metadata_row is not None:
+            source_metadata = json_loads(source_metadata_row["metadata_json"], {})
+            if isinstance(source_metadata, dict):
+                source_agent_id = str(source_metadata.get("agent_id") or "")
+    if card_agent_id and source_agent_id and card_agent_id != source_agent_id:
+        return None
+    return card_agent_id or source_agent_id or None
+
+
+def repair_invalid_project_state_checkpoints(
+    root: Path,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    limit: int = 100,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Quarantine invalid current heads and restore their direct predecessors."""
+
+    if not is_initialized(root):
+        return {"ok": False, "initialized": False, "quarantined_count": 0}
+    limit = max(1, min(int(limit), 1000))
+    project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
+    session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
+    clauses = ["card_type = 'project_state'", _current_card_authority_clause("cards")]
+    params: list[Any] = []
+    if project_id:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    select_fields = """
+        id, session_id, project_id, visibility_scope, supersedes_card_id,
+        length(CAST(title AS BLOB)) AS title_bytes,
+        length(CAST(summary AS BLOB)) AS summary_bytes,
+        length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+        length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+        length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+        length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+    """
+    conn = connect(root)
+    quarantined: list[dict[str, Any]] = []
+    reactivated: list[str] = []
+    touched: set[str] = set()
+    heads: list[sqlite3.Row] = []
+    try:
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+        heads = conn.execute(
+            f"""
+            SELECT {select_fields} FROM cards
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at DESC, rowid DESC LIMIT ?
+            """,
+            (*params, limit + 1),
+        ).fetchall()
+        pending = list(heads[:limit])
+        visited: set[str] = set()
+        while pending and len(quarantined) < limit:
+            head = pending.pop(0)
+            head_id = str(head["id"])
+            if head_id in visited:
+                continue
+            visited.add(head_id)
+            error = _project_state_card_integrity_error(
+                conn,
+                head_id,
+                size_row=head,
+            )
+            if error is None:
+                continue
+            predecessor = None
+            head_agent_id = _project_state_repair_agent_id(conn, head)
+            predecessor_id = str(head["supersedes_card_id"] or "")
+            if predecessor_id and predecessor_id not in visited:
+                candidate = conn.execute(
+                    f"""
+                    SELECT {select_fields} FROM cards
+                    WHERE id = ? AND card_type = 'project_state'
+                      AND superseded_by_card_id = ?
+                    """,
+                    (predecessor_id, head_id),
+                ).fetchone()
+                if candidate is not None and (
+                    head_agent_id is not None
+                    and str(candidate["project_id"] or "")
+                    == str(head["project_id"] or "")
+                    and str(candidate["visibility_scope"] or "")
+                    == str(head["visibility_scope"] or "")
+                    and _project_state_repair_agent_id(conn, candidate)
+                    == head_agent_id
+                    and (
+                        str(head["visibility_scope"] or "") == "project"
+                        or str(candidate["session_id"] or "")
+                        == str(head["session_id"] or "")
+                    )
+                ):
+                    predecessor = candidate
+            record = {
+                "card_id": head_id,
+                "reason": error[:512],
+                "predecessor_card_id": (
+                    str(predecessor["id"]) if predecessor is not None else None
+                ),
+            }
+            quarantined.append(record)
+            if predecessor is not None:
+                pending.insert(0, predecessor)
+            if dry_run:
+                continue
+            if head_id in reactivated:
+                reactivated.remove(head_id)
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE cards SET status = 'historical', supersedes_card_id = NULL,
+                    superseded_by_card_id = NULL, updated_at = ? WHERE id = ?
+                """,
+                (now, head_id),
+            )
+            touched.add(head_id)
+            if predecessor is not None:
+                predecessor_id = str(predecessor["id"])
+                if conn.execute(
+                    """
+                    UPDATE cards SET superseded_by_card_id = NULL, updated_at = ?
+                    WHERE id = ? AND superseded_by_card_id = ?
+                    """,
+                    (now, predecessor_id, head_id),
+                ).rowcount == 1:
+                    reactivated.append(predecessor_id)
+                    touched.add(predecessor_id)
+            audit_event(
+                conn,
+                action="project_state_checkpoint_quarantined",
+                target_type="card",
+                target_id=head_id,
+                payload=record,
+            )
+        if not dry_run:
+            if touched:
+                mark_card_sidecar_outbox(
+                    conn,
+                    sorted(touched),
+                    reason="project_state_checkpoint_quarantined",
+                )
+            conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if touched:
+        sync_card_sidecars_after_commit(root, sorted(touched))
+    return {
+        "ok": True,
+        "initialized": True,
+        "dry_run": bool(dry_run),
+        "quarantined_count": len(quarantined),
+        "quarantined": quarantined,
+        "reactivated_card_ids": reactivated,
+        "has_more": len(heads) > limit or bool(pending),
+    }
 
 
 def _discover_resume_state(
@@ -7732,7 +9213,13 @@ def _discover_resume_state(
     state_row = conn.execute(
         f"""
         SELECT session_id, project_id, visibility_scope,
-               created_at AS checkpoint_at, id
+               created_at AS checkpoint_at, id,
+               length(CAST(title AS BLOB)) AS title_bytes,
+               length(CAST(summary AS BLOB)) AS summary_bytes,
+               length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+               length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+               length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+               length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
         FROM cards
         WHERE {' AND '.join([*card_clauses, _current_card_authority_clause('cards')])}
         ORDER BY created_at DESC, rowid DESC
@@ -7740,6 +9227,19 @@ def _discover_resume_state(
         """,
         tuple(card_params),
     ).fetchone()
+    invalid_checkpoint = None
+    if state_row is not None:
+        invalid_reason = _project_state_card_integrity_error(
+            conn,
+            str(state_row["id"]),
+            size_row=state_row,
+        )
+        if invalid_reason is not None:
+            invalid_checkpoint = {
+                "checkpoint_id": str(state_row["id"]),
+                "reason": invalid_reason,
+            }
+            state_row = None
     stale_state_exists = False
     discovery_source = "project_state_card"
     if state_row is None:
@@ -7814,6 +9314,7 @@ def _discover_resume_state(
         "source": discovery_source,
         "state": dict(state_row) if state_row is not None else None,
         "stale_state_exists": stale_state_exists,
+        "invalid_checkpoint": invalid_checkpoint,
     }
 
 
@@ -8099,6 +9600,31 @@ def recover_thread(
             )
         if conn is None:
             conn = connect(root)
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        valid_current_project_state_ids = (
+            _valid_visible_current_project_state_ids(
+                conn,
+                session_id=capability_session_id or None,
+                project_id=capability_project_id,
+            )
+        )
+        (
+            valid_current_project_state_event_ids,
+            _valid_current_project_state_legacy_refs,
+        ) = _current_project_state_source_references(
+            conn,
+            session_id=capability_session_id or None,
+            project_id=capability_project_id,
+            valid_card_ids=valid_current_project_state_ids,
+        )
+        operational_current_card_ids = _operational_visible_current_card_ids(
+            conn,
+            session_id=capability_session_id or None,
+            project_id=capability_project_id,
+            valid_project_state_card_ids=valid_current_project_state_ids,
+            valid_project_state_event_ids=valid_current_project_state_event_ids,
+        )
         recent_events = [
             dict(row)
             for row in _visible_scroll_rows(
@@ -8111,6 +9637,8 @@ def recover_thread(
                     else None
                 ),
                 limit=recent_event_limit,
+                current_project_states_only=planner_profile == "resume",
+                valid_project_state_card_ids=valid_current_project_state_ids,
             )
         ]
         recent_events.reverse()
@@ -8118,6 +9646,15 @@ def recover_thread(
             session_id=capability_session_id or None,
             project_id=capability_project_id,
         )
+        if operational_current_card_ids:
+            valid_state_placeholders = ", ".join(
+                "?" for _ in operational_current_card_ids
+            )
+            valid_state_clause = f"id IN ({valid_state_placeholders})"
+            valid_state_params = sorted(operational_current_card_ids)
+        else:
+            valid_state_clause = "0"
+            valid_state_params = []
         cards = [
             dict(row)
             for row in conn.execute(
@@ -8126,11 +9663,12 @@ def recover_thread(
                        source_refs_json, updated_at
                 FROM cards
                 WHERE {_current_card_authority_clause()}
+                  AND {valid_state_clause}
                   AND {visible_card_clause}
                 ORDER BY salience DESC, updated_at DESC
                 LIMIT 12
                 """,
-                tuple(visible_card_params),
+                (*valid_state_params, *visible_card_params),
             )
         ]
         if (
@@ -8179,6 +9717,10 @@ def recover_thread(
                 row,
                 session_id=capability_session_id or None,
                 project_id=capability_project_id,
+                operational_card_ids=operational_current_card_ids,
+                valid_project_state_event_ids=(
+                    valid_current_project_state_event_ids
+                ),
             ):
                 pending_jobs.append(dict(row))
                 if len(pending_jobs) >= 20:
@@ -8759,6 +10301,24 @@ def resume_latest(
         )
         state_row = selected.get("state")
         if state_row is None:
+            invalid_checkpoint = selected.get("invalid_checkpoint")
+            if isinstance(invalid_checkpoint, dict):
+                return {
+                    "ok": False,
+                    "initialized": True,
+                    "root": str(root),
+                    "reason": "invalid_project_state_checkpoint",
+                    "resume_mode": resume_mode,
+                    "session_id": requested_session or None,
+                    "project_id": requested_project or None,
+                    "invalid_checkpoint": invalid_checkpoint,
+                    "repair_required": True,
+                    "repair_command": "repair-project-state-checkpoints --apply",
+                    "warning": (
+                        "latest project-state checkpoint is invalid; "
+                        "quarantine it before resuming its predecessor"
+                    ),
+                }
             return {
                 "ok": False,
                 "initialized": True,

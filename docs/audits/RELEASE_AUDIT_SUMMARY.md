@@ -23,10 +23,10 @@ Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The post-review Windows v0.3 source candidate ran 697 CI-equivalent unittest
-checks with 25 environment-gated skips; all 672 executed checks passed. An
-independent pytest run passed 674 tests with 25 skips and 319 subtests. Ruff,
-mypy across 29 source files, compileall, fixture
+The post-review Windows v0.3 source candidate ran 738 CI-equivalent unittest
+checks with 25 environment-gated skips; all 713 executed checks passed on each
+of Python 3.11, 3.12, and 3.13. An independent pytest run passed 715 tests with
+25 skips and 327 subtests. Ruff, mypy across 30 source files, compileall, fixture
 allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
 passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
 records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
@@ -34,7 +34,7 @@ records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
 verification, restore, pack, and bundle verification passed from clean wheel and
 source-distribution installs.
 
-Review hardening after the final private review pass added:
+Release review hardening included:
 
 - private directory/file modes and a `repair-permissions` command;
 - Hermes secret-key handling that avoids subprocess argv;
@@ -108,6 +108,10 @@ Review hardening after the final private review pass added:
   conflict maintenance, one total Yarn deadline, and exact-toolchain
   distribution receipts verified again after CI artifact download on Linux and
   Windows.
+- final follow-up fixes for one-current-head same-agent checkpoint authority,
+  bounded and explicitly repairable legacy project state, resilient bounded MCP
+  frames, thread-free CLI/MCP imports, and receipt-v2 distributions rebuilt
+  twice from the exact canonical source ZIP.
 
 The Python package version is `0.3.0`, and the catalog capability
 `SCHEMA_VERSION` remains `0.2.0`. This feature release uses additive in-place

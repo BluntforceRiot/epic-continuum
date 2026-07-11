@@ -1,11 +1,17 @@
 # Changelog
 
-## 0.3.0 - 2026-07-10
+## 0.3.0 - 2026-07-11
 
 - Added automatic latest-state resume discovery for the CLI and MCP surface,
   with strict personal resume modes, canonical partition lookup, immutable
   checkpoint ordering, guarded CLI recovery receipts, and discovery limited to
   project/session state that the recovery packet can actually render.
+- Made same-agent project-state checkpoints one atomic temporal authority chain:
+  only the newest checkpoint is current, while predecessors remain historical
+  evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint
+  quarantine and repair, and recovery filtering that excludes superseded state.
+  The canonical input envelope is 12 KiB, proven resumable at the supported
+  8,192-token boundary while retaining the wider bounded stored-evidence envelope.
 - Kept local Yarn briefing budgets coherent by reserving usable context after
   output and protocol overhead, rejecting non-integral token settings, and made
   recovery recent-event limits explicitly bounded across the core API, CLI,
@@ -87,16 +93,18 @@
   accumulating abandoned worker threads after timeouts, including a connection
   that refuses to unblock when closed. POSIX fork children
   discard inherited thread/lock references and lazily create one child-local
-  runner on first use.
+  runner on first use. CLI and MCP imports now remain thread-free because the
+  runner itself is constructed only when Yarn is first used.
 - Made CI wheel and source-distribution artifacts reproducible builds of the
   provenance-bearing release archive, with duplicate-member, version-parity,
   clean-source, and mid-build worktree-change checks plus an embedded build
   epoch and pinned distribution-toolchain recipe.
 - Added a canonical distribution finalizer that requires the exact Python/build
-  toolchain and wheel generator, compares two builds byte-for-byte, validates
-  wheel/sdist identity and embedded provenance, closes the uploaded directory
-  over a hash-bound receipt, and runs the downloaded wheel and sdist suites on
-  both Linux and Windows CI.
+  toolchain and wheel generator, validates the complete wheel `RECORD`, binds
+  exact source/wheel/sdist package manifests, rebuilds twice from separate
+  canonical source-ZIP extractions, and closes the uploaded directory with a v2
+  hash receipt. Download verification is build-tool independent, and the wheel
+  and sdist suites run on both Linux and Windows CI.
 - Kept the catalog capability schema at `0.2.0`; these features are additive and do not
   require a destructive migration or downgrade of existing catalogs.
 

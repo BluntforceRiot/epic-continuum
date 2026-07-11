@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -256,6 +258,39 @@ class LocalModelTests(unittest.TestCase):
             self.assertEqual(result["fallback"], "deterministic")
             http_json.assert_not_called()
             self.assertFalse(root.exists())
+
+    def test_cli_and_mcp_imports_do_not_start_yarn_stage_runner(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        python_path = [str(repo_root / "src")]
+        if env.get("PYTHONPATH"):
+            python_path.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(python_path)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, threading; "
+                    "import continuum.cli, continuum.mcp_server; "
+                    "from continuum.core import local_model; "
+                    "print(json.dumps({"
+                    "'runner_created': local_model._LOCAL_STAGE_RUNNER is not None, "
+                    "'runner_threads': sum(t.name == 'continuum-local-stage-runner' "
+                    "and t.is_alive() for t in threading.enumerate())"
+                    "}))"
+                ),
+            ],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        payload = json.loads(probe.stdout)
+        self.assertFalse(payload["runner_created"], payload)
+        self.assertEqual(payload["runner_threads"], 0, payload)
 
     @unittest.skipUnless(
         hasattr(os, "fork") and hasattr(os, "register_at_fork"),
@@ -1320,7 +1355,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
-            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            if local_model._LOCAL_STAGE_RUNNER is not None:
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
             original_configuration = local_model._configuration
             preprocessing_started = threading.Event()
             release = threading.Event()
@@ -1434,7 +1470,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
-            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            if local_model._LOCAL_STAGE_RUNNER is not None:
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
             original_configuration = local_model._configuration
             release = threading.Event()
             resource_started = threading.Event()

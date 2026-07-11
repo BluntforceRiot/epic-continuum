@@ -94,7 +94,7 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertIn("VISIBLE-CHECKPOINT", result["packet_text"])
             self.assertNotIn("PRIVATE-CHECKPOINT", result["packet_text"])
 
-    def test_resume_scroll_fallback_skips_global_event(self) -> None:
+    def test_unscoped_resume_selects_global_scroll_without_deriving_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             append_scroll_event(
@@ -118,10 +118,15 @@ class ResumeLatestTests(unittest.TestCase):
 
             self.assertTrue(result["ok"], result)
             self.assertEqual(result["discovery"]["source"], "scroll_event")
-            self.assertEqual(result["session_id"], "visible-scroll-session")
+            self.assertEqual(result["session_id"], "global-scroll-session")
+            self.assertEqual(result["project_id"], None)
+            self.assertEqual(
+                result["visibility_capability"],
+                {"session_id": None, "project_id": None},
+            )
             self.assertEqual(result["recent_event_count"], 1)
-            self.assertIn("VISIBLE-SCROLL-EVENT", result["packet_text"])
-            self.assertNotIn("GLOBAL-SCROLL-EVENT", result["packet_text"])
+            self.assertIn("GLOBAL-SCROLL-EVENT", result["packet_text"])
+            self.assertNotIn("VISIBLE-SCROLL-EVENT", result["packet_text"])
 
     def test_unscoped_resume_skips_stale_partitions_without_poisoning_fresh_scroll(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,7 +365,7 @@ class ResumeLatestTests(unittest.TestCase):
                         "project_id": "bounded-packet-project",
                     },
                 )
-            configure_personal_profile(root, safe_context_ceiling=256)
+            configure_personal_profile(root, safe_context_ceiling=384)
 
             result = resume_latest(
                 root,
@@ -370,9 +375,9 @@ class ResumeLatestTests(unittest.TestCase):
             )
 
             self.assertTrue(result["ok"], result)
-            self.assertEqual(result["packet_token_budget"], 256)
+            self.assertEqual(result["packet_token_budget"], 384)
             self.assertEqual(result["recent_event_count"], 24)
-            self.assertLessEqual(result["packet_estimated_tokens"], 256)
+            self.assertLessEqual(result["packet_estimated_tokens"], 384)
             self.assertEqual(
                 result["packet_estimated_tokens"],
                 estimate_tokens(result["packet_text"]),
@@ -380,7 +385,7 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertTrue(result["packet_truncated"], result)
             self.assertIn('"session_id":"bounded-packet-session"', result["packet_text"])
             self.assertIn('"project_id":"bounded-packet-project"', result["packet_text"])
-            self.assertIn('"recent_event_count":24', result["packet_text"])
+            self.assertIn("Bound the complete recovery packet", result["packet_text"])
             self.assertNotIn("## Recent Scroll", result["packet_text"])
             self.assertNotIn("## Recalled Cards", result["packet_text"])
             self.assertLessEqual(result["packet_text"].count("LARGE-PACKET-EVENT-23"), 1)
@@ -461,23 +466,470 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertIn("RECOVERY-JOB-MARKER", result["packet_text"])
             self.assertIn("PRESERVE-JOB-PAYLOAD", result["packet_text"])
             self.assertIn("RECOVERY-BOOK-MARKER", result["packet_text"])
-            self.assertNotIn("MUST-RUN-RESTORE-DRILL", result["context"]["context_text"])
+            self.assertIn("MUST-RUN-RESTORE-DRILL", result["context"]["context_text"])
+            self.assertIn("KEEP-RESTORE-PROOF", result["context"]["context_text"])
 
-    def test_resume_pins_selected_checkpoint_ahead_of_higher_salience_cards(self) -> None:
+    def test_resume_preserves_the_callers_visibility_capability_scope_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
+            session_state = record_project_state(
+                root,
+                session_id="matrix-session",
+                agent_id="codex-sol",
+                project_id="matrix-project",
+                objective="SESSION-SCOPED-AUTHORIZED-CHECKPOINT",
+                metadata={"visibility_scope": "session"},
+            )
+            project_state = record_project_state(
+                root,
+                session_id="matrix-session",
+                agent_id="codex-sol",
+                project_id="matrix-project",
+                objective="NEWER-PROJECT-SCOPED-CHECKPOINT",
+            )
+            append_scroll_event(
+                root,
+                session_id="matrix-session",
+                event_type="message",
+                role="user",
+                content="PROJECT-SCROLL-CAPABILITY-MARKER",
+                metadata={
+                    "visibility_scope": "project",
+                    "project_id": "matrix-project",
+                },
+            )
+            append_scroll_event(
+                root,
+                session_id="matrix-session",
+                event_type="message",
+                role="user",
+                content="SESSION-SCROLL-CAPABILITY-MARKER",
+                metadata={"visibility_scope": "session"},
+            )
+            conn = connect(root)
+            try:
+                create_card(
+                    conn,
+                    root=root,
+                    card_type="reference",
+                    title="PROJECT-CARD-CAPABILITY-MARKER",
+                    summary="Evidence authorized only by the project capability.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="matrix-session",
+                    project_id="matrix-project",
+                )
+                create_card(
+                    conn,
+                    root=root,
+                    card_type="reference",
+                    title="SESSION-CARD-CAPABILITY-MARKER",
+                    summary="Evidence authorized only by the session capability.",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="matrix-session",
+                    project_id="matrix-project",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            cases = [
+                (
+                    "session_only",
+                    {"session_id": "matrix-session"},
+                    {"session_id": "matrix-session", "project_id": None},
+                    session_state["card_id"],
+                    True,
+                    False,
+                ),
+                (
+                    "project_only",
+                    {"project_id": "matrix-project"},
+                    {"session_id": None, "project_id": "matrix-project"},
+                    project_state["card_id"],
+                    False,
+                    True,
+                ),
+                (
+                    "session_and_project",
+                    {
+                        "session_id": "matrix-session",
+                        "project_id": "matrix-project",
+                    },
+                    {
+                        "session_id": "matrix-session",
+                        "project_id": "matrix-project",
+                    },
+                    project_state["card_id"],
+                    True,
+                    True,
+                ),
+                (
+                    "unscoped_project_checkpoint",
+                    {},
+                    {"session_id": None, "project_id": "matrix-project"},
+                    project_state["card_id"],
+                    False,
+                    True,
+                ),
+            ]
+            for (
+                name,
+                kwargs,
+                expected_capability,
+                expected_checkpoint_id,
+                sees_session,
+                sees_project,
+            ) in cases:
+                with self.subTest(name=name):
+                    result = resume_latest(
+                        root,
+                        token_budget=12000,
+                        model_assist=False,
+                        **kwargs,
+                    )
+
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(
+                        result["visibility_capability"],
+                        expected_capability,
+                    )
+                    self.assertEqual(
+                        result["discovery"]["checkpoint_id"],
+                        expected_checkpoint_id,
+                    )
+                    context_text = result["context"]["context_text"]
+                    self.assertTrue(result["context"]["mandatory_checkpoint_fit"])
+                    self.assertIn(expected_checkpoint_id, context_text)
+                    for marker in (
+                        session_state["card_id"],
+                        "SESSION-SCOPED-AUTHORIZED-CHECKPOINT",
+                        "SESSION-CARD-CAPABILITY-MARKER",
+                        "SESSION-SCROLL-CAPABILITY-MARKER",
+                    ):
+                        if sees_session:
+                            self.assertIn(marker, context_text)
+                        else:
+                            self.assertNotIn(marker, context_text)
+                    for marker in (
+                        project_state["card_id"],
+                        "NEWER-PROJECT-SCOPED-CHECKPOINT",
+                        "PROJECT-CARD-CAPABILITY-MARKER",
+                        "PROJECT-SCROLL-CAPABILITY-MARKER",
+                    ):
+                        if sees_project:
+                            self.assertIn(marker, context_text)
+                        else:
+                            self.assertNotIn(marker, context_text)
+
+        unauthorized_cases = (
+            (
+                "session_cannot_select_project_checkpoint",
+                {"session_id": "authority-session"},
+                "project",
+            ),
+            (
+                "project_cannot_select_session_checkpoint",
+                {"project_id": "authority-project"},
+                "session",
+            ),
+        )
+        for name, kwargs, checkpoint_scope in unauthorized_cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                record_project_state(
+                    root,
+                    session_id="authority-session",
+                    agent_id="codex-sol",
+                    project_id="authority-project",
+                    objective="UNAUTHORIZED-CHECKPOINT-MUST-NOT-RETURN",
+                    metadata={"visibility_scope": checkpoint_scope},
+                )
+
+                result = resume_latest(root, model_assist=False, **kwargs)
+
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["reason"], "no_resume_state")
+                self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_dual_scope_resume_preserves_both_requested_capabilities_for_asymmetric_checkpoints(
+        self,
+    ) -> None:
+        for winner in ("session", "project"):
+            with self.subTest(winner=winner), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                if winner == "session":
+                    project_state = record_project_state(
+                        root,
+                        session_id="project-checkpoint-session",
+                        agent_id="codex-sol",
+                        project_id="requested-project",
+                        objective="REQUESTED-PROJECT-CARD-MARKER",
+                    )
+                    session_state = record_project_state(
+                        root,
+                        session_id="requested-session",
+                        agent_id="codex-sol",
+                        project_id="other-project",
+                        objective="REQUESTED-SESSION-CARD-MARKER",
+                        metadata={"visibility_scope": "session"},
+                    )
+                    selected_checkpoint_id = session_state["card_id"]
+                else:
+                    session_state = record_project_state(
+                        root,
+                        session_id="requested-session",
+                        agent_id="codex-sol",
+                        project_id="other-project",
+                        objective="REQUESTED-SESSION-CARD-MARKER",
+                        metadata={"visibility_scope": "session"},
+                    )
+                    project_state = record_project_state(
+                        root,
+                        session_id="project-checkpoint-session",
+                        agent_id="codex-sol",
+                        project_id="requested-project",
+                        objective="REQUESTED-PROJECT-CARD-MARKER",
+                    )
+                    selected_checkpoint_id = project_state["card_id"]
+
+                append_scroll_event(
+                    root,
+                    session_id="requested-session",
+                    event_type="message",
+                    role="user",
+                    content="REQUESTED-SESSION-SCROLL-MARKER",
+                    metadata={"visibility_scope": "session"},
+                )
+                append_scroll_event(
+                    root,
+                    session_id="project-evidence-session",
+                    event_type="message",
+                    role="user",
+                    content="REQUESTED-PROJECT-SCROLL-MARKER",
+                    metadata={
+                        "visibility_scope": "project",
+                        "project_id": "requested-project",
+                    },
+                )
+
+                result = resume_latest(
+                    root,
+                    session_id="requested-session",
+                    project_id="requested-project",
+                    token_budget=12000,
+                    model_assist=False,
+                )
+
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(
+                    result["visibility_capability"],
+                    {
+                        "session_id": "requested-session",
+                        "project_id": "requested-project",
+                    },
+                )
+                self.assertEqual(
+                    result["discovery"]["checkpoint_id"],
+                    selected_checkpoint_id,
+                )
+                context_text = result["context"]["context_text"]
+                for marker in (
+                    "REQUESTED-SESSION-CARD-MARKER",
+                    "REQUESTED-PROJECT-CARD-MARKER",
+                    "REQUESTED-SESSION-SCROLL-MARKER",
+                    "REQUESTED-PROJECT-SCROLL-MARKER",
+                ):
+                    self.assertIn(marker, context_text)
+
+    def test_compile_context_rejects_unauthorized_mandatory_checkpoint_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="unauthorized-session",
+                agent_id="codex-sol",
+                project_id="unauthorized-project",
+                objective="UNAUTHORIZED-MANDATORY-CARD-MARKER",
+            )
+            event = append_scroll_event(
+                root,
+                session_id="unauthorized-session",
+                event_type="message",
+                role="user",
+                content="UNAUTHORIZED-MANDATORY-SCROLL-MARKER",
+                metadata={
+                    "visibility_scope": "project",
+                    "project_id": "unauthorized-project",
+                },
+            )
+            cases = (
+                (
+                    "card_with_explicit_capability",
+                    {
+                        "source": "project_state_card",
+                        "checkpoint_id": state["card_id"],
+                        "session_id": "unauthorized-session",
+                        "project_id": "unauthorized-project",
+                        "checkpoint_visibility_scope": "project",
+                    },
+                    {
+                        "visibility_capability": {
+                            "session_id": "allowed-session",
+                            "project_id": None,
+                        }
+                    },
+                    "UNAUTHORIZED-MANDATORY-CARD-MARKER",
+                ),
+                (
+                    "scroll_with_implicit_session_capability",
+                    {
+                        "source": "scroll_event",
+                        "checkpoint_id": event["event_id"],
+                        "session_id": "unauthorized-session",
+                        "project_id": "unauthorized-project",
+                        "checkpoint_visibility_scope": "project",
+                    },
+                    {},
+                    "UNAUTHORIZED-MANDATORY-SCROLL-MARKER",
+                ),
+            )
+            for name, mandatory_checkpoint, extra_kwargs, marker in cases:
+                with self.subTest(name=name):
+                    result = compile_context(
+                        root,
+                        session_id="allowed-session",
+                        token_budget=3000,
+                        planner_profile="resume",
+                        create=False,
+                        mandatory_checkpoint=mandatory_checkpoint,
+                        **extra_kwargs,
+                    )
+
+                    self.assertFalse(result["ok"], result)
+                    self.assertFalse(result["mandatory_checkpoint_found"])
+                    self.assertFalse(result["mandatory_checkpoint_fit"])
+                    self.assertEqual(result["reason"], "checkpoint_missing")
+                    self.assertNotIn(marker, result["context_text"])
+                    self.assertNotIn(
+                        mandatory_checkpoint["checkpoint_id"],
+                        result["context_text"],
+                    )
+
+    def test_public_context_apis_reject_foreign_visibility_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="declared-session",
+                agent_id="codex-sol",
+                project_id="declared-project",
+                objective="Declared recovery authority",
+            )
+            forged_capabilities = (
+                (
+                    "session_id",
+                    {"session_id": "foreign-session", "project_id": None},
+                ),
+                (
+                    "project_id",
+                    {"session_id": None, "project_id": "foreign-project"},
+                ),
+            )
+            for api_name in ("compile_context", "recover_thread"):
+                for field, forged_capability in forged_capabilities:
+                    with self.subTest(api=api_name, field=field):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            rf"visibility_capability {field} must match",
+                        ):
+                            if api_name == "compile_context":
+                                compile_context(
+                                    root,
+                                    session_id="declared-session",
+                                    project_id="declared-project",
+                                    token_budget=1000,
+                                    planner_profile="resume",
+                                    create=False,
+                                    visibility_capability=forged_capability,
+                                )
+                            else:
+                                recover_thread(
+                                    root,
+                                    session_id="declared-session",
+                                    project_id="declared-project",
+                                    token_budget=1000,
+                                    planner_profile="resume",
+                                    visibility_capability=forged_capability,
+                                )
+                with self.subTest(api=api_name, field="empty"):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "cannot remove all declared coordinates",
+                    ):
+                        if api_name == "compile_context":
+                            compile_context(
+                                root,
+                                session_id="declared-session",
+                                project_id="declared-project",
+                                token_budget=1000,
+                                planner_profile="resume",
+                                create=False,
+                                visibility_capability={
+                                    "session_id": None,
+                                    "project_id": None,
+                                },
+                            )
+                        else:
+                            recover_thread(
+                                root,
+                                session_id="declared-session",
+                                project_id="declared-project",
+                                token_budget=1000,
+                                planner_profile="resume",
+                                visibility_capability={
+                                    "session_id": None,
+                                    "project_id": None,
+                                },
+                            )
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_pins_lossless_checkpoint_ahead_of_crowded_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["context"]["scroll_event_fetch_limit"] = 2
+            write_config(root, config)
+            objective_tail = "PINNED-CHECKPOINT-OBJECTIVE-TAIL"
             state = record_project_state(
                 root,
                 session_id="crowded-session",
                 agent_id="codex-sol",
                 project_id="crowded-project",
-                objective="X" * 20000,
+                objective=(
+                    "PINNED-CHECKPOINT-OBJECTIVE:"
+                    + ("X" * 3200)
+                    + objective_tail
+                ),
                 decisions=["PINNED-CHECKPOINT-DECISION"],
                 open_tasks=["PINNED-CHECKPOINT-TASK"],
             )
+            for index in range(3):
+                append_scroll_event(
+                    root,
+                    session_id="crowded-session",
+                    event_type="message",
+                    role="user",
+                    content=f"newer capped Scroll event {index}",
+                    metadata={
+                        "visibility_scope": "project",
+                        "project_id": "crowded-project",
+                    },
+                )
             conn = connect(root)
             try:
-                for index in range(15):
+                for index in range(90):
                     create_card(
                         conn,
                         root=root,
@@ -486,6 +938,7 @@ class ResumeLatestTests(unittest.TestCase):
                         summary=f"Crowded project reference {index}",
                         source_refs=[],
                         salience=1.0,
+                        confidence=1.0,
                         visibility_scope="project",
                         session_id="crowded-session",
                         project_id="crowded-project",
@@ -494,19 +947,426 @@ class ResumeLatestTests(unittest.TestCase):
             finally:
                 conn.close()
 
+            too_small = resume_latest(
+                root,
+                project_id="crowded-project",
+                query="deliberately-unmatched-query",
+                token_budget=700,
+                model_assist=False,
+            )
+
+            self.assertFalse(too_small["ok"], too_small)
+            self.assertEqual(too_small["reason"], "checkpoint_did_not_fit")
+            self.assertGreater(too_small["minimum_checkpoint_tokens"], 700)
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
             result = resume_latest(
                 root,
                 project_id="crowded-project",
+                query="deliberately-unmatched-query",
                 token_budget=3000,
                 model_assist=False,
             )
 
             self.assertTrue(result["ok"], result)
             self.assertEqual(result["discovery"]["checkpoint_id"], state["card_id"])
+            self.assertTrue(result["context"]["mandatory_checkpoint_fit"])
+            self.assertEqual(
+                result["context"]["mandatory_checkpoint_id"],
+                state["card_id"],
+            )
+            self.assertIn(state["card_id"], result["context"]["context_text"])
+            self.assertIn(state["card_id"], result["packet_text"])
+            self.assertIn(state["event_id"], result["context"]["context_text"])
+            self.assertIn(objective_tail, result["context"]["context_text"])
+            self.assertIn(objective_tail, result["packet_text"])
             self.assertIn("PINNED-CHECKPOINT-TASK", result["packet_text"])
             self.assertIn("PINNED-CHECKPOINT-DECISION", result["packet_text"])
 
-    def test_resume_respects_a_valid_context_ceiling_below_256_tokens(self) -> None:
+    def test_resume_fails_closed_when_project_state_source_is_invalid(self) -> None:
+        for mutation in (
+            "missing",
+            "session_mismatch",
+            "project_mismatch",
+            "scope_mismatch",
+            "content_mismatch",
+            "content_hash_mismatch",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                state = record_project_state(
+                    root,
+                    session_id="source-check-session",
+                    agent_id="codex-sol",
+                    project_id="source-check-project",
+                    objective="SOURCE-CHECKPOINT-MUST-FAIL-CLOSED",
+                )
+                conn = connect(root)
+                try:
+                    if mutation == "missing":
+                        conn.execute(
+                            "DELETE FROM scroll_events WHERE id = ?",
+                            (state["event_id"],),
+                        )
+                    elif mutation == "session_mismatch":
+                        conn.execute(
+                            "UPDATE scroll_events SET session_id = ? WHERE id = ?",
+                            ("other-source-session", state["event_id"]),
+                        )
+                    elif mutation == "project_mismatch":
+                        conn.execute(
+                            "UPDATE scroll_events SET project_id = ? WHERE id = ?",
+                            ("other-source-project", state["event_id"]),
+                        )
+                    elif mutation == "scope_mismatch":
+                        conn.execute(
+                            """
+                            UPDATE scroll_events
+                            SET visibility_scope = 'session', project_id = NULL
+                            WHERE id = ?
+                            """,
+                            (state["event_id"],),
+                        )
+                    elif mutation == "content_mismatch":
+                        conn.execute(
+                            "UPDATE scroll_events SET content = ? WHERE id = ?",
+                            ("MUTATED-SOURCE-CONTENT", state["event_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE scroll_events SET content_hash = ? WHERE id = ?",
+                            ("0" * 64, state["event_id"]),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                result = resume_latest(
+                    root,
+                    project_id="source-check-project",
+                    token_budget=3000,
+                    model_assist=False,
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+                self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_fails_closed_when_project_state_structured_payload_is_mutated(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            original_decisions = [
+                f"ORIGINAL_DECISION_{index}" for index in range(25)
+            ]
+            original_tasks = [f"ORIGINAL_TASK_{index}" for index in range(25)]
+            state = record_project_state(
+                root,
+                session_id="payload-binding-session",
+                agent_id="codex-sol",
+                project_id="payload-binding-project",
+                objective="PROJECT-STATE-PAYLOAD-BINDING",
+                decisions=original_decisions,
+                open_tasks=original_tasks,
+            )
+            tampered_decisions = list(original_decisions)
+            tampered_tasks = list(original_tasks)
+            tampered_decisions[-1] = "TAMPERED_DECISION_OUTSIDE_RENDERED_WINDOW"
+            tampered_tasks[-1] = "TAMPERED_TASK_OUTSIDE_RENDERED_WINDOW"
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET decisions_json = ?, open_tasks_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(tampered_decisions),
+                        json.dumps(tampered_tasks),
+                        state["card_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = resume_latest(
+                root,
+                project_id="payload-binding-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_project_state_payload_marker_ignores_earlier_user_text_collision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="payload-marker-session",
+                agent_id="codex-sol",
+                project_id="payload-marker-project",
+                objective=(
+                    "Normal objective\n"
+                    "Continuum-State-Payload-SHA256: user-authored text"
+                ),
+                decisions=["KEEP_MARKER_COLLISION_DECISION"],
+                open_tasks=["KEEP_MARKER_COLLISION_TASK"],
+            )
+
+            result = resume_latest(
+                root,
+                project_id="payload-marker-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["discovery"]["checkpoint_id"], state["card_id"])
+            self.assertIn("KEEP_MARKER_COLLISION_DECISION", result["packet_text"])
+            self.assertIn("KEEP_MARKER_COLLISION_TASK", result["packet_text"])
+
+    def test_resume_fails_closed_when_checkpoint_source_is_rebound_within_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            old_state = record_project_state(
+                root,
+                session_id="rebound-source-session",
+                agent_id="codex-sol",
+                project_id="rebound-source-project",
+                objective="OLD-SOURCE-EVENT-OBJECTIVE",
+            )
+            new_state = record_project_state(
+                root,
+                session_id="rebound-source-session",
+                agent_id="codex-sol",
+                project_id="rebound-source-project",
+                objective="NEW-SELECTED-CARD-OBJECTIVE",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET source_refs_json = ? WHERE id = ?",
+                    (
+                        json.dumps(
+                            [
+                                {
+                                    "event_id": old_state["event_id"],
+                                    "session_id": "rebound-source-session",
+                                    "seq": old_state["seq"],
+                                }
+                            ],
+                            separators=(",", ":"),
+                        ),
+                        new_state["card_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = resume_latest(
+                root,
+                project_id="rebound-source-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "checkpoint_changed_during_resume")
+            self.assertEqual(
+                result["discovery"]["checkpoint_id"],
+                new_state["card_id"],
+            )
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_resolves_legacy_project_state_source_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            objective_tail = "LEGACY-SOURCE-OBJECTIVE-TAIL"
+            state = record_project_state(
+                root,
+                session_id="legacy-source-session",
+                agent_id="codex-sol",
+                project_id="legacy-source-project",
+                objective=("X" * 1200) + objective_tail,
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET source_refs_json = ? WHERE id = ?",
+                    (
+                        json.dumps(
+                            [
+                                {
+                                    "session_id": "legacy-source-session",
+                                    "seq": state["seq"],
+                                }
+                            ],
+                            separators=(",", ":"),
+                        ),
+                        state["card_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = resume_latest(
+                root,
+                project_id="legacy-source-project",
+                token_budget=3000,
+                model_assist=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn(state["event_id"], result["context"]["context_text"])
+            self.assertIn(objective_tail, result["packet_text"])
+
+    def test_resume_pins_selected_scroll_checkpoint_beyond_the_fetch_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["context"]["scroll_event_fetch_limit"] = 2
+            write_config(root, config)
+            checkpoint = append_scroll_event(
+                root,
+                session_id="saturated-scroll-session",
+                event_type="message",
+                role="user",
+                content="SATURATED-SCROLL-SELECTED-CHECKPOINT",
+                metadata={"visibility_scope": "session"},
+            )
+            for index in range(3):
+                append_scroll_event(
+                    root,
+                    session_id="saturated-scroll-session",
+                    event_type="message",
+                    role="user",
+                    content=f"newer capped Scroll event {index}",
+                    metadata={"visibility_scope": "session"},
+                )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE scroll_events SET created_at = ? WHERE id = ?",
+                    ("2099-01-01T00:00:00+00:00", checkpoint["event_id"]),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = resume_latest(
+                root,
+                session_id="saturated-scroll-session",
+                query="deliberately-unmatched-query",
+                token_budget=3000,
+                model_assist=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["discovery"]["source"], "scroll_event")
+            self.assertEqual(
+                result["discovery"]["checkpoint_id"],
+                checkpoint["event_id"],
+            )
+            self.assertTrue(result["context"]["mandatory_checkpoint_fit"])
+            self.assertIn(checkpoint["event_id"], result["context"]["context_text"])
+            self.assertIn(
+                "SATURATED-SCROLL-SELECTED-CHECKPOINT",
+                result["context"]["context_text"],
+            )
+            self.assertIn(checkpoint["event_id"], result["packet_text"])
+
+    def test_resume_fails_closed_when_selected_scroll_checkpoint_is_corrupted(
+        self,
+    ) -> None:
+        for mutation in ("content", "content_hash", "sequence"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                checkpoint = append_scroll_event(
+                    root,
+                    session_id="corrupt-scroll-session",
+                    event_type="message",
+                    role="user",
+                    content="IMMUTABLE-SELECTED-SCROLL-CHECKPOINT",
+                    metadata={"visibility_scope": "session"},
+                )
+                conn = connect(root)
+                try:
+                    if mutation == "content":
+                        conn.execute(
+                            "UPDATE scroll_events SET content = ? WHERE id = ?",
+                            ("MUTATED-SELECTED-SCROLL-CONTENT", checkpoint["event_id"]),
+                        )
+                    elif mutation == "content_hash":
+                        conn.execute(
+                            "UPDATE scroll_events SET content_hash = ? WHERE id = ?",
+                            ("0" * 64, checkpoint["event_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE scroll_events SET seq = ? WHERE id = ?",
+                            ("not-a-sequence", checkpoint["event_id"]),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                result = resume_latest(
+                    root,
+                    session_id="corrupt-scroll-session",
+                    token_budget=3000,
+                    model_assist=False,
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(
+                    result["reason"],
+                    "checkpoint_changed_during_resume",
+                )
+                self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_does_not_succeed_with_an_id_only_checkpoint_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["context"]["default_token_budget"] = 300
+            config["context"]["max_token_budget"] = 300
+            config["personal_profile"]["safe_context_ceiling"] = 300
+            write_config(root, config)
+            record_project_state(
+                root,
+                session_id="complete-minimum-session",
+                agent_id="codex-sol",
+                project_id="complete-minimum-project",
+                objective="REQUIRED-CHECKPOINT-STATE:" + ("x" * 4000),
+                decisions=["REQUIRED-CHECKPOINT-DECISION"],
+                open_tasks=["REQUIRED-CHECKPOINT-TASK"],
+            )
+
+            result = resume_latest(
+                root,
+                project_id="complete-minimum-project",
+                token_budget=300,
+                model_assist=False,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "checkpoint_did_not_fit")
+            self.assertEqual(result["packet_token_budget"], 300)
+            self.assertGreater(result["minimum_checkpoint_tokens"], 300)
+            self.assertGreater(result["minimum_packet_tokens"], 300)
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_reports_when_checkpoint_cannot_fit_a_supported_small_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             config = default_config()
@@ -524,22 +1384,14 @@ class ResumeLatestTests(unittest.TestCase):
 
             result = resume_latest(root, project_id="small-budget-project", token_budget=1000)
 
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["personal_profile"]["safe_context_ceiling"], 100)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "checkpoint_did_not_fit")
             self.assertEqual(result["packet_token_budget"], 100)
-            self.assertLessEqual(result["packet_estimated_tokens"], 100)
-            packet_lines = result["packet_text"].strip().splitlines()
-            self.assertEqual(packet_lines[0], "```json")
-            self.assertEqual(packet_lines[-1], "```")
-            metadata = json.loads("\n".join(packet_lines[1:-1]))
-            self.assertEqual(
-                metadata["packet_estimated_tokens"],
-                result["packet_estimated_tokens"],
-            )
-            self.assertEqual(metadata["packet_token_budget"], 100)
-            self.assertTrue(metadata["packet_truncated"])
+            self.assertGreater(result["minimum_checkpoint_tokens"], 0)
+            self.assertGreater(result["minimum_packet_tokens"], 100)
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
 
-    def test_resume_refuses_a_budget_smaller_than_the_compact_envelope(self) -> None:
+    def test_resume_reports_checkpoint_did_not_fit_at_one_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             config = default_config()
@@ -558,8 +1410,9 @@ class ResumeLatestTests(unittest.TestCase):
             result = resume_latest(root, model_assist=False)
 
             self.assertFalse(result["ok"], result)
-            self.assertEqual(result["reason"], "packet_budget_too_small")
+            self.assertEqual(result["reason"], "checkpoint_did_not_fit")
             self.assertEqual(result["packet_token_budget"], 1)
+            self.assertGreater(result["minimum_checkpoint_tokens"], 1)
             self.assertGreater(result["minimum_packet_tokens"], 1)
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
@@ -590,6 +1443,139 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertLessEqual(packet["estimated_tokens"], 500)
             self.assertTrue(packet["planner_trace"])
             self.assertTrue(packet["sections"])
+
+    def test_resume_planner_ranks_query_score_before_card_candidate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                target_card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="zirconium lattice target",
+                    summary="The two-term target should outrank one-term noise.",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="query-ranking-session",
+                    salience=0.3,
+                    confidence=0.3,
+                )
+                for index in range(90):
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"zirconium noise {index}",
+                        summary="A one-term candidate with slightly higher salience.",
+                        source_refs=[],
+                        visibility_scope="session",
+                        session_id="query-ranking-session",
+                        salience=0.4,
+                        confidence=0.4,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            packet = compile_context(
+                root,
+                session_id="query-ranking-session",
+                query="zirconium lattice",
+                token_budget=2000,
+                planner_profile="resume",
+                create=False,
+            )
+
+            current_cards = next(
+                section
+                for section in packet["sections"]
+                if section["kind"] == "current_cards"
+            )
+            self.assertEqual(current_cards["ids"][0], target_card_id)
+
+    def test_resume_prioritizes_query_cue_under_tight_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            session_id = "query-budget-session"
+            project_id = "query-budget-project"
+            record_project_state(
+                root,
+                session_id=session_id,
+                agent_id="codex-sol",
+                project_id=project_id,
+                objective="Initial release state",
+            )
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content=(
+                    "ZIRCONIUM-CUE-TARGET preserves the buried lattice evidence."
+                ),
+                metadata={
+                    "visibility_scope": "project",
+                    "project_id": project_id,
+                },
+            )
+            for index in range(110):
+                append_scroll_event(
+                    root,
+                    session_id=session_id,
+                    event_type="message",
+                    role="user",
+                    content=f"ordinary unrelated scroll noise {index}",
+                    metadata={
+                        "visibility_scope": "project",
+                        "project_id": project_id,
+                    },
+                )
+            record_project_state(
+                root,
+                session_id=session_id,
+                agent_id="codex-sol",
+                project_id=project_id,
+                objective="Continue local release verification",
+                open_tasks=["finish deterministic gates"],
+            )
+            conn = connect(root)
+            try:
+                create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="High salience unrelated card",
+                    summary="ordinary filler " * 1200,
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id=session_id,
+                    project_id=project_id,
+                    salience=1.0,
+                    confidence=1.0,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resumed = resume_latest(
+                root,
+                session_id=session_id,
+                project_id=project_id,
+                query="zirconium lattice evidence",
+                token_budget=900,
+                model_assist=False,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertIn("ZIRCONIUM-CUE-TARGET", resumed["packet_text"])
+            optional_inclusions = [
+                item
+                for item in resumed["context"]["planner_trace"]
+                if item.get("included") and not item.get("mandatory")
+            ]
+            self.assertEqual(optional_inclusions[0]["source"], "cue_recall")
 
     def test_resume_planner_respects_configured_scroll_fetch_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

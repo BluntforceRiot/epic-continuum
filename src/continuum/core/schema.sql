@@ -174,6 +174,7 @@ CREATE TABLE IF NOT EXISTS partition_aliases (
 CREATE TABLE IF NOT EXISTS card_sidecar_outbox (
     card_id TEXT PRIMARY KEY,
     reason TEXT NOT NULL,
+    generation TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -220,15 +221,33 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_scroll_events_session_seq ON scroll_events(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status, salience DESC);
+CREATE INDEX IF NOT EXISTS idx_cards_mempalace_import_pending_created ON cards(
+    status,
+    CASE WHEN json_valid(metadata_json)
+         THEN json_extract(metadata_json, '$.import_id')
+         ELSE NULL
+    END,
+    created_at,
+    id
+);
 CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC);
+CREATE INDEX IF NOT EXISTS idx_cards_conflict_group ON cards(conflict_group);
+CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary ON cards(lower(trim(title)), visibility_scope, project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary_normalized ON cards(lower(trim(title)), coalesce(visibility_scope, 'session'), coalesce(project_id, ''), coalesce(session_id, ''));
+CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary ON cards(coalesce(visibility_scope, 'session'), coalesce(project_id, ''), coalesce(session_id, ''));
+CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary_direct ON cards(visibility_scope, project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_cards_supersedes_card_id ON cards(supersedes_card_id);
 CREATE INDEX IF NOT EXISTS idx_books_tier ON books(storage_tier, status);
 CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_job_type_status ON queue_jobs(job_type, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_card_id ON graph_nodes(card_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_edge ON graph_edge_sources(edge_id);
 CREATE INDEX IF NOT EXISTS idx_partition_aliases_internal ON partition_aliases(kind, internal_id);
 CREATE INDEX IF NOT EXISTS idx_card_sidecar_outbox_updated ON card_sidecar_outbox(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_events_action_target ON audit_events(action, target_type, target_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_operation ON artifacts(operation_id);

@@ -10,7 +10,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 from urllib.parse import urlsplit
 
 from .config import (
@@ -37,6 +37,11 @@ MAX_YARN_EVIDENCE_IDS = 100
 YARN_INPUT_TRUNCATION_NOTICE = (
     "\n\n[Continuum Yarn input truncated to fit serialized request limits.]"
 )
+TOTAL_DEADLINE_ERROR = "local model operation exceeded the total deadline"
+CONFIGURATION_BOOTSTRAP_SECONDS = 1.0
+
+
+_T = TypeVar("_T")
 
 
 def _estimate_tokens(text: str) -> int:
@@ -51,10 +56,120 @@ class LocalModelError(RuntimeError):
     pass
 
 
+def _remaining_deadline_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise LocalModelError(TOTAL_DEADLINE_ERROR)
+    return remaining
+
+
+class _LocalStageRunner:
+    """Run deadline-bound local work without creating a thread per timeout."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: tuple[
+            Callable[[], Any],
+            threading.Event,
+            list[Any],
+            list[Exception],
+        ] | None = None
+        self._active = False
+        self._thread = threading.Thread(
+            target=self._work,
+            name="continuum-local-stage-runner",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _work(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None:
+                    self._condition.wait()
+                callback, completed, results, errors = self._pending
+                self._pending = None
+                self._active = True
+            try:
+                results.append(callback())
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                with self._condition:
+                    self._active = False
+                    completed.set()
+                    self._condition.notify_all()
+
+    def run(self, deadline: float, callback: Callable[[], _T]) -> _T:
+        """Run one stage, waiting at most until the absolute deadline."""
+        completed = threading.Event()
+        results: list[Any] = []
+        errors: list[Exception] = []
+        with self._condition:
+            while self._active or self._pending is not None:
+                self._condition.wait(
+                    timeout=_remaining_deadline_seconds(deadline)
+                )
+            _remaining_deadline_seconds(deadline)
+            self._pending = (callback, completed, results, errors)
+            self._condition.notify()
+        if not completed.wait(timeout=_remaining_deadline_seconds(deadline)):
+            raise LocalModelError(TOTAL_DEADLINE_ERROR)
+        _remaining_deadline_seconds(deadline)
+        if errors:
+            raise errors[0]
+        if not results:
+            raise LocalModelError("local model deadline stage returned no result")
+        return cast(_T, results[0])
+
+    def wait_idle(self, timeout_seconds: float) -> bool:
+        """Wait for test or shutdown coordination without accepting more work."""
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self._condition:
+            while self._active or self._pending is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+
 _CircuitKey = tuple[str, str, str, str]
 _CIRCUITS: dict[_CircuitKey, dict[str, float | int]] = {}
 _CIRCUIT_LOCK = threading.Lock()
 _INFERENCE_GATE = threading.BoundedSemaphore(1)
+_LOCAL_STAGE_RUNNER_GUARD = threading.Lock()
+_LOCAL_STAGE_RUNNER: _LocalStageRunner | None = _LocalStageRunner()
+
+
+def _local_stage_runner() -> _LocalStageRunner:
+    """Return the one deadline-stage runner owned by this process."""
+
+    global _LOCAL_STAGE_RUNNER
+    runner = _LOCAL_STAGE_RUNNER
+    if runner is not None:
+        return runner
+    with _LOCAL_STAGE_RUNNER_GUARD:
+        runner = _LOCAL_STAGE_RUNNER
+        if runner is None:
+            runner = _LocalStageRunner()
+            _LOCAL_STAGE_RUNNER = runner
+        return runner
+
+
+def _reset_local_model_after_fork() -> None:
+    """Discard thread-backed parent state without starting threads in the child."""
+
+    global _CIRCUIT_LOCK, _INFERENCE_GATE, _LOCAL_STAGE_RUNNER_GUARD
+    global _LOCAL_STAGE_RUNNER
+    _CIRCUIT_LOCK = threading.Lock()
+    _INFERENCE_GATE = threading.BoundedSemaphore(1)
+    _LOCAL_STAGE_RUNNER_GUARD = threading.Lock()
+    _LOCAL_STAGE_RUNNER = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_local_model_after_fork)
 
 
 def _configuration(root: Path) -> dict[str, Any]:
@@ -335,9 +450,14 @@ def _http_json(
     *,
     method: str,
     url: str,
-    timeout_seconds: int,
+    timeout_seconds: float,
     payload: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
+    request_deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+    if deadline is not None:
+        request_deadline = min(request_deadline, deadline)
+    _remaining_deadline_seconds(request_deadline)
     data: bytes | None = None
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
     if payload is not None:
@@ -362,21 +482,23 @@ def _http_json(
         if parsed.scheme == "https"
         else http.client.HTTPConnection
     )
-    timeout = max(1, int(timeout_seconds))
-    connection = connection_class(parsed.hostname, port, timeout=timeout)
-    deadline = time.monotonic() + timeout
+    connection = connection_class(
+        parsed.hostname,
+        port,
+        timeout=_remaining_deadline_seconds(request_deadline),
+    )
     cancelled = threading.Event()
     outcome: list[dict[str, Any] | Exception] = []
 
     def remaining_timeout() -> float:
-        remaining = deadline - time.monotonic()
-        if cancelled.is_set() or remaining <= 0:
-            raise LocalModelError("local model endpoint exceeded the total deadline")
-        return max(0.001, remaining)
+        if cancelled.is_set():
+            raise LocalModelError(TOTAL_DEADLINE_ERROR)
+        return _remaining_deadline_seconds(request_deadline)
 
     def request_once() -> None:
         response: http.client.HTTPResponse | None = None
         try:
+            remaining_timeout()
             connection.request(method, parsed.path or "/", body=data, headers=headers)
             remaining_timeout()
             if connection.sock is not None:
@@ -450,14 +572,13 @@ def _http_json(
                 raise LocalModelError(
                     "local model endpoint returned a non-object response"
                 )
+            remaining_timeout()
             outcome.append(result)
         except LocalModelError as exc:
             outcome.append(exc)
         except (http.client.HTTPException, socket.timeout, TimeoutError, OSError):
-            if cancelled.is_set() or time.monotonic() >= deadline:
-                outcome.append(
-                    LocalModelError("local model endpoint exceeded the total deadline")
-                )
+            if cancelled.is_set() or time.monotonic() >= request_deadline:
+                outcome.append(LocalModelError(TOTAL_DEADLINE_ERROR))
             else:
                 outcome.append(
                     LocalModelError("local model endpoint is unavailable or timed out")
@@ -471,15 +592,13 @@ def _http_json(
                 response.close()
             connection.close()
 
-    worker = threading.Thread(
-        target=request_once, name="continuum-local-http", daemon=True
-    )
-    worker.start()
-    worker.join(timeout=max(0.0, deadline - time.monotonic()))
-    if worker.is_alive():
+    try:
+        _local_stage_runner().run(request_deadline, request_once)
+    except LocalModelError:
         cancelled.set()
         connection.close()
-        raise LocalModelError("local model endpoint exceeded the total deadline")
+        raise
+    _remaining_deadline_seconds(request_deadline)
     if not outcome:
         raise LocalModelError("local model endpoint is unavailable or timed out")
     result_or_error = outcome[0]
@@ -569,7 +688,18 @@ def _model_ids(payload: dict[str, Any]) -> list[str]:
 
 
 def local_model_health(root: Path, *, probe: bool = True) -> dict[str, Any]:
-    settings = _settings(root)
+    return _local_model_health(root, settings=_settings(root), probe=probe)
+
+
+def _local_model_health(
+    root: Path,
+    *,
+    settings: dict[str, Any],
+    probe: bool,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    if deadline is not None:
+        _remaining_deadline_seconds(deadline)
     enabled = bool(settings.get("enabled", False))
     result: dict[str, Any] = {
         "ok": True,
@@ -588,7 +718,25 @@ def local_model_health(root: Path, *, probe: bool = True) -> dict[str, Any]:
     available, cooldown = _circuit_status(root, settings)
     result["circuit_open"] = not available
     result["retry_after_seconds"] = cooldown
-    resources = _resource_guard(settings)
+    try:
+        resources = (
+            _resource_guard(settings)
+            if deadline is None
+            else _local_stage_runner().run(
+                deadline,
+                lambda: _resource_guard(settings),
+            )
+        )
+    except LocalModelError as exc:
+        result.update(
+            {
+                "ok": False,
+                "reachable": False,
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        )
+        return result
     result["resource_guard"] = resources
     if not resources["safe"]:
         result.update(
@@ -607,18 +755,35 @@ def local_model_health(root: Path, *, probe: bool = True) -> dict[str, Any]:
         )
         return result
     try:
+        health_timeout = float(settings.get("health_timeout_seconds", 3))
+        health_remaining = (
+            health_timeout
+            if deadline is None
+            else min(health_timeout, _remaining_deadline_seconds(deadline))
+        )
         health = _http_json(
             method="GET",
             url=f"{str(settings['base_url']).rstrip('/')}/health",
-            timeout_seconds=int(settings.get("health_timeout_seconds", 3)),
+            timeout_seconds=health_remaining,
+            deadline=deadline,
         )
+        if deadline is not None:
+            _remaining_deadline_seconds(deadline)
         if health.get("status") != "ok":
             raise LocalModelError("local model health endpoint did not report ready")
+        model_remaining = (
+            health_timeout
+            if deadline is None
+            else min(health_timeout, _remaining_deadline_seconds(deadline))
+        )
         models = _http_json(
             method="GET",
             url=f"{str(settings['base_url']).rstrip('/')}/models",
-            timeout_seconds=int(settings.get("health_timeout_seconds", 3)),
+            timeout_seconds=model_remaining,
+            deadline=deadline,
         )
+        if deadline is not None:
+            _remaining_deadline_seconds(deadline)
         ids = _model_ids(models)
         configured_model = str(settings.get("model") or "")
         identity_verified = configured_model in ids
@@ -999,14 +1164,35 @@ def assist_resume(
     project_id: str | None,
     evidence_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    config = _configuration(root)
-    settings = dict(config.get("local_inference", {}))
-    safe_context_ceiling = int(
-        dict(config.get("personal_profile", {})).get(
-            "safe_context_ceiling",
-            config["context"]["max_token_budget"],
+    operation_started = time.monotonic()
+
+    def deadline_failure(exc: LocalModelError) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "used": False,
+            "reason": "model_request_failed",
+            "detail": str(exc),
+            "error_type": type(exc).__name__,
+            "fallback": "deterministic",
+        }
+
+    try:
+        config = _local_stage_runner().run(
+            operation_started + CONFIGURATION_BOOTSTRAP_SECONDS,
+            lambda: _configuration(root),
         )
+    except LocalModelError as exc:
+        if str(exc) != TOTAL_DEADLINE_ERROR:
+            raise
+        return deadline_failure(exc)
+    settings = dict(config.get("local_inference", {}))
+    operation_deadline = operation_started + _integral_timeout(
+        settings.get("timeout_seconds", 90)
     )
+    try:
+        _remaining_deadline_seconds(operation_deadline)
+    except LocalModelError as exc:
+        return deadline_failure(exc)
     if not bool(settings.get("enabled", False)):
         return {
             "ok": False,
@@ -1014,165 +1200,253 @@ def assist_resume(
             "reason": "disabled",
             "fallback": "deterministic",
         }
-    available, cooldown = _circuit_status(root, settings)
-    if not available:
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "circuit_open",
-            "retry_after_seconds": cooldown,
-            "fallback": "deterministic",
-        }
-    max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
-        settings.get("max_input_tokens", 32768),
-        settings.get("max_output_tokens", 768),
-    )
-    requested_estimated_tokens = _estimate_tokens(str(context_text))
-    safe_context = _portable_model_text(root, context_text)
-    safe_context = (
-        redact_text_secrets(safe_context)
-        if bool(settings.get("redact_secrets", True))
-        else safe_context
-    )
-    if scan_text_for_secrets(safe_context, max_findings=1):
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "outbound_secret_detected",
-            "fallback": "deterministic",
-        }
-    original_safe_context = safe_context
-    original_estimated_tokens = _estimate_tokens(safe_context)
-    unique_evidence_ids = list(dict.fromkeys(str(value) for value in (evidence_ids or [])))
-    evidence_id_limit = _automatic_yarn_evidence_id_limit(settings)
-    bounded_evidence_ids = _bounded_evidence_ids(
-        unique_evidence_ids,
-        limit=evidence_id_limit,
-    )
-    request_id = secrets.token_hex(16)
-    input_token_allowance = max_input_tokens - max_output_tokens
 
-    def prepare_request(
-        candidate_context: str,
-    ) -> tuple[dict[str, Any], dict[str, str], str, int, int]:
-        candidate_hash = hashlib.sha256(candidate_context.encode("utf-8")).hexdigest()
-        candidate_payload, candidate_aliases = _build_resume_request_payload(
-            settings,
-            safe_context=candidate_context,
-            session_id=session_id,
-            project_id=project_id,
-            evidence_ids=bounded_evidence_ids,
-            request_id=request_id,
-            context_sha256=candidate_hash,
-            max_output_tokens=max_output_tokens,
-        )
-        candidate_bytes, candidate_tokens = _request_metrics(candidate_payload)
-        return (
-            candidate_payload,
-            candidate_aliases,
-            candidate_hash,
-            candidate_bytes,
-            candidate_tokens,
-        )
-
-    request_payload, evidence_aliases, context_sha256, request_bytes, estimated_input_tokens = (
-        prepare_request(safe_context)
-    )
-    input_truncated = False
-    input_chars_omitted = 0
-    exceeds_serialized_budget = (
-        estimated_input_tokens > input_token_allowance
-        or request_bytes > MAX_HTTP_REQUEST_BYTES
-    )
-    if (
-        exceeds_serialized_budget
-        and requested_estimated_tokens <= safe_context_ceiling
-        and original_safe_context
-    ):
-        low = 0
-        high = len(original_safe_context) - 1
-        best: tuple[
-            str,
-            int,
-            dict[str, Any],
-            dict[str, str],
-            str,
-            int,
-            int,
-        ] | None = None
-        while low <= high:
-            prefix_length = (low + high) // 2
-            candidate_context = (
-                original_safe_context[:prefix_length]
-                + YARN_INPUT_TRUNCATION_NOTICE
+    def prepare_inputs() -> tuple[str, dict[str, Any]]:
+        available, cooldown = _circuit_status(root, settings)
+        if not available:
+            return (
+                "result",
+                {
+                    "ok": False,
+                    "used": False,
+                    "reason": "circuit_open",
+                    "retry_after_seconds": cooldown,
+                    "fallback": "deterministic",
+                },
             )
-            (
+        safe_context_ceiling = int(
+            dict(config.get("personal_profile", {})).get(
+                "safe_context_ceiling",
+                config["context"]["max_token_budget"],
+            )
+        )
+        max_input_tokens, max_output_tokens = validate_yarn_token_budgets(
+            settings.get("max_input_tokens", 32768),
+            settings.get("max_output_tokens", 768),
+        )
+        requested_estimated_tokens = _estimate_tokens(str(context_text))
+        safe_context = _portable_model_text(root, context_text)
+        safe_context = (
+            redact_text_secrets(safe_context)
+            if bool(settings.get("redact_secrets", True))
+            else safe_context
+        )
+        if scan_text_for_secrets(safe_context, max_findings=1):
+            return (
+                "result",
+                {
+                    "ok": False,
+                    "used": False,
+                    "reason": "outbound_secret_detected",
+                    "fallback": "deterministic",
+                },
+            )
+        original_safe_context = safe_context
+        original_estimated_tokens = _estimate_tokens(safe_context)
+        unique_evidence_ids = list(
+            dict.fromkeys(str(value) for value in (evidence_ids or []))
+        )
+        evidence_id_limit = _automatic_yarn_evidence_id_limit(settings)
+        bounded_evidence_ids = _bounded_evidence_ids(
+            unique_evidence_ids,
+            limit=evidence_id_limit,
+        )
+        request_id = secrets.token_hex(16)
+        input_token_allowance = max_input_tokens - max_output_tokens
+
+        def prepare_request(
+            candidate_context: str,
+        ) -> tuple[dict[str, Any], dict[str, str], str, int, int]:
+            candidate_hash = hashlib.sha256(
+                candidate_context.encode("utf-8")
+            ).hexdigest()
+            candidate_payload, candidate_aliases = _build_resume_request_payload(
+                settings,
+                safe_context=candidate_context,
+                session_id=session_id,
+                project_id=project_id,
+                evidence_ids=bounded_evidence_ids,
+                request_id=request_id,
+                context_sha256=candidate_hash,
+                max_output_tokens=max_output_tokens,
+            )
+            candidate_bytes, candidate_tokens = _request_metrics(candidate_payload)
+            return (
                 candidate_payload,
                 candidate_aliases,
                 candidate_hash,
                 candidate_bytes,
                 candidate_tokens,
-            ) = prepare_request(candidate_context)
-            if (
-                candidate_tokens <= input_token_allowance
-                and candidate_bytes <= MAX_HTTP_REQUEST_BYTES
-            ):
-                best = (
-                    candidate_context,
-                    prefix_length,
+            )
+
+        (
+            request_payload,
+            evidence_aliases,
+            context_sha256,
+            request_bytes,
+            estimated_input_tokens,
+        ) = prepare_request(safe_context)
+        input_truncated = False
+        input_chars_omitted = 0
+        exceeds_serialized_budget = (
+            estimated_input_tokens > input_token_allowance
+            or request_bytes > MAX_HTTP_REQUEST_BYTES
+        )
+        if (
+            exceeds_serialized_budget
+            and requested_estimated_tokens <= safe_context_ceiling
+            and original_safe_context
+        ):
+            low = 0
+            high = len(original_safe_context) - 1
+            best: tuple[
+                str,
+                int,
+                dict[str, Any],
+                dict[str, str],
+                str,
+                int,
+                int,
+            ] | None = None
+            while low <= high:
+                prefix_length = (low + high) // 2
+                candidate_context = (
+                    original_safe_context[:prefix_length]
+                    + YARN_INPUT_TRUNCATION_NOTICE
+                )
+                (
                     candidate_payload,
                     candidate_aliases,
                     candidate_hash,
                     candidate_bytes,
                     candidate_tokens,
-                )
-                low = prefix_length + 1
-            else:
-                high = prefix_length - 1
-        if best is not None:
-            (
-                safe_context,
-                retained_chars,
-                request_payload,
-                evidence_aliases,
-                context_sha256,
-                request_bytes,
-                estimated_input_tokens,
-            ) = best
-            input_truncated = True
-            input_chars_omitted = len(original_safe_context) - retained_chars
-            exceeds_serialized_budget = False
+                ) = prepare_request(candidate_context)
+                if (
+                    candidate_tokens <= input_token_allowance
+                    and candidate_bytes <= MAX_HTTP_REQUEST_BYTES
+                ):
+                    best = (
+                        candidate_context,
+                        prefix_length,
+                        candidate_payload,
+                        candidate_aliases,
+                        candidate_hash,
+                        candidate_bytes,
+                        candidate_tokens,
+                    )
+                    low = prefix_length + 1
+                else:
+                    high = prefix_length - 1
+            if best is not None:
+                (
+                    safe_context,
+                    retained_chars,
+                    request_payload,
+                    evidence_aliases,
+                    context_sha256,
+                    request_bytes,
+                    estimated_input_tokens,
+                ) = best
+                input_truncated = True
+                input_chars_omitted = len(original_safe_context) - retained_chars
+                exceeds_serialized_budget = False
 
+        if (
+            requested_estimated_tokens > safe_context_ceiling
+            or exceeds_serialized_budget
+        ):
+            if request_bytes > MAX_HTTP_REQUEST_BYTES:
+                detail = "serialized_request_byte_budget_exceeded"
+            elif estimated_input_tokens > input_token_allowance:
+                detail = "serialized_input_token_budget_exceeded"
+            else:
+                detail = "configured_safe_context_ceiling_exceeded"
+            return (
+                "result",
+                {
+                    "ok": False,
+                    "used": False,
+                    "reason": "input_budget_exceeded",
+                    "detail": detail,
+                    "estimated_tokens": original_estimated_tokens,
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "safe_context_ceiling": safe_context_ceiling,
+                    "max_input_tokens": max_input_tokens,
+                    "max_output_tokens": max_output_tokens,
+                    "usable_input_tokens": input_token_allowance,
+                    "request_bytes": request_bytes,
+                    "max_request_bytes": MAX_HTTP_REQUEST_BYTES,
+                    "evidence_id_count": len(bounded_evidence_ids),
+                    "evidence_id_limit": evidence_id_limit,
+                    "evidence_ids_omitted": (
+                        len(unique_evidence_ids) - len(bounded_evidence_ids)
+                    ),
+                    "fallback": "deterministic",
+                },
+            )
+        return (
+            "prepared",
+            {
+                "safe_context": safe_context,
+                "original_estimated_tokens": original_estimated_tokens,
+                "requested_estimated_tokens": requested_estimated_tokens,
+                "unique_evidence_ids": unique_evidence_ids,
+                "evidence_id_limit": evidence_id_limit,
+                "bounded_evidence_ids": bounded_evidence_ids,
+                "request_id": request_id,
+                "request_payload": request_payload,
+                "evidence_aliases": evidence_aliases,
+                "context_sha256": context_sha256,
+                "request_bytes": request_bytes,
+                "estimated_input_tokens": estimated_input_tokens,
+                "input_truncated": input_truncated,
+                "input_chars_omitted": input_chars_omitted,
+            },
+        )
+
+    try:
+        preparation_kind, preparation = _local_stage_runner().run(
+            operation_deadline, prepare_inputs
+        )
+    except LocalModelError as exc:
+        if str(exc) == TOTAL_DEADLINE_ERROR:
+            return deadline_failure(exc)
+        raise
+    if preparation_kind == "result":
+        return preparation
+    safe_context = str(preparation["safe_context"])
+    original_estimated_tokens = int(preparation["original_estimated_tokens"])
+    requested_estimated_tokens = int(preparation["requested_estimated_tokens"])
+    unique_evidence_ids = list(preparation["unique_evidence_ids"])
+    evidence_id_limit = int(preparation["evidence_id_limit"])
+    bounded_evidence_ids = list(preparation["bounded_evidence_ids"])
+    request_id = str(preparation["request_id"])
+    request_payload = dict(preparation["request_payload"])
+    evidence_aliases = dict(preparation["evidence_aliases"])
+    context_sha256 = str(preparation["context_sha256"])
+    request_bytes = int(preparation["request_bytes"])
+    estimated_input_tokens = int(preparation["estimated_input_tokens"])
+    input_truncated = bool(preparation["input_truncated"])
+    input_chars_omitted = int(preparation["input_chars_omitted"])
     outbound_evidence_ids = list(evidence_aliases)
-    if requested_estimated_tokens > safe_context_ceiling or exceeds_serialized_budget:
-        if request_bytes > MAX_HTTP_REQUEST_BYTES:
-            detail = "serialized_request_byte_budget_exceeded"
-        elif estimated_input_tokens > input_token_allowance:
-            detail = "serialized_input_token_budget_exceeded"
-        else:
-            detail = "configured_safe_context_ceiling_exceeded"
-        return {
-            "ok": False,
-            "used": False,
-            "reason": "input_budget_exceeded",
-            "detail": detail,
-            "estimated_tokens": original_estimated_tokens,
-            "estimated_input_tokens": estimated_input_tokens,
-            "safe_context_ceiling": safe_context_ceiling,
-            "max_input_tokens": max_input_tokens,
-            "max_output_tokens": max_output_tokens,
-            "usable_input_tokens": input_token_allowance,
-            "request_bytes": request_bytes,
-            "max_request_bytes": MAX_HTTP_REQUEST_BYTES,
-            "evidence_id_count": len(bounded_evidence_ids),
-            "evidence_id_limit": evidence_id_limit,
-            "evidence_ids_omitted": len(unique_evidence_ids) - len(bounded_evidence_ids),
-            "fallback": "deterministic",
-        }
-    gate_acquired = _INFERENCE_GATE.acquire(
-        timeout=max(0, int(settings.get("queue_wait_seconds", 2)))
-    )
+    try:
+        gate_wait = min(
+            max(0.0, float(settings.get("queue_wait_seconds", 2))),
+            _remaining_deadline_seconds(operation_deadline),
+        )
+    except LocalModelError as exc:
+        return deadline_failure(exc)
+    gate_acquired = _INFERENCE_GATE.acquire(timeout=gate_wait)
     if not gate_acquired:
+        if time.monotonic() >= operation_deadline:
+            return {
+                "ok": False,
+                "used": False,
+                "reason": "model_request_failed",
+                "detail": TOTAL_DEADLINE_ERROR,
+                "error_type": LocalModelError.__name__,
+                "fallback": "deterministic",
+            }
         return {
             "ok": False,
             "used": False,
@@ -1180,7 +1454,14 @@ def assist_resume(
             "fallback": "deterministic",
         }
     try:
-        health = local_model_health(root, probe=True)
+        _remaining_deadline_seconds(operation_deadline)
+        health = _local_model_health(
+            root,
+            settings=settings,
+            probe=True,
+            deadline=operation_deadline,
+        )
+        _remaining_deadline_seconds(operation_deadline)
         if not health.get("ready"):
             if health.get("reason") not in {
                 "insufficient_resource_headroom",
@@ -1198,40 +1479,50 @@ def assist_resume(
         response = _http_json(
             method="POST",
             url=f"{str(settings['base_url']).rstrip('/')}/chat/completions",
-            timeout_seconds=int(settings.get("timeout_seconds", 90)),
+            timeout_seconds=_remaining_deadline_seconds(operation_deadline),
             payload=request_payload,
+            deadline=operation_deadline,
         )
-        response_model = str(response.get("model") or "")
-        if response_model != str(settings["model"]):
-            raise LocalModelError(
-                "local model response identity does not match the configured model"
-            )
-        content = _extract_message_content(response)
-        try:
-            parsed = _strict_json_loads(content)
-        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-            if (
-                isinstance(exc, RecursionError)
-                or "nesting exceeds" in str(exc).casefold()
-            ):
+        _remaining_deadline_seconds(operation_deadline)
+
+        def parse_and_validate() -> tuple[str, dict[str, Any]]:
+            response_model = str(response.get("model") or "")
+            if response_model != str(settings["model"]):
                 raise LocalModelError(
-                    "Yarn briefing exceeded the JSON nesting safety ceiling"
-                ) from exc
-            raise LocalModelError("Yarn briefing is not valid JSON") from exc
-        briefing = _validate_resume_briefing(
-            parsed,
-            request_id=request_id,
-            context_sha256=context_sha256,
-            model_id=str(settings["model"]),
-            allowed_evidence_ids=set(outbound_evidence_ids),
+                    "local model response identity does not match the configured model"
+                )
+            content = _extract_message_content(response)
+            try:
+                parsed = _strict_json_loads(content)
+            except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                if (
+                    isinstance(exc, RecursionError)
+                    or "nesting exceeds" in str(exc).casefold()
+                ):
+                    raise LocalModelError(
+                        "Yarn briefing exceeded the JSON nesting safety ceiling"
+                    ) from exc
+                raise LocalModelError("Yarn briefing is not valid JSON") from exc
+            briefing = _validate_resume_briefing(
+                parsed,
+                request_id=request_id,
+                context_sha256=context_sha256,
+                model_id=str(settings["model"]),
+                allowed_evidence_ids=set(outbound_evidence_ids),
+            )
+            if scan_text_for_secrets(
+                json.dumps(briefing, ensure_ascii=True), max_findings=1
+            ):
+                raise LocalModelError("Yarn briefing contained secret-like output")
+            briefing["citations"] = [
+                evidence_aliases[citation] for citation in briefing["citations"]
+            ]
+            return response_model, briefing
+
+        response_model, briefing = _local_stage_runner().run(
+            operation_deadline, parse_and_validate
         )
-        if scan_text_for_secrets(
-            json.dumps(briefing, ensure_ascii=True), max_findings=1
-        ):
-            raise LocalModelError("Yarn briefing contained secret-like output")
-        briefing["citations"] = [
-            evidence_aliases[citation] for citation in briefing["citations"]
-        ]
+        _remaining_deadline_seconds(operation_deadline)
         _record_success(root, settings)
         return {
             "ok": True,

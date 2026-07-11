@@ -23,8 +23,10 @@ Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The final Windows v0.3 candidate passed 636 tests with 24 environment-gated
-skips. Ruff, mypy across 29 source files, compileall, fixture
+The post-review Windows v0.3 source candidate ran 697 CI-equivalent unittest
+checks with 25 environment-gated skips; all 672 executed checks passed. An
+independent pytest run passed 674 tests with 25 skips and 319 subtests. Ruff,
+mypy across 29 source files, compileall, fixture
 allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
 passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
 records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
@@ -99,10 +101,18 @@ Review hardening after the final private review pass added:
   project-state conflict isolation, serialized Yarn request sizing and
   configuration preservation, malformed queue timestamps, immutable Git-blob
   release snapshots, and provenance-bound reproducible distribution builds.
+- final external-review fixes for caller-authorized resume discovery, mandatory
+  complete checkpoint envelopes, pre-limit query relevance, universal worker
+  lease renewal, crash-reconstructable Scribe receipts, serialized sidecar
+  generations, indexed bounded MemPalace continuations, globally budgeted
+  conflict maintenance, one total Yarn deadline, and exact-toolchain
+  distribution receipts verified again after CI artifact download on Linux and
+  Windows.
 
 The Python package version is `0.3.0`, and the catalog capability
-`SCHEMA_VERSION` remains `0.2.0`. This feature release adds no catalog migration.
-The 0.2 cycle includes additive catalog migrations for
+`SCHEMA_VERSION` remains `0.2.0`. This feature release uses additive in-place
+catalog extensions and requires no destructive migration or capability-version
+bump. The 0.2 cycle includes additive catalog migrations for
 durable Scroll visibility fields, source-scoped graph edge contributions,
 partition aliases, snapshot integrity bindings, sidecar synchronization queues,
 and proof/bundle hardening. Existing roots are upgraded in place, with legacy

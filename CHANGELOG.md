@@ -35,16 +35,68 @@
   selected checkpoint is no longer the exact newest state while the packet is
   assembled. Tiny budgets now return valid compact envelopes or a clean error;
   unscoped fallback skips stale checkpoint partitions.
+- Preserved the caller's original session/project visibility capability during
+  automatic discovery and recovery. Selected checkpoints are authorized before
+  selection, bypass evidence-count windows as mandatory candidates, retain their
+  complete resumable state, and return `checkpoint_did_not_fit` rather than an
+  ID-only success when the configured packet ceiling is too small. Query scoring
+  now runs before the bounded Card candidate limit, and the most relevant
+  optional source is considered first when a tight packet budget cannot fit one
+  item from every source.
 - Isolated project-state checkpoints from derived-card conflict groups and made
-  malformed pending-job timestamps an explicit unhealthy queue condition.
+  malformed pending-job timestamps an explicit unhealthy queue condition. New
+  project-state events hash-bind their complete decision and open-task arrays;
+  selected checkpoints fail closed if those structured fields later diverge.
+- Added background lease renewal for every queue job type plus unexpired-owner
+  commit fencing and durable per-job effect receipts. Reclaimed or replayed jobs
+  cannot duplicate database-visible effects. Card sidecar snapshot, atomic file
+  replacement, and generation-specific outbox acknowledgement are serialized so
+  a process exit after replacement cannot let an older writer overtake newer
+  Card state. Scribe frontier reads, segment/Card writes, roll audit emission,
+  and per-segment committed-step receipts now share one lease-fenced writer
+  transaction, including when an expired attempt overlaps its reclaimed
+  successor; a replay reconstructs the final job receipt from those steps.
+  Bounded MemPalace review batches use an indexed `LIMIT + 1` window, report
+  remaining work as a lower bound, receipt each completed step, and atomically
+  enqueue a same-import, same-limit continuation so a durable partial batch
+  cannot strand its tail.
+- Made conflict maintenance explicitly bounded across candidate Cards, pair
+  comparisons, component members, mutations, and transaction time. Exhausted
+  passes return continuation metadata and advance a durable circular cursor
+  without partially assigning an oversized component. Closure checks use
+  capped indexed probes, targeted scans reject non-advancing one-Card pages,
+  and an expired transaction deadline rolls back every Card and outbox change.
+  Fair anchors now reserve their whole exact-title/durable-group closure before
+  optional cursor noise; oversized closures request a larger budget, and groups
+  beyond the hard automatic ceiling require explicit review. Targeted fuzzy
+  evidence that cannot fit one pass is explicitly deferred instead of cycling
+  or reporting false completion, while normalized boundary/title indexes keep
+  capped candidate queries in index order. Incomplete targeted closures and
+  boundaries now return without Card, group, or audit mutation. Automatic
+  maintenance attempts at most one hard-cap escalation, then emits a
+  deduplicated durable review signal. Later passes remain bounded while still
+  allowing changed components to recover without an acknowledgement deadlock.
 - Sized Yarn briefings from the transformed, fully serialized request under both
   token and transport limits, exact-fit trimmed unusually escape-dense input,
   bounded evidence aliases, preserved omitted CLI settings, and kept legacy
   low-budget profiles upgrade-compatible.
+- Applied one absolute monotonic Yarn deadline from assist entry through
+  configuration loading, input transformation and sizing, inference-gate
+  waiting, resource and endpoint preflights, completion transfer, parsing, and
+  validation. Deadline-bound local stages share one fixed runner instead of
+  accumulating abandoned worker threads after timeouts, including a connection
+  that refuses to unblock when closed. POSIX fork children
+  discard inherited thread/lock references and lazily create one child-local
+  runner on first use.
 - Made CI wheel and source-distribution artifacts reproducible builds of the
   provenance-bearing release archive, with duplicate-member, version-parity,
   clean-source, and mid-build worktree-change checks plus an embedded build
   epoch and pinned distribution-toolchain recipe.
+- Added a canonical distribution finalizer that requires the exact Python/build
+  toolchain and wheel generator, compares two builds byte-for-byte, validates
+  wheel/sdist identity and embedded provenance, closes the uploaded directory
+  over a hash-bound receipt, and runs the downloaded wheel and sdist suites on
+  both Linux and Windows CI.
 - Kept the catalog capability schema at `0.2.0`; these features are additive and do not
   require a destructive migration or downgrade of existing catalogs.
 

@@ -2102,15 +2102,19 @@ def mark_card_sidecar_outbox(conn: sqlite3.Connection, card_ids: list[str], *, r
     for card_id in dict.fromkeys(card_ids):
         if not card_id:
             continue
+        generation = unique_id("sidecar_generation")
         conn.execute(
             """
-            INSERT INTO card_sidecar_outbox(card_id, reason, created_at, updated_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO card_sidecar_outbox(
+                card_id, reason, generation, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?)
             ON CONFLICT(card_id) DO UPDATE SET
                 reason = excluded.reason,
+                generation = excluded.generation,
                 updated_at = excluded.updated_at
             """,
-            (card_id, reason, now, now),
+            (card_id, reason, generation, now, now),
         )
         count += 1
     return count
@@ -2173,6 +2177,11 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
         ("cards", "conflict_group", "conflict_group TEXT"),
         ("cards", "supersedes_card_id", "supersedes_card_id TEXT"),
         ("cards", "superseded_by_card_id", "superseded_by_card_id TEXT"),
+        (
+            "card_sidecar_outbox",
+            "generation",
+            "generation TEXT NOT NULL DEFAULT ''",
+        ),
         ("queue_jobs", "attempt_count", "attempt_count INTEGER NOT NULL DEFAULT 0"),
         ("queue_jobs", "error_json", "error_json TEXT"),
         ("queue_jobs", "lease_owner", "lease_owner TEXT"),
@@ -3412,6 +3421,7 @@ def enqueue_job(
     related_card_ids: list[str] | None = None,
     preemptible: bool = True,
     dedupe_key: str | None = None,
+    replace_pending: bool = False,
 ) -> str:
     # Queue rows are a durable sink too. Most call sites only pass generated IDs,
     # but direct/API use can otherwise smuggle secrets into payload_json. Redact
@@ -3420,7 +3430,36 @@ def enqueue_job(
     safe_related_card_ids = redact_value_secrets(related_card_ids or [])
     safe_role = redact_text_secrets(str(role))
     safe_job_type = redact_text_secrets(str(job_type))
+    now = utc_now()
     stored_dedupe_key = None
+
+    def reuse_pending(job_id: str) -> str:
+        if not replace_pending:
+            return job_id
+        updated = conn.execute(
+            """
+            UPDATE queue_jobs
+            SET priority = ?, preemptible = ?, related_card_ids_json = ?,
+                payload_json = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending' AND dedupe_key = ?
+              AND role = ? AND job_type = ?
+            """,
+            (
+                priority,
+                1 if preemptible else 0,
+                json_dumps(safe_related_card_ids),
+                json_dumps(safe_payload),
+                now,
+                job_id,
+                stored_dedupe_key,
+                safe_role,
+                safe_job_type,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("pending queue job changed while refreshing its payload")
+        return job_id
+
     if dedupe_key is not None:
         raw_dedupe_key = str(dedupe_key).strip()
         if not raw_dedupe_key:
@@ -3437,8 +3476,7 @@ def enqueue_job(
             (stored_dedupe_key,),
         ).fetchone()
         if existing is not None:
-            return str(existing["id"])
-    now = utc_now()
+            return reuse_pending(str(existing["id"]))
     job_id = unique_id("job")
     try:
         conn.execute(
@@ -3474,7 +3512,7 @@ def enqueue_job(
         ).fetchone()
         if existing is None:
             raise
-        return str(existing["id"])
+        return reuse_pending(str(existing["id"]))
     return job_id
 
 
@@ -3602,36 +3640,84 @@ def create_card(
 def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str, Any]:
     unique_card_ids = [card_id for card_id in dict.fromkeys(card_ids) if card_id]
     if not unique_card_ids:
-        return {"ok": True, "synced": 0, "failed": 0, "failures": []}
+        return {
+            "ok": True,
+            "synced": 0,
+            "deferred": 0,
+            "failed": 0,
+            "failures": [],
+        }
     conn = connect(root)
     synced = 0
+    deferred = 0
     failures: list[dict[str, Any]] = []
     try:
         for card_id in unique_card_ids:
+            observed_generation: str | None = None
             try:
-                location_uri = sync_card_sidecar(root, conn, card_id)
-                audit_event(
-                    conn,
-                    action="card_sidecar_synced",
-                    target_type="card",
-                    target_id=card_id,
-                    payload={"location_uri": location_uri},
+                # Serialize the Card snapshot, atomic file replacement, and
+                # outbox acknowledgement. A process can die after replacing
+                # the file, so post-write revalidation alone cannot prevent an
+                # older writer from overtaking a newer completed sync.
+                conn.execute("BEGIN IMMEDIATE")
+                outbox_row = conn.execute(
+                    "SELECT generation FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+                observed_generation = (
+                    str(outbox_row["generation"] or "")
+                    if outbox_row is not None
+                    else None
                 )
-                conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
-                synced += 1
+                location_uri = sync_card_sidecar(root, conn, card_id)
+                acknowledged = outbox_row is None
+                if observed_generation is not None:
+                    acknowledged = (
+                        conn.execute(
+                            """
+                            DELETE FROM card_sidecar_outbox
+                            WHERE card_id = ? AND generation = ?
+                            """,
+                            (card_id, observed_generation),
+                        ).rowcount
+                        == 1
+                    )
+                if acknowledged:
+                    audit_event(
+                        conn,
+                        action="card_sidecar_synced",
+                        target_type="card",
+                        target_id=card_id,
+                        payload={"location_uri": location_uri},
+                    )
+                    synced += 1
+                else:
+                    audit_event(
+                        conn,
+                        action="card_sidecar_sync_superseded",
+                        target_type="card",
+                        target_id=card_id,
+                        payload={"location_uri": location_uri},
+                    )
+                    deferred += 1
+                conn.commit()
             except Exception as exc:
+                if conn.in_transaction:
+                    conn.rollback()
                 error = str(exc)
                 failures.append({"card_id": card_id, "error": error})
-                conn.execute(
-                    """
-                    UPDATE card_sidecar_outbox
-                    SET attempt_count = attempt_count + 1,
-                        last_error = ?,
-                        updated_at = ?
-                    WHERE card_id = ?
-                    """,
-                    (error, utc_now(), card_id),
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                if observed_generation is not None:
+                    conn.execute(
+                        """
+                        UPDATE card_sidecar_outbox
+                        SET attempt_count = attempt_count + 1,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE card_id = ? AND generation = ?
+                        """,
+                        (error, utc_now(), card_id, observed_generation),
+                    )
                 audit_event(
                     conn,
                     action="card_sidecar_sync_failed",
@@ -3648,17 +3734,26 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
                     related_card_ids=[card_id],
                     dedupe_key=f"card:{card_id}",
                 )
-        conn.commit()
+                conn.commit()
     except Exception as exc:
+        if conn.in_transaction:
+            conn.rollback()
         return {
             "ok": False,
             "synced": synced,
+            "deferred": deferred,
             "failed": len(unique_card_ids) - synced,
             "failures": [*failures, {"card_id": None, "error": str(exc)}],
         }
     finally:
         conn.close()
-    return {"ok": not failures, "synced": synced, "failed": len(failures), "failures": failures}
+    return {
+        "ok": not failures,
+        "synced": synced,
+        "deferred": deferred,
+        "failed": len(failures),
+        "failures": failures,
+    }
 
 
 def sync_pending_card_sidecars(root: Path, *, limit: int = 10000) -> dict[str, Any]:
@@ -4411,7 +4506,17 @@ def segment_hash_material(events: list[sqlite3.Row] | tuple[sqlite3.Row, ...], *
     )
 
 
-def roll_scroll_segment(root: Path, *, session_id: str, start_seq: int, end_seq: int) -> dict[str, Any]:
+def roll_scroll_segment(
+    root: Path,
+    *,
+    session_id: str,
+    start_seq: int,
+    end_seq: int,
+    transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
+    transaction_effect: (
+        Callable[[sqlite3.Connection, dict[str, Any]], None] | None
+    ) = None,
+) -> dict[str, Any]:
     init_db(root)
     session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
     start_seq = int(start_seq)
@@ -4422,6 +4527,14 @@ def roll_scroll_segment(root: Path, *, session_id: str, start_seq: int, end_seq:
         raise ValueError("scroll segment end_seq must be >= start_seq")
     conn = connect(root)
     try:
+        # Scribe workers pass a live-lease guard here.  Acquiring the writer
+        # lock before the first frontier read makes the guard, deterministic
+        # segment write, Card/audit effects, and final ownership check one
+        # serializable unit.  Direct callers retain the same behavior without
+        # a queue lease.
+        conn.execute("BEGIN IMMEDIATE")
+        if transaction_guard is not None:
+            transaction_guard(conn)
         max_row = conn.execute(
             "SELECT coalesce(max(seq), 0) AS max_seq FROM scroll_events WHERE session_id = ?",
             (session_id,),
@@ -4617,18 +4730,29 @@ def roll_scroll_segment(root: Path, *, session_id: str, start_seq: int, end_seq:
                 "source_scopes": source_scopes,
             },
         )
-        conn.commit()
-        sync_card_sidecars_after_commit(root, [card_id])
-        sidecar_path = card_sidecar_path(root, card_id)
-        return {
+        committed_result = {
             "segment_id": segment_id,
             "card_id": card_id,
-            "card_uri": str(sidecar_path) if sidecar_path and sidecar_path.exists() else None,
             "event_count": len(events),
             "token_estimate": token_total,
             "librarian_job_id": librarian_job,
             "archivist_job_id": archivist_job,
         }
+        if transaction_effect is not None:
+            transaction_effect(conn, committed_result)
+        if transaction_guard is not None:
+            transaction_guard(conn)
+        conn.commit()
+        sync_card_sidecars_after_commit(root, [card_id])
+        sidecar_path = card_sidecar_path(root, card_id)
+        return {
+            **committed_result,
+            "card_uri": str(sidecar_path) if sidecar_path and sidecar_path.exists() else None,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4963,6 +5087,383 @@ def _cue_recall_context_payload(item: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validated_visibility_capability(
+    root: Path,
+    *,
+    declared_session_id: str,
+    declared_project_id: str | None,
+    visibility_capability: dict[str, Any],
+    allow_unscoped_global: bool = False,
+) -> dict[str, str | None]:
+    """Return a canonical capability that can only narrow declared coordinates."""
+
+    capability_session_id = str(
+        canonical_partition_identifier(
+            root,
+            "session_id",
+            visibility_capability.get("session_id"),
+            lookup=True,
+        )
+        or ""
+    )
+    capability_project_id = canonical_partition_identifier(
+        root,
+        "project_id",
+        visibility_capability.get("project_id"),
+        lookup=True,
+    )
+    if capability_session_id and capability_session_id != declared_session_id:
+        raise ValueError(
+            "visibility_capability session_id must match the declared session_id"
+        )
+    if capability_project_id and capability_project_id != declared_project_id:
+        raise ValueError(
+            "visibility_capability project_id must match the declared project_id"
+        )
+    if (
+        not capability_session_id
+        and not capability_project_id
+        and (declared_session_id or declared_project_id)
+        and not allow_unscoped_global
+    ):
+        raise ValueError(
+            "visibility_capability cannot remove all declared coordinates"
+        )
+    return {
+        "session_id": capability_session_id or None,
+        "project_id": capability_project_id,
+    }
+
+
+def _validated_resume_visibility_capability(
+    root: Path,
+    *,
+    declared_session_id: str,
+    declared_project_id: str | None,
+    expected_discovery: dict[str, Any],
+    visibility_capability: dict[str, Any],
+) -> dict[str, str | None]:
+    """Validate the exact caller capability bound to one resume discovery."""
+
+    capability_session_id = str(
+        canonical_partition_identifier(
+            root,
+            "session_id",
+            visibility_capability.get("session_id"),
+            lookup=True,
+        )
+        or ""
+    )
+    capability_project_id = canonical_partition_identifier(
+        root,
+        "project_id",
+        visibility_capability.get("project_id"),
+        lookup=True,
+    )
+    requested_session_id = str(
+        canonical_partition_identifier(
+            root,
+            "session_id",
+            expected_discovery.get("requested_session_id"),
+            lookup=True,
+        )
+        or ""
+    )
+    requested_project_id = canonical_partition_identifier(
+        root,
+        "project_id",
+        expected_discovery.get("requested_project_id"),
+        lookup=True,
+    )
+    checkpoint_session_id = str(expected_discovery.get("session_id") or "")
+    checkpoint_project_id = str(expected_discovery.get("project_id") or "") or None
+    if (
+        checkpoint_session_id != declared_session_id
+        or checkpoint_project_id != declared_project_id
+    ):
+        raise ValueError(
+            "resume discovery coordinates must match the declared recovery coordinates"
+        )
+
+    if requested_session_id or requested_project_id:
+        expected_capability = {
+            "session_id": requested_session_id or None,
+            "project_id": requested_project_id,
+        }
+    else:
+        checkpoint_scope = normalize_visibility_scope(
+            str(expected_discovery.get("checkpoint_visibility_scope") or ""),
+            field="resume checkpoint visibility_scope",
+        )
+        if checkpoint_scope == "session":
+            expected_capability = {
+                "session_id": declared_session_id or None,
+                "project_id": None,
+            }
+        elif checkpoint_scope == "project":
+            expected_capability = {
+                "session_id": None,
+                "project_id": declared_project_id,
+            }
+        elif checkpoint_scope == "global":
+            expected_capability = {"session_id": None, "project_id": None}
+        else:
+            raise ValueError("private checkpoints cannot authorize automatic resume")
+
+    supplied_capability = {
+        "session_id": capability_session_id or None,
+        "project_id": capability_project_id,
+    }
+    if supplied_capability != expected_capability:
+        raise ValueError(
+            "visibility_capability must exactly preserve the resume request capability"
+        )
+    return supplied_capability
+
+
+def _checkpoint_allows_unscoped_global_capability(
+    root: Path,
+    *,
+    checkpoint: dict[str, Any] | None,
+    declared_session_id: str,
+    declared_project_id: str | None,
+) -> bool:
+    """Authorize the empty capability only for one durable unscoped-global checkpoint."""
+
+    if (
+        checkpoint is None
+        or str(checkpoint.get("checkpoint_visibility_scope") or "") != "global"
+        or str(checkpoint.get("requested_session_id") or "")
+        or str(checkpoint.get("requested_project_id") or "")
+        or str(checkpoint.get("session_id") or "") != declared_session_id
+        or str(checkpoint.get("project_id") or "")
+        != str(declared_project_id or "")
+        or declared_project_id is not None
+        or not is_initialized(root)
+    ):
+        return False
+    source = str(checkpoint.get("source") or "")
+    checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+    if source == "scroll_event":
+        table = "scroll_events"
+    elif source == "project_state_card":
+        table = "cards"
+    else:
+        return False
+    conn = connect_existing(root)
+    try:
+        row = conn.execute(
+            f"""
+            SELECT session_id, project_id, visibility_scope
+            FROM {table}
+            WHERE id = ?
+            """,
+            (checkpoint_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(
+        row is not None
+        and str(row["session_id"] or "") == declared_session_id
+        and not str(row["project_id"] or "")
+        and str(row["visibility_scope"] or "") == "global"
+    )
+
+
+def _project_state_source_event(
+    conn: sqlite3.Connection,
+    *,
+    source_refs: Any,
+    checkpoint_session_id: str,
+    checkpoint_project_id: str,
+    checkpoint_visibility_scope: str,
+    capability_session_id: str | None,
+    capability_project_id: str | None,
+) -> sqlite3.Row | None:
+    """Resolve one lossless project-state source under the caller's capability."""
+
+    if not isinstance(source_refs, list):
+        return None
+    for raw_reference in source_refs:
+        if not isinstance(raw_reference, dict):
+            continue
+        reference_event_id = str(raw_reference.get("event_id") or "")
+        reference_session_id = str(raw_reference.get("session_id") or "")
+        reference_seq: int | None = None
+        raw_seq = raw_reference.get("seq")
+        if raw_seq is not None and not isinstance(raw_seq, bool):
+            try:
+                reference_seq = int(raw_seq)
+            except (TypeError, ValueError):
+                reference_seq = None
+
+        if reference_event_id:
+            source_row = conn.execute(
+                """
+                SELECT id, session_id, seq, role, event_type, content,
+                       content_hash, visibility_scope, project_id, created_at
+                FROM scroll_events
+                WHERE id = ?
+                """,
+                (reference_event_id,),
+            ).fetchone()
+        elif reference_session_id and reference_seq is not None:
+            source_row = conn.execute(
+                """
+                SELECT id, session_id, seq, role, event_type, content,
+                       content_hash, visibility_scope, project_id, created_at
+                FROM scroll_events
+                WHERE session_id = ? AND seq = ?
+                """,
+                (reference_session_id, reference_seq),
+            ).fetchone()
+        else:
+            continue
+
+        if source_row is None:
+            continue
+        source_content = str(source_row["content"] or "")
+        source_content_hash = str(source_row["content_hash"] or "")
+        if (
+            content_hash(source_content) != source_content_hash
+            or str(source_row["id"] or "")
+            != stable_id(
+                "evt",
+                str(source_row["session_id"] or ""),
+                str(source_row["seq"]),
+                source_content_hash,
+            )
+        ):
+            continue
+        source_project_id = str(source_row["project_id"] or "")
+        # Session-visible Scroll rows deliberately carry no project capability,
+        # while their project-state Cards retain the project classification.
+        expected_source_project_id = (
+            checkpoint_project_id
+            if checkpoint_visibility_scope == "project"
+            else ""
+        )
+        if (
+            str(source_row["event_type"] or "") != "project_state"
+            or str(source_row["session_id"] or "") != checkpoint_session_id
+            or source_project_id != expected_source_project_id
+            or str(source_row["visibility_scope"] or "")
+            != checkpoint_visibility_scope
+        ):
+            continue
+        if reference_session_id and str(source_row["session_id"] or "") != reference_session_id:
+            continue
+        if reference_seq is not None and int(source_row["seq"]) != reference_seq:
+            continue
+        if not _metadata_scope_visible(
+            {
+                "visibility_scope": source_row["visibility_scope"],
+                "project_id": source_row["project_id"],
+            },
+            candidate_session_id=str(source_row["session_id"] or "") or None,
+            session_id=capability_session_id,
+            project_id=capability_project_id,
+        ):
+            continue
+        return source_row
+    return None
+
+
+def _canonical_project_state_source_refs(
+    source_refs: Any,
+    source_event: sqlite3.Row,
+) -> list[Any] | None:
+    """Restore the canonical event/session/sequence binding for one source ref."""
+
+    if not isinstance(source_refs, list):
+        return None
+    event_id = str(source_event["id"] or "")
+    session_id = str(source_event["session_id"] or "")
+    seq = int(source_event["seq"])
+    canonical_refs: list[Any] = []
+    matched = False
+    for raw_reference in source_refs:
+        if not isinstance(raw_reference, dict):
+            canonical_refs.append(raw_reference)
+            continue
+        reference_event_id = str(raw_reference.get("event_id") or "")
+        reference_session_id = str(raw_reference.get("session_id") or "")
+        try:
+            reference_seq = (
+                None
+                if raw_reference.get("seq") is None
+                or isinstance(raw_reference.get("seq"), bool)
+                else int(raw_reference["seq"])
+            )
+        except (TypeError, ValueError):
+            reference_seq = None
+        modern_match = (
+            reference_event_id == event_id
+            and (not reference_session_id or reference_session_id == session_id)
+            and (reference_seq is None or reference_seq == seq)
+        )
+        legacy_match = (
+            not reference_event_id
+            and reference_session_id == session_id
+            and reference_seq == seq
+        )
+        if modern_match or legacy_match:
+            canonical_refs.append(
+                {
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "seq": seq,
+                }
+            )
+            matched = True
+        else:
+            canonical_refs.append(raw_reference)
+    return canonical_refs if matched else None
+
+
+_PROJECT_STATE_PAYLOAD_MARKER = "Continuum-State-Payload-SHA256: "
+
+
+def _project_state_payload_hash(
+    decisions: Any,
+    open_tasks: Any,
+) -> str | None:
+    if not isinstance(decisions, list) or not isinstance(open_tasks, list):
+        return None
+    return content_hash(
+        json_dumps(
+            {
+                "schema": "continuum.project_state_payload.v1",
+                "decisions": decisions,
+                "open_tasks": open_tasks,
+            }
+        )
+    )
+
+
+def _project_state_event_binds_payload(
+    event_content: str,
+    *,
+    decisions: Any,
+    open_tasks: Any,
+) -> bool:
+    payload_hash = _project_state_payload_hash(decisions, open_tasks)
+    if payload_hash is None:
+        return False
+    content_lines = str(event_content).splitlines()
+    if (
+        not content_lines
+        or not content_lines[-1].startswith(_PROJECT_STATE_PAYLOAD_MARKER)
+    ):
+        # Pre-v0.3 project-state events did not bind their structured arrays.
+        return True
+    stored_hash = content_lines[-1][len(_PROJECT_STATE_PAYLOAD_MARKER) :]
+    if re.fullmatch(r"[0-9a-f]{64}", stored_hash) is None:
+        # A legacy user-authored line may happen to share the marker prefix.
+        return True
+    return stored_hash == payload_hash
+
+
 def _compile_context_planner_v2(
     root: Path,
     *,
@@ -4973,11 +5474,32 @@ def _compile_context_planner_v2(
     card_scope: str | None,
     project_id: str | None,
     cue_recall_limit: int,
+    visibility_capability: dict[str, Any] | None,
+    mandatory_checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build a deterministic, source-balanced resume packet with an explain trace."""
 
     session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
+    capability_was_supplied = visibility_capability is not None
+    capability_session_id = session_id
+    capability_project_id = project_id
+    if visibility_capability is not None:
+        capability_session_id = str(
+            canonical_partition_identifier(
+                root,
+                "session_id",
+                visibility_capability.get("session_id"),
+                lookup=True,
+            )
+            or ""
+        )
+        capability_project_id = canonical_partition_identifier(
+            root,
+            "project_id",
+            visibility_capability.get("project_id"),
+            lookup=True,
+        )
     if create:
         init_db(root)
     elif not is_initialized(root):
@@ -4993,6 +5515,14 @@ def _compile_context_planner_v2(
             "section_count": 0,
             "context_text": "",
             "planner_trace": [],
+            "mandatory_checkpoint_id": (
+                str(mandatory_checkpoint.get("checkpoint_id") or "")
+                if mandatory_checkpoint is not None
+                else None
+            ),
+            "mandatory_checkpoint_found": False,
+            "mandatory_checkpoint_fit": mandatory_checkpoint is None,
+            "mandatory_checkpoint_minimum_tokens": 0,
         }
     config = _status_config(root, create=create)
     if project_id and card_scope in {None, "global", "session_then_global"}:
@@ -5011,21 +5541,39 @@ def _compile_context_planner_v2(
     bounded_limit = max(1, min(int(cue_recall_limit), 20))
     trace: list[dict[str, Any]] = []
     candidates: dict[str, list[dict[str, Any]]] = {"recent_scroll": [], "current_cards": [], "cue_recall": []}
+    mandatory_candidate: dict[str, Any] | None = None
+    mandatory_source: str | None = None
     conn = connect(root) if create else connect_existing(root)
     try:
+        terms = extract_terms(query or project_id or session_id, limit=8)
+        query_terms = extract_terms(query or "", limit=8)
         recent_rows = _visible_scroll_rows(
             conn,
             session_id=session_id,
             project_id=project_id,
+            visibility_capability=(
+                {
+                    "session_id": capability_session_id or None,
+                    "project_id": capability_project_id,
+                }
+                if capability_was_supplied
+                else None
+            ),
             limit=max(
                 1,
                 min(configured_event_limit, max(24, usable_budget // 10)),
             ),
         )
         for row in recent_rows:
+            direct = sum(
+                1
+                for term in query_terms
+                if term.casefold() in str(row["content"] or "").casefold()
+            )
             payload = {
                 "source": "scroll_event",
                 "authority": "non_authoritative_evidence",
+                "event_id": row["id"],
                 "session_id": row["session_id"],
                 "seq": row["seq"],
                 "role": row["role"],
@@ -5040,27 +5588,61 @@ def _compile_context_planner_v2(
                     "id": f"scroll:{row['session_id']}:{row['seq']}",
                     "payload": payload,
                     "text": markdown_json_evidence(payload),
-                    "score": 0.55,
-                    "reason": "recent ordered evidence",
+                    "score": 0.55 + direct * 0.25,
+                    "query_relevance": direct,
+                    "reason": (
+                        "direct query match"
+                        if direct
+                        else "recent ordered evidence"
+                    ),
                 }
             )
-        terms = extract_terms(query or project_id or session_id, limit=8)
-        scope_clause, scope_params = _card_scope_filter(card_scope, session_id, project_id=project_id)
+        if query:
+            # Python's sort is stable, so equally relevant Scroll evidence
+            # retains the descending temporal order returned above.
+            candidates["recent_scroll"].sort(
+                key=lambda item: -int(item.get("query_relevance") or 0)
+            )
+        if capability_was_supplied:
+            visible_clause, scope_params = _visible_card_clause(
+                session_id=capability_session_id or None,
+                project_id=capability_project_id,
+            )
+            scope_clause = f" AND {visible_clause}"
+        else:
+            scope_clause, scope_params = _card_scope_filter(
+                card_scope,
+                session_id,
+                project_id=project_id,
+            )
+        direct_match_sql = " + ".join(
+            "CASE WHEN instr("
+            "lower(coalesce(title, '') || ' ' || coalesce(summary, '')), ?"
+            ") > 0 THEN 1 ELSE 0 END"
+            for _term in terms
+        ) or "0"
         matches = conn.execute(
             f"""
-            SELECT id, card_type, title, summary, salience, confidence,
-                   visibility_scope, session_id, project_id, source_refs_json,
-                   conflict_group, superseded_by_card_id, updated_at
-            FROM cards
-            WHERE {_current_card_authority_clause()}
-              {scope_clause}
-            ORDER BY salience DESC, updated_at DESC
+            SELECT *
+            FROM (
+                SELECT id, card_type, title, summary, salience, confidence,
+                       visibility_scope, session_id, project_id, source_refs_json,
+                       conflict_group, superseded_by_card_id, updated_at,
+                       ({direct_match_sql}) AS direct_match_count
+                FROM cards
+                WHERE {_current_card_authority_clause()}
+                  {scope_clause}
+            ) AS ranked_cards
+            ORDER BY (
+                coalesce(salience, 0.0) + coalesce(confidence, 0.0)
+                + direct_match_count * 0.25
+            ) DESC, updated_at DESC, id
             LIMIT 80
             """,
-            tuple(scope_params),
+            (*[str(term).lower() for term in terms], *scope_params),
         ).fetchall()
         for row in matches:
-            direct = sum(1 for term in terms if term.casefold() in f"{row['title']} {row['summary']}".casefold())
+            direct = int(row["direct_match_count"] or 0)
             superseded = bool(row["superseded_by_card_id"])
             contested = bool(row["conflict_group"])
             payload = {
@@ -5084,6 +5666,7 @@ def _compile_context_planner_v2(
                 "payload": payload,
                 "text": markdown_json_evidence(payload),
                 "score": float(row["salience"] or 0.0) + float(row["confidence"] or 0.0) + direct * 0.25,
+                "query_relevance": direct if query else 0,
                 "reason": "direct query/project match" if direct else "salience and confidence",
                 "superseded": superseded,
                 "contested": contested,
@@ -5092,7 +5675,253 @@ def _compile_context_planner_v2(
                 trace.append({"id": candidate["id"], "source": "card", "included": False, "reason": "superseded_or_contested"})
             else:
                 candidates["current_cards"].append(candidate)
-        candidates["current_cards"].sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+        candidates["current_cards"].sort(
+            key=lambda item: (
+                -int(item.get("query_relevance") or 0),
+                -float(item["score"]),
+                str(item["id"]),
+            )
+        )
+
+        if mandatory_checkpoint is not None:
+            checkpoint_source = str(mandatory_checkpoint.get("source") or "")
+            checkpoint_id = str(mandatory_checkpoint.get("checkpoint_id") or "")
+            checkpoint_session_id = str(mandatory_checkpoint.get("session_id") or "")
+            checkpoint_project_id = str(mandatory_checkpoint.get("project_id") or "")
+            checkpoint_visibility_scope = str(
+                mandatory_checkpoint.get("checkpoint_visibility_scope")
+                or mandatory_checkpoint.get("visibility_scope")
+                or ""
+            )
+            if checkpoint_source == "project_state_card":
+                checkpoint_row = conn.execute(
+                    f"""
+                    SELECT id, card_type, title, summary, salience, confidence,
+                           visibility_scope, session_id, project_id, source_refs_json,
+                           decisions_json, open_tasks_json, conflict_group,
+                           superseded_by_card_id, updated_at
+                    FROM cards
+                    WHERE id = ?
+                      AND {_current_card_authority_clause()}
+                    """,
+                    (checkpoint_id,),
+                ).fetchone()
+                checkpoint_source_refs = (
+                    json_loads(checkpoint_row["source_refs_json"], [])
+                    if checkpoint_row is not None
+                    else []
+                )
+                checkpoint_decisions = (
+                    json_loads(checkpoint_row["decisions_json"], [])
+                    if checkpoint_row is not None
+                    else []
+                )
+                checkpoint_open_tasks = (
+                    json_loads(checkpoint_row["open_tasks_json"], [])
+                    if checkpoint_row is not None
+                    else []
+                )
+                checkpoint_event = None
+                if (
+                    checkpoint_row is not None
+                    and str(checkpoint_row["session_id"] or "") == checkpoint_session_id
+                    and str(checkpoint_row["project_id"] or "") == checkpoint_project_id
+                    and str(checkpoint_row["visibility_scope"] or "")
+                    == checkpoint_visibility_scope
+                    and _card_row_visible(
+                        checkpoint_row,
+                        session_id=capability_session_id or None,
+                        project_id=capability_project_id,
+                    )
+                ):
+                    checkpoint_event = _project_state_source_event(
+                        conn,
+                        source_refs=checkpoint_source_refs,
+                        checkpoint_session_id=checkpoint_session_id,
+                        checkpoint_project_id=checkpoint_project_id,
+                        checkpoint_visibility_scope=checkpoint_visibility_scope,
+                        capability_session_id=capability_session_id or None,
+                        capability_project_id=capability_project_id,
+                    )
+                if checkpoint_row is not None and checkpoint_event is not None:
+                    canonical_source_refs = _canonical_project_state_source_refs(
+                        checkpoint_source_refs,
+                        checkpoint_event,
+                    )
+                    derived_checkpoint_summary = summarize_text(
+                        str(checkpoint_event["content"] or ""),
+                        limit=900,
+                    )
+                    expected_checkpoint_id = (
+                        stable_id(
+                            "card",
+                            str(checkpoint_row["visibility_scope"] or ""),
+                            str(checkpoint_row["session_id"] or ""),
+                            str(checkpoint_row["project_id"] or ""),
+                            str(checkpoint_row["card_type"] or ""),
+                            str(checkpoint_row["title"] or ""),
+                            content_hash(str(checkpoint_row["summary"] or "")),
+                            json_dumps(canonical_source_refs),
+                        )
+                        if canonical_source_refs is not None
+                        else None
+                    )
+                    if (
+                        str(checkpoint_row["summary"] or "")
+                        != derived_checkpoint_summary
+                        or expected_checkpoint_id != str(checkpoint_row["id"] or "")
+                        or not _project_state_event_binds_payload(
+                            str(checkpoint_event["content"] or ""),
+                            decisions=checkpoint_decisions,
+                            open_tasks=checkpoint_open_tasks,
+                        )
+                    ):
+                        checkpoint_event = None
+                    else:
+                        checkpoint_source_refs = canonical_source_refs
+                if checkpoint_row is not None and checkpoint_event is not None:
+                    payload = {
+                        "source": "card",
+                        "authority": "non_authoritative_evidence",
+                        "mandatory_checkpoint": True,
+                        "checkpoint_source": checkpoint_source,
+                        "checkpoint_id": checkpoint_id,
+                        "card_id": checkpoint_row["id"],
+                        "card_type": checkpoint_row["card_type"],
+                        "title": checkpoint_row["title"],
+                        "summary": checkpoint_row["summary"],
+                        "salience": checkpoint_row["salience"],
+                        "confidence": checkpoint_row["confidence"],
+                        "visibility_scope": checkpoint_row["visibility_scope"],
+                        "session_id": checkpoint_row["session_id"],
+                        "project_id": checkpoint_row["project_id"],
+                        "source_refs": checkpoint_source_refs,
+                        "source_event_id": checkpoint_event["id"],
+                        "source_event_seq": checkpoint_event["seq"],
+                        "content": checkpoint_event["content"],
+                        "decisions": checkpoint_decisions,
+                        "open_tasks": checkpoint_open_tasks,
+                    }
+                    minimal_payload = {
+                        "source": "resume_checkpoint",
+                        "authority": "non_authoritative_evidence",
+                        "mandatory_checkpoint": True,
+                        "checkpoint_source": checkpoint_source,
+                        "checkpoint_id": checkpoint_id,
+                        "card_id": checkpoint_row["id"],
+                        "card_type": checkpoint_row["card_type"],
+                        "title": checkpoint_row["title"],
+                        "summary": checkpoint_row["summary"],
+                        "visibility_scope": checkpoint_row["visibility_scope"],
+                        "session_id": checkpoint_row["session_id"],
+                        "project_id": checkpoint_row["project_id"],
+                        "source_refs": checkpoint_source_refs,
+                        "source_event_id": checkpoint_event["id"],
+                        "source_event_seq": checkpoint_event["seq"],
+                        "content": checkpoint_event["content"],
+                        "decisions": checkpoint_decisions,
+                        "open_tasks": checkpoint_open_tasks,
+                    }
+                    mandatory_candidate = {
+                        "id": checkpoint_id,
+                        "payload": payload,
+                        "text": markdown_json_evidence(payload),
+                        "minimal_text": markdown_json_evidence(minimal_payload),
+                        "score": float("inf"),
+                        "reason": "selected resume checkpoint",
+                        "mandatory": True,
+                    }
+                    mandatory_source = "current_cards"
+                    candidates[mandatory_source] = [
+                        item
+                        for item in candidates[mandatory_source]
+                        if str(item["id"]) != checkpoint_id
+                    ]
+            elif checkpoint_source == "scroll_event":
+                checkpoint_row = conn.execute(
+                    """
+                    SELECT id, session_id, seq, role, event_type, content,
+                           token_estimate, content_hash, visibility_scope, project_id,
+                           metadata_json, created_at
+                    FROM scroll_events
+                    WHERE id = ?
+                    """,
+                    (checkpoint_id,),
+                ).fetchone()
+                if (
+                    checkpoint_row is not None
+                    and str(checkpoint_row["session_id"] or "") == checkpoint_session_id
+                    and str(checkpoint_row["project_id"] or "") == checkpoint_project_id
+                    and str(checkpoint_row["visibility_scope"] or "")
+                    == checkpoint_visibility_scope
+                    and content_hash(str(checkpoint_row["content"] or ""))
+                    == str(checkpoint_row["content_hash"] or "")
+                    and stable_id(
+                        "evt",
+                        str(checkpoint_row["session_id"] or ""),
+                        str(checkpoint_row["seq"]),
+                        str(checkpoint_row["content_hash"] or ""),
+                    )
+                    == str(checkpoint_row["id"] or "")
+                    and _metadata_scope_visible(
+                        {
+                            "visibility_scope": checkpoint_row["visibility_scope"],
+                            "project_id": checkpoint_row["project_id"],
+                        },
+                        candidate_session_id=str(
+                            checkpoint_row["session_id"] or ""
+                        )
+                        or None,
+                        session_id=capability_session_id or None,
+                        project_id=capability_project_id,
+                    )
+                ):
+                    payload = {
+                        "source": "scroll_event",
+                        "authority": "non_authoritative_evidence",
+                        "mandatory_checkpoint": True,
+                        "checkpoint_source": checkpoint_source,
+                        "checkpoint_id": checkpoint_id,
+                        "event_id": checkpoint_row["id"],
+                        "session_id": checkpoint_row["session_id"],
+                        "seq": checkpoint_row["seq"],
+                        "role": checkpoint_row["role"],
+                        "event_type": checkpoint_row["event_type"],
+                        "visibility_scope": checkpoint_row["visibility_scope"],
+                        "project_id": checkpoint_row["project_id"],
+                        "content": checkpoint_row["content"],
+                        "created_at": checkpoint_row["created_at"],
+                    }
+                    minimal_payload = {
+                        "source": "resume_checkpoint",
+                        "authority": "non_authoritative_evidence",
+                        "mandatory_checkpoint": True,
+                        "checkpoint_source": checkpoint_source,
+                        "checkpoint_id": checkpoint_id,
+                        "event_id": checkpoint_row["id"],
+                        "seq": checkpoint_row["seq"],
+                        "role": checkpoint_row["role"],
+                        "event_type": checkpoint_row["event_type"],
+                        "content": checkpoint_row["content"],
+                        "visibility_scope": checkpoint_row["visibility_scope"],
+                        "session_id": checkpoint_row["session_id"],
+                        "project_id": checkpoint_row["project_id"],
+                    }
+                    mandatory_candidate = {
+                        "id": f"scroll:{checkpoint_row['session_id']}:{checkpoint_row['seq']}",
+                        "payload": payload,
+                        "text": markdown_json_evidence(payload),
+                        "minimal_text": markdown_json_evidence(minimal_payload),
+                        "score": float("inf"),
+                        "reason": "selected resume checkpoint",
+                        "mandatory": True,
+                    }
+                    mandatory_source = "recent_scroll"
+                    candidates[mandatory_source] = [
+                        item
+                        for item in candidates[mandatory_source]
+                        if str(item["payload"].get("event_id") or "") != checkpoint_id
+                    ]
     finally:
         conn.close()
 
@@ -5100,13 +5929,17 @@ def _compile_context_planner_v2(
         cue_result = cue_recall(
             root,
             cue=query,
-            session_id=session_id,
-            project_id=project_id,
+            session_id=(capability_session_id or None) if capability_was_supplied else session_id,
+            project_id=capability_project_id if capability_was_supplied else project_id,
             limit=bounded_limit,
             max_associations=max(8, min(32, bounded_limit * 4)),
             create=False,
         )
         for item in cue_result.get("results", []):
+            if mandatory_checkpoint is not None and str(item.get("id") or "") == str(
+                mandatory_checkpoint.get("checkpoint_id") or ""
+            ):
+                continue
             candidate_id = f"cue:{item.get('kind')}:{item.get('id')}"
             if item.get("kind") == "card" and (
                 item.get("superseded_by_card_id") or item.get("conflict_group")
@@ -5127,6 +5960,7 @@ def _compile_context_planner_v2(
                     "payload": payload,
                     "text": markdown_json_evidence(payload),
                     "score": float(item.get("score") or 0.0),
+                    "query_relevance": 1,
                     "reason": "; ".join(str(reason) for reason in item.get("reasons", [])[:2]) or "associative cue match",
                 }
             )
@@ -5137,6 +5971,79 @@ def _compile_context_planner_v2(
     sections: dict[str, list[str]] = {source: [] for source in candidates}
     indexes = {source: 0 for source in candidates}
     source_order = ["current_cards", "recent_scroll", "cue_recall"]
+    if query:
+        default_source_rank = {
+            source: index for index, source in enumerate(source_order)
+        }
+        source_order.sort(
+            key=lambda source: (
+                -int(
+                    candidates[source][0].get("query_relevance") or 0
+                    if candidates[source]
+                    else 0
+                ),
+                default_source_rank[source],
+            )
+        )
+    elif mandatory_source is not None:
+        source_order = [mandatory_source, *[source for source in source_order if source != mandatory_source]]
+    mandatory_checkpoint_found = mandatory_checkpoint is None or mandatory_candidate is not None
+    mandatory_checkpoint_fit = mandatory_checkpoint is None
+    mandatory_checkpoint_minimum_tokens = 0
+    mandatory_checkpoint_minimal_context_text = ""
+    if mandatory_candidate is not None and mandatory_source is not None:
+        assert mandatory_checkpoint is not None
+        mandatory_full_text = str(mandatory_candidate["text"])
+        mandatory_minimal_text = str(mandatory_candidate["minimal_text"])
+        mandatory_checkpoint_minimum_tokens = estimate_tokens(
+            f"## {mandatory_source}\n{mandatory_minimal_text}"
+        )
+        mandatory_checkpoint_minimal_context_text = (
+            f"## {mandatory_source}\n{mandatory_minimal_text}"
+        )
+        mandatory_full_tokens = estimate_tokens(
+            f"## {mandatory_source}\n{mandatory_full_text}"
+        )
+        if mandatory_full_tokens <= usable_budget:
+            mandatory_text = mandatory_full_text
+            mandatory_tokens = mandatory_full_tokens
+            mandatory_truncated = False
+        elif mandatory_checkpoint_minimum_tokens <= usable_budget:
+            mandatory_text = mandatory_minimal_text
+            mandatory_tokens = mandatory_checkpoint_minimum_tokens
+            mandatory_truncated = True
+        else:
+            mandatory_text = ""
+            mandatory_tokens = 0
+            mandatory_truncated = False
+        if mandatory_text:
+            sections[mandatory_source].append(mandatory_text)
+            selected[mandatory_source].append(str(mandatory_candidate["id"]))
+            remaining = max(0, usable_budget - mandatory_tokens)
+            mandatory_checkpoint_fit = True
+            trace.append(
+                {
+                    "id": mandatory_candidate["id"],
+                    "checkpoint_id": mandatory_checkpoint.get("checkpoint_id"),
+                    "source": mandatory_source,
+                    "included": True,
+                    "mandatory": True,
+                    "reason": mandatory_candidate["reason"],
+                    "truncated": mandatory_truncated,
+                }
+            )
+        else:
+            trace.append(
+                {
+                    "id": mandatory_candidate["id"],
+                    "checkpoint_id": mandatory_checkpoint.get("checkpoint_id"),
+                    "source": mandatory_source,
+                    "included": False,
+                    "mandatory": True,
+                    "reason": "checkpoint_did_not_fit",
+                    "truncated": False,
+                }
+            )
     while remaining > 0 and any(indexes[source] < len(candidates[source]) for source in source_order):
         progressed = False
         for source in source_order:
@@ -5181,8 +6088,14 @@ def _compile_context_planner_v2(
 
     context_text = render_sections()
     while estimate_tokens(context_text) > usable_budget and any(sections.values()):
+        removed = False
         for source in reversed(source_order):
-            if sections[source]:
+            mandatory_floor = (
+                1
+                if source == mandatory_source and mandatory_checkpoint_fit
+                else 0
+            )
+            if len(sections[source]) > mandatory_floor:
                 removed_id = selected[source].pop() if selected[source] else None
                 sections[source].pop()
                 trace.append(
@@ -5193,11 +6106,32 @@ def _compile_context_planner_v2(
                         "reason": "post_selection_budget_trim",
                     }
                 )
+                removed = True
                 break
+        if not removed:
+            mandatory_checkpoint_fit = False
+            for source in source_order:
+                sections[source].clear()
+                selected[source].clear()
+            trace.append(
+                {
+                    "id": (
+                        mandatory_candidate.get("id")
+                        if mandatory_candidate is not None
+                        else None
+                    ),
+                    "source": mandatory_source,
+                    "included": False,
+                    "mandatory": True,
+                    "reason": "checkpoint_did_not_fit",
+                }
+            )
+            break
         context_text = render_sections()
+    context_text = render_sections()
     remaining = max(0, usable_budget - estimate_tokens(context_text))
     return {
-        "ok": True,
+        "ok": mandatory_checkpoint_found and mandatory_checkpoint_fit,
         "initialized": True,
         "planner_profile": "resume",
         "session_id": session_id,
@@ -5211,6 +6145,35 @@ def _compile_context_planner_v2(
         "planner_trace": trace,
         "truncated": any(item.get("truncated") for item in trace),
         "context_text": context_text,
+        "visibility_capability": {
+            "session_id": capability_session_id or None,
+            "project_id": capability_project_id,
+        },
+        "mandatory_checkpoint_id": (
+            str(mandatory_checkpoint.get("checkpoint_id") or "")
+            if mandatory_checkpoint is not None
+            else None
+        ),
+        "mandatory_checkpoint_source": (
+            str(mandatory_checkpoint.get("source") or "")
+            if mandatory_checkpoint is not None
+            else None
+        ),
+        "mandatory_checkpoint_found": mandatory_checkpoint_found,
+        "mandatory_checkpoint_fit": mandatory_checkpoint_fit,
+        "mandatory_checkpoint_minimum_tokens": mandatory_checkpoint_minimum_tokens,
+        "_mandatory_checkpoint_minimal_context_text": (
+            mandatory_checkpoint_minimal_context_text
+        ),
+        "reason": (
+            None
+            if mandatory_checkpoint_found and mandatory_checkpoint_fit
+            else (
+                "checkpoint_did_not_fit"
+                if mandatory_checkpoint_found
+                else "checkpoint_missing"
+            )
+        ),
     }
 
 
@@ -5226,7 +6189,39 @@ def compile_context(
     include_cue_recall: bool = False,
     cue_recall_limit: int = 4,
     planner_profile: str = "legacy",
+    visibility_capability: dict[str, Any] | None = None,
+    mandatory_checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    session_id = str(
+        canonical_partition_identifier(
+            root,
+            "session_id",
+            session_id,
+            lookup=True,
+        )
+        or ""
+    )
+    project_id = canonical_partition_identifier(
+        root,
+        "project_id",
+        project_id,
+        lookup=True,
+    )
+    if visibility_capability is not None:
+        visibility_capability = _validated_visibility_capability(
+            root,
+            declared_session_id=session_id,
+            declared_project_id=project_id,
+            visibility_capability=visibility_capability,
+            allow_unscoped_global=(
+                _checkpoint_allows_unscoped_global_capability(
+                    root,
+                    checkpoint=mandatory_checkpoint,
+                    declared_session_id=session_id,
+                    declared_project_id=project_id,
+                )
+            ),
+        )
     if planner_profile == "resume":
         return _compile_context_planner_v2(
             root,
@@ -5237,9 +6232,9 @@ def compile_context(
             card_scope=card_scope,
             project_id=project_id,
             cue_recall_limit=cue_recall_limit,
+            visibility_capability=visibility_capability,
+            mandatory_checkpoint=mandatory_checkpoint,
         )
-    session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
-    project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
     try:
         bounded_cue_recall_limit = max(1, min(int(cue_recall_limit), 20))
     except (TypeError, ValueError):
@@ -5769,20 +6764,43 @@ def _visible_scroll_rows(
     session_id: str,
     limit: int,
     project_id: str | None = None,
+    visibility_capability: dict[str, Any] | None = None,
 ) -> list[sqlite3.Row]:
     limit = validate_recent_event_limit(limit)
-    visible_clause, visible_params = _visible_scroll_clause(session_id=session_id, project_id=project_id)
+    visible_session_id: str | None
+    visible_project_id: str | None
+    if visibility_capability is None:
+        visible_session_id = session_id
+        visible_project_id = project_id
+    else:
+        visible_session_id = str(visibility_capability.get("session_id") or "") or None
+        visible_project_id = str(visibility_capability.get("project_id") or "") or None
+    visible_clause, visible_params = _visible_scroll_clause(
+        session_id=visible_session_id,
+        project_id=visible_project_id,
+    )
+    if visibility_capability is None:
+        boundary_clause = f"session_id = ? AND {visible_clause}"
+        boundary_params: tuple[Any, ...] = (session_id, *visible_params)
+        ordering = "seq DESC"
+    else:
+        # Automatic resume may select a checkpoint in a different session than
+        # the session capability supplied alongside a project capability.  The
+        # selected coordinates order/pin the checkpoint; they must not replace
+        # either half of the caller's original visibility union.
+        boundary_clause = visible_clause
+        boundary_params = tuple(visible_params)
+        ordering = "created_at DESC, rowid DESC"
     return conn.execute(
         f"""
-        SELECT session_id, seq, role, event_type, content, token_estimate,
+        SELECT id, session_id, seq, role, event_type, content, token_estimate,
                visibility_scope, project_id, metadata_json, created_at
         FROM scroll_events
-        WHERE session_id = ?
-          AND {visible_clause}
-        ORDER BY seq DESC
+        WHERE {boundary_clause}
+        ORDER BY {ordering}
         LIMIT ?
         """,
-        (session_id, *visible_params, limit),
+        (*boundary_params, limit),
     ).fetchall()
 
 
@@ -5790,7 +6808,7 @@ def _event_payload_visible(
     conn: sqlite3.Connection,
     payload: dict[str, Any],
     *,
-    session_id: str,
+    session_id: str | None,
     project_id: str | None = None,
 ) -> bool | None:
     event_row = None
@@ -5836,7 +6854,7 @@ def _queue_job_visible(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     *,
-    session_id: str,
+    session_id: str | None,
     project_id: str | None = None,
 ) -> bool:
     payload = json_loads(row["payload_json"], {})
@@ -6524,6 +7542,19 @@ def record_project_state(
     safe_decisions = enforce_value_secret_policy(root, decisions, scope="project state decisions")
     safe_open_tasks = enforce_value_secret_policy(root, open_tasks, scope="project state open_tasks")
     safe_changed_files = enforce_value_secret_policy(root, changed_files, scope="project state changed_files")
+    state_payload_hash = _project_state_payload_hash(
+        safe_decisions,
+        safe_open_tasks,
+    )
+    if state_payload_hash is None:
+        raise ValueError("project state decisions and open_tasks must be lists")
+    safe_content = (
+        safe_content.rstrip()
+        + "\n"
+        + _PROJECT_STATE_PAYLOAD_MARKER
+        + state_payload_hash
+    )
+    safe_metadata["state_payload_hash"] = state_payload_hash
     if isinstance(safe_changed_files, list):
         safe_metadata["changed_files"] = safe_changed_files
 
@@ -6626,6 +7657,34 @@ class ResumePacketBudgetError(ValueError):
         )
 
 
+class ResumeCheckpointDidNotFitError(ValueError):
+    """Raised when a bounded resume packet cannot retain its selected checkpoint."""
+
+    def __init__(
+        self,
+        *,
+        token_budget: int,
+        minimum_checkpoint_tokens: int,
+        minimum_packet_tokens: int | None = None,
+    ) -> None:
+        self.token_budget = int(token_budget)
+        self.minimum_checkpoint_tokens = int(minimum_checkpoint_tokens)
+        self.minimum_packet_tokens = (
+            int(minimum_packet_tokens)
+            if minimum_packet_tokens is not None
+            else None
+        )
+        required = (
+            self.minimum_packet_tokens
+            if self.minimum_packet_tokens is not None
+            else self.minimum_checkpoint_tokens
+        )
+        super().__init__(
+            "resume token budget is too small to retain the selected checkpoint: "
+            f"{self.token_budget} < {required}"
+        )
+
+
 def _discover_resume_state(
     conn: sqlite3.Connection,
     *,
@@ -6635,22 +7694,45 @@ def _discover_resume_state(
     """Select one latest resumable row under a stable catalog snapshot."""
 
     scoped_resume = bool(requested_session or requested_project)
-    card_params: list[Any] = []
+
+    def authorized_visibility_clause(table: str = "") -> tuple[str, list[Any]]:
+        prefix = f"{table}." if table else ""
+        visibility = f"{prefix}visibility_scope"
+        session = f"{prefix}session_id"
+        project = f"{prefix}project_id"
+        if requested_session and requested_project:
+            return (
+                f"(({visibility} = 'session' AND {session} = ?) OR "
+                f"({visibility} = 'project' AND {project} = ?))",
+                [requested_session, requested_project],
+            )
+        if requested_session:
+            return (
+                f"({visibility} = 'session' AND {session} = ?)",
+                [requested_session],
+            )
+        if requested_project:
+            return (
+                f"({visibility} = 'project' AND {project} = ?)",
+                [requested_project],
+            )
+        return (
+            f"({visibility} = 'session' OR "
+            f"({visibility} = 'project' AND coalesce({project}, '') != '') OR "
+            f"({visibility} = 'global' AND coalesce({project}, '') = ''))",
+            [],
+        )
+
+    card_visibility_clause, card_params = authorized_visibility_clause()
     card_clauses = [
         "card_type = 'project_state'",
         "coalesce(session_id, '') != ''",
-        "(visibility_scope = 'session' OR "
-        "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+        card_visibility_clause,
     ]
-    if requested_session:
-        card_clauses.append("session_id = ?")
-        card_params.append(requested_session)
-    if requested_project:
-        card_clauses.append("project_id = ?")
-        card_params.append(requested_project)
     state_row = conn.execute(
         f"""
-        SELECT session_id, project_id, created_at AS checkpoint_at, id
+        SELECT session_id, project_id, visibility_scope,
+               created_at AS checkpoint_at, id
         FROM cards
         WHERE {' AND '.join([*card_clauses, _current_card_authority_clause('cards')])}
         ORDER BY created_at DESC, rowid DESC
@@ -6669,18 +7751,11 @@ def _discover_resume_state(
             is not None
         )
         if not (stale_state_exists and scoped_resume):
+            event_visibility_clause, event_params = authorized_visibility_clause()
             event_clauses = [
                 "coalesce(session_id, '') != ''",
-                "(visibility_scope = 'session' OR "
-                "(visibility_scope = 'project' AND coalesce(project_id, '') != ''))",
+                event_visibility_clause,
             ]
-            event_params: list[Any] = []
-            if requested_session:
-                event_clauses.append("session_id = ?")
-                event_params.append(requested_session)
-            if requested_project:
-                event_clauses.append("project_id = ?")
-                event_params.append(requested_project)
             if not scoped_resume:
                 event_clauses.append(
                     f"""
@@ -6689,30 +7764,44 @@ def _discover_resume_state(
                         FROM cards AS stale_state
                         WHERE stale_state.card_type = 'project_state'
                           AND coalesce(stale_state.session_id, '') != ''
-                          AND (
-                                stale_state.visibility_scope = 'session'
-                             OR (
-                                    stale_state.visibility_scope = 'project'
-                                AND coalesce(stale_state.project_id, '') != ''
-                             )
-                          )
+                           AND (
+                                 stale_state.visibility_scope = 'session'
+                              OR (
+                                     stale_state.visibility_scope = 'project'
+                                 AND coalesce(stale_state.project_id, '') != ''
+                                 )
+                              OR (
+                                     stale_state.visibility_scope = 'global'
+                                 AND coalesce(stale_state.project_id, '') = ''
+                                 )
+                           )
                           AND NOT ({_current_card_authority_clause('stale_state')})
-                          AND (
-                                (
-                                    stale_state.visibility_scope = 'project'
-                                    AND stale_state.project_id = scroll_events.project_id
-                                )
-                             OR (
-                                    stale_state.visibility_scope = 'session'
-                                    AND stale_state.session_id = scroll_events.session_id
-                                )
-                          )
+                           AND (
+                                 (
+                                     stale_state.visibility_scope = 'project'
+                                     AND scroll_events.visibility_scope = 'project'
+                                     AND stale_state.project_id = scroll_events.project_id
+                                 )
+                              OR (
+                                     stale_state.visibility_scope = 'session'
+                                     AND scroll_events.visibility_scope = 'session'
+                                     AND stale_state.session_id = scroll_events.session_id
+                                 )
+                              OR (
+                                     stale_state.visibility_scope = 'global'
+                                     AND coalesce(stale_state.project_id, '') = ''
+                                     AND scroll_events.visibility_scope = 'global'
+                                     AND coalesce(scroll_events.project_id, '') = ''
+                                     AND stale_state.session_id = scroll_events.session_id
+                                 )
+                           )
                     )
                     """
                 )
             state_row = conn.execute(
                 f"""
-                SELECT session_id, project_id, created_at AS checkpoint_at, id
+                SELECT session_id, project_id, visibility_scope,
+                       created_at AS checkpoint_at, id
                 FROM scroll_events
                 WHERE {' AND '.join(event_clauses)}
                 ORDER BY created_at DESC, rowid DESC
@@ -6750,6 +7839,7 @@ def _render_compact_resume_recovery_packet(
     project_id: str | None,
     packet_token_budget: int,
     packet_estimated_tokens: int,
+    checkpoint_context_text: str = "",
 ) -> str:
     metadata = {
         "source": "recovery_metadata",
@@ -6761,7 +7851,10 @@ def _render_compact_resume_recovery_packet(
         "packet_estimated_tokens": packet_estimated_tokens,
         "packet_truncated": True,
     }
-    return markdown_evidence_block(json_dumps(metadata), language="json") + "\n"
+    packet = markdown_evidence_block(json_dumps(metadata), language="json")
+    if checkpoint_context_text:
+        packet = f"{packet}\n\n{checkpoint_context_text.strip()}"
+    return packet + "\n"
 
 
 def _render_resume_operational_details(
@@ -6894,15 +7987,75 @@ def recover_thread(
     recent_event_limit: int = 24,
     planner_profile: str = "legacy",
     expected_discovery: dict[str, Any] | None = None,
+    visibility_capability: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recent_event_limit = validate_recent_event_limit(recent_event_limit)
     init_db(root)
     lookup_session_id = str(canonical_partition_identifier(root, "recovery session_id", session_id, lookup=True) or "")
     lookup_project_id = canonical_partition_identifier(root, "recovery project_id", project_id, lookup=True)
+    if expected_discovery is not None and visibility_capability is None:
+        raise ValueError("expected_discovery requires an explicit visibility_capability")
+    if visibility_capability is None:
+        capability_session_id = lookup_session_id
+        capability_project_id = lookup_project_id
+    else:
+        if expected_discovery is not None:
+            validated_capability = _validated_resume_visibility_capability(
+                root,
+                declared_session_id=lookup_session_id,
+                declared_project_id=lookup_project_id,
+                expected_discovery=expected_discovery,
+                visibility_capability=visibility_capability,
+            )
+        else:
+            validated_capability = _validated_visibility_capability(
+                root,
+                declared_session_id=lookup_session_id,
+                declared_project_id=lookup_project_id,
+                visibility_capability=visibility_capability,
+            )
+        capability_session_id = str(validated_capability["session_id"] or "")
+        capability_project_id = validated_capability["project_id"]
+    effective_visibility_capability = {
+        "session_id": capability_session_id or None,
+        "project_id": capability_project_id,
+    }
     config = load_config(root)
     if token_budget <= 0:
         token_budget = int(config["context"]["default_token_budget"])
     effective_query = query or lookup_project_id or lookup_session_id
+
+    def compile_recovery_context(context_budget: int) -> dict[str, Any]:
+        if expected_discovery is not None and planner_profile == "resume":
+            return _compile_context_planner_v2(
+                root,
+                session_id=lookup_session_id,
+                token_budget=context_budget,
+                query=effective_query,
+                create=False,
+                card_scope="project" if lookup_project_id else "session",
+                project_id=lookup_project_id,
+                cue_recall_limit=4,
+                visibility_capability=effective_visibility_capability,
+                mandatory_checkpoint=expected_discovery,
+            )
+        return compile_context(
+            root,
+            session_id=lookup_session_id,
+            token_budget=context_budget,
+            query=effective_query,
+            create=expected_discovery is None,
+            card_scope="project" if lookup_project_id else "session",
+            project_id=lookup_project_id,
+            planner_profile=planner_profile,
+            visibility_capability=(
+                effective_visibility_capability
+                if visibility_capability is not None
+                else None
+            ),
+            mandatory_checkpoint=None,
+        )
+
     conn: sqlite3.Connection | None = None
     try:
         if expected_discovery is not None:
@@ -6926,43 +8079,45 @@ def recover_thread(
                 != str(expected_discovery.get("checkpoint_id") or "")
                 or str(checkpoint["session_id"] or "") != lookup_session_id
                 or str(checkpoint["project_id"] or "") != str(lookup_project_id or "")
+                or str(checkpoint["visibility_scope"] or "")
+                != str(expected_discovery.get("checkpoint_visibility_scope") or "")
             ):
                 raise ResumeCheckpointChangedError(
                     "resume checkpoint changed after discovery: "
                     f"{expected_discovery.get('checkpoint_id')}"
                 )
 
-        context = compile_context(
-            root,
-            session_id=lookup_session_id,
-            token_budget=token_budget,
-            query=effective_query,
-            create=expected_discovery is None,
-            card_scope="project" if lookup_project_id else "session",
-            project_id=lookup_project_id,
-            planner_profile=planner_profile,
-        )
+        context = compile_recovery_context(token_budget)
+        if (
+            expected_discovery is not None
+            and planner_profile == "resume"
+            and not context.get("mandatory_checkpoint_found")
+        ):
+            raise ResumeCheckpointChangedError(
+                "resume checkpoint disappeared during context compilation: "
+                f"{expected_discovery.get('checkpoint_id')}"
+            )
         if conn is None:
             conn = connect(root)
-        metadata_needle = f'"session_id":"{lookup_session_id}"'
         recent_events = [
             dict(row)
             for row in _visible_scroll_rows(
                 conn,
                 session_id=lookup_session_id,
                 project_id=lookup_project_id,
+                visibility_capability=(
+                    effective_visibility_capability
+                    if visibility_capability is not None
+                    else None
+                ),
                 limit=recent_event_limit,
             )
         ]
         recent_events.reverse()
-        visible_card_clause, visible_card_params = _visible_card_clause(session_id=lookup_session_id, project_id=lookup_project_id)
-        card_match_clauses = ["metadata_json LIKE ?", "title LIKE ?", "summary LIKE ?"]
-        card_match_params: list[Any] = [f"%{metadata_needle}%", f"%{lookup_session_id}%", f"%{lookup_session_id}%"]
-        if lookup_project_id:
-            card_match_clauses.extend(["project_id = ?", "title LIKE ?", "summary LIKE ?", "metadata_json LIKE ?"])
-            card_match_params.extend(
-                [lookup_project_id, f"%{lookup_project_id}%", f"%{lookup_project_id}%", f"%{lookup_project_id}%"]
-            )
+        visible_card_clause, visible_card_params = _visible_card_clause(
+            session_id=capability_session_id or None,
+            project_id=capability_project_id,
+        )
         cards = [
             dict(row)
             for row in conn.execute(
@@ -6972,11 +8127,10 @@ def recover_thread(
                 FROM cards
                 WHERE {_current_card_authority_clause()}
                   AND {visible_card_clause}
-                  AND ({" OR ".join(card_match_clauses)})
                 ORDER BY salience DESC, updated_at DESC
                 LIMIT 12
                 """,
-                (*visible_card_params, *card_match_params),
+                tuple(visible_card_params),
             )
         ]
         if (
@@ -6991,9 +8145,8 @@ def recover_thread(
                 FROM cards
                 WHERE id = ?
                   AND {_current_card_authority_clause()}
-                  AND {visible_card_clause}
                 """,
-                (checkpoint_id, *visible_card_params),
+                (checkpoint_id,),
             ).fetchone()
             if checkpoint_card is None:
                 raise ResumeCheckpointChangedError(
@@ -7021,7 +8174,12 @@ def recover_thread(
             ORDER BY priority ASC, created_at ASC
             """
         ):
-            if _queue_job_visible(conn, row, session_id=lookup_session_id, project_id=lookup_project_id):
+            if _queue_job_visible(
+                conn,
+                row,
+                session_id=capability_session_id or None,
+                project_id=capability_project_id,
+            ):
                 pending_jobs.append(dict(row))
                 if len(pending_jobs) >= 20:
                     break
@@ -7245,6 +8403,44 @@ def recover_thread(
             details_truncated = detail_source_truncated or any(
                 operational_details.values()
             )
+            requires_checkpoint = expected_discovery is not None
+            minimum_checkpoint_tokens = int(
+                context.get("mandatory_checkpoint_minimum_tokens") or 0
+            )
+            minimum_checkpoint_context_text = str(
+                context.get("_mandatory_checkpoint_minimal_context_text") or ""
+            )
+            minimum_checkpoint_packet_tokens: int | None = None
+            if expected_discovery is not None:
+                if (
+                    not context.get("mandatory_checkpoint_found")
+                    or minimum_checkpoint_tokens <= 0
+                    or not minimum_checkpoint_context_text
+                ):
+                    raise ResumeCheckpointChangedError(
+                        "resume checkpoint was not available to the bounded packet: "
+                        f"{expected_discovery.get('checkpoint_id')}"
+                    )
+                _, minimum_checkpoint_packet_tokens = _stabilize_packet_estimate(
+                    lambda estimated: _render_compact_resume_recovery_packet(
+                        recovery_id=recovery_id,
+                        session_id=lookup_session_id,
+                        project_id=lookup_project_id,
+                        packet_token_budget=packet_token_budget,
+                        packet_estimated_tokens=estimated,
+                        checkpoint_context_text=minimum_checkpoint_context_text,
+                    )
+                )
+                if (
+                    not context.get("mandatory_checkpoint_fit")
+                    or minimum_checkpoint_packet_tokens > packet_token_budget
+                ):
+                    raise ResumeCheckpointDidNotFitError(
+                        token_budget=packet_token_budget,
+                        minimum_checkpoint_tokens=minimum_checkpoint_tokens,
+                        minimum_packet_tokens=minimum_checkpoint_packet_tokens,
+                    )
+            available_budget = 0
             if base_packet_tokens <= packet_token_budget:
                 available_budget = max(
                     0,
@@ -7255,12 +8451,18 @@ def recover_thread(
                 )
                 has_details = any(operational_details.values())
                 if has_details:
+                    details_pool = available_budget
+                    if requires_checkpoint:
+                        details_pool = max(
+                            0,
+                            available_budget - minimum_checkpoint_tokens,
+                        )
                     details_budget = max(
                         0,
                         (
-                            available_budget
+                            details_pool
                             if not original_context_text
-                            else available_budget // 2
+                            else details_pool // 2
                         )
                         - details_header_tokens,
                     )
@@ -7280,7 +8482,7 @@ def recover_thread(
                     else 0
                 )
                 context_budget = max(
-                    0,
+                    minimum_checkpoint_tokens if requires_checkpoint else 0,
                     available_budget - details_section_tokens,
                 )
             else:
@@ -7290,16 +8492,7 @@ def recover_thread(
                 original_context_text
             ) > context_budget:
                 if context_budget > 0:
-                    context = compile_context(
-                        root,
-                        session_id=lookup_session_id,
-                        token_budget=context_budget,
-                        query=effective_query,
-                        create=False,
-                        card_scope="project" if lookup_project_id else "session",
-                        project_id=lookup_project_id,
-                        planner_profile="resume",
-                    )
+                    context = compile_recovery_context(context_budget)
                 else:
                     context = {
                         **context,
@@ -7313,6 +8506,12 @@ def recover_thread(
                         "truncated": bool(original_context_text),
                         "context_text": "",
                     }
+            if requires_checkpoint and not context.get("mandatory_checkpoint_fit"):
+                raise ResumeCheckpointDidNotFitError(
+                    token_budget=packet_token_budget,
+                    minimum_checkpoint_tokens=minimum_checkpoint_tokens,
+                    minimum_packet_tokens=minimum_checkpoint_packet_tokens,
+                )
             packet_truncated = details_truncated or bool(context.get("truncated")) or (
                 str(context.get("context_text") or "") != original_context_text
             )
@@ -7338,31 +8537,45 @@ def recover_thread(
 
             if packet_estimated_tokens > packet_token_budget:
                 packet_truncated = True
-                context = {
-                    **context,
-                    "token_budget": 0,
-                    "usable_context_budget": 0,
-                    "estimated_tokens": 0,
-                    "remaining_budget": 0,
-                    "section_count": 0,
-                    "sections": [],
-                    "planner_trace": [],
-                    "truncated": bool(original_context_text),
-                    "context_text": "",
-                }
-                details_budget = max(
-                    0,
-                    packet_token_budget
-                    - base_packet_tokens
-                    - estimate_tokens("\n\n## Operational Recovery Details\n\n")
-                    - 8,
-                )
-                operational_details_text, _details_were_truncated = (
-                    _render_resume_operational_details(
-                        operational_details,
-                        token_budget=details_budget,
+                if requires_checkpoint:
+                    operational_details_text = ""
+                    context_budget = max(
+                        minimum_checkpoint_tokens,
+                        available_budget,
                     )
-                )
+                    context = compile_recovery_context(context_budget)
+                    if not context.get("mandatory_checkpoint_fit"):
+                        raise ResumeCheckpointDidNotFitError(
+                            token_budget=packet_token_budget,
+                            minimum_checkpoint_tokens=minimum_checkpoint_tokens,
+                            minimum_packet_tokens=minimum_checkpoint_packet_tokens,
+                        )
+                else:
+                    context = {
+                        **context,
+                        "token_budget": 0,
+                        "usable_context_budget": 0,
+                        "estimated_tokens": 0,
+                        "remaining_budget": 0,
+                        "section_count": 0,
+                        "sections": [],
+                        "planner_trace": [],
+                        "truncated": bool(original_context_text),
+                        "context_text": "",
+                    }
+                    details_budget = max(
+                        0,
+                        packet_token_budget
+                        - base_packet_tokens
+                        - estimate_tokens("\n\n## Operational Recovery Details\n\n")
+                        - 8,
+                    )
+                    operational_details_text, _details_were_truncated = (
+                        _render_resume_operational_details(
+                            operational_details,
+                            token_budget=details_budget,
+                        )
+                    )
                 packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
                     lambda estimated: _render_resume_recovery_packet(
                         recovery_id=recovery_id,
@@ -7374,38 +8587,66 @@ def recover_thread(
                         packet_truncated=True,
                         operational_summary=operational_summary,
                         operational_details_text=operational_details_text,
-                        context_text="",
+                        context_text=str(context.get("context_text") or ""),
                     )
                 )
 
             if packet_estimated_tokens > packet_token_budget:
                 operational_details_text = ""
-                context = {
-                    **context,
-                    "token_budget": 0,
-                    "usable_context_budget": 0,
-                    "estimated_tokens": 0,
-                    "remaining_budget": 0,
-                    "section_count": 0,
-                    "sections": [],
-                    "planner_trace": [],
-                    "truncated": True,
-                    "context_text": "",
-                }
-                packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
-                    lambda estimated: _render_compact_resume_recovery_packet(
-                        recovery_id=recovery_id,
-                        session_id=lookup_session_id,
-                        project_id=lookup_project_id,
-                        packet_token_budget=packet_token_budget,
-                        packet_estimated_tokens=estimated,
+                if requires_checkpoint:
+                    context = compile_recovery_context(minimum_checkpoint_tokens)
+                    if not context.get("mandatory_checkpoint_fit"):
+                        raise ResumeCheckpointDidNotFitError(
+                            token_budget=packet_token_budget,
+                            minimum_checkpoint_tokens=minimum_checkpoint_tokens,
+                            minimum_packet_tokens=minimum_checkpoint_packet_tokens,
+                        )
+                    packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
+                        lambda estimated: _render_compact_resume_recovery_packet(
+                            recovery_id=recovery_id,
+                            session_id=lookup_session_id,
+                            project_id=lookup_project_id,
+                            packet_token_budget=packet_token_budget,
+                            packet_estimated_tokens=estimated,
+                            checkpoint_context_text=str(
+                                context.get("context_text") or ""
+                            ),
+                        )
                     )
-                )
-                if packet_estimated_tokens > packet_token_budget:
-                    raise ResumePacketBudgetError(
-                        token_budget=packet_token_budget,
-                        minimum_tokens=packet_estimated_tokens,
+                    if packet_estimated_tokens > packet_token_budget:
+                        raise ResumeCheckpointDidNotFitError(
+                            token_budget=packet_token_budget,
+                            minimum_checkpoint_tokens=minimum_checkpoint_tokens,
+                            minimum_packet_tokens=packet_estimated_tokens,
+                        )
+                else:
+                    context = {
+                        **context,
+                        "token_budget": 0,
+                        "usable_context_budget": 0,
+                        "estimated_tokens": 0,
+                        "remaining_budget": 0,
+                        "section_count": 0,
+                        "sections": [],
+                        "planner_trace": [],
+                        "truncated": True,
+                        "context_text": "",
+                    }
+                    packet_text, packet_estimated_tokens = _stabilize_packet_estimate(
+                        lambda estimated: _render_compact_resume_recovery_packet(
+                            recovery_id=recovery_id,
+                            session_id=lookup_session_id,
+                            project_id=lookup_project_id,
+                            packet_token_budget=packet_token_budget,
+                            packet_estimated_tokens=estimated,
+                        )
                     )
+                    if packet_estimated_tokens > packet_token_budget:
+                        raise ResumePacketBudgetError(
+                            token_budget=packet_token_budget,
+                            minimum_tokens=packet_estimated_tokens,
+                        )
+        context.pop("_mandatory_checkpoint_minimal_context_text", None)
         safe_session = safe_external_name(lookup_session_id, limit=80)
         packet_path = root / "exports" / "thread_recovery" / f"{safe_session}_{recovery_id}.md"
         secure_mkdir(packet_path.parent)
@@ -7424,6 +8665,7 @@ def recover_thread(
             "session_id_redacted": lookup_session_id != session_id,
             "project_id": lookup_project_id,
             "project_id_redacted": lookup_project_id != project_id,
+            "visibility_capability": effective_visibility_capability,
             "packet_uri": str(packet_path),
             "packet_hash": content_hash(packet_text),
             "packet_estimated_tokens": packet_estimated_tokens,
@@ -7532,16 +8774,42 @@ def resume_latest(
             }
         discovered_session = str(state_row["session_id"] or requested_session)
         discovered_project = str(state_row["project_id"] or requested_project) or None
+        checkpoint_visibility_scope = normalize_visibility_scope(
+            str(state_row["visibility_scope"] or ""),
+            field="resume checkpoint visibility_scope",
+        )
         discovery = {
             "source": selected["source"],
             "session_id": discovered_session,
             "project_id": discovered_project,
+            "checkpoint_visibility_scope": checkpoint_visibility_scope,
             "checkpoint_at": state_row["checkpoint_at"],
             "updated_at": state_row["checkpoint_at"],
             "requested_session_id": requested_session or None,
             "requested_project_id": requested_project or None,
             "checkpoint_id": str(state_row["id"]),
         }
+        if requested_session or requested_project:
+            visibility_capability = {
+                "session_id": requested_session or None,
+                "project_id": requested_project or None,
+            }
+        elif checkpoint_visibility_scope == "project":
+            visibility_capability = {
+                "session_id": None,
+                "project_id": discovered_project,
+            }
+        elif checkpoint_visibility_scope == "session":
+            visibility_capability = {
+                "session_id": discovered_session,
+                "project_id": None,
+            }
+        else:
+            visibility_capability = {
+                "session_id": None,
+                "project_id": None,
+            }
+        discovery["visibility_capability"] = dict(visibility_capability)
     finally:
         conn.close()
 
@@ -7555,6 +8823,7 @@ def resume_latest(
             recent_event_limit=recent_event_limit,
             planner_profile="resume",
             expected_discovery=discovery,
+            visibility_capability=visibility_capability,
         )
     except ResumeCheckpointChangedError:
         return {
@@ -7567,6 +8836,22 @@ def resume_latest(
             "project_id": discovered_project,
             "discovery": discovery,
         }
+    except ResumeCheckpointDidNotFitError as exc:
+        response = {
+            "ok": False,
+            "initialized": True,
+            "root": str(root),
+            "reason": "checkpoint_did_not_fit",
+            "resume_mode": resume_mode,
+            "session_id": discovered_session,
+            "project_id": discovered_project,
+            "packet_token_budget": exc.token_budget,
+            "minimum_checkpoint_tokens": exc.minimum_checkpoint_tokens,
+            "discovery": discovery,
+        }
+        if exc.minimum_packet_tokens is not None:
+            response["minimum_packet_tokens"] = exc.minimum_packet_tokens
+        return response
     except ResumePacketBudgetError as exc:
         return {
             "ok": False,

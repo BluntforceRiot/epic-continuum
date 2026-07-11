@@ -868,6 +868,7 @@ version = "9.9.9"
                         "--sdist",
                         "--wheel",
                         "--no-isolation",
+                        "--skip-dependency-check",
                         "--outdir",
                         str(build_out),
                     ],

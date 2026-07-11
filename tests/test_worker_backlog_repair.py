@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.atomic import load_atomic_yaml
+from continuum.core import workers as worker_module
 from continuum.core.store import (
     add_graph_edge,
     append_scroll_event,
@@ -386,6 +387,448 @@ class WorkerBacklogRepairTest(unittest.TestCase):
                 conn.close()
             self.assertEqual(card_status, "active")
             self.assertEqual(job_status, "succeeded")
+
+    def test_bounded_mempalace_worker_receipts_resume_until_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            import_id = "bounded-worker-import"
+            conn = connect(root)
+            card_ids: list[str] = []
+            try:
+                for index in range(3):
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="mempalace_drawer",
+                        title=f"Bounded worker drawer {index}",
+                        summary="Each bounded placement batch remains resumable.",
+                        source_refs=[],
+                        metadata={
+                            "import_id": import_id,
+                            "mempalace_wing": "operator",
+                            "mempalace_room": "bounded",
+                        },
+                    )
+                    graph_place_card(
+                        conn,
+                        card_id,
+                        label=f"Bounded worker drawer {index}",
+                    )
+                    card_ids.append(card_id)
+                initial_job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_mempalace_import",
+                    priority=65,
+                    payload={"import_id": import_id, "limit": 1},
+                    dedupe_key=f"import:{import_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            first = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(first["ok"], first)
+            first_result = first["processed"][0]["result"]
+            self.assertFalse(first_result["complete"], first_result)
+            self.assertTrue(first_result["resumable"], first_result)
+            self.assertEqual(first_result["reviewed_cards"], 1)
+            self.assertEqual(first_result["remaining_eligible"], 1)
+            self.assertTrue(first_result["remaining_eligible_is_lower_bound"])
+            self.assertEqual(first_result["limit"], 1)
+            second_job_id = str(first_result["continuation_job_id"])
+            self.assertTrue(second_job_id)
+
+            conn = connect_existing(root)
+            try:
+                continuation = conn.execute(
+                    "SELECT status, role, dedupe_key, payload_json FROM queue_jobs WHERE id = ?",
+                    (second_job_id,),
+                ).fetchone()
+                initial_dedupe_key = str(
+                    conn.execute(
+                        "SELECT dedupe_key FROM queue_jobs WHERE id = ?",
+                        (initial_job_id,),
+                    ).fetchone()["dedupe_key"]
+                )
+                first_receipts = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_id = ?
+                        """,
+                        (initial_job_id,),
+                    ).fetchone()["n"]
+                )
+                first_effects = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n FROM audit_events
+                        WHERE action = 'reconcile_graph_placed_card'
+                          AND json_extract(payload_json, '$.reason') = 'reviewed_mempalace_import'
+                        """
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(continuation["status"], "pending")
+            self.assertEqual(continuation["role"], "librarian")
+            self.assertEqual(continuation["dedupe_key"], initial_dedupe_key)
+            self.assertEqual(json.loads(continuation["payload_json"])["limit"], 1)
+            self.assertEqual(first_receipts, 1)
+            self.assertEqual(first_effects, 1)
+
+            # Re-run the committed first job to model a crash after its effect
+            # receipt but before the queue row became terminal. Its durable
+            # receipt must win without consuming the pending continuation.
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'pending', started_at = NULL, finished_at = NULL,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        heartbeat_at = NULL, error_json = NULL, dedupe_key = NULL
+                    WHERE id = ?
+                    """,
+                    (initial_job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            replay = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(replay["ok"], replay)
+            replay_result = replay["processed"][0]["result"]
+            self.assertTrue(replay_result["idempotent_replay"], replay_result)
+            self.assertEqual(replay_result["continuation_job_id"], second_job_id)
+
+            conn = connect(root)
+            try:
+                replay_counts = {
+                    "receipts": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_job_effect_committed'
+                            """
+                        ).fetchone()["n"]
+                    ),
+                    "effects": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'reconcile_graph_placed_card'
+                              AND json_extract(payload_json, '$.reason') = 'reviewed_mempalace_import'
+                            """
+                        ).fetchone()["n"]
+                    ),
+                }
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'running', started_at = coalesce(started_at, ?),
+                        lease_owner = 'expired-worker',
+                        lease_expires_at = '2000-01-01T00:00:00+00:00',
+                        heartbeat_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    ("2000-01-01T00:00:00+00:00", second_job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(replay_counts, {"receipts": 1, "effects": 1})
+
+            recovered = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(recovered["ok"], recovered)
+            self.assertEqual(recovered["reclaimed_expired_jobs"], 1)
+            recovered_result = recovered["processed"][0]["result"]
+            self.assertFalse(recovered_result["complete"], recovered_result)
+            self.assertEqual(recovered_result["reviewed_cards"], 1)
+            self.assertEqual(recovered_result["remaining_eligible"], 1)
+            self.assertTrue(recovered_result["remaining_eligible_is_lower_bound"])
+            self.assertEqual(recovered_result["limit"], 1)
+            third_job_id = str(recovered_result["continuation_job_id"])
+
+            completed = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(completed["ok"], completed)
+            completed_result = completed["processed"][0]["result"]
+            self.assertTrue(completed_result["complete"], completed_result)
+            self.assertFalse(completed_result["resumable"], completed_result)
+            self.assertEqual(completed_result["reviewed_cards"], 1)
+            self.assertEqual(completed_result["remaining_eligible"], 0)
+            self.assertFalse(completed_result["remaining_eligible_is_lower_bound"])
+            self.assertIsNone(completed_result["continuation_job_id"])
+
+            conn = connect_existing(root)
+            try:
+                statuses = {
+                    str(row["status"])
+                    for row in conn.execute(
+                        f"SELECT status FROM cards WHERE id IN ({','.join('?' for _ in card_ids)})",
+                        card_ids,
+                    )
+                }
+                receipt_rows = conn.execute(
+                    """
+                    SELECT target_id, count(*) AS n
+                    FROM audit_events
+                    WHERE action = 'worker_job_effect_committed'
+                    GROUP BY target_id
+                    """
+                ).fetchall()
+                effect_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n FROM audit_events
+                        WHERE action = 'reconcile_graph_placed_card'
+                          AND json_extract(payload_json, '$.reason') = 'reviewed_mempalace_import'
+                        """
+                    ).fetchone()["n"]
+                )
+                pending_continuations = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n FROM queue_jobs
+                        WHERE job_type = 'review_mempalace_import' AND status = 'pending'
+                        """
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(statuses, {"active"})
+            self.assertEqual(
+                {str(row["target_id"]): int(row["n"]) for row in receipt_rows},
+                {initial_job_id: 1, second_job_id: 1, third_job_id: 1},
+            )
+            self.assertEqual(effect_count, len(card_ids))
+            self.assertEqual(pending_continuations, 0)
+
+    def test_mempalace_partial_refreshes_reused_pending_continuation_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            import_id = "reused-bounded-import"
+            conn = connect(root)
+            try:
+                for index in range(3):
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="mempalace_drawer",
+                        title=f"Reused bounded drawer {index}",
+                        summary="A reused continuation retains the active batch limit.",
+                        source_refs=[],
+                        metadata={
+                            "import_id": import_id,
+                            "mempalace_wing": "operator",
+                            "mempalace_room": "bounded",
+                        },
+                    )
+                    graph_place_card(conn, card_id, label=f"Reused bounded drawer {index}")
+                pending_job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_mempalace_import",
+                    priority=12,
+                    payload={
+                        "import_id": import_id,
+                        "limit": 2,
+                        "reason": "concurrent_pending_job",
+                    },
+                    dedupe_key=f"import:{import_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = review_mempalace_import(root, import_id=import_id, limit=1)
+
+            self.assertFalse(result["complete"], result)
+            self.assertEqual(result["limit"], 1)
+            self.assertEqual(result["continuation_job_id"], pending_job_id)
+            conn = connect_existing(root)
+            try:
+                pending = conn.execute(
+                    """
+                    SELECT priority, status, payload_json
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (pending_job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["priority"], 65)
+            self.assertEqual(
+                json.loads(pending["payload_json"]),
+                {
+                    "import_id": import_id,
+                    "limit": 1,
+                    "reason": "bounded_mempalace_import_continuation",
+                },
+            )
+
+    def test_mempalace_candidate_window_uses_indexed_bounded_work(self) -> None:
+        def measured_steps(card_count: int) -> int:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                init_db(root)
+                conn = connect(root)
+                try:
+                    now = "2026-01-01T00:00:00+00:00"
+                    import_id = "bounded-plan-import"
+                    metadata_json = json.dumps(
+                        {"import_id": import_id},
+                        separators=(",", ":"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO cards(
+                            id, card_type, title, summary, status,
+                            source_refs_json, entities_json, topics_json,
+                            decisions_json, open_tasks_json, metadata_json,
+                            visibility_scope, session_id, created_at, updated_at
+                        )
+                        VALUES(?, 'mempalace_drawer', ?, ?,
+                               'pending_librarian_review', '[]', '[]', '[]',
+                               '[]', '[]', ?, 'session', 'bounded-session', ?, ?)
+                        """,
+                        [
+                            (
+                                f"bounded-mempalace-card-{index:05d}",
+                                f"Bounded drawer {index:05d}",
+                                f"Bounded drawer summary {index:05d}",
+                                metadata_json,
+                                now,
+                                now,
+                            )
+                            for index in range(card_count)
+                        ],
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO graph_nodes(
+                            id, kind, label, canonical_key, metadata_json,
+                            created_at, updated_at
+                        )
+                        VALUES('bounded-shelf-node', 'term', 'bounded shelf',
+                               'term:bounded-shelf', '{}', ?, ?)
+                        """,
+                        (now, now),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO graph_nodes(
+                            id, kind, label, canonical_key, card_id,
+                            metadata_json, created_at, updated_at
+                        )
+                        VALUES(?, 'card', ?, ?, ?, '{}', ?, ?)
+                        """,
+                        [
+                            (
+                                f"bounded-card-node-{index:05d}",
+                                f"Bounded card node {index:05d}",
+                                f"card:bounded-mempalace-card-{index:05d}",
+                                f"bounded-mempalace-card-{index:05d}",
+                                now,
+                                now,
+                            )
+                            for index in range(card_count)
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO graph_edges(
+                            id, source_node_id, relation, target_node_id,
+                            status, source_refs_json, created_at, updated_at
+                        )
+                        VALUES(?, ?, 'placed_in', 'bounded-shelf-node',
+                               'active', '[]', ?, ?)
+                        """,
+                        [
+                            (
+                                f"bounded-edge-{index:05d}",
+                                f"bounded-card-node-{index:05d}",
+                                now,
+                                now,
+                            )
+                            for index in range(card_count)
+                        ],
+                    )
+                    conn.commit()
+
+                    where_clause, params = worker_module._legacy_card_where(
+                        import_id=import_id
+                    )
+                    plan = " ".join(
+                        str(row["detail"])
+                        for row in conn.execute(
+                            f"""
+                            EXPLAIN QUERY PLAN
+                            SELECT c.id, c.card_type, c.project_id,
+                                   c.metadata_json, c.created_at
+                            FROM cards c
+                            WHERE {where_clause}
+                            ORDER BY c.created_at, c.id
+                            LIMIT ?
+                            """,
+                            (*params, 2),
+                        )
+                    )
+                    self.assertIn(
+                        "idx_cards_mempalace_import_pending_created",
+                        plan,
+                    )
+                    self.assertIn("idx_graph_nodes_card_id", plan)
+                    self.assertIn("idx_queue_job_type_status", plan)
+                    self.assertNotIn("TEMP B-TREE", plan)
+
+                    steps = 0
+
+                    def count_step() -> int:
+                        nonlocal steps
+                        steps += 1
+                        return 0
+
+                    conn.set_progress_handler(count_step, 1)
+                    rows = worker_module._legacy_card_candidates(
+                        conn,
+                        limit=2,
+                        import_id=import_id,
+                    )
+                    conn.set_progress_handler(None, 0)
+                    self.assertEqual(len(rows), 2)
+                    return steps
+                finally:
+                    conn.close()
+
+        small_steps = measured_steps(100)
+        large_steps = measured_steps(5_000)
+        self.assertLess(large_steps, (small_steps * 4) + 500)
 
     def test_service_runs_maintenance_on_cadence_not_every_idle_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

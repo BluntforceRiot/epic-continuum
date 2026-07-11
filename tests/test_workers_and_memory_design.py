@@ -5,11 +5,15 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.atomic import load_atomic_yaml
+from continuum.core import store as store_module
+from continuum.core import workers as worker_module
 from continuum.core.config import default_config, write_config
 from continuum.core.evals import run_memory_quality_evals
 from continuum.core.store import (
@@ -20,6 +24,7 @@ from continuum.core.store import (
     connect,
     connect_existing,
     create_card,
+    enqueue_job,
     init_db,
     ingest_file,
     resolve_stored_uri,
@@ -277,8 +282,117 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertTrue(groups[alpha])
             self.assertEqual(groups[alpha], groups[beta])
             for row in rows:
-                sidecar = load_atomic_yaml(resolve_stored_uri(root, row["location_uri"]).read_text(encoding="utf-8"))
+                sidecar = load_atomic_yaml(
+                    resolve_stored_uri(root, row["location_uri"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
                 self.assertEqual(sidecar["conflict_group"], row["conflict_group"])
+
+    def test_sidecar_sync_serializes_file_replace_through_crash_and_newer_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Sidecar generation race",
+                    summary="OLD-SIDECAR-SUMMARY",
+                    source_refs=[],
+                    visibility_scope="session",
+                    session_id="sidecar-generation-session",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            old_file_replaced = threading.Event()
+            allow_simulated_crash = threading.Event()
+            original_write = store_module.write_card_sidecar_from_values
+
+            def crash_after_old_write(*args: object, **kwargs: object) -> str | None:
+                result = original_write(*args, **kwargs)
+                if kwargs.get("summary") == "OLD-SIDECAR-SUMMARY":
+                    old_file_replaced.set()
+                    allow_simulated_crash.wait(timeout=5)
+                    raise SystemExit("simulated process death after sidecar replace")
+                return result
+
+            first_errors: list[BaseException] = []
+            newer_update_committed = threading.Event()
+            newer_sync_results: list[dict[str, object]] = []
+
+            def run_old_sync() -> None:
+                try:
+                    sync_card_sidecars_after_commit(root, [card_id])
+                except BaseException as exc:
+                    first_errors.append(exc)
+
+            def update_and_sync_newer_card() -> None:
+                conn = connect(root)
+                try:
+                    conn.execute(
+                        "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                        ("NEW-SIDECAR-SUMMARY", store_module.utc_now(), card_id),
+                    )
+                    store_module.mark_card_sidecar_outbox(
+                        conn,
+                        [card_id],
+                        reason="concurrent_card_update",
+                    )
+                    conn.commit()
+                    newer_update_committed.set()
+                finally:
+                    conn.close()
+                newer_sync_results.append(
+                    sync_card_sidecars_after_commit(root, [card_id])
+                )
+
+            with patch.object(
+                store_module,
+                "write_card_sidecar_from_values",
+                side_effect=crash_after_old_write,
+            ):
+                old_thread = threading.Thread(target=run_old_sync)
+                old_thread.start()
+                self.assertTrue(old_file_replaced.wait(timeout=5))
+                newer_thread = threading.Thread(target=update_and_sync_newer_card)
+                newer_thread.start()
+                self.assertFalse(newer_update_committed.wait(timeout=0.1))
+                allow_simulated_crash.set()
+                old_thread.join(timeout=5)
+                newer_thread.join(timeout=5)
+                self.assertFalse(old_thread.is_alive())
+                self.assertFalse(newer_thread.is_alive())
+
+            self.assertEqual(len(first_errors), 1)
+            self.assertIsInstance(first_errors[0], SystemExit)
+            self.assertTrue(newer_update_committed.is_set())
+            self.assertTrue(newer_sync_results[0]["ok"], newer_sync_results)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT summary, location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                pending_after_drain = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            sidecar_path = resolve_stored_uri(root, str(row["location_uri"]))
+            sidecar = load_atomic_yaml(sidecar_path.read_text(encoding="utf-8"))
+            self.assertEqual(row["summary"], "NEW-SIDECAR-SUMMARY")
+            self.assertEqual(sidecar["summary"], "NEW-SIDECAR-SUMMARY")
+            self.assertEqual(pending_after_drain, 0)
 
     def test_sidecar_outbox_survives_commit_until_worker_drains_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +623,162 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertIsNotNone(row["heartbeat_at"])
             self.assertEqual(row["attempt_count"], 1)
 
+    def test_conflict_maintenance_escalates_once_then_deduplicates_review_signal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            base = {
+                "ok": True,
+                "scan": {
+                    "anchor_card_id": "card_maintenance_anchor",
+                    "anchor_identity_hash": "a" * 64,
+                },
+                "continuation": {
+                    "required": True,
+                    "requires_larger_budget": True,
+                    "required_candidate_cards_lower_bound": 201,
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                },
+            }
+            escalated = {
+                "ok": True,
+                "scan": {
+                    "anchor_card_id": "card_maintenance_anchor",
+                    "anchor_identity_hash": "a" * 64,
+                },
+                "continuation": {
+                    "required": True,
+                    "requires_larger_budget": True,
+                    "required_candidate_cards_lower_bound": 513,
+                    "manual_review_required": True,
+                    "manual_review_reason": (
+                        "targeted_fuzzy_boundary_exceeds_automatic_candidate_limit"
+                    ),
+                },
+            }
+            maintenance_stub = {"ok": True}
+            with (
+                patch.object(
+                    worker_module,
+                    "detect_conflicts",
+                    side_effect=[base, escalated],
+                ) as detected,
+                patch.object(
+                    worker_module,
+                    "drain_card_sidecar_outbox",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "decay_graph_routes",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "apply_storage_tiering",
+                    return_value=maintenance_stub,
+                ),
+            ):
+                first = run_worker_pass(root, limit=1, maintenance=True)
+
+            self.assertEqual(detected.call_count, 2)
+            escalation_kwargs = detected.call_args_list[1].kwargs
+            self.assertEqual(
+                escalation_kwargs["candidate_card_limit"],
+                worker_module.MAX_CONFLICT_CANDIDATE_CARDS,
+            )
+            self.assertEqual(
+                escalation_kwargs["comparison_limit"],
+                worker_module.MAX_CONFLICT_COMPARISONS,
+            )
+            signal = first["maintenance"]["conflict_review_required"]
+            self.assertTrue(signal["created"], signal)
+            self.assertTrue(signal["manual_review_required"], signal)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "detect_conflicts",
+                    return_value=base,
+                ) as repeated_detection,
+                patch.object(
+                    worker_module,
+                    "drain_card_sidecar_outbox",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "decay_graph_routes",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "apply_storage_tiering",
+                    return_value=maintenance_stub,
+                ),
+            ):
+                repeated = run_worker_pass(root, limit=1, maintenance=True)
+
+            self.assertEqual(repeated_detection.call_count, 2)
+            self.assertFalse(
+                repeated["maintenance"]["conflict_review_required"]["created"]
+            )
+            resolved = {
+                "ok": True,
+                "scan": base["scan"],
+                "continuation": {
+                    "required": False,
+                    "requires_larger_budget": False,
+                    "required_candidate_cards_lower_bound": 0,
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                },
+            }
+            with (
+                patch.object(
+                    worker_module,
+                    "detect_conflicts",
+                    side_effect=[base, resolved],
+                ) as recovered_detection,
+                patch.object(
+                    worker_module,
+                    "drain_card_sidecar_outbox",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "decay_graph_routes",
+                    return_value=maintenance_stub,
+                ),
+                patch.object(
+                    worker_module,
+                    "apply_storage_tiering",
+                    return_value=maintenance_stub,
+                ),
+            ):
+                recovered = run_worker_pass(root, limit=1, maintenance=True)
+
+            self.assertEqual(recovered_detection.call_count, 2)
+            self.assertIn("conflict_escalation", recovered["maintenance"])
+            self.assertNotIn("conflict_review_required", recovered["maintenance"])
+            conn = connect_existing(root)
+            try:
+                review_audits = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM audit_events
+                        WHERE action = 'librarian_conflict_review_required'
+                        """
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(review_audits, 1)
+
     def test_worker_pass_does_not_finish_job_after_lease_owner_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -568,6 +838,988 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(row["status"], "running")
             self.assertEqual(row["lease_owner"], "new-worker")
             self.assertIsNone(row["finished_at"])
+
+    def test_non_scribe_worker_renews_lease_while_processor_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="renewal_probe",
+                    priority=1,
+                    payload={},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            def slow_processor(_root: Path, _job: dict, **_kwargs: object) -> dict:
+                time.sleep(0.08)
+                return {"ok": True}
+
+            with (
+                patch.object(worker_module, "_lease_renewal_interval", return_value=0.01),
+                patch.object(
+                    worker_module,
+                    "_heartbeat_job",
+                    wraps=worker_module._heartbeat_job,
+                ) as heartbeat,
+                patch.object(worker_module, "_process_job", side_effect=slow_processor),
+            ):
+                result = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(result["ok"], result)
+            # One call is made by the fenced finisher; additional calls prove
+            # the generic background renewer ran for a non-Scribe processor.
+            self.assertGreaterEqual(heartbeat.call_count, 2)
+
+    def test_scribe_mid_effect_expiry_replays_durable_step_without_duplicate_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            session_id = "scribe-mid-effect-expiry"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="Scribe mid-effect lease fencing evidence.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_roll = worker_module.roll_scroll_segment
+
+            def commit_then_expire(*args: object, **kwargs: object) -> dict:
+                result = original_roll(*args, **kwargs)
+                expiry_conn = connect(root)
+                try:
+                    cursor = expiry_conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET lease_expires_at = '2000-01-01T00:00:00+00:00',
+                            heartbeat_at = '2000-01-01T00:00:00+00:00'
+                        WHERE id = ? AND status = 'running'
+                        """,
+                        (job_id,),
+                    )
+                    expiry_conn.commit()
+                    self.assertEqual(cursor.rowcount, 1)
+                finally:
+                    expiry_conn.close()
+                return result
+
+            with patch.object(
+                worker_module,
+                "roll_scroll_segment",
+                side_effect=commit_then_expire,
+            ):
+                expired = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(expired["ok"], expired)
+            self.assertIn("worker lease lost", expired["processed"][0]["error"])
+            conn = connect_existing(root)
+            try:
+                before = {
+                    "segments": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "cards": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM cards WHERE card_type = 'scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "roll_audits": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM audit_events WHERE action = 'roll_scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "intents": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_scribe_segment_step_intent'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "receipts": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_job_effect_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                before,
+                {
+                    "segments": 1,
+                    "cards": 1,
+                    "roll_audits": 1,
+                    "intents": 1,
+                    "receipts": 0,
+                },
+            )
+
+            recovered = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(recovered["ok"], recovered)
+            self.assertEqual(recovered["reclaimed_expired_jobs"], 1)
+            conn = connect_existing(root)
+            try:
+                after = {
+                    "segments": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "cards": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM cards WHERE card_type = 'scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "roll_audits": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM audit_events WHERE action = 'roll_scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "intents": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_scribe_segment_step_intent'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "receipts": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_job_effect_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                after,
+                {
+                    "segments": 1,
+                    "cards": 1,
+                    "roll_audits": 1,
+                    "intents": 1,
+                    "receipts": 1,
+                },
+            )
+
+    def test_scribe_final_receipt_failure_replays_committed_step_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            session_id = "scribe-final-receipt-replay"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="The committed Scribe step must survive a final receipt crash.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                worker_module,
+                "_record_worker_effect",
+                side_effect=RuntimeError("forced final Scribe receipt failure"),
+            ):
+                interrupted = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+
+            conn = connect(root)
+            try:
+                segment_id = str(
+                    conn.execute(
+                        "SELECT id FROM scroll_segments WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()["id"]
+                )
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_scribe_segment_step_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_job_effect_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    0,
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'pending', started_at = NULL, finished_at = NULL,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        heartbeat_at = NULL, error_json = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            replayed = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(replayed["ok"], replayed)
+            replay_result = replayed["processed"][0]["result"]
+            self.assertEqual(replay_result["rolled_count"], 1)
+            self.assertEqual(replay_result["rolled"][0]["segment_id"], segment_id)
+
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()["n"]
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM audit_events WHERE action = 'roll_scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    1,
+                )
+                receipt = conn.execute(
+                    """
+                    SELECT payload_json FROM audit_events
+                    WHERE action = 'worker_job_effect_committed'
+                      AND target_id = ?
+                    ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            receipt_payload = json.loads(receipt["payload_json"])
+            self.assertEqual(receipt_payload["result"]["rolled_count"], 1)
+            self.assertEqual(
+                receipt_payload["result"]["rolled"][0]["segment_id"],
+                segment_id,
+            )
+
+    def test_scribe_final_transaction_guard_rolls_back_step_and_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            session_id = "scribe-final-guard-rollback"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="A lost lease must roll back every Scribe segment effect.",
+            )
+            owner = "scribe-final-guard-owner"
+            expires_at = (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+            ).isoformat()
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                        heartbeat_at = ?, started_at = ?
+                    WHERE id = ?
+                    """,
+                    (owner, expires_at, expires_at, expires_at, job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            lease = worker_module._JobLease(root, job_id, owner, 300)
+            guard_calls = 0
+
+            def fail_final_guard(transaction_conn: sqlite3.Connection) -> None:
+                nonlocal guard_calls
+                guard_calls += 1
+                lease.assert_owned(transaction_conn)
+                if guard_calls == 2:
+                    raise RuntimeError("forced final Scribe guard failure")
+
+            def record_step(
+                transaction_conn: sqlite3.Connection,
+                step_result: dict[str, object],
+            ) -> None:
+                worker_module._record_scribe_step_committed(
+                    transaction_conn,
+                    lease,
+                    session_id=session_id,
+                    start_seq=1,
+                    end_seq=1,
+                    batch_number=1,
+                    result=step_result,
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "forced final Scribe guard"):
+                roll_scroll_segment(
+                    root,
+                    session_id=session_id,
+                    start_seq=1,
+                    end_seq=1,
+                    transaction_guard=fail_final_guard,
+                    transaction_effect=record_step,
+                )
+
+            conn = connect_existing(root)
+            try:
+                counts = {
+                    "segments": int(
+                        conn.execute("SELECT count(*) AS n FROM scroll_segments").fetchone()["n"]
+                    ),
+                    "cards": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM cards WHERE card_type = 'scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "roll_audits": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM audit_events WHERE action = 'roll_scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "step_receipts": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_scribe_segment_step_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "child_jobs": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM queue_jobs WHERE role IN ('librarian', 'archivist')"
+                        ).fetchone()["n"]
+                    ),
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                counts,
+                {
+                    "segments": 0,
+                    "cards": 0,
+                    "roll_audits": 0,
+                    "step_receipts": 0,
+                    "child_jobs": 0,
+                },
+            )
+
+    def test_reclaimed_scribe_attempt_cannot_overlap_segment_effect_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            session_id = "scribe-overlapping-reclaim"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="Only the live Scribe lease may commit this segment.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_roll = worker_module.roll_scroll_segment
+            both_attempts_ready = threading.Barrier(2)
+            first_attempt_ready = threading.Event()
+            results: dict[str, dict] = {}
+
+            def collide_before_store(*args: object, **kwargs: object) -> dict:
+                first_attempt_ready.set()
+                both_attempts_ready.wait(timeout=5.0)
+                return original_roll(*args, **kwargs)
+
+            def run_worker(name: str) -> None:
+                results[name] = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            with patch.object(
+                worker_module,
+                "roll_scroll_segment",
+                side_effect=collide_before_store,
+            ):
+                old_worker = threading.Thread(
+                    target=run_worker,
+                    args=("old",),
+                    daemon=True,
+                )
+                old_worker.start()
+                self.assertTrue(first_attempt_ready.wait(5.0))
+                conn = connect(root)
+                try:
+                    expired = conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET lease_expires_at = '2000-01-01T00:00:00+00:00',
+                            heartbeat_at = '2000-01-01T00:00:00+00:00'
+                        WHERE id = ? AND status = 'running'
+                        """,
+                        (job_id,),
+                    )
+                    conn.commit()
+                    self.assertEqual(expired.rowcount, 1)
+                finally:
+                    conn.close()
+                new_worker = threading.Thread(
+                    target=run_worker,
+                    args=("new",),
+                    daemon=True,
+                )
+                new_worker.start()
+                old_worker.join(10.0)
+                new_worker.join(10.0)
+
+            self.assertFalse(old_worker.is_alive())
+            self.assertFalse(new_worker.is_alive())
+            self.assertFalse(results["old"]["ok"], results)
+            self.assertIn("worker lease lost", results["old"]["processed"][0]["error"])
+            self.assertTrue(results["new"]["ok"], results)
+
+            conn = connect_existing(root)
+            try:
+                job = conn.execute(
+                    "SELECT status, attempt_count FROM queue_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                counts = {
+                    "segments": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "cards": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM cards WHERE card_type = 'scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "roll_audits": int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM audit_events WHERE action = 'roll_scroll_segment'"
+                        ).fetchone()["n"]
+                    ),
+                    "intents": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_scribe_segment_step_intent'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                    "receipts": int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n FROM audit_events
+                            WHERE action = 'worker_job_effect_committed'
+                              AND target_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()["n"]
+                    ),
+                }
+            finally:
+                conn.close()
+            self.assertEqual(job["status"], "succeeded")
+            self.assertEqual(job["attempt_count"], 2)
+            self.assertEqual(
+                counts,
+                {
+                    "segments": 1,
+                    "cards": 1,
+                    "roll_audits": 1,
+                    "intents": 1,
+                    "receipts": 1,
+                },
+            )
+
+    def test_forced_expiry_and_durable_replay_are_fenced_for_every_job_type(self) -> None:
+        job_types = (
+            "scroll_event_ingested",
+            "review_card_placement",
+            "verify_book_integrity",
+            "verify_segment_integrity",
+            "sync_card_sidecar",
+            "review_mempalace_import",
+        )
+
+        def prepare_case(root: Path, job_type: str) -> dict[str, object]:
+            init_db(root)
+            if job_type == "scroll_event_ingested":
+                config = default_config()
+                config["capture"]["roll_segments_every_events"] = 1
+                write_config(root, config)
+                session_id = "forced-expiry-scroll"
+                append_scroll_event(
+                    root,
+                    session_id=session_id,
+                    event_type="message",
+                    role="user",
+                    content="Forced expiry Scroll evidence.",
+                )
+                role = "scribe"
+                payload = {"session_id": session_id}
+                marker_sql = "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?"
+                marker_params = (session_id,)
+            elif job_type == "review_card_placement":
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="decision",
+                        title="Forced expiry placement",
+                        summary="Use fenced placement for durable worker effects.",
+                        source_refs=[],
+                        topics=["fencing"],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                role = "librarian"
+                payload = {"card_id": card_id}
+                marker_sql = (
+                    "SELECT count(*) AS n FROM audit_events "
+                    "WHERE action = 'librarian_review_card' AND target_id = ?"
+                )
+                marker_params = (card_id,)
+            elif job_type == "verify_book_integrity":
+                source = root.parent / "forced-expiry-book.txt"
+                source.write_text("Durable book integrity evidence.\n", encoding="utf-8")
+                ingested = ingest_file(root, path=source)
+                book_id = str(ingested["book_id"])
+                conn = connect(root)
+                try:
+                    expected_hash = str(
+                        conn.execute(
+                            "SELECT content_hash FROM books WHERE id = ?",
+                            (book_id,),
+                        ).fetchone()["content_hash"]
+                    )
+                finally:
+                    conn.close()
+                role = "archivist"
+                payload = {"book_id": book_id, "content_hash": expected_hash}
+                marker_sql = (
+                    "SELECT count(*) AS n FROM audit_events "
+                    "WHERE action = 'archivist_verify_book' AND target_id = ?"
+                )
+                marker_params = (book_id,)
+            elif job_type == "verify_segment_integrity":
+                session_id = "forced-expiry-segment"
+                append_scroll_event(
+                    root,
+                    session_id=session_id,
+                    event_type="message",
+                    role="user",
+                    content="Durable segment integrity evidence.",
+                )
+                segment = roll_scroll_segment(
+                    root,
+                    session_id=session_id,
+                    start_seq=1,
+                    end_seq=1,
+                )
+                segment_id = str(segment["segment_id"])
+                conn = connect(root)
+                try:
+                    expected_hash = str(
+                        conn.execute(
+                            "SELECT segment_hash FROM scroll_segments WHERE id = ?",
+                            (segment_id,),
+                        ).fetchone()["segment_hash"]
+                    )
+                finally:
+                    conn.close()
+                role = "archivist"
+                payload = {"segment_id": segment_id, "segment_hash": expected_hash}
+                marker_sql = (
+                    "SELECT count(*) AS n FROM audit_events "
+                    "WHERE action = 'archivist_verify_segment' AND target_id = ?"
+                )
+                marker_params = (segment_id,)
+            elif job_type == "sync_card_sidecar":
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title="Forced expiry sidecar",
+                        summary="Sidecar writes converge across durable replay.",
+                        source_refs=[],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                role = "archivist"
+                payload = {"card_id": card_id}
+                marker_sql = (
+                    "SELECT count(*) AS n FROM audit_events "
+                    "WHERE action = 'card_sidecar_synced' AND target_id = ?"
+                )
+                marker_params = (card_id,)
+            else:
+                import_id = "forced-expiry-import"
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="mempalace_drawer",
+                        title="Forced expiry MemPalace card",
+                        summary="Graph-placed imported memory.",
+                        source_refs=[],
+                        metadata={"import_id": import_id},
+                    )
+                    card_node = upsert_graph_node(
+                        conn,
+                        kind="card",
+                        label="Forced expiry MemPalace card",
+                        card_id=card_id,
+                    )
+                    term_node = upsert_graph_node(conn, kind="term", label="mempalace")
+                    add_graph_edge(
+                        conn,
+                        source_node_id=card_node,
+                        relation="mentions",
+                        target_node_id=term_node,
+                        weight=0.5,
+                        confidence=0.8,
+                        source_refs=[{"card_id": card_id}],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                role = "archivist"
+                payload = {"import_id": import_id}
+                marker_sql = (
+                    "SELECT count(*) AS n FROM audit_events "
+                    "WHERE action = 'reconcile_graph_placed_card' AND target_id = ?"
+                )
+                marker_params = (card_id,)
+
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role=role,
+                    job_type=job_type,
+                    priority=1,
+                    payload=payload,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return {
+                "role": role,
+                "job_id": job_id,
+                "marker_sql": marker_sql,
+                "marker_params": marker_params,
+            }
+
+        def durable_counts(root: Path, case: dict[str, object]) -> tuple[int, int]:
+            conn = connect_existing(root)
+            try:
+                receipt_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_type = 'queue_job'
+                          AND target_id = ?
+                        """,
+                        (case["job_id"],),
+                    ).fetchone()["n"]
+                )
+                marker_count = int(
+                    conn.execute(
+                        str(case["marker_sql"]),
+                        tuple(case["marker_params"]),
+                    ).fetchone()["n"]
+                )
+                return receipt_count, marker_count
+            finally:
+                conn.close()
+
+        for job_type in job_types:
+            with self.subTest(job_type=job_type), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                case = prepare_case(root, job_type)
+                before_receipts, before_markers = durable_counts(root, case)
+                self.assertEqual(before_receipts, 0)
+                conn = connect_existing(root)
+                try:
+                    schema_before = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    tables_before = {
+                        str(row["name"])
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                finally:
+                    conn.close()
+
+                entered_processor = threading.Event()
+                release_processor = threading.Event()
+                worker_result: dict[str, object] = {}
+                original_process_job = worker_module._process_job
+
+                def pause_after_claim(
+                    worker_root: Path,
+                    job: dict,
+                    **kwargs: object,
+                ) -> dict:
+                    entered_processor.set()
+                    if not release_processor.wait(5.0):
+                        raise TimeoutError("test did not release claimed worker")
+                    return original_process_job(worker_root, job, **kwargs)
+
+                def run_expiring_worker() -> None:
+                    worker_result["result"] = run_worker_pass(
+                        root,
+                        roles=[str(case["role"])],
+                        limit=1,
+                        maintenance=False,
+                    )
+
+                with patch.object(
+                    worker_module,
+                    "_process_job",
+                    side_effect=pause_after_claim,
+                ):
+                    thread = threading.Thread(target=run_expiring_worker, daemon=True)
+                    thread.start()
+                    self.assertTrue(entered_processor.wait(5.0), job_type)
+                    conn = connect(root)
+                    try:
+                        cursor = conn.execute(
+                            """
+                            UPDATE queue_jobs
+                            SET lease_expires_at = '2000-01-01T00:00:00+00:00',
+                                heartbeat_at = '2000-01-01T00:00:00+00:00'
+                            WHERE id = ? AND status = 'running'
+                            """,
+                            (case["job_id"],),
+                        )
+                        conn.commit()
+                        self.assertEqual(cursor.rowcount, 1)
+                    finally:
+                        conn.close()
+                    release_processor.set()
+                    thread.join(10.0)
+                    self.assertFalse(thread.is_alive(), job_type)
+
+                expired_result = worker_result["result"]
+                self.assertFalse(expired_result["ok"], expired_result)
+                self.assertIn(
+                    "worker lease lost",
+                    expired_result["processed"][0]["error"],
+                )
+                self.assertEqual(
+                    durable_counts(root, case),
+                    (0, before_markers),
+                    expired_result,
+                )
+
+                recovered = run_worker_pass(
+                    root,
+                    roles=[str(case["role"])],
+                    limit=1,
+                    maintenance=False,
+                )
+                self.assertTrue(recovered["ok"], recovered)
+                self.assertEqual(recovered["reclaimed_expired_jobs"], 1)
+                self.assertEqual(
+                    durable_counts(root, case),
+                    (1, before_markers + 1),
+                    recovered,
+                )
+
+                # Simulate a crash after the fenced effect transaction committed
+                # but before the queue row reached its terminal state.
+                conn = connect(root)
+                try:
+                    conn.execute("DELETE FROM queue_jobs WHERE id != ?", (case["job_id"],))
+                    conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET status = 'pending', started_at = NULL, finished_at = NULL,
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            heartbeat_at = NULL, error_json = NULL
+                        WHERE id = ?
+                        """,
+                        (case["job_id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                replayed = run_worker_pass(
+                    root,
+                    roles=[str(case["role"])],
+                    limit=1,
+                    maintenance=False,
+                )
+                self.assertTrue(replayed["ok"], replayed)
+                self.assertTrue(
+                    replayed["processed"][0]["result"]["idempotent_replay"],
+                    replayed,
+                )
+                self.assertEqual(
+                    durable_counts(root, case),
+                    (1, before_markers + 1),
+                    replayed,
+                )
+
+                conn = connect_existing(root)
+                try:
+                    self.assertEqual(
+                        int(conn.execute("PRAGMA user_version").fetchone()[0]),
+                        schema_before,
+                    )
+                    tables_after = {
+                        str(row["name"])
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                finally:
+                    conn.close()
+                self.assertEqual(tables_after, tables_before)
+                self.assertIn("audit_events", tables_after)
 
     def test_prune_memory_requires_topic_or_explicit_global_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

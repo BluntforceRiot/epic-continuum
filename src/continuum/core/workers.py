@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import contextvars
+import math
 import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -15,6 +18,7 @@ from .store import (
     add_graph_edge,
     audit_event,
     canonical_partition_identifier,
+    card_sidecar_path,
     connect,
     connect_existing,
     content_hash,
@@ -55,6 +59,94 @@ DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
 MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN = 64
 _WORKER_SERVICE_ROOTS: set[str] = set()
 _WORKER_SERVICE_ROOTS_GUARD = threading.Lock()
+_WORKER_EFFECT_ACTION = "worker_job_effect_committed"
+_WORKER_EFFECT_SCHEMA = "continuum.worker_job_effect.v1"
+_SCRIBE_STEP_ACTION = "worker_scribe_segment_step_intent"
+_SCRIBE_STEP_COMMITTED_ACTION = "worker_scribe_segment_step_committed"
+
+
+class _JobLease:
+    """Durable ownership token for one claimed queue row."""
+
+    def __init__(self, root: Path, job_id: str, lease_owner: str, lease_seconds: int) -> None:
+        self.root = root
+        self.job_id = str(job_id)
+        self.lease_owner = str(lease_owner)
+        self.lease_seconds = max(1, int(lease_seconds))
+
+    def renew(self) -> bool:
+        conn = connect(self.root)
+        try:
+            renewed = _heartbeat_job(
+                conn,
+                self.job_id,
+                lease_owner=self.lease_owner,
+                lease_seconds=self.lease_seconds,
+            )
+            conn.commit()
+            return renewed
+        finally:
+            conn.close()
+
+    def renew_in_transaction(self, conn) -> bool:
+        """Renew using a processor's writer connection without committing it."""
+        return _heartbeat_job(
+            conn,
+            self.job_id,
+            lease_owner=self.lease_owner,
+            lease_seconds=self.lease_seconds,
+        )
+
+    def assert_owned(self, conn) -> None:
+        if not _job_lease_is_owned(conn, self.job_id, lease_owner=self.lease_owner):
+            raise RuntimeError("worker lease lost before committing job effects")
+
+
+_CURRENT_JOB_LEASE: contextvars.ContextVar[_JobLease | None] = contextvars.ContextVar(
+    "continuum_current_job_lease",
+    default=None,
+)
+
+
+def _lease_renewal_interval(lease_seconds: int) -> float:
+    return max(0.05, min(5.0, max(1, int(lease_seconds)) / 3.0))
+
+
+class _JobLeaseRenewer:
+    """Renew a claimed row while arbitrary worker code is executing."""
+
+    def __init__(self, lease: _JobLease) -> None:
+        self.lease = lease
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"continuum-lease-{lease.job_id}",
+            daemon=True,
+        )
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, _lease_renewal_interval(self.lease.lease_seconds) * 2.0))
+
+    def _run(self) -> None:
+        interval = _lease_renewal_interval(self.lease.lease_seconds)
+        while not self._stop.wait(interval):
+            try:
+                if not self.lease.renew():
+                    self._lost.set()
+                    return
+            except Exception:
+                # A transient SQLite busy/error is not proof of lost ownership.
+                # The owning processor and final fenced commit re-check the row.
+                continue
 
 
 def _lease_expiry(seconds: int) -> str:
@@ -232,10 +324,227 @@ def _heartbeat_job(conn, job_id: str, *, lease_owner: str, lease_seconds: int) -
         UPDATE queue_jobs
         SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
         WHERE id = ? AND status = ? AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > ?
         """,
-        (now, expires_at, now, job_id, ACTIVE_JOB_STATUS, lease_owner),
+        (now, expires_at, now, job_id, ACTIVE_JOB_STATUS, lease_owner, now),
     )
     return int(cursor.rowcount or 0) == 1
+
+
+def _job_lease_is_owned(conn, job_id: str, *, lease_owner: str) -> bool:
+    now = utc_now()
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM queue_jobs
+        WHERE id = ?
+          AND status = ?
+          AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > ?
+        """,
+        (job_id, ACTIVE_JOB_STATUS, lease_owner, now),
+    ).fetchone()
+    return row is not None
+
+
+def _prior_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None:
+    if lease is None:
+        return None
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (_WORKER_EFFECT_ACTION, lease.job_id),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json_loads(row["payload_json"], {})
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return None
+    return {**result, "idempotent_replay": True}
+
+
+def _record_worker_effect(
+    conn,
+    lease: _JobLease | None,
+    *,
+    job_type: str,
+    result: dict[str, Any],
+) -> None:
+    if lease is None:
+        return
+    lease.assert_owned(conn)
+    audit_event(
+        conn,
+        action=_WORKER_EFFECT_ACTION,
+        target_type="queue_job",
+        target_id=lease.job_id,
+        payload={
+            "schema": _WORKER_EFFECT_SCHEMA,
+            "job_type": job_type,
+            "result": result,
+        },
+    )
+
+
+def _begin_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None:
+    if lease is None:
+        return None
+    lease.assert_owned(conn)
+    return _prior_worker_effect(conn, lease)
+
+
+def _record_scribe_step_intent(
+    root: Path,
+    lease: _JobLease | None,
+    *,
+    session_id: str,
+    start_seq: int,
+    end_seq: int,
+) -> None:
+    """Bind one deterministic Scribe range to its queue job before store commit."""
+    if lease is None:
+        return
+    step_key = f"{session_id}:{int(start_seq)}:{int(end_seq)}"
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        lease.assert_owned(conn)
+        already_recorded = conn.execute(
+            """
+            SELECT 1
+            FROM audit_events
+            WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.step_key') = ?
+            LIMIT 1
+            """,
+            (_SCRIBE_STEP_ACTION, lease.job_id, step_key),
+        ).fetchone()
+        if already_recorded is None:
+            audit_event(
+                conn,
+                action=_SCRIBE_STEP_ACTION,
+                target_type="queue_job",
+                target_id=lease.job_id,
+                payload={
+                    "schema": "continuum.worker_scribe_segment_step.v1",
+                    "step_key": step_key,
+                    "session_id": session_id,
+                    "start_seq": int(start_seq),
+                    "end_seq": int(end_seq),
+                },
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _record_scribe_step_committed(
+    conn,
+    lease: _JobLease | None,
+    *,
+    session_id: str,
+    start_seq: int,
+    end_seq: int,
+    batch_number: int,
+    result: dict[str, Any],
+) -> None:
+    """Commit one Scribe step receipt atomically with its segment effects."""
+
+    if lease is None:
+        return
+    lease.assert_owned(conn)
+    step_key = f"{session_id}:{int(start_seq)}:{int(end_seq)}"
+    already_recorded = conn.execute(
+        """
+        SELECT 1
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.step_key') = ?
+        LIMIT 1
+        """,
+        (_SCRIBE_STEP_COMMITTED_ACTION, lease.job_id, step_key),
+    ).fetchone()
+    if already_recorded is None:
+        audit_event(
+            conn,
+            action=_SCRIBE_STEP_COMMITTED_ACTION,
+            target_type="queue_job",
+            target_id=lease.job_id,
+            payload={
+                "schema": "continuum.worker_scribe_segment_step_committed.v1",
+                "step_key": step_key,
+                "session_id": session_id,
+                "start_seq": int(start_seq),
+                "end_seq": int(end_seq),
+                "batch_number": int(batch_number),
+                "result": result,
+            },
+        )
+
+
+def _committed_scribe_steps(
+    root: Path,
+    lease: _JobLease | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if lease is None:
+        return [], 0
+    conn = connect(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM audit_events
+            WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+            ORDER BY rowid
+            """,
+            (_SCRIBE_STEP_COMMITTED_ACTION, lease.job_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    committed: list[dict[str, Any]] = []
+    seen_segments: set[str] = set()
+    max_batch_number = 0
+    for row in rows:
+        payload = json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            continue
+        step_result = payload.get("result")
+        if not isinstance(step_result, dict):
+            continue
+        segment_id = str(step_result.get("segment_id") or "")
+        if not segment_id or segment_id in seen_segments:
+            continue
+        seen_segments.add(segment_id)
+        materialized = dict(step_result)
+        card_id = str(materialized.get("card_id") or "")
+        sidecar_path = card_sidecar_path(root, card_id) if card_id else None
+        materialized["card_uri"] = (
+            str(sidecar_path)
+            if sidecar_path is not None and sidecar_path.exists()
+            else None
+        )
+        committed.append(materialized)
+        try:
+            max_batch_number = max(
+                max_batch_number,
+                int(payload.get("batch_number") or 0),
+            )
+        except (TypeError, ValueError):
+            pass
+    return committed, max_batch_number
 
 
 def _finish_job(
@@ -258,8 +567,11 @@ def _finish_job(
         job_id,
     ]
     if lease_owner is not None:
-        where_clause = "WHERE id = ? AND status = ? AND lease_owner = ?"
-        params.extend([ACTIVE_JOB_STATUS, lease_owner])
+        where_clause = (
+            "WHERE id = ? AND status = ? AND lease_owner = ? "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
+        )
+        params.extend([ACTIVE_JOB_STATUS, lease_owner, now])
     cursor = conn.execute(
         f"""
         UPDATE queue_jobs
@@ -565,10 +877,13 @@ def _apply_graph_placed_card_reconciliation(
     cards: list[dict[str, Any]],
     *,
     reason: str,
+    heartbeat: Callable[[], bool] | None = None,
 ) -> list[str]:
     changed: list[str] = []
     now = utc_now()
-    for card in cards:
+    for index, card in enumerate(cards):
+        if heartbeat is not None and index % 64 == 0 and not heartbeat():
+            raise RuntimeError("worker lease lost during MemPalace reconciliation")
         collection, shelf = _legacy_card_placement(card)
         cursor = conn.execute(
             """
@@ -600,6 +915,8 @@ def _apply_graph_placed_card_reconciliation(
             },
             actor="worker",
         )
+    if heartbeat is not None and changed and not heartbeat():
+        raise RuntimeError("worker lease lost during MemPalace reconciliation")
     if changed:
         mark_card_sidecar_outbox(conn, changed, reason=reason)
     return changed
@@ -741,16 +1058,77 @@ def review_mempalace_import(
     init_db(root)
     conn = connect(root)
     changed_cards: list[str] = []
+    lease = _CURRENT_JOB_LEASE.get()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        eligible_before = _count_legacy_card_candidates(conn, import_id=import_id)
-        cards = _legacy_card_candidates(conn, limit=limit, import_id=import_id)
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            conn.commit()
+            return prior
+        candidate_window = _legacy_card_candidates(
+            conn,
+            limit=limit + 1,
+            import_id=import_id,
+        )
+        cards = candidate_window[:limit]
+        has_more = len(candidate_window) > limit
+        eligible_before = len(candidate_window)
         changed_cards = _apply_graph_placed_card_reconciliation(
             conn,
             cards,
             reason="reviewed_mempalace_import",
+            heartbeat=(lambda: lease.renew_in_transaction(conn)) if lease is not None else None,
         )
-        remaining = _count_legacy_card_candidates(conn, import_id=import_id)
+        remaining = max(0, len(candidate_window) - len(cards))
+        complete = not has_more
+        continuation_job_id: str | None = None
+        if not complete:
+            continuation_role = "librarian"
+            continuation_priority = 65
+            if lease is not None:
+                current_job = conn.execute(
+                    "SELECT role, priority FROM queue_jobs WHERE id = ?",
+                    (lease.job_id,),
+                ).fetchone()
+                if current_job is not None:
+                    continuation_role = str(current_job["role"] or continuation_role)
+                    continuation_priority = int(
+                        current_job["priority"]
+                        if current_job["priority"] is not None
+                        else continuation_priority
+                    )
+            continuation_job_id = enqueue_job(
+                conn,
+                role=continuation_role,
+                job_type="review_mempalace_import",
+                priority=continuation_priority,
+                payload={
+                    "import_id": import_id,
+                    "limit": limit,
+                    "reason": "bounded_mempalace_import_continuation",
+                },
+                dedupe_key=f"import:{import_id}",
+                replace_pending=True,
+            )
+        core_result = {
+            "ok": True,
+            "complete": complete,
+            "resumable": not complete,
+            "reviewed_import": import_id,
+            "eligible_before": eligible_before,
+            "eligible_before_is_lower_bound": has_more,
+            "reviewed_cards": len(changed_cards),
+            "remaining_eligible": remaining,
+            "remaining_eligible_is_lower_bound": has_more,
+            "limit": limit,
+            "continuation_job_id": continuation_job_id,
+        }
+        _record_worker_effect(
+            conn,
+            lease,
+            job_type="review_mempalace_import",
+            result=core_result,
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -760,15 +1138,7 @@ def review_mempalace_import(
     sidecars: dict[str, Any] = {"ok": True, "synced": 0, "failed": 0}
     if changed_cards:
         sidecars = sync_card_sidecars_after_commit(root, changed_cards)
-    return {
-        "ok": remaining == 0 and bool(sidecars.get("ok", True)),
-        "reviewed_import": import_id,
-        "eligible_before": eligible_before,
-        "reviewed_cards": len(changed_cards),
-        "remaining_eligible": remaining,
-        "limit": limit,
-        "sidecars": sidecars,
-    }
+    return {**core_result, "ok": bool(core_result["ok"]) and bool(sidecars.get("ok", True)), "sidecars": sidecars}
 
 
 def _last_segment_end(conn, session_id: str) -> int:
@@ -875,6 +1245,20 @@ def roll_due_scroll_segments(
 ) -> dict[str, Any]:
     """Roll eligible Scroll windows, renewing an owning worker lease as needed."""
     init_db(root)
+    lease = _CURRENT_JOB_LEASE.get()
+    if lease is not None:
+        receipt_conn = connect(root)
+        try:
+            receipt_conn.execute("BEGIN IMMEDIATE")
+            prior = _begin_worker_effect(receipt_conn, lease)
+            receipt_conn.commit()
+        except Exception:
+            receipt_conn.rollback()
+            raise
+        finally:
+            receipt_conn.close()
+        if prior is not None:
+            return prior
     config = load_config(root)
     threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
     if session_id:
@@ -938,11 +1322,43 @@ def roll_due_scroll_segments(
             retry_from_fresh_frontier = False
             for run_start, run_end in runs:
                 try:
+                    _record_scribe_step_intent(
+                        root,
+                        lease,
+                        session_id=current_session,
+                        start_seq=run_start,
+                        end_seq=run_end,
+                    )
+                    transaction_effect = None
+                    if lease is not None:
+                        current_lease = lease
+
+                        def transaction_effect(
+                            transaction_conn,
+                            step_result: dict[str, Any],
+                            *,
+                            current_session_id: str = current_session,
+                            current_start_seq: int = run_start,
+                            current_end_seq: int = run_end,
+                            current_batch_number: int = batches_processed,
+                        ) -> None:
+                            _record_scribe_step_committed(
+                                transaction_conn,
+                                current_lease,
+                                session_id=current_session_id,
+                                start_seq=current_start_seq,
+                                end_seq=current_end_seq,
+                                batch_number=current_batch_number,
+                                result=step_result,
+                            )
+
                     result = roll_scroll_segment(
                         root,
                         session_id=current_session,
                         start_seq=run_start,
                         end_seq=run_end,
+                        transaction_guard=(lease.assert_owned if lease is not None else None),
+                        transaction_effect=transaction_effect,
                     )
                     if heartbeat is not None and not heartbeat():
                         raise RuntimeError("worker lease lost during Scribe segmentation")
@@ -975,7 +1391,15 @@ def roll_due_scroll_segments(
             if continuation["continuation_job_id"] is not None:
                 continuations.append({"session_id": current_session, **continuation})
 
-    return {
+    if lease is not None:
+        committed_rolled, committed_batch_number = _committed_scribe_steps(
+            root,
+            lease,
+        )
+        rolled = committed_rolled
+        batches_processed = max(batches_processed, committed_batch_number)
+
+    result = {
         "ok": True,
         "rolled_count": len(rolled),
         "rolled": rolled,
@@ -985,11 +1409,34 @@ def roll_due_scroll_segments(
         "continuations": continuations,
         "concurrent_progress": concurrent_progress,
     }
+    if lease is not None:
+        receipt_conn = connect(root)
+        try:
+            receipt_conn.execute("BEGIN IMMEDIATE")
+            _record_worker_effect(
+                receipt_conn,
+                lease,
+                job_type="scroll_event_ingested",
+                result=result,
+            )
+            receipt_conn.commit()
+        except Exception:
+            receipt_conn.rollback()
+            raise
+        finally:
+            receipt_conn.close()
+    return result
 
 
 def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
     conn = connect(root)
+    lease = _CURRENT_JOB_LEASE.get()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            conn.commit()
+            return prior
         row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
         if row is None:
             return {"ok": False, "reason": "card_missing", "card_id": card_id}
@@ -1024,17 +1471,37 @@ def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
         )
         audit_event(conn, action="librarian_review_card", target_type="card", target_id=card_id, payload={"shelf": shelf})
         mark_card_sidecar_outbox(conn, [card_id], reason="librarian_review_card")
+        core_result = {
+            "ok": True,
+            "card_id": card_id,
+            "shelf": shelf,
+            "term_edges": len(terms[:16]),
+        }
+        _record_worker_effect(
+            conn,
+            lease,
+            job_type="review_card_placement",
+            result=core_result,
+        )
         conn.commit()
         sync_card_sidecars_after_commit(root, [card_id])
         conflict = detect_conflicts(root, card_id=card_id, limit=10)
-        return {"ok": True, "card_id": card_id, "shelf": shelf, "term_edges": len(terms[:16]), "conflicts": conflict}
+        return {**core_result, "conflicts": conflict}
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str | None = None) -> dict[str, Any]:
     conn = connect(root)
+    lease = _CURRENT_JOB_LEASE.get()
     try:
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            return prior
         row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         if row is None:
             return {"ok": False, "reason": "book_missing", "book_id": book_id}
@@ -1067,6 +1534,14 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
             metadata["last_original_sha256"] = actual_original_hash
         if actual_reader_hash:
             metadata["last_reader_text_hash"] = actual_reader_hash
+        # Hashing can be arbitrarily slow for large archives. Do it without a
+        # SQLite writer lock so the generic lease-renewal thread can keep this
+        # job alive, then fence the small durable-effect transaction again.
+        conn.execute("BEGIN IMMEDIATE")
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            conn.commit()
+            return prior
         conn.execute(
             """
             UPDATE books
@@ -1082,21 +1557,36 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
             target_id=book_id,
             payload={"ok": ok, "reason": reason, "checked_original": bool(original_path and original_path.exists())},
         )
-        conn.commit()
-        return {
+        result = {
             "ok": ok,
             "book_id": book_id,
             "reason": reason,
             "checked_original": bool(original_path and original_path.exists()),
             "checked_reader": bool((not original_path or not original_path.exists()) and reader_path and reader_path.exists()),
         }
+        _record_worker_effect(
+            conn,
+            lease,
+            job_type="verify_book_integrity",
+            result=result,
+        )
+        conn.commit()
+        return result
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def verify_segment_integrity(root: Path, *, segment_id: str, segment_hash: str | None = None) -> dict[str, Any]:
     conn = connect(root)
+    lease = _CURRENT_JOB_LEASE.get()
     try:
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            return prior
         row = conn.execute("SELECT * FROM scroll_segments WHERE id = ?", (segment_id,)).fetchone()
         if row is None:
             return {"ok": False, "reason": "segment_missing", "segment_id": segment_id}
@@ -1120,6 +1610,13 @@ def verify_segment_integrity(root: Path, *, segment_id: str, segment_hash: str |
         segment_hash_ok = actual == expected or legacy_actual == expected
         ok = segment_hash_ok and not event_hash_mismatches
         reason = "ok" if ok else ("scroll_event_hash_mismatch" if event_hash_mismatches else "segment_hash_mismatch")
+        # Keep event hashing out of the writer transaction for the same reason
+        # as book hashing above; ownership is re-checked under the write lock.
+        conn.execute("BEGIN IMMEDIATE")
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            conn.commit()
+            return prior
         audit_event(
             conn,
             action="archivist_verify_segment",
@@ -1127,14 +1624,25 @@ def verify_segment_integrity(root: Path, *, segment_id: str, segment_hash: str |
             target_id=segment_id,
             payload={"ok": ok, "event_count": len(events), "reason": reason, "event_hash_mismatch_count": len(event_hash_mismatches)},
         )
-        conn.commit()
-        return {
+        result = {
             "ok": ok,
             "segment_id": segment_id,
             "reason": reason,
             "event_hash_mismatch_count": len(event_hash_mismatches),
             "event_hash_mismatches": event_hash_mismatches[:10],
         }
+        _record_worker_effect(
+            conn,
+            lease,
+            job_type="verify_segment_integrity",
+            result=result,
+        )
+        conn.commit()
+        return result
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1277,6 +1785,745 @@ def decay_graph_routes(root: Path, *, limit: int = 200, prune_threshold: int = 3
 _CONFLICT_NEGATION_MARKERS = (" not ", " no ", "never", "disable", "removed")
 _CONFLICT_DISMISSAL_METADATA_KEY = "dismissed_conflict_components"
 _MAX_CONFLICT_DISMISSALS_PER_CARD = 8
+_CONFLICT_SCAN_CURSOR_ACTION = "librarian_conflict_scan_cursor"
+_CONFLICT_REVIEW_REQUIRED_ACTION = "librarian_conflict_review_required"
+MAX_CONFLICT_CANDIDATE_CARDS = 512
+MAX_CONFLICT_COMPARISONS = 130816  # 512 choose 2
+MAX_CONFLICT_CARD_MUTATIONS = 512
+MAX_CONFLICT_COMPONENT_MEMBERS = 512
+MAX_CONFLICT_TRANSACTION_SECONDS = 5.0
+
+
+def _ensure_conflict_indexes(root: Path) -> None:
+    """Install additive indexes before opening the bounded writer transaction."""
+    conn = connect(root)
+    try:
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_conflict_group
+            ON cards(conflict_group)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary
+            ON cards(lower(trim(title)), visibility_scope, project_id, session_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary_normalized
+            ON cards(
+                lower(trim(title)),
+                coalesce(visibility_scope, 'session'),
+                coalesce(project_id, ''),
+                coalesce(session_id, '')
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary
+            ON cards(
+                coalesce(visibility_scope, 'session'),
+                coalesce(project_id, ''),
+                coalesce(session_id, '')
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary_direct
+            ON cards(visibility_scope, project_id, session_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cards_supersedes_card_id
+            ON cards(supersedes_card_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_events_action_target
+            ON audit_events(action, target_type, target_id, created_at)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class _ConflictWorkBudget:
+    def __init__(
+        self,
+        *,
+        candidate_cards: int,
+        comparisons: int,
+        component_members: int,
+        card_mutations: int,
+        transaction_seconds: float,
+    ) -> None:
+        self.candidate_card_limit = max(1, min(int(candidate_cards), MAX_CONFLICT_CANDIDATE_CARDS))
+        self.comparison_limit = max(1, min(int(comparisons), MAX_CONFLICT_COMPARISONS))
+        self.component_member_limit = max(
+            1,
+            min(int(component_members), MAX_CONFLICT_COMPONENT_MEMBERS),
+        )
+        self.card_mutation_limit = max(1, min(int(card_mutations), MAX_CONFLICT_CARD_MUTATIONS))
+        self.transaction_seconds = max(
+            0.01,
+            min(float(transaction_seconds), MAX_CONFLICT_TRANSACTION_SECONDS),
+        )
+        self.started = time.monotonic()
+        self.deadline = self.started + self.transaction_seconds
+        self.finished: float | None = None
+        self.candidate_cards = 0
+        self.comparisons = 0
+        self.component_members = 0
+        self.card_mutations = 0
+        self.candidate_exhausted = False
+        self.comparison_exhausted = False
+        self.component_member_exhausted = False
+        self.card_mutation_exhausted = False
+        self.time_exhausted = False
+
+    def start_transaction(self) -> None:
+        self.started = time.monotonic()
+        self.deadline = self.started + self.transaction_seconds
+        self.finished = None
+
+    def finish_transaction(self) -> None:
+        self.finished = time.monotonic()
+        if self.finished > self.deadline:
+            self.time_exhausted = True
+
+    def has_time(self) -> bool:
+        if time.monotonic() <= self.deadline:
+            return True
+        self.time_exhausted = True
+        return False
+
+    def consume_comparison(self) -> bool:
+        if self.comparisons >= self.comparison_limit:
+            self.comparison_exhausted = True
+            return False
+        if not self.has_time():
+            return False
+        self.comparisons += 1
+        return True
+
+    def consume_component_member(self) -> bool:
+        if self.component_members >= self.component_member_limit:
+            self.component_member_exhausted = True
+            return False
+        if not self.has_time():
+            return False
+        self.component_members += 1
+        return True
+
+    def can_mutate(self, count: int) -> bool:
+        if count < 0:
+            return False
+        if self.card_mutations + count > self.card_mutation_limit:
+            self.card_mutation_exhausted = True
+            return False
+        return self.has_time()
+
+    def record_mutations(self, count: int) -> None:
+        self.card_mutations += max(0, int(count))
+
+    def result(self) -> dict[str, Any]:
+        elapsed = max(
+            0.0,
+            (self.finished if self.finished is not None else time.monotonic())
+            - self.started,
+        )
+        return {
+            "limits": {
+                "candidate_cards": self.candidate_card_limit,
+                "comparisons": self.comparison_limit,
+                "component_members": self.component_member_limit,
+                "card_mutations": self.card_mutation_limit,
+                "transaction_seconds": self.transaction_seconds,
+            },
+            "used": {
+                "candidate_cards": self.candidate_cards,
+                "comparisons": self.comparisons,
+                "component_members": self.component_members,
+                "card_mutations": self.card_mutations,
+                # A deadline abort may be observed just after the configured
+                # instant.  Work-budget consumption is capped at the declared
+                # allowance; the observed duration remains available below.
+                "transaction_seconds": round(min(elapsed, self.transaction_seconds), 6),
+            },
+            "observed_transaction_seconds": round(elapsed, 6),
+            "time_exhausted": self.time_exhausted,
+            "exhausted": {
+                "candidate_cards": self.candidate_exhausted,
+                "comparisons": self.comparison_exhausted,
+                "component_members": self.component_member_exhausted,
+                "card_mutations": self.card_mutation_exhausted,
+                "transaction_seconds": self.time_exhausted,
+            },
+        }
+
+
+class _ConflictDeadlineExceeded(RuntimeError):
+    """Internal signal used to roll back an over-deadline conflict pass."""
+
+
+def _require_conflict_time(budget: _ConflictWorkBudget) -> None:
+    if not budget.has_time():
+        raise _ConflictDeadlineExceeded("conflict work deadline exceeded")
+
+
+def _install_conflict_deadline_progress(conn, budget: _ConflictWorkBudget) -> None:
+    """Interrupt one long SQLite statement when the conflict deadline expires."""
+
+    def cancel_after_deadline() -> int:
+        return 0 if budget.has_time() else 1
+
+    conn.set_progress_handler(cancel_after_deadline, 100)
+
+
+def _conflict_work_budget(
+    component_limit: int,
+    *,
+    candidate_card_limit: int | None,
+    comparison_limit: int | None,
+    component_member_limit: int | None,
+    mutation_limit: int | None,
+    transaction_seconds: float | None,
+) -> _ConflictWorkBudget:
+    components = max(1, int(component_limit))
+    requested_candidates = candidate_card_limit or max(32, min(MAX_CONFLICT_CANDIDATE_CARDS, components * 8))
+    requested_comparisons = comparison_limit or min(
+        MAX_CONFLICT_COMPARISONS,
+        requested_candidates * (requested_candidates - 1) // 2,
+    )
+    # Always make the selected set small enough that a complete worst-case pair
+    # pass fits the comparison budget. This prevents partial adjacency from being
+    # mistaken for a complete conflict component.
+    max_candidates_for_comparisons = max(
+        2,
+        int((1 + math.isqrt(1 + (8 * max(1, int(requested_comparisons))))) // 2),
+    )
+    effective_candidates = min(int(requested_candidates), max_candidates_for_comparisons)
+    return _ConflictWorkBudget(
+        candidate_cards=effective_candidates,
+        comparisons=requested_comparisons,
+        component_members=component_member_limit or effective_candidates,
+        card_mutations=mutation_limit or effective_candidates,
+        transaction_seconds=(
+            MAX_CONFLICT_TRANSACTION_SECONDS
+            if transaction_seconds is None
+            else transaction_seconds
+        ),
+    )
+
+
+def _latest_conflict_scan_cursor(conn, *, card_id: str | None) -> int:
+    target_id = str(card_id) if card_id else "global"
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'conflict_scan' AND target_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+        """,
+        (_CONFLICT_SCAN_CURSOR_ACTION, target_id),
+    ).fetchone()
+    payload = json_loads(row["payload_json"], {}) if row is not None else {}
+    try:
+        return max(0, int(payload.get("next_rowid", 0))) if isinstance(payload, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rows_by_ids(conn, card_ids: list[str]) -> list[Any]:
+    if not card_ids:
+        return []
+    placeholders = ",".join("?" for _ in card_ids)
+    return conn.execute(
+        f"SELECT rowid AS card_rowid, * FROM cards WHERE id IN ({placeholders}) ORDER BY rowid",
+        card_ids,
+    ).fetchall()
+
+
+def _current_ids_for_rows(
+    conn,
+    rows: list[Any],
+    *,
+    budget: _ConflictWorkBudget,
+) -> set[str]:
+    card_ids = [str(row["id"]) for row in rows]
+    if not card_ids:
+        return set()
+    # One indexed existence probe per selected Card is enough.  Returning every
+    # successor row allowed one selected predecessor with an arbitrarily large
+    # fan-out to escape the candidate budget.
+    referenced: set[str] = set()
+    for card_id in card_ids:
+        _require_conflict_time(budget)
+        if conn.execute(
+            """
+            SELECT 1
+            FROM cards
+            WHERE supersedes_card_id = ?
+            LIMIT 1
+            """,
+            (card_id,),
+        ).fetchone() is not None:
+            referenced.add(card_id)
+    return {
+        str(row["id"])
+        for row in rows
+        if str(row["status"] or "").casefold() not in NON_CURRENT_CARD_STATUSES
+        and not str(row["superseded_by_card_id"] or "").strip()
+        and str(row["id"]) not in referenced
+    }
+
+
+def _bounded_card_count(
+    conn,
+    *,
+    where_clause: str,
+    params: tuple[Any, ...],
+    selected_count: int,
+    budget: _ConflictWorkBudget,
+) -> int:
+    """Count only far enough to prove selected rows are or are not closed."""
+
+    _require_conflict_time(budget)
+    probe_limit = max(1, int(selected_count) + 1)
+    row = conn.execute(
+        f"""
+        SELECT count(*) AS n
+        FROM (
+            SELECT 1
+            FROM cards
+            WHERE {where_clause}
+            LIMIT ?
+        ) AS bounded_conflict_closure
+        """,
+        (*params, probe_limit),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _complete_conflict_groups(
+    conn,
+    rows: list[Any],
+    *,
+    budget: _ConflictWorkBudget,
+) -> set[str]:
+    selected_counts: dict[str, int] = {}
+    for row in rows:
+        group = str(row["conflict_group"] or "").strip()
+        if group:
+            selected_counts[group] = selected_counts.get(group, 0) + 1
+    if not selected_counts:
+        return set()
+    return {
+        group
+        for group, count in selected_counts.items()
+        if _bounded_card_count(
+            conn,
+            where_clause="conflict_group = ?",
+            params=(group,),
+            selected_count=count,
+            budget=budget,
+        )
+        == count
+    }
+
+
+def _conflict_boundary_clause(
+    boundary: tuple[str, str, str],
+) -> tuple[str, tuple[Any, ...]]:
+    if boundary[0] == "project":
+        return "visibility_scope = 'project' AND project_id = ?", (boundary[1],)
+    if boundary[0] == "global":
+        return "visibility_scope = 'global'", ()
+    return (
+        "coalesce(visibility_scope, 'session') = ? "
+        "AND coalesce(project_id, '') = ? AND coalesce(session_id, '') = ?",
+        boundary,
+    )
+
+
+def _conflict_index_boundary_clause(
+    boundary: tuple[str, str, str],
+) -> tuple[str, tuple[Any, ...], str]:
+    """Return an expression-index-compatible boundary and stable row order."""
+
+    scope, project_id, session_id = boundary
+    base = (
+        "coalesce(visibility_scope, 'session') = ? "
+        "AND coalesce(project_id, '') = ?"
+    )
+    if scope in {"project", "global"}:
+        return (
+            base,
+            (scope, project_id),
+            "coalesce(session_id, ''), rowid",
+        )
+    return (
+        f"{base} AND coalesce(session_id, '') = ?",
+        (scope, project_id, session_id),
+        "rowid",
+    )
+
+
+def _complete_conflict_boundaries(
+    conn,
+    rows: list[Any],
+    *,
+    budget: _ConflictWorkBudget,
+) -> set[tuple[str, str, str]]:
+    selected_counts: dict[tuple[str, str, str], int] = {}
+    for row in rows:
+        boundary = _conflict_boundary(row)
+        selected_counts[boundary] = selected_counts.get(boundary, 0) + 1
+    complete: set[tuple[str, str, str]] = set()
+    for boundary, selected_count in selected_counts.items():
+        clause, params = _conflict_boundary_clause(boundary)
+        actual_count = _bounded_card_count(
+            conn,
+            where_clause=clause,
+            params=params,
+            selected_count=selected_count,
+            budget=budget,
+        )
+        if actual_count == selected_count:
+            complete.add(boundary)
+    return complete
+
+
+def _complete_conflict_titles(
+    conn,
+    rows: list[Any],
+    *,
+    budget: _ConflictWorkBudget,
+) -> set[tuple[tuple[str, str, str], str]]:
+    selected_counts: dict[tuple[tuple[str, str, str], str], int] = {}
+    for row in rows:
+        title = _conflict_title_key(row["title"])
+        if not title:
+            continue
+        key = (_conflict_boundary(row), title)
+        selected_counts[key] = selected_counts.get(key, 0) + 1
+    complete: set[tuple[tuple[str, str, str], str]] = set()
+    for (boundary, title), selected_count in selected_counts.items():
+        clause, params, _order_by = _conflict_index_boundary_clause(boundary)
+        actual_count = _bounded_card_count(
+            conn,
+            where_clause=f"lower(trim(title)) = ? AND {clause}",
+            params=(title, *params),
+            selected_count=selected_count,
+            budget=budget,
+        )
+        if actual_count == selected_count:
+            complete.add((boundary, title))
+    return complete
+
+
+def _bounded_conflict_rows(
+    conn,
+    *,
+    card_id: str | None,
+    cursor: int,
+    budget: _ConflictWorkBudget,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Load one fair anchor plus its whole bounded durable/text closure.
+
+    Optional cursor noise must never occupy slots needed by the anchor's exact
+    title or durable conflict group.  Otherwise a component whose size equals
+    the candidate ceiling can be fragmented forever by unrelated rows.
+    """
+
+    candidate_limit = budget.candidate_card_limit
+    requested_cursor = 0 if card_id else max(0, int(cursor))
+
+    def transitive_closure(seed_rows: list[Any]) -> list[Any]:
+        closure: dict[str, Any] = {
+            str(row["id"]): row for row in seed_rows
+        }
+        pending = sorted(
+            closure.values(), key=lambda row: int(row["card_rowid"])
+        )
+        expanded_groups: set[str] = set()
+        expanded_titles: set[tuple[tuple[str, str, str], str]] = set()
+        while pending and len(closure) <= candidate_limit:
+            current = pending.pop(0)
+            related_sets: list[list[Any]] = []
+            group = str(current["conflict_group"] or "").strip()
+            if group and group not in expanded_groups:
+                expanded_groups.add(group)
+                related_sets.append(
+                    conn.execute(
+                        """
+                        SELECT rowid AS card_rowid, *
+                        FROM cards
+                        WHERE conflict_group = ?
+                        ORDER BY rowid
+                        LIMIT ?
+                        """,
+                        (group, candidate_limit + 1),
+                    ).fetchall()
+                )
+            title = _conflict_title_key(current["title"])
+            title_key = (_conflict_boundary(current), title)
+            if title and title_key not in expanded_titles:
+                expanded_titles.add(title_key)
+                boundary_clause, boundary_params, boundary_order = (
+                    _conflict_index_boundary_clause(title_key[0])
+                )
+                related_sets.append(
+                    conn.execute(
+                        f"""
+                        SELECT rowid AS card_rowid, *
+                        FROM cards
+                        WHERE lower(trim(title)) = ? AND {boundary_clause}
+                        ORDER BY {boundary_order}
+                        LIMIT ?
+                        """,
+                        (title, *boundary_params, candidate_limit + 1),
+                    ).fetchall()
+                )
+            for related_rows in related_sets:
+                for row in related_rows:
+                    row_id = str(row["id"])
+                    if row_id in closure:
+                        continue
+                    closure[row_id] = row
+                    pending.append(row)
+                    if len(closure) > candidate_limit:
+                        break
+                if len(closure) > candidate_limit:
+                    break
+        return sorted(
+            closure.values(), key=lambda item: int(item["card_rowid"])
+        )
+
+    anchor_wrapped = False
+    if card_id:
+        anchor = conn.execute(
+            "SELECT rowid AS card_rowid, * FROM cards WHERE id = ?",
+            (str(card_id),),
+        ).fetchone()
+    else:
+        anchor = conn.execute(
+            """
+            SELECT rowid AS card_rowid, *
+            FROM cards
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT 1
+            """,
+            (requested_cursor,),
+        ).fetchone()
+        if anchor is None and requested_cursor > 0:
+            anchor = conn.execute(
+                """
+                SELECT rowid AS card_rowid, *
+                FROM cards
+                WHERE rowid <= ?
+                ORDER BY rowid
+                LIMIT 1
+                """,
+                (requested_cursor,),
+            ).fetchone()
+            anchor_wrapped = anchor is not None
+    if anchor is None:
+        return [], {
+            "cursor": requested_cursor,
+            "next_cursor": 0,
+            "has_more": False,
+            "wrapped": False,
+            "base_candidate_count": 0,
+            "required_candidate_cards_lower_bound": 0,
+            "manual_review_required": False,
+            "manual_review_reason": None,
+            "optional_boundary_overflow": False,
+            "anchor_card_id": None,
+            "anchor_identity_hash": None,
+        }
+
+    closure_rows = transitive_closure([anchor])
+    required_candidate_cards_lower_bound = (
+        len(closure_rows) if len(closure_rows) > candidate_limit else 0
+    )
+    selected: dict[str, Any] = {
+        str(row["id"]): row for row in closure_rows[:candidate_limit]
+    }
+    remaining = max(0, candidate_limit - len(selected))
+    optional_rows: list[Any] = []
+    wrapped = anchor_wrapped
+    has_more = required_candidate_cards_lower_bound > candidate_limit
+    optional_boundary_overflow = False
+
+    if not has_more:
+        if card_id:
+            scope_clause, scope_params, optional_order = (
+                _conflict_index_boundary_clause(_conflict_boundary(anchor))
+            )
+            # Targeted optional pages are single-pass only; legacy cursor state
+            # cannot accumulate fuzzy evidence and would defeat the index order.
+            optional_cursor = 0
+        else:
+            scope_clause, scope_params, optional_order = "1 = 1", (), "rowid"
+            optional_cursor = int(anchor["card_rowid"])
+        excluded_ids = sorted(selected)
+        placeholders = ",".join("?" for _ in excluded_ids)
+        exclusion_clause = (
+            f" AND id NOT IN ({placeholders})" if excluded_ids else ""
+        )
+
+        after_rows = conn.execute(
+            f"""
+            SELECT rowid AS card_rowid, *
+            FROM cards
+            WHERE {scope_clause} AND rowid > ?{exclusion_clause}
+            ORDER BY {optional_order}
+            LIMIT ?
+            """,
+            (*scope_params, optional_cursor, *excluded_ids, remaining + 1),
+        ).fetchall()
+        optional_rows.extend(after_rows[:remaining])
+        has_more = len(after_rows) > remaining
+        wrap_capacity = max(0, remaining - len(optional_rows))
+        if not has_more and optional_cursor > 0:
+            wrap_rows = conn.execute(
+                f"""
+                SELECT rowid AS card_rowid, *
+                FROM cards
+                WHERE {scope_clause} AND rowid <= ?{exclusion_clause}
+                ORDER BY {optional_order}
+                LIMIT ?
+                """,
+                (*scope_params, optional_cursor, *excluded_ids, wrap_capacity + 1),
+            ).fetchall()
+            wrapped = wrapped or bool(wrap_rows)
+            optional_rows.extend(wrap_rows[:wrap_capacity])
+            has_more = len(wrap_rows) > wrap_capacity
+        for row in optional_rows:
+            selected[str(row["id"])] = row
+
+        if card_id and not has_more and optional_rows:
+            expanded_rows = transitive_closure(list(selected.values()))
+            if len(expanded_rows) > candidate_limit:
+                required_candidate_cards_lower_bound = max(
+                    required_candidate_cards_lower_bound,
+                    len(expanded_rows),
+                )
+                selected = {
+                    str(row["id"]): row
+                    for row in expanded_rows[:candidate_limit]
+                }
+                has_more = True
+            else:
+                selected = {str(row["id"]): row for row in expanded_rows}
+
+    if (
+        card_id
+        and required_candidate_cards_lower_bound <= candidate_limit
+        and has_more
+    ):
+        # Targeted optional pages are not accumulated across calls, so cycling
+        # them cannot prove a fuzzy cross-title component. Keep optional rows
+        # only when the entire boundary fits this pass. The writer phase below
+        # defers the whole targeted result when these rows do not fit.
+        selected = {
+            str(row["id"]): row for row in closure_rows[:candidate_limit]
+        }
+        optional_rows = []
+        optional_boundary_overflow = True
+        has_more = False
+        wrapped = False
+
+    if card_id:
+        if required_candidate_cards_lower_bound > candidate_limit:
+            next_cursor = requested_cursor
+        else:
+            # Targeted evidence is either complete in this pass or explicitly
+            # escalated below; non-accumulating optional pages have no cursor.
+            next_cursor = 0
+    else:
+        # Advance one fair anchor at a time. Optional rows are evidence for this
+        # pass, not permission to skip their future closure turn.
+        next_cursor = int(anchor["card_rowid"]) if has_more else 0
+
+    rows = sorted(selected.values(), key=lambda row: int(row["card_rowid"]))
+    budget.candidate_cards = len(rows)
+    budget.candidate_exhausted = has_more
+    manual_review_required = (
+        required_candidate_cards_lower_bound > MAX_CONFLICT_CANDIDATE_CARDS
+    )
+    anchor_group = str(anchor["conflict_group"] or "").strip()
+    anchor_identity = (
+        {
+            "schema": "continuum.conflict_anchor.v1",
+            "durable_group": anchor_group,
+        }
+        if anchor_group
+        else {
+            "schema": "continuum.conflict_anchor.v1",
+            "boundary": list(_conflict_boundary(anchor)),
+            "title_key": _conflict_title_key(anchor["title"]),
+        }
+    )
+    anchor_identity_hash = content_hash(
+        json_dumps(anchor_identity)
+    )
+    return rows, {
+        "cursor": requested_cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "wrapped": wrapped,
+        "base_candidate_count": 1,
+        "required_candidate_cards_lower_bound": required_candidate_cards_lower_bound,
+        "manual_review_required": manual_review_required,
+        "manual_review_reason": (
+            "component_exceeds_automatic_candidate_limit"
+            if manual_review_required
+            else None
+        ),
+        "optional_boundary_overflow": optional_boundary_overflow,
+        "anchor_card_id": str(anchor["id"]),
+        "anchor_identity_hash": anchor_identity_hash,
+    }
+
+
+def _assert_bounded_supersession_dag(rows: list[Any]) -> None:
+    card_ids = {str(row["id"]) for row in rows}
+    edges: dict[str, set[str]] = {card_id: set() for card_id in card_ids}
+    for row in rows:
+        card_id = str(row["id"])
+        superseded_by = str(row["superseded_by_card_id"] or "").strip()
+        supersedes = str(row["supersedes_card_id"] or "").strip()
+        if superseded_by in card_ids:
+            edges[card_id].add(superseded_by)
+        if supersedes in card_ids:
+            edges[supersedes].add(card_id)
+    incoming = {card_id: 0 for card_id in edges}
+    for targets in edges.values():
+        for target in targets:
+            incoming[target] += 1
+    ready = [card_id for card_id, count in incoming.items() if count == 0]
+    visited = 0
+    while ready:
+        card_id = ready.pop()
+        visited += 1
+        for target in edges[card_id]:
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                ready.append(target)
+    if visited != len(edges):
+        cyclic = sorted(card_id for card_id, count in incoming.items() if count > 0)
+        raise ValueError(f"supersession graph must be acyclic; cycle involves: {', '.join(cyclic)}")
 
 
 def _load_temporal_card_state(conn) -> tuple[list[Any], dict[str, Any], set[str]]:
@@ -1368,8 +2615,20 @@ def _conflict_boundary(card: Any) -> tuple[str, str, str]:
     return (scope, project_id, session_id)
 
 
+_ASCII_TITLE_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def _conflict_title_key(value: Any) -> str:
+    """Match SQLite's indexed ``lower(trim(title))`` normalization exactly."""
+
+    return str(value or "").strip(" ").translate(_ASCII_TITLE_LOWER)
+
+
 def _conflict_signature(card: Any) -> dict[str, Any]:
-    title = str(card["title"] or "").casefold().strip()
+    title = _conflict_title_key(card["title"])
     summary = " ".join(str(card["summary"] or "").casefold().split())
     metadata = json_loads(card["metadata_json"], {})
     if not isinstance(metadata, dict):
@@ -1451,36 +2710,20 @@ def _append_conflict_dismissal(
     return json_dumps(metadata)
 
 
-def _conflict_adjacency(cards: list[Any]) -> dict[str, set[str]]:
+def _conflict_adjacency(
+    cards: list[Any],
+    *,
+    budget: _ConflictWorkBudget,
+    complete_groups: set[str],
+    boundary_complete: bool,
+) -> tuple[dict[str, set[str]], bool]:
     by_id = {str(card["id"]): card for card in cards}
     signatures = {card_id: _conflict_signature(card) for card_id, card in by_id.items()}
-    term_members: dict[str, set[str]] = {}
-    anchor_members: dict[str, set[str]] = {}
-    title_members: dict[str, set[str]] = {}
     existing_group_members: dict[str, set[str]] = {}
-    for card_id, signature in signatures.items():
-        for term in signature["term_set"]:
-            term_members.setdefault(term, set()).add(card_id)
-        if signature["anchor"]:
-            anchor_members.setdefault(signature["anchor"], set()).add(card_id)
-        if signature["title"]:
-            title_members.setdefault(signature["title"], set()).add(card_id)
+    for card_id in signatures:
         existing_group = str(by_id[card_id]["conflict_group"] or "").strip()
-        if existing_group:
+        if existing_group and existing_group in complete_groups:
             existing_group_members.setdefault(existing_group, set()).add(card_id)
-
-    potential_pairs: set[tuple[str, str]] = set()
-    for card_id, signature in signatures.items():
-        peers: set[str] = set(title_members.get(signature["title"], set()))
-        if signature["anchor"]:
-            peers.update(term_members.get(signature["anchor"], set()))
-        for term in signature["term_set"]:
-            peers.update(anchor_members.get(term, set()))
-        for peer_id in peers:
-            if peer_id != card_id:
-                potential_pairs.add(
-                    (card_id, peer_id) if card_id < peer_id else (peer_id, card_id)
-                )
 
     adjacency: dict[str, set[str]] = {card_id: set() for card_id in by_id}
     # Existing group membership is durable review state. Treat it as an edge so
@@ -1490,38 +2733,57 @@ def _conflict_adjacency(cards: list[Any]) -> dict[str, set[str]]:
         if len(members) < 2:
             continue
         anchor_id = min(members)
-        for member_id in members - {anchor_id}:
+        for member_id in sorted(members - {anchor_id}):
             adjacency[anchor_id].add(member_id)
             adjacency[member_id].add(anchor_id)
-    for left_id, right_id in sorted(potential_pairs):
-        left = signatures[left_id]
-        right = signatures[right_id]
-        if not _conflict_card_types_compatible(left["card_type"], right["card_type"]):
-            continue
-        # Sequential project-state Cards from one agent are ordered checkpoints,
-        # not competing claims. Cross-agent checkpoints may still disagree and
-        # must remain eligible for conflict detection. Any durable group
-        # explicitly assigned by a reviewer is still preserved above.
-        if (
-            left["card_type"] == right["card_type"] == "project_state"
-            and left["agent_id"]
-            and left["agent_id"] == right["agent_id"]
-        ):
-            continue
-        if left["title"] == right["title"] and left["summary"] == right["summary"]:
-            continue
-        concept_match = (
-            left["anchor"] in right["term_set"]
-            or right["anchor"] in left["term_set"]
-            or left["title"] == right["title"]
-        )
-        if not concept_match:
-            continue
-        if left["negative"] == right["negative"] and left["title"] != right["title"]:
-            continue
-        adjacency[left_id].add(right_id)
-        adjacency[right_id].add(left_id)
-    return adjacency
+
+    ordered_ids = sorted(by_id, key=lambda card_id: int(by_id[card_id]["card_rowid"]))
+    for left_index, left_id in enumerate(ordered_ids):
+        for right_id in ordered_ids[left_index + 1 :]:
+            if not budget.consume_comparison():
+                return adjacency, False
+            left = signatures[left_id]
+            right = signatures[right_id]
+            # The indexed candidate loader supplies exact-title peers globally;
+            # other comparisons stay bounded to this fair cursor window.
+            potential_pair = (
+                left["title"] == right["title"]
+                or (
+                    boundary_complete
+                    and (
+                        left["anchor"] in right["term_set"]
+                        or right["anchor"] in left["term_set"]
+                    )
+                )
+            )
+            if not potential_pair:
+                continue
+            if not _conflict_card_types_compatible(left["card_type"], right["card_type"]):
+                continue
+            # Sequential project-state Cards from one agent are ordered checkpoints,
+            # not competing claims. Cross-agent checkpoints may still disagree and
+            # must remain eligible for conflict detection. Any durable group
+            # explicitly assigned by a reviewer is still preserved above.
+            if (
+                left["card_type"] == right["card_type"] == "project_state"
+                and left["agent_id"]
+                and left["agent_id"] == right["agent_id"]
+            ):
+                continue
+            if left["title"] == right["title"] and left["summary"] == right["summary"]:
+                continue
+            concept_match = (
+                left["anchor"] in right["term_set"]
+                or right["anchor"] in left["term_set"]
+                or left["title"] == right["title"]
+            )
+            if not concept_match:
+                continue
+            if left["negative"] == right["negative"] and left["title"] != right["title"]:
+                continue
+            adjacency[left_id].add(right_id)
+            adjacency[right_id].add(left_id)
+    return adjacency, True
 
 
 def _clear_orphan_conflict_groups(
@@ -1530,25 +2792,40 @@ def _clear_orphan_conflict_groups(
     rows: list[Any],
     current_ids: set[str],
     now: str,
-) -> tuple[set[str], set[str]]:
+    budget: _ConflictWorkBudget,
+    complete_groups: set[str],
+) -> tuple[set[str], set[str], int]:
     grouped: dict[str, list[str]] = {}
     by_id = {str(row["id"]): row for row in rows}
     touched: set[str] = set()
     cleared_groups: set[str] = set()
+    deferred_groups = 0
     for row in rows:
+        if not budget.has_time():
+            break
         card_id = str(row["id"])
         group = str(row["conflict_group"] or "").strip()
         if row["conflict_group"] is not None and not group:
+            if not budget.can_mutate(1):
+                deferred_groups += 1
+                continue
             conn.execute(
                 "UPDATE cards SET conflict_group = NULL, updated_at = ? WHERE id = ?",
                 (now, card_id),
             )
             touched.add(card_id)
+            budget.record_mutations(1)
             continue
         if group:
             grouped.setdefault(group, []).append(card_id)
 
     for group, member_ids in grouped.items():
+        if not budget.has_time():
+            deferred_groups += 1
+            continue
+        if group not in complete_groups:
+            deferred_groups += 1
+            continue
         current_members = [card_id for card_id in member_ids if card_id in current_ids]
         invalid_members = [card_id for card_id in member_ids if card_id not in current_ids]
         clear_ids = list(invalid_members)
@@ -1570,36 +2847,125 @@ def _clear_orphan_conflict_groups(
         ):
             clear_ids.extend(current_members)
             cleared_groups.add(group)
-        for card_id in dict.fromkeys(clear_ids):
+        unique_clear_ids = list(dict.fromkeys(clear_ids))
+        if not budget.can_mutate(len(unique_clear_ids)):
+            deferred_groups += 1
+            cleared_groups.discard(group)
+            continue
+        for card_id in unique_clear_ids:
             conn.execute(
                 "UPDATE cards SET conflict_group = NULL, updated_at = ? WHERE id = ? AND conflict_group = ?",
                 (now, card_id, group),
             )
             touched.add(card_id)
-    return touched, cleared_groups
+        budget.record_mutations(len(unique_clear_ids))
+    return touched, cleared_groups, deferred_groups
 
 
-def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+def detect_conflicts(
+    root: Path,
+    *,
+    card_id: str | None = None,
+    limit: int = 50,
+    candidate_card_limit: int | None = None,
+    comparison_limit: int | None = None,
+    component_member_limit: int | None = None,
+    mutation_limit: int | None = None,
+    transaction_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Detect conflict components under one explicit, global work budget."""
+
+    if card_id and candidate_card_limit is not None and int(candidate_card_limit) < 2:
+        raise ValueError("targeted conflict scans require candidate_card_limit >= 2")
+    component_limit = max(1, int(limit))
+    budget = _conflict_work_budget(
+        component_limit,
+        candidate_card_limit=candidate_card_limit,
+        comparison_limit=comparison_limit,
+        component_member_limit=component_member_limit,
+        mutation_limit=mutation_limit,
+        transaction_seconds=transaction_seconds,
+    )
     init_db(root)
+    index_setup_started = time.monotonic()
+    _ensure_conflict_indexes(root)
+    index_setup_seconds = round(time.monotonic() - index_setup_started, 6)
+    budget.start_transaction()
+    candidate_conn = connect(root)
+    try:
+        cursor = (
+            0
+            if card_id
+            else _latest_conflict_scan_cursor(candidate_conn, card_id=None)
+        )
+        candidate_rows, scan_state = _bounded_conflict_rows(
+            candidate_conn,
+            card_id=card_id,
+            cursor=cursor,
+            budget=budget,
+        )
+        selected_ids = [str(row["id"]) for row in candidate_rows]
+        targeted_candidate_incomplete = bool(
+            card_id
+            and (
+                scan_state.get("optional_boundary_overflow")
+                or int(
+                    scan_state.get("required_candidate_cards_lower_bound") or 0
+                )
+                > budget.candidate_card_limit
+            )
+        )
+        if targeted_candidate_incomplete:
+            # Omitted rows may be exact, durable, fuzzy, or transitive members
+            # of the anchor component. Do not perform even cleanup mutations
+            # from an incomplete targeted candidate set.
+            selected_ids = []
+    finally:
+        candidate_conn.close()
     conn = connect(root)
     touched_cards: set[str] = set()
+    conflicts: list[dict[str, Any]] = []
+    orphan_groups: set[str] = set()
+    trailing_orphan_groups: set[str] = set()
+    suppressed_components: list[dict[str, Any]] = []
+    selected_components: list[dict[str, Any]] = []
+    eligible_components: list[dict[str, Any]] = []
+    deferred_components = int(targeted_candidate_incomplete)
+    deferred_orphan_groups = 0
+    scan_complete = True
+    deadline_aborted = False
+    rows: list[Any] = []
     try:
+        _install_conflict_deadline_progress(conn, budget)
+        _require_conflict_time(budget)
         conn.execute("BEGIN IMMEDIATE")
-        _assert_supersession_dag(conn)
-        rows, by_id, current_ids = _load_temporal_card_state(conn)
+        rows = _rows_by_ids(conn, selected_ids)
+        _assert_bounded_supersession_dag(rows)
+        by_id = {str(row["id"]): row for row in rows}
+        current_ids = _current_ids_for_rows(conn, rows, budget=budget)
+        complete_groups = _complete_conflict_groups(conn, rows, budget=budget)
+        complete_boundaries = _complete_conflict_boundaries(conn, rows, budget=budget)
+        complete_titles = _complete_conflict_titles(conn, rows, budget=budget)
         now = utc_now()
-        orphan_cards, orphan_groups = _clear_orphan_conflict_groups(
+
+        orphan_cards, orphan_groups, first_deferred_orphans = _clear_orphan_conflict_groups(
             conn,
             rows=rows,
             current_ids=current_ids,
             now=now,
+            budget=budget,
+            complete_groups=complete_groups,
         )
+        deferred_orphan_groups += first_deferred_orphans
         touched_cards.update(orphan_cards)
 
-        # Cleanup changes authority and grouping state. Reload before deriving
-        # components so results, audit rows, and the committed catalog all refer
-        # to the same post-cleanup snapshot.
-        rows, by_id, current_ids = _load_temporal_card_state(conn)
+        # Cleanup changes grouping state. Reload only this bounded candidate set.
+        rows = _rows_by_ids(conn, selected_ids)
+        by_id = {str(row["id"]): row for row in rows}
+        current_ids = _current_ids_for_rows(conn, rows, budget=budget)
+        complete_groups = _complete_conflict_groups(conn, rows, budget=budget)
+        complete_boundaries = _complete_conflict_boundaries(conn, rows, budget=budget)
+        complete_titles = _complete_conflict_titles(conn, rows, budget=budget)
 
         boundary_rows: dict[tuple[str, str, str], list[Any]] = {}
         for row in rows:
@@ -1608,8 +2974,16 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
 
         all_components: list[dict[str, Any]] = []
         for boundary, cards in sorted(boundary_rows.items()):
-            adjacency = _conflict_adjacency(cards)
-            unseen = set(adjacency)
+            adjacency, adjacency_complete = _conflict_adjacency(
+                cards,
+                budget=budget,
+                complete_groups=complete_groups,
+                boundary_complete=boundary in complete_boundaries,
+            )
+            if not adjacency_complete:
+                scan_complete = False
+                break
+            unseen = {member_id for member_id, peers in adjacency.items() if peers}
             ordered_ids = sorted(
                 unseen,
                 key=lambda member_id: int(by_id[member_id]["card_rowid"]),
@@ -1619,12 +2993,19 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                     continue
                 pending = [seed_id]
                 component_ids: set[str] = set()
+                component_complete = True
                 while pending:
                     current = pending.pop()
                     if current in component_ids:
                         continue
+                    if not budget.consume_component_member():
+                        component_complete = False
+                        scan_complete = False
+                        break
                     component_ids.add(current)
                     pending.extend(adjacency.get(current, ()))
+                if not component_complete:
+                    break
                 unseen.difference_update(component_ids)
                 if len(component_ids) < 2:
                     continue
@@ -1635,6 +3016,38 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                     for member_id in member_ids
                     if str(by_id[member_id]["conflict_group"] or "").strip()
                 }
+                member_groups = [
+                    str(by_id[member_id]["conflict_group"] or "").strip()
+                    for member_id in member_ids
+                ]
+                has_incomplete_existing_group = any(
+                    group and group not in complete_groups
+                    for group in member_groups
+                )
+                component_titles = {
+                    _conflict_title_key(by_id[member_id]["title"])
+                    for member_id in member_ids
+                    if str(by_id[member_id]["title"] or "").strip()
+                }
+                all_titles_closed = bool(component_titles) and all(
+                    (boundary, title) in complete_titles
+                    for title in component_titles
+                )
+                all_members_in_closed_groups = bool(member_groups) and all(
+                    group and group in complete_groups
+                    for group in member_groups
+                )
+                closure_proven = (
+                    not has_incomplete_existing_group
+                    and (
+                        boundary in complete_boundaries
+                        or all_titles_closed
+                        or all_members_in_closed_groups
+                    )
+                )
+                if not closure_proven:
+                    deferred_components += 1
+                    continue
                 all_components.append(
                     {
                         "boundary": boundary,
@@ -1652,9 +3065,14 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                                 for member_id in member_ids
                             )
                         ),
-                        "first_rowid": min(int(by_id[member_id]["card_rowid"]) for member_id in member_ids),
+                        "first_rowid": min(
+                            int(by_id[member_id]["card_rowid"])
+                            for member_id in member_ids
+                        ),
                     }
                 )
+            if not scan_complete:
+                break
 
         suppressed_components = [record for record in all_components if record["suppressed"]]
         for component_record in suppressed_components:
@@ -1663,11 +3081,15 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 for member_id in component_record["member_ids"]
                 if str(by_id[member_id]["conflict_group"] or "").strip()
             ]
+            if not budget.can_mutate(len(grouped_member_ids)):
+                deferred_components += 1
+                continue
             for member_id in grouped_member_ids:
                 conn.execute(
                     "UPDATE cards SET conflict_group = NULL, updated_at = ? WHERE id = ?",
                     (now, member_id),
                 )
+            budget.record_mutations(len(grouped_member_ids))
             if grouped_member_ids:
                 touched_cards.update(grouped_member_ids)
                 audit_event(
@@ -1690,10 +3112,6 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 if requested_card_id in record["member_ids"]
             ][:1]
         else:
-            # Limit components, not mutable Card rows. Ungrouped/newly expanded
-            # components sort first by immutable insertion order, so repeated
-            # limit=1 passes make progress instead of revisiting a group whose
-            # updated_at was just changed by the previous pass.
             selected_components = sorted(
                 eligible_components,
                 key=lambda record: (
@@ -1701,11 +3119,14 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                     int(record["first_rowid"]),
                     tuple(record["member_ids"]),
                 ),
-            )[: max(1, int(limit))]
+            )[:component_limit]
 
         detected_components: list[dict[str, Any]] = []
         claimed_groups: set[str] = set()
         for component_record in selected_components:
+            if not budget.has_time():
+                deferred_components += 1
+                break
             member_ids = list(component_record["member_ids"])
             anchor_id = min(
                 member_ids,
@@ -1728,11 +3149,15 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 for member_id in member_ids
                 if str(by_id[member_id]["conflict_group"] or "") != group
             ]
+            if not budget.can_mutate(len(changed_ids)):
+                deferred_components += 1
+                continue
             for member_id in changed_ids:
                 conn.execute(
                     "UPDATE cards SET conflict_group = ?, updated_at = ? WHERE id = ?",
                     (group, now, member_id),
                 )
+            budget.record_mutations(len(changed_ids))
             if changed_ids:
                 touched_cards.update(changed_ids)
                 audit_event(
@@ -1744,19 +3169,29 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 )
             detected_components.append({"conflict_group": group, "card_ids": member_ids})
 
-        # Assigning a repaired connected component can leave behind the final
-        # member of an older fragmented group. Clear that orphan in the same
-        # transaction so a contested marker always means at least two current Cards.
-        refreshed_rows, _refreshed_by_id, refreshed_current_ids = _load_temporal_card_state(conn)
-        trailing_orphans, trailing_orphan_groups = _clear_orphan_conflict_groups(
+        refreshed_rows = _rows_by_ids(conn, selected_ids)
+        refreshed_current_ids = _current_ids_for_rows(conn, refreshed_rows, budget=budget)
+        refreshed_complete_groups = _complete_conflict_groups(
             conn,
-            rows=refreshed_rows,
-            current_ids=refreshed_current_ids,
-            now=now,
+            refreshed_rows,
+            budget=budget,
         )
+        trailing_orphans, trailing_orphan_groups, trailing_deferred_orphans = (
+            _clear_orphan_conflict_groups(
+                conn,
+                rows=refreshed_rows,
+                current_ids=refreshed_current_ids,
+                now=now,
+                budget=budget,
+                complete_groups=refreshed_complete_groups,
+            )
+        )
+        deferred_orphan_groups += trailing_deferred_orphans
         touched_cards.update(trailing_orphans)
-        _final_rows, final_by_id, final_current_ids = _load_temporal_card_state(conn)
-        conflicts: list[dict[str, Any]] = []
+
+        final_rows = _rows_by_ids(conn, selected_ids)
+        final_by_id = {str(row["id"]): row for row in final_rows}
+        final_current_ids = _current_ids_for_rows(conn, final_rows, budget=budget)
         for detected_record in detected_components:
             member_ids = list(detected_record["card_ids"])
             groups = {
@@ -1771,6 +3206,7 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 for member_id in member_ids
             ):
                 conflicts.append({"conflict_group": next(iter(groups)), "card_ids": member_ids})
+
         if orphan_cards or trailing_orphans:
             audit_event(
                 conn,
@@ -1779,17 +3215,129 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
                 target_id=None,
                 payload={"card_ids": sorted(orphan_cards | trailing_orphans)},
             )
+        _require_conflict_time(budget)
         if touched_cards:
             mark_card_sidecar_outbox(conn, sorted(touched_cards), reason="conflict_group_updated")
+
+        _require_conflict_time(budget)
+        if (
+            not targeted_candidate_incomplete
+            and (scan_state["has_more"] or cursor > 0)
+        ):
+            audit_event(
+                conn,
+                action=_CONFLICT_SCAN_CURSOR_ACTION,
+                target_type="conflict_scan",
+                target_id=str(card_id) if card_id else "global",
+                payload={
+                    "schema": "continuum.conflict_scan_cursor.v1",
+                    "next_rowid": int(scan_state["next_cursor"]),
+                    "candidate_count": len(rows),
+                    "wrapped": bool(scan_state["wrapped"]),
+                },
+            )
+        _require_conflict_time(budget)
         conn.commit()
+        budget.finish_transaction()
+    except (_ConflictDeadlineExceeded, sqlite3.OperationalError) as exc:
+        is_deadline_interrupt = (
+            isinstance(exc, _ConflictDeadlineExceeded)
+            or (
+                budget.time_exhausted
+                and "interrupted" in str(exc).casefold()
+            )
+        )
+        if conn.in_transaction:
+            conn.rollback()
+        if not is_deadline_interrupt:
+            raise
+        deadline_aborted = True
+        scan_complete = False
+        deferred_components += 1
+        touched_cards.clear()
+        conflicts.clear()
+        orphan_groups.clear()
+        trailing_orphan_groups.clear()
+        suppressed_components = []
+        selected_components = []
+        eligible_components = []
+        budget.card_mutations = 0
+        scan_state = {
+            **scan_state,
+            "next_cursor": int(cursor),
+            "has_more": True,
+        }
     except Exception:
-        conn.rollback()
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
+        conn.set_progress_handler(None, 0)
+        if budget.finished is None:
+            budget.finish_transaction()
         conn.close()
 
     if touched_cards:
         sync_card_sidecars_after_commit(root, sorted(touched_cards))
+    selected_fingerprints = {
+        str(record["fingerprint"])
+        for record in selected_components
+    }
+    deferred_components += sum(
+        1
+        for record in eligible_components
+        if record["needs_assignment"]
+        and str(record["fingerprint"]) not in selected_fingerprints
+    )
+    optional_fuzzy_evidence_deferred = bool(
+        card_id and scan_state.get("optional_boundary_overflow")
+    )
+    optional_fuzzy_requires_larger = optional_fuzzy_evidence_deferred
+    reported_candidate_lower_bound = int(
+        scan_state.get("required_candidate_cards_lower_bound") or 0
+    )
+    if optional_fuzzy_requires_larger:
+        reported_candidate_lower_bound = max(
+            reported_candidate_lower_bound,
+            budget.candidate_card_limit + 1,
+        )
+    targeted_nonadvancing_structural_deferral = bool(
+        card_id
+        and int(scan_state.get("next_cursor") or 0) == 0
+        and (deferred_components or deferred_orphan_groups or not scan_complete)
+        and not scan_state.get("has_more")
+        and not optional_fuzzy_requires_larger
+        and not budget.comparison_exhausted
+        and not budget.component_member_exhausted
+        and not budget.card_mutation_exhausted
+        and not budget.time_exhausted
+    )
+    if targeted_nonadvancing_structural_deferral:
+        reported_candidate_lower_bound = max(
+            reported_candidate_lower_bound,
+            budget.candidate_card_limit + 1,
+        )
+    manual_review_required = bool(
+        scan_state.get("manual_review_required")
+        or reported_candidate_lower_bound > MAX_CONFLICT_CANDIDATE_CARDS
+    )
+    manual_review_reason = scan_state.get("manual_review_reason")
+    if manual_review_required and manual_review_reason is None:
+        manual_review_reason = "targeted_fuzzy_boundary_exceeds_automatic_candidate_limit"
+    partial = bool(
+        scan_state["has_more"]
+        or not scan_complete
+        or deferred_components
+        or deferred_orphan_groups
+        or budget.time_exhausted
+        or optional_fuzzy_requires_larger
+    )
+    budget_result = budget.result()
+    exhausted_dimensions = sorted(
+        name
+        for name, exhausted in budget_result["exhausted"].items()
+        if exhausted
+    )
     return {
         "ok": True,
         "conflict_count": len(conflicts),
@@ -1798,7 +3346,156 @@ def detect_conflicts(root: Path, *, card_id: str | None = None, limit: int = 50)
         "orphan_groups_cleared": len(orphan_groups | trailing_orphan_groups),
         "suppressed_component_count": len(suppressed_components),
         "supersession_dag": True,
+        "supersession_dag_scope": "candidate_window",
+        "partial": partial,
+        "has_more": partial,
+        "deadline_aborted": deadline_aborted,
+        "deferred_components": deferred_components,
+        "deferred_orphan_groups": deferred_orphan_groups,
+        "scan": scan_state,
+        "continuation": {
+            "required": partial,
+            "strategy": "targeted_rowid_cursor" if card_id else "circular_rowid_cursor",
+            "next_cursor": int(scan_state["next_cursor"]),
+            "card_id": str(card_id) if card_id else None,
+            "budget_exhausted": exhausted_dimensions,
+            "required_candidate_cards_lower_bound": reported_candidate_lower_bound,
+            "optional_fuzzy_evidence_deferred": optional_fuzzy_evidence_deferred,
+            "manual_review_required": manual_review_required,
+            "manual_review_reason": manual_review_reason,
+            "requires_larger_budget": bool(
+                reported_candidate_lower_bound > budget.candidate_card_limit
+                or budget.component_member_exhausted
+                or budget.card_mutation_exhausted
+                or budget.time_exhausted
+            ),
+        },
+        "work_budget": budget_result,
+        "index_setup": {
+            "outside_scan_budget": True,
+            "seconds": index_setup_seconds,
+        },
     }
+
+
+def _conflict_result_requires_larger_budget(result: dict[str, Any]) -> bool:
+    continuation = result.get("continuation")
+    return bool(
+        isinstance(continuation, dict)
+        and continuation.get("required")
+        and continuation.get("requires_larger_budget")
+    )
+
+
+def _conflict_review_signal_key(result: dict[str, Any]) -> str:
+    raw_scan = result.get("scan")
+    scan: dict[str, Any] = raw_scan if isinstance(raw_scan, dict) else {}
+    identity_hash = str(scan.get("anchor_identity_hash") or "global")
+    return "conflict_review_v1_" + content_hash(identity_hash)[:32]
+
+
+def _record_conflict_review_signal(
+    root: Path,
+    *,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    signal_key = _conflict_review_signal_key(result)
+    raw_continuation = result.get("continuation")
+    continuation: dict[str, Any] = (
+        raw_continuation if isinstance(raw_continuation, dict) else {}
+    )
+    raw_scan = result.get("scan")
+    scan: dict[str, Any] = raw_scan if isinstance(raw_scan, dict) else {}
+    anchor_card_id = str(scan.get("anchor_card_id") or "")
+    payload = {
+        "schema": "continuum.conflict_review_required.v1",
+        "signal_key": signal_key,
+        "anchor_card_id": anchor_card_id[:128] or None,
+        "anchor_card_id_hash": content_hash(anchor_card_id),
+        "anchor_identity_hash": scan.get("anchor_identity_hash"),
+        "required_candidate_cards_lower_bound": int(
+            continuation.get("required_candidate_cards_lower_bound") or 0
+        ),
+        "manual_review_required": bool(
+            continuation.get("manual_review_required")
+        ),
+        "manual_review_reason": continuation.get("manual_review_reason")
+        or "automatic_conflict_escalation_incomplete",
+    }
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT payload_json, created_at
+            FROM audit_events
+            WHERE action = ? AND target_type = 'conflict_review'
+              AND target_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (_CONFLICT_REVIEW_REQUIRED_ACTION, signal_key),
+        ).fetchone()
+        if existing is None:
+            audit_event(
+                conn,
+                action=_CONFLICT_REVIEW_REQUIRED_ACTION,
+                target_type="conflict_review",
+                target_id=signal_key,
+                payload=payload,
+            )
+            created = True
+            created_at = utc_now()
+        else:
+            created = False
+            created_at = existing["created_at"]
+            existing_payload = json_loads(existing["payload_json"], {})
+            if isinstance(existing_payload, dict):
+                payload = existing_payload
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "created": created,
+        "signal_key": signal_key,
+        "created_at": created_at,
+        **payload,
+    }
+
+
+def _run_conflict_maintenance(root: Path) -> dict[str, Any]:
+    """Run one base pass, at most one hard-cap escalation, then quarantine."""
+
+    base = detect_conflicts(root, limit=25)
+    result: dict[str, Any] = {"conflicts": base}
+    if not _conflict_result_requires_larger_budget(base):
+        return result
+    raw_scan = base.get("scan")
+    scan: dict[str, Any] = raw_scan if isinstance(raw_scan, dict) else {}
+    anchor_card_id = str(scan.get("anchor_card_id") or "")
+    final_result = base
+    if anchor_card_id:
+        escalated = detect_conflicts(
+            root,
+            card_id=anchor_card_id,
+            limit=25,
+            candidate_card_limit=MAX_CONFLICT_CANDIDATE_CARDS,
+            comparison_limit=MAX_CONFLICT_COMPARISONS,
+            component_member_limit=MAX_CONFLICT_COMPONENT_MEMBERS,
+            mutation_limit=MAX_CONFLICT_CARD_MUTATIONS,
+            transaction_seconds=MAX_CONFLICT_TRANSACTION_SECONDS,
+        )
+        result["conflict_escalation"] = escalated
+        final_result = escalated
+    if _conflict_result_requires_larger_budget(final_result):
+        result["conflict_review_required"] = _record_conflict_review_signal(
+            root,
+            result=final_result,
+        )
+    return result
 
 
 def resolve_conflict(
@@ -2130,7 +3827,13 @@ def prune_memory(
 
 def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
     conn = connect(root)
+    lease = _CURRENT_JOB_LEASE.get()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = _begin_worker_effect(conn, lease)
+        if prior is not None:
+            conn.commit()
+            return prior
         location_uri = sync_card_sidecar(root, conn, card_id)
         if location_uri is None:
             audit_event(
@@ -2141,8 +3844,15 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
                 payload={"reason": "card_missing_or_sidecars_disabled"},
             )
             conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
+            result = {"ok": False, "reason": "card_missing_or_sidecars_disabled", "card_id": card_id}
+            _record_worker_effect(
+                conn,
+                lease,
+                job_type="sync_card_sidecar",
+                result=result,
+            )
             conn.commit()
-            return {"ok": False, "reason": "card_missing_or_sidecars_disabled", "card_id": card_id}
+            return result
         audit_event(
             conn,
             action="card_sidecar_synced",
@@ -2151,8 +3861,19 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
             payload={"location_uri": location_uri, "worker": "archivist"},
         )
         conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
+        result = {"ok": True, "card_id": card_id, "location_uri": location_uri}
+        _record_worker_effect(
+            conn,
+            lease,
+            job_type="sync_card_sidecar",
+            result=result,
+        )
         conn.commit()
-        return {"ok": True, "card_id": card_id, "location_uri": location_uri}
+        return result
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2204,7 +3925,16 @@ def _process_job(
     if job_type == "sync_card_sidecar":
         return sync_card_sidecar_job(root, card_id=str(payload["card_id"]))
     if job_type == "review_mempalace_import":
-        return review_mempalace_import(root, import_id=str(payload.get("import_id") or ""))
+        raw_limit = payload.get("limit")
+        return review_mempalace_import(
+            root,
+            import_id=str(payload.get("import_id") or ""),
+            limit=(
+                MAX_BACKLOG_RECONCILE_LIMIT
+                if raw_limit is None
+                else int(raw_limit)
+            ),
+        )
     return {"ok": True, "skipped": True, "reason": "unknown_job_type", "job_type": job_type}
 
 
@@ -2233,27 +3963,18 @@ def run_worker_pass(
             conn.close()
         if job is None:
             break
+        lease = _JobLease(root, str(job["id"]), worker_id, lease_seconds)
+        renewer = _JobLeaseRenewer(lease)
+        lease_token = _CURRENT_JOB_LEASE.set(lease)
+        renewer.start()
         try:
-            def renew_lease() -> bool:
-                lease_conn = connect(root)
-                try:
-                    renewed = _heartbeat_job(
-                        lease_conn,
-                        job["id"],
-                        lease_owner=worker_id,
-                        lease_seconds=lease_seconds,
-                    )
-                    lease_conn.commit()
-                    return renewed
-                finally:
-                    lease_conn.close()
-
             if job["job_type"] == "scroll_event_ingested":
-                result = _process_job(root, job, heartbeat=renew_lease)
+                result = _process_job(root, job, heartbeat=lease.renew)
             else:
                 # Preserve the small internal hook surface used by integrations
                 # and tests that replace non-Scribe job processors.
                 result = _process_job(root, job)
+            renewer.stop()
             job_ok = bool(result.get("ok", True))
             job_status = "skipped" if result.get("skipped") else ("succeeded" if job_ok else "failed")
             conn = connect(root)
@@ -2272,6 +3993,7 @@ def run_worker_pass(
                 conn.close()
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "status": job_status, "ok": job_ok, "result": result})
         except Exception as exc:
+            renewer.stop()
             conn = connect(root)
             try:
                 _finish_job(conn, job["id"], status="failed", error=str(exc), lease_owner=worker_id)
@@ -2279,12 +4001,15 @@ def run_worker_pass(
             finally:
                 conn.close()
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "ok": False, "error": str(exc)})
+        finally:
+            renewer.stop()
+            _CURRENT_JOB_LEASE.reset(lease_token)
     maintenance_result: dict[str, Any] = {}
     if maintenance:
         maintenance_result["sidecars"] = drain_card_sidecar_outbox(root, limit=50)
         maintenance_result["decay"] = decay_graph_routes(root, limit=50)
         maintenance_result["tiering"] = apply_storage_tiering(root, dry_run=False, limit=50)
-        maintenance_result["conflicts"] = detect_conflicts(root, limit=25)
+        maintenance_result.update(_run_conflict_maintenance(root))
     return {
         "ok": all(item.get("ok", False) for item in processed) if processed else True,
         "worker_id": worker_id,

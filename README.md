@@ -49,8 +49,8 @@ Epic Continuum 0.3 turns durable memory into a safer daily recovery system:
   fails back to the deterministic packet.
 - **Homelab Guardian controls** enforce measurable resource headroom, a
   process-local inference gate backed by the recommended one-slot server,
-  request/response limits, wall-clock deadlines, model identity, secret
-  redaction, circuit breaking, and a conservative context ceiling.
+  request/response limits, one end-to-end wall-clock deadline, model identity,
+  secret redaction, circuit breaking, and a conservative context ceiling.
 - **Personal profiles** remember safe context, preferred project resume, and
   whether Yarn should assist recovery.
 - **Expanded health telemetry** reports queue age, running-job heartbeat, Scroll

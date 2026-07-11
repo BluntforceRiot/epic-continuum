@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from continuum.core import local_model
@@ -33,6 +36,34 @@ SAFE_RESOURCES = {
 }
 
 
+def _fork_disabled_assist_probe(root: str, sender: Any) -> None:
+    try:
+        started = time.monotonic()
+        result = assist_resume(
+            Path(root),
+            context_text="forked disabled evidence",
+            session_id="forked-session",
+            project_id=None,
+        )
+        elapsed = time.monotonic() - started
+        runner_threads = sum(
+            thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        sender.send(
+            {
+                "result": result,
+                "elapsed": elapsed,
+                "runner_threads": runner_threads,
+                "runner_created": local_model._LOCAL_STAGE_RUNNER is not None,
+            }
+        )
+    except BaseException as exc:
+        sender.send({"error": repr(exc)})
+    finally:
+        sender.close()
+
+
 class _ModelHandler(BaseHTTPRequestHandler):
     model = DEFAULT_YARN_MODEL
     last_request: dict[str, object] | None = None
@@ -45,6 +76,7 @@ class _ModelHandler(BaseHTTPRequestHandler):
     content_override: str | None = None
     outer_response_override: str | None = None
     served_models_override: list[str] | None = None
+    response_delays: dict[str, float] = {}
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -60,12 +92,22 @@ class _ModelHandler(BaseHTTPRequestHandler):
             "bogus" if self.malformed_content_length else str(len(body)),
         )
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _delay(self, stage: str) -> None:
+        delay = float(type(self).response_delays.get(stage, 0.0))
+        if delay > 0:
+            time.sleep(delay)
 
     def do_GET(self) -> None:
         if self.path.endswith("/health"):
+            self._delay("health")
             self._send({"status": "ok"}, status=self.health_status)
         else:
+            self._delay("models")
             model_ids = self.served_models_override or [self.model]
             self._send(
                 {
@@ -80,6 +122,7 @@ class _ModelHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or "0")
         request = json.loads(self.rfile.read(length).decode("utf-8"))
         type(self).last_request = request
+        self._delay("completion")
         if self.outer_response_override is not None:
             body = self.outer_response_override.encode("utf-8")
             self.send_response(200)
@@ -136,6 +179,7 @@ class _Server:
         _ModelHandler.content_override = None
         _ModelHandler.outer_response_override = None
         _ModelHandler.served_models_override = None
+        _ModelHandler.response_delays = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ModelHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -212,6 +256,45 @@ class LocalModelTests(unittest.TestCase):
             self.assertEqual(result["fallback"], "deterministic")
             http_json.assert_not_called()
             self.assertFalse(root.exists())
+
+    @unittest.skipUnless(
+        hasattr(os, "fork") and hasattr(os, "register_at_fork"),
+        "requires POSIX fork callbacks",
+    )
+    def test_forked_child_lazily_recreates_exactly_one_stage_runner(self) -> None:
+        context = multiprocessing.get_context("fork")
+        receiver, sender = context.Pipe(duplex=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            process = context.Process(
+                target=_fork_disabled_assist_probe,
+                args=(str(Path(tmp) / "continuum"), sender),
+            )
+            process.start()
+            sender.close()
+            payload: dict[str, Any] | None = None
+            try:
+                self.assertTrue(receiver.poll(5), "forked child did not return")
+                payload = receiver.recv()
+                process.join(timeout=5)
+            finally:
+                receiver.close()
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        self.assertEqual(process.exitcode, 0)
+        assert payload is not None
+        self.assertNotIn("error", payload, payload)
+        result = payload["result"]
+        self.assertEqual(result["reason"], "disabled", result)
+        self.assertFalse(result["used"], result)
+        self.assertLess(
+            payload["elapsed"],
+            local_model.CONFIGURATION_BOOTSTRAP_SECONDS,
+            payload,
+        )
+        self.assertTrue(payload["runner_created"], payload)
+        self.assertEqual(payload["runner_threads"], 1, payload)
 
     def test_endpoint_validation_is_loopback_by_default(self) -> None:
         self.assertEqual(
@@ -1086,6 +1169,337 @@ class LocalModelTests(unittest.TestCase):
                     elapsed,
                     1.5,
                     f"{stage} exceeded the wall-clock deadline: {elapsed:.3f}s",
+                )
+
+    def test_blocked_http_requests_use_one_runner_without_thread_growth(self) -> None:
+        release = threading.Event()
+
+        class IgnoringCloseConnection:
+            sock = None
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return
+
+            def request(self, *_args: object, **_kwargs: object) -> None:
+                release.wait(timeout=5)
+
+            def close(self) -> None:
+                return
+
+        http_threads_before = sum(
+            thread.name == "continuum-local-http" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        stage_threads_before = sum(
+            thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        elapsed_times: list[float] = []
+        try:
+            with mock.patch(
+                "continuum.core.local_model.http.client.HTTPConnection",
+                IgnoringCloseConnection,
+            ):
+                for _ in range(3):
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(
+                        local_model.LocalModelError,
+                        "total deadline",
+                    ):
+                        local_model._http_json(
+                            method="GET",
+                            url="http://127.0.0.1:9/health",
+                            timeout_seconds=0.05,
+                        )
+                    elapsed_times.append(time.monotonic() - started)
+        finally:
+            release.set()
+            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+
+        http_threads_after = sum(
+            thread.name == "continuum-local-http" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        stage_threads_after = sum(
+            thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        self.assertEqual(http_threads_after, http_threads_before)
+        self.assertEqual(stage_threads_before, 1)
+        self.assertEqual(stage_threads_after, stage_threads_before)
+        for elapsed in elapsed_times:
+            self.assertLess(elapsed, 0.5)
+
+    def test_assist_uses_one_deadline_across_preflight_and_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+            root = Path(tmp) / "continuum"
+            configure_yarn(
+                root,
+                enabled=True,
+                base_url=base_url,
+                timeout_seconds=1,
+            )
+            _ModelHandler.response_delays = {
+                "health": 0.25,
+                "models": 0.25,
+                "completion": 0.75,
+            }
+            with mock.patch(
+                "continuum.core.local_model._resource_guard",
+                return_value=SAFE_RESOURCES,
+            ):
+                started = time.monotonic()
+                result = assist_resume(
+                    root,
+                    context_text="deadline evidence",
+                    session_id="s",
+                    project_id="p",
+                )
+                elapsed = time.monotonic() - started
+
+            self.assertFalse(result["used"], result)
+            self.assertEqual(result["reason"], "model_request_failed")
+            self.assertEqual(result["fallback"], "deterministic")
+            self.assertIn("total deadline", result["detail"])
+            self.assertIsNotNone(_ModelHandler.last_request)
+            self.assertLess(
+                elapsed,
+                1.5,
+                f"full Yarn operation exceeded its deadline: {elapsed:.3f}s",
+            )
+
+    def test_assist_deadline_includes_slow_context_preprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, timeout_seconds=1)
+            release = threading.Event()
+            stage_threads_before = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+
+            def slow_portable_text(_root: Path, text: str) -> str:
+                release.wait(timeout=5)
+                return text
+
+            try:
+                with mock.patch(
+                    "continuum.core.local_model._portable_model_text",
+                    side_effect=slow_portable_text,
+                ):
+                    started = time.monotonic()
+                    result = assist_resume(
+                        root,
+                        context_text="deadline preprocessing evidence",
+                        session_id="s",
+                        project_id="p",
+                    )
+                    elapsed = time.monotonic() - started
+            finally:
+                release.set()
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+
+            stage_threads_after = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+            self.assertEqual(len(stage_threads_before), 1)
+            self.assertEqual(len(stage_threads_after), len(stage_threads_before))
+            self.assertFalse(result["used"], result)
+            self.assertEqual(result["reason"], "model_request_failed")
+            self.assertEqual(result["detail"], local_model.TOTAL_DEADLINE_ERROR)
+            self.assertLess(
+                elapsed,
+                1.5,
+                f"preprocessing exceeded the wall-clock deadline: {elapsed:.3f}s",
+            )
+
+    def test_assist_deadline_is_anchored_before_slow_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, timeout_seconds=1)
+            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            original_configuration = local_model._configuration
+            preprocessing_started = threading.Event()
+            release = threading.Event()
+
+            def slow_configuration(current_root: Path) -> dict[str, object]:
+                time.sleep(0.65)
+                return original_configuration(current_root)
+
+            def blocked_portable_text(_root: Path, text: str) -> str:
+                preprocessing_started.set()
+                release.wait(timeout=5)
+                return text
+
+            try:
+                with (
+                    mock.patch(
+                        "continuum.core.local_model._configuration",
+                        side_effect=slow_configuration,
+                    ) as configuration,
+                    mock.patch(
+                        "continuum.core.local_model._portable_model_text",
+                        side_effect=blocked_portable_text,
+                    ),
+                ):
+                    started = time.monotonic()
+                    result = assist_resume(
+                        root,
+                        context_text="configuration deadline evidence",
+                        session_id="s",
+                        project_id="p",
+                    )
+                    elapsed = time.monotonic() - started
+            finally:
+                release.set()
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+
+            self.assertEqual(configuration.call_count, 1)
+            self.assertTrue(preprocessing_started.is_set())
+            self.assertFalse(result["used"], result)
+            self.assertEqual(result["reason"], "model_request_failed")
+            self.assertEqual(result["detail"], local_model.TOTAL_DEADLINE_ERROR)
+            self.assertLess(
+                elapsed,
+                1.5,
+                f"configuration was excluded from the assist deadline: {elapsed:.3f}s",
+            )
+
+    def test_repeated_blocked_resource_checks_do_not_grow_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, timeout_seconds=1)
+            releases = [threading.Event() for _ in range(3)]
+            resource_calls = 0
+            stage_threads_before = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+
+            def blocked_resource_guard(_settings: dict[str, object]) -> dict[str, object]:
+                nonlocal resource_calls
+                release = releases[resource_calls]
+                resource_calls += 1
+                release.wait(timeout=5)
+                return SAFE_RESOURCES
+
+            results: list[dict[str, object]] = []
+            elapsed_times: list[float] = []
+            try:
+                with mock.patch(
+                    "continuum.core.local_model._resource_guard",
+                    side_effect=blocked_resource_guard,
+                ):
+                    for release in releases:
+                        started = time.monotonic()
+                        results.append(
+                            assist_resume(
+                                root,
+                                context_text="resource deadline evidence",
+                                session_id="s",
+                                project_id="p",
+                            )
+                        )
+                        elapsed_times.append(time.monotonic() - started)
+                        release.set()
+                        self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            finally:
+                for release in releases:
+                    release.set()
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+
+            stage_threads_after = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+            self.assertEqual(resource_calls, len(releases))
+            self.assertEqual(len(stage_threads_before), 1)
+            self.assertEqual(len(stage_threads_after), len(stage_threads_before))
+            for result, elapsed in zip(results, elapsed_times, strict=True):
+                self.assertFalse(result["used"], result)
+                self.assertEqual(result["reason"], "model_request_failed")
+                self.assertIn("total deadline", str(result["detail"]))
+                self.assertLess(
+                    elapsed,
+                    1.5,
+                    f"resource check exceeded the deadline: {elapsed:.3f}s",
+                )
+
+    def test_repeated_assists_do_not_queue_behind_one_blocked_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, timeout_seconds=1)
+            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            original_configuration = local_model._configuration
+            release = threading.Event()
+            resource_started = threading.Event()
+            resource_calls = 0
+            stage_threads_before = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+
+            def blocked_resource_guard(_settings: dict[str, object]) -> dict[str, object]:
+                nonlocal resource_calls
+                resource_calls += 1
+                resource_started.set()
+                release.wait(timeout=10)
+                return SAFE_RESOURCES
+
+            results: list[dict[str, object]] = []
+            elapsed_times: list[float] = []
+            try:
+                with (
+                    mock.patch(
+                        "continuum.core.local_model._configuration",
+                        wraps=original_configuration,
+                    ) as configuration,
+                    mock.patch(
+                        "continuum.core.local_model._resource_guard",
+                        side_effect=blocked_resource_guard,
+                    ),
+                ):
+                    for _ in range(3):
+                        started = time.monotonic()
+                        results.append(
+                            assist_resume(
+                                root,
+                                context_text="blocked runner deadline evidence",
+                                session_id="s",
+                                project_id="p",
+                            )
+                        )
+                        elapsed_times.append(time.monotonic() - started)
+                    self.assertTrue(resource_started.is_set())
+                    self.assertEqual(resource_calls, 1)
+                    self.assertEqual(configuration.call_count, 1)
+            finally:
+                release.set()
+                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+
+            stage_threads_after = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "continuum-local-stage-runner" and thread.is_alive()
+            ]
+            self.assertEqual(resource_calls, 1)
+            self.assertEqual(configuration.call_count, 1)
+            self.assertEqual(len(stage_threads_before), 1)
+            self.assertEqual(len(stage_threads_after), len(stage_threads_before))
+            for result, elapsed in zip(results, elapsed_times, strict=True):
+                self.assertFalse(result["used"], result)
+                self.assertEqual(result["reason"], "model_request_failed")
+                self.assertEqual(result["detail"], local_model.TOTAL_DEADLINE_ERROR)
+                self.assertLess(
+                    elapsed,
+                    1.5,
+                    f"blocked runner call exceeded its deadline: {elapsed:.3f}s",
                 )
 
     def test_unknown_evidence_citation_is_refused(self) -> None:

@@ -62,10 +62,33 @@ Hermes, Claude Code, or local-agent session can ask for that same project throug
 `cue-recall`, `recover-thread --project-id`, or `compile-context --project-id`
 instead of relying on the previous chat window still being alive.
 
+New checkpoints include a canonical digest of the complete decision and
+open-task arrays in the immutable source event. Resume recomputes that digest
+before accepting the selected Card; legacy checkpoints without the marker remain
+readable, while a marked checkpoint with divergent structured state fails closed.
+
 Recovery packets only include evidence visible to the requested session/project
 scope. Pending queue jobs are included only when their referenced Card, segment,
 or Scroll event is visible to that same scope; jobs with incomplete provenance
 fail closed instead of appearing in unrelated recovery packets.
+
+Automatic `resume` keeps the caller's requested visibility capability separate
+from the coordinates of the checkpoint it discovers. A project-only request
+cannot acquire session-visible evidence, and a session-only request cannot use a
+discovered project identifier to read project-visible evidence. Checkpoint
+selection applies the same rule before any recovery packet is built.
+
+The selected checkpoint is a mandatory Planner candidate. Its identifier,
+title/content, summary, decisions, open tasks, scope, and source references are
+reserved before optional Cards, Scroll events, or Cue Recall evidence. When that
+complete minimum cannot fit, resume returns `checkpoint_did_not_fit` and writes
+no misleading recovery packet.
+
+For query-guided resume, Card relevance is scored before the bounded candidate
+window is selected. After the mandatory checkpoint is reserved, the optional
+source with the strongest direct query relevance is considered first. This keeps
+a buried Cue Recall or Card match from being crowded out solely by source order
+when the remaining context budget is tight.
 
 ## Upgrade Backfill
 

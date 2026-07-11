@@ -28,7 +28,7 @@ Documentation = "https://github.com/BluntforceRiot/epic-continuum#readme"
 Changelog = "https://github.com/BluntforceRiot/epic-continuum/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

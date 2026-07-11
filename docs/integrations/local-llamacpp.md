@@ -95,7 +95,12 @@ Leave the Yarn-derived safe ceiling in place unless you are lowering it.
 - The default endpoint must be a literal loopback address with the `/v1` path.
 - Remote endpoints require an explicit opt-in and HTTPS.
 - Continuum checks `/v1/health`, exact model identity, input plus output budget,
-  total wall-clock deadline, response type, response size, and schema. RAM/VRAM
+  response type, response size, and schema. `timeout_seconds` is one monotonic
+  wall-clock budget measured from assist entry and shared by configuration
+  loading, input redaction and sizing, gate waiting, resource checks, both
+  preflight requests, completion transfer, parsing, and validation; per-stage
+  waits receive only the remaining budget. Local deadline stages use one fixed
+  runner so repeated timeouts do not grow a pool of abandoned threads. RAM/VRAM
   minimums are enforced when the host can measure them; unavailable measurements
   are reported as advisory rather than guessed safe.
 - A process-local gate permits one inference per Continuum process. Keep

@@ -191,6 +191,31 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conflict_resolution_receipts (
+    id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK(action IN ('dismiss', 'supersede')),
+    component_fingerprint TEXT NOT NULL,
+    conflict_group TEXT NOT NULL,
+    visibility_scope TEXT NOT NULL,
+    project_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    selected_card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE RESTRICT,
+    member_count INTEGER NOT NULL CHECK(member_count >= 2),
+    actor TEXT NOT NULL,
+    audit_event_id TEXT NOT NULL UNIQUE REFERENCES audit_events(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    UNIQUE(action, component_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS conflict_resolution_members (
+    receipt_id TEXT NOT NULL REFERENCES conflict_resolution_receipts(id) ON DELETE CASCADE,
+    card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE RESTRICT,
+    member_ordinal INTEGER NOT NULL CHECK(member_ordinal >= 0),
+    member_binding_hash TEXT NOT NULL,
+    PRIMARY KEY(receipt_id, card_id),
+    UNIQUE(receipt_id, member_ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     id TEXT PRIMARY KEY,
     snapshot_uri TEXT NOT NULL,
@@ -249,5 +274,7 @@ CREATE INDEX IF NOT EXISTS idx_partition_aliases_internal ON partition_aliases(k
 CREATE INDEX IF NOT EXISTS idx_card_sidecar_outbox_updated ON card_sidecar_outbox(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action_target ON audit_events(action, target_type, target_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_conflict_resolution_receipts_fingerprint ON conflict_resolution_receipts(component_fingerprint, action);
+CREATE INDEX IF NOT EXISTS idx_conflict_resolution_members_card ON conflict_resolution_members(card_id, receipt_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_operation ON artifacts(operation_id);

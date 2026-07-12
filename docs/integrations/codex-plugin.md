@@ -39,7 +39,11 @@ Codex configuration directly. The server currently supports MCP protocol
 invalid UTF-8 frame returns a parse error and the server resumes at the next
 newline-delimited request. `continuum_record_project_state` mirrors the core
 checkpoint field, item-count, and metadata limits described in
-[Shared Agent State](../shared-agent-state.md).
+[Shared Agent State](../shared-agent-state.md). Project-state metadata accepts
+only string values under the benign integration keys `agent_type`, `client_name`, `client_version`,
+`hook_event_name`, `model`, `platform`, `source`, `task_id`, and `turn_id`.
+Temporal authority, conflict membership, dismissal, and supersession fields are
+owned by Continuum and cannot be supplied through the public MCP surface.
 
 MCP roots and file inputs are restricted by default to `CONTINUUM_ROOT` plus
 paths listed in `CONTINUUM_ALLOWED_ROOTS`. Add the repo, workspace, or evidence
@@ -125,6 +129,11 @@ packet, and the same packet is written to:
 ```text
 <continuum-root>\exports\thread_recovery\*.md
 ```
+
+If the requested authority boundary has multiple validated independent-agent
+heads, `continuum_resume_latest` returns `authority_ambiguous` with
+`resolution_required=true` and writes no packet. Resolve or merge the competing
+component before retrying; timestamp recency is not an authority decision.
 
 ## Tool Surface
 

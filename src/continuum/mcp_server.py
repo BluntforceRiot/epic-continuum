@@ -15,17 +15,10 @@ from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace
 from .core.local_model import local_model_health
 from .core.project_state import (
-    MAX_PROJECT_STATE_BRANCH_BYTES,
-    MAX_PROJECT_STATE_CHANGED_FILE_BYTES,
     MAX_PROJECT_STATE_CHANGED_FILES,
-    MAX_PROJECT_STATE_COMMIT_BYTES,
     MAX_PROJECT_STATE_DECISIONS,
-    MAX_PROJECT_STATE_ITEM_BYTES,
-    MAX_PROJECT_STATE_METADATA_CONTAINER_MEMBERS,
-    MAX_PROJECT_STATE_NOTES_BYTES,
-    MAX_PROJECT_STATE_OBJECTIVE_BYTES,
     MAX_PROJECT_STATE_OPEN_TASKS,
-    MAX_PROJECT_STATE_REPO_PATH_BYTES,
+    PROJECT_STATE_RESERVED_METADATA_KEYS,
     validate_project_state_input,
 )
 from .core.safety import redact_text_secrets, scan_text_for_secrets
@@ -220,12 +213,32 @@ def optional_metadata(args: JSON) -> JSON | None:
 
 PUBLIC_METADATA_FORBIDDEN_FRAGMENTS = (
     "authority",
+    "conflict",
+    "dismiss",
     "exact_memory",
     "explicit_memory",
     "protect",
+    "supersed",
+    "temporal",
     "trust",
 )
-PUBLIC_METADATA_FORBIDDEN_KEYS = {"session_id", "project_id", "visibility_scope"}
+PUBLIC_METADATA_FORBIDDEN_KEYS = {
+    "session_id",
+    "project_id",
+    "visibility_scope",
+}
+PUBLIC_METADATA_RESERVED_KEYS = set(PROJECT_STATE_RESERVED_METADATA_KEYS)
+PUBLIC_PROJECT_STATE_METADATA_PROPERTIES: dict[str, JSON] = {
+    "agent_type": {"type": "string"},
+    "client_name": {"type": "string"},
+    "client_version": {"type": "string"},
+    "hook_event_name": {"type": "string"},
+    "model": {"type": "string"},
+    "platform": {"type": "string"},
+    "source": {"type": "string"},
+    "task_id": {"type": "string"},
+    "turn_id": {"type": "string"},
+}
 
 
 def public_metadata(args: JSON, *, disable_exact_memory: bool = False) -> JSON:
@@ -234,10 +247,38 @@ def public_metadata(args: JSON, *, disable_exact_memory: bool = False) -> JSON:
         normalized = key.casefold()
         if normalized in PUBLIC_METADATA_FORBIDDEN_KEYS:
             raise ValueError(f"metadata.{key} is not accepted; pass partition fields as top-level tool arguments")
-        if normalized == "continuum_disable_exact_memory" or any(fragment in normalized for fragment in PUBLIC_METADATA_FORBIDDEN_FRAGMENTS):
+        if (
+            normalized in PUBLIC_METADATA_RESERVED_KEYS
+            or normalized == "continuum_disable_exact_memory"
+            or any(
+                fragment in normalized
+                for fragment in PUBLIC_METADATA_FORBIDDEN_FRAGMENTS
+            )
+        ):
             metadata.pop(key, None)
     if disable_exact_memory:
         metadata["continuum_disable_exact_memory"] = True
+    return metadata
+
+
+def public_project_state_metadata(args: JSON) -> JSON:
+    metadata = public_metadata(args)
+    unknown = sorted(set(metadata) - set(PUBLIC_PROJECT_STATE_METADATA_PROPERTIES))
+    if unknown:
+        raise ValueError(
+            "project-state metadata accepts only: "
+            + ", ".join(sorted(PUBLIC_PROJECT_STATE_METADATA_PROPERTIES))
+            + "; unsupported: "
+            + ", ".join(unknown)
+        )
+    non_string = sorted(
+        key for key, value in metadata.items() if not isinstance(value, str)
+    )
+    if non_string:
+        raise ValueError(
+            "project-state metadata values must be strings; invalid: "
+            + ", ".join(non_string)
+        )
     return metadata
 
 
@@ -622,7 +663,7 @@ def tool_record_project_state(args: JSON) -> Any:
         decisions=args.get("decisions"),
         open_tasks=args.get("open_tasks"),
         notes=optional_str(args, "notes"),
-        metadata=public_metadata(args),
+        metadata=public_project_state_metadata(args),
     )
     session_id = str(
         validate_public_partition_arg(root, "session_id", raw_session_id)
@@ -1593,7 +1634,9 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "notes": {"type": "string"},
                 "metadata": {
                     "type": "object",
-                    "maxProperties": MAX_PROJECT_STATE_METADATA_CONTAINER_MEMBERS,
+                    "maxProperties": len(PUBLIC_PROJECT_STATE_METADATA_PROPERTIES),
+                    "properties": PUBLIC_PROJECT_STATE_METADATA_PROPERTIES,
+                    "additionalProperties": False,
                 },
             },
             "additionalProperties": False,

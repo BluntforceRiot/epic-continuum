@@ -48,9 +48,15 @@ Snapshots copy restorable catalog and sidecar state. Restore drills prove that a
 
 This matters because a backup is only useful if it can actually be restored.
 
+Snapshot preflight and restore verification validate the complete temporal
+authority state, not only file hashes. Current and historical project-state
+payload bindings, reciprocal same-boundary supersession links, acyclic lineage,
+same-agent head uniqueness, conflict-group closure, and exact resolution
+receipts must all agree before the state is accepted.
+
 ## Handoff Bundles
 
-`pack-root` creates a verified portable bundle. `verify-bundle` checks the archive envelope, manifest, hashes, portability, proof state, and semantic root health.
+`pack-root` creates a verified portable bundle. `verify-bundle` checks the archive envelope, manifest, hashes, portability, proof state, and semantic root health, including the temporal authority checks applied to snapshots and restores.
 
 Bundles are intended for handoff, audit, and transport. They are stricter than ordinary local working roots.
 
@@ -72,6 +78,16 @@ sessions. Only the newest head is operational; its predecessors remain
 historical evidence and are excluded from recent Scroll and Cue Recall sections
 of a resume packet. Session/private chains remain session-bound, and different
 agents keep independent current heads.
+
+## Ambiguous Authority
+
+Independent-agent heads remain visible for review, but recency alone does not
+make one authoritative. If automatic resume validates more than one current
+head at the requested project/session boundary, it returns
+`authority_ambiguous`, sets `resolution_required`, and writes no recovery
+packet. Explicitly supersede or merge the competing component, then retry
+resume. A bounded scan that cannot prove there is only one head also fails
+closed with the same result.
 
 Recovery packets only include evidence visible to the requested session/project
 scope. Pending queue jobs are included only when their referenced Card, segment,
@@ -119,7 +135,17 @@ continuum repair-project-state-checkpoints \
 ```
 
 Apply mode preserves the invalid Card as historical evidence and restores only
-a reciprocal, same-authority predecessor. Run it again while `has_more` is true.
+a reciprocal, same-authority predecessor. The repair writes a system audit that
+hash-binds the exact pointerless quarantined Card authority/payload state, its
+bound Scroll source event, and the original integrity error. Derived placement,
+recall, and sidecar-location fields remain maintainable, so semantic
+verification and snapshots can proceed while any later mutation of
+that evidence fails closed again. Any related receipt, member, and original
+resolution-audit rows are included in the quarantine binding. Remaining
+incoming authority links are severed without promoting an unproven alternative;
+exact conflict receipts that
+contain the quarantined Card remain preserved but are treated as retired
+evidence. Run repair again while `has_more` is true.
 
 ## Upgrade Backfill
 

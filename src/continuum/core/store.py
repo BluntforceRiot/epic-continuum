@@ -34,6 +34,7 @@ from .safety import (
     scan_text_for_secrets,
     scan_value_for_secrets,
 )
+from .temporal_authority import temporal_authority_integrity_report
 from .units import format_size, parse_size
 from .writer_claim import WriterClaimError, ensure_writer_claim, writer_claim_status
 
@@ -170,6 +171,25 @@ def _current_card_authority_clause(table: str = "cards") -> str:
     return (
         f"{_current_card_status_clause(f'{table}.status')} "
         f"AND coalesce({table}.conflict_group, '') = '' "
+        f"AND coalesce({table}.superseded_by_card_id, '') = '' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM cards AS authority_successor "
+        f"WHERE authority_successor.supersedes_card_id = {table}.id"
+        ")"
+    )
+
+
+def _current_project_state_authority_clause(table: str = "cards") -> str:
+    """Return current project-state heads, including unresolved conflicts.
+
+    A conflict group makes a generic Card ineligible for recall, but it must not
+    make a project-state authority head disappear from resume or lineage logic.
+    """
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        raise ValueError(f"unsafe Card table alias: {table}")
+    return (
+        f"{_current_card_status_clause(f'{table}.status')} "
         f"AND coalesce({table}.superseded_by_card_id, '') = '' "
         "AND NOT EXISTS ("
         "SELECT 1 FROM cards AS authority_successor "
@@ -592,8 +612,16 @@ SNAPSHOT_DURABLE_TABLES = (
     "partition_aliases",
     "card_sidecar_outbox",
     "audit_events",
+    "conflict_resolution_receipts",
+    "conflict_resolution_members",
     "snapshots",
     "artifacts",
+)
+SNAPSHOT_V2_ADDITIVE_COUNT_TABLES = frozenset(
+    {
+        "conflict_resolution_receipts",
+        "conflict_resolution_members",
+    }
 )
 
 
@@ -613,6 +641,45 @@ def catalog_counts_from_db_file(db_path: Path, tables: tuple[str, ...] = SNAPSHO
         }
     finally:
         conn.close()
+
+
+def snapshot_manifest_count_comparison(
+    db_path: Path,
+    expected_counts: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare durable counts while preserving pre-receipt v2 snapshots.
+
+    The two resolution tables were added to the existing v2 manifest contract.
+    Their absent count keys mean zero only when the frozen catalog physically
+    predates those tables. A current catalog with either table present must bind
+    its count key exactly like every other durable table.
+    """
+
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path, immutable=True), uri=True)
+    try:
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+            if row[0]
+        }
+    finally:
+        conn.close()
+    actual_counts = catalog_counts_from_db_file(db_path)
+    comparison_expected = dict(expected_counts)
+    tolerated_absent_tables: list[str] = []
+    for table in sorted(SNAPSHOT_V2_ADDITIVE_COUNT_TABLES):
+        if table not in existing_tables and table not in comparison_expected:
+            comparison_expected[table] = 0
+            tolerated_absent_tables.append(table)
+    return {
+        "ok": actual_counts == comparison_expected,
+        "actual": actual_counts,
+        "expected": dict(expected_counts),
+        "comparison_expected": comparison_expected,
+        "tolerated_absent_tables": tolerated_absent_tables,
+    }
 
 
 def snapshot_id_from_catalog_path(snapshot_path: Path) -> str | None:
@@ -821,10 +888,24 @@ def verify_snapshot_manifest_for_root(
             }
         )
     if snapshot_path.exists():
-        actual_counts = catalog_counts_from_db_file(snapshot_path)
-        expected_counts = manifest.get("counts") if isinstance(manifest.get("counts"), dict) else {}
-        if actual_counts != expected_counts:
-            errors.append({"error": "snapshot_counts_mismatch", "expected": expected_counts, "actual": actual_counts})
+        raw_expected_counts = manifest.get("counts")
+        expected_counts: dict[str, Any] = (
+            dict(raw_expected_counts)
+            if isinstance(raw_expected_counts, dict)
+            else {}
+        )
+        count_comparison = snapshot_manifest_count_comparison(
+            snapshot_path,
+            expected_counts,
+        )
+        if not count_comparison["ok"]:
+            errors.append(
+                {
+                    "error": "snapshot_counts_mismatch",
+                    "expected": expected_counts,
+                    "actual": count_comparison["actual"],
+                }
+            )
     sidecars_path = snapshot_sidecars_path(snapshot_path)
     raw_expected_sidecars = manifest.get("card_sidecars")
     expected_sidecars: dict[str, Any] = raw_expected_sidecars if isinstance(raw_expected_sidecars, dict) else {}
@@ -5522,6 +5603,17 @@ def _project_state_payload_hash(
     )
 
 
+def _project_state_payload_marker_hash(event_content: str) -> str | None:
+    content_lines = str(event_content).splitlines()
+    if (
+        not content_lines
+        or not content_lines[-1].startswith(_PROJECT_STATE_PAYLOAD_MARKER)
+    ):
+        return None
+    stored_hash = content_lines[-1][len(_PROJECT_STATE_PAYLOAD_MARKER) :]
+    return stored_hash if re.fullmatch(r"[0-9a-f]{64}", stored_hash) else None
+
+
 def _project_state_event_binds_payload(
     event_content: str,
     *,
@@ -5532,14 +5624,13 @@ def _project_state_event_binds_payload(
     if payload_hash is None:
         return False
     content_lines = str(event_content).splitlines()
-    if (
-        not content_lines
-        or not content_lines[-1].startswith(_PROJECT_STATE_PAYLOAD_MARKER)
+    if not content_lines or not content_lines[-1].startswith(
+        _PROJECT_STATE_PAYLOAD_MARKER
     ):
         # Pre-v0.3 project-state events did not bind their structured arrays.
         return True
-    stored_hash = content_lines[-1][len(_PROJECT_STATE_PAYLOAD_MARKER) :]
-    if re.fullmatch(r"[0-9a-f]{64}", stored_hash) is None:
+    stored_hash = _project_state_payload_marker_hash(event_content)
+    if stored_hash is None:
         # A legacy user-authored line may happen to share the marker prefix.
         return True
     return stored_hash == payload_hash
@@ -8142,7 +8233,7 @@ def _current_project_state_authority_heads(
         "card_type = 'project_state'",
         "visibility_scope = ?",
         "coalesce(project_id, '') = ?",
-        _current_card_authority_clause("cards"),
+        _current_project_state_authority_clause("cards"),
     ]
     params: list[Any] = [visibility_scope, project_id]
     if visibility_scope in {"session", "private"}:
@@ -8151,7 +8242,7 @@ def _current_project_state_authority_heads(
     rows = conn.execute(
         f"""
         SELECT rowid AS card_rowid, id, created_at, supersedes_card_id,
-               session_id, project_id, visibility_scope,
+               session_id, project_id, visibility_scope, conflict_group,
                length(CAST(title AS BLOB)) AS title_bytes,
                length(CAST(summary AS BLOB)) AS summary_bytes,
                length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
@@ -8375,6 +8466,19 @@ def record_project_state(
             project_id=safe_project_id,
             agent_id=safe_agent_id,
         )
+        unresolved_groups = sorted(
+            {
+                str(row["conflict_group"] or "").strip()
+                for row in previous_heads
+                if str(row["conflict_group"] or "").strip()
+            }
+        )
+        if unresolved_groups:
+            raise ValueError(
+                "current project-state authority has an unresolved conflict; "
+                "resolve or merge it before recording a new checkpoint: "
+                + ", ".join(unresolved_groups)
+            )
         summary = summarize_text(safe_content, limit=900)
         card_id = create_card(
             conn,
@@ -8819,6 +8923,32 @@ def _project_state_card_integrity_error(
         content_hash(str(row["summary"] or "")),
         json_dumps(canonical_source_refs),
     )
+    expected_payload_hash = _project_state_payload_hash(decisions, open_tasks)
+    source_payload_marker_hash = _project_state_payload_marker_hash(
+        str(source_event["content"] or "")
+    )
+    card_metadata_payload_hash = (
+        str(card_metadata.get("state_payload_hash") or "")
+        if isinstance(card_metadata, dict)
+        else ""
+    )
+    source_metadata_payload_hash = (
+        str(source_metadata.get("state_payload_hash") or "")
+        if isinstance(source_metadata, dict)
+        else ""
+    )
+    v03_payload_binding_invalid = (
+        source_payload_marker_hash is not None
+        and (
+            expected_payload_hash is None
+            or source_payload_marker_hash != expected_payload_hash
+            or card_metadata_payload_hash != expected_payload_hash
+            or source_metadata_payload_hash != expected_payload_hash
+        )
+    ) or (
+        source_payload_marker_hash is None
+        and bool(card_metadata_payload_hash or source_metadata_payload_hash)
+    )
     if (
         str(row["summary"] or "")
         != summarize_text(str(source_event["content"] or ""), limit=900)
@@ -8828,6 +8958,7 @@ def _project_state_card_integrity_error(
             decisions=decisions,
             open_tasks=open_tasks,
         )
+        or v03_payload_binding_invalid
     ):
         return "project-state Card payload integrity is invalid"
     return None
@@ -9008,6 +9139,285 @@ def _project_state_repair_agent_id(
     return card_agent_id or source_agent_id or None
 
 
+PROJECT_STATE_QUARANTINE_SCHEMA = "continuum.project_state_quarantine.v1"
+_PROJECT_STATE_QUARANTINE_CARD_COLUMNS = (
+    "id",
+    "card_type",
+    "title",
+    "summary",
+    "status",
+    "visibility_scope",
+    "session_id",
+    "project_id",
+    "conflict_group",
+    "supersedes_card_id",
+    "superseded_by_card_id",
+    "source_refs_json",
+    "decisions_json",
+    "open_tasks_json",
+    "metadata_json",
+    "created_at",
+)
+_PROJECT_STATE_QUARANTINE_SCROLL_COLUMNS = (
+    "id",
+    "session_id",
+    "seq",
+    "event_type",
+    "role",
+    "content",
+    "token_estimate",
+    "content_hash",
+    "visibility_scope",
+    "project_id",
+    "metadata_json",
+    "created_at",
+)
+_PROJECT_STATE_QUARANTINE_RECEIPT_COLUMNS = (
+    "id",
+    "action",
+    "component_fingerprint",
+    "conflict_group",
+    "visibility_scope",
+    "project_id",
+    "session_id",
+    "selected_card_id",
+    "member_count",
+    "actor",
+    "audit_event_id",
+    "created_at",
+)
+_PROJECT_STATE_QUARANTINE_RECEIPT_MEMBER_COLUMNS = (
+    "receipt_id",
+    "card_id",
+    "member_ordinal",
+    "member_binding_hash",
+)
+_PROJECT_STATE_QUARANTINE_AUDIT_COLUMNS = (
+    "id",
+    "actor",
+    "action",
+    "target_type",
+    "target_id",
+    "payload_json",
+    "created_at",
+)
+
+
+def _project_state_quarantine_source_material(
+    conn: sqlite3.Connection,
+    card: sqlite3.Row,
+) -> list[dict[str, Any]]:
+    source_refs = json_loads(card["source_refs_json"], None)
+    if not isinstance(source_refs, list):
+        return []
+    columns = ", ".join(_PROJECT_STATE_QUARANTINE_SCROLL_COLUMNS)
+    rows_by_id: dict[str, sqlite3.Row] = {}
+    for reference in source_refs:
+        if not isinstance(reference, dict):
+            continue
+        event_id = reference.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            row = conn.execute(
+                f"SELECT {columns} FROM scroll_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is not None:
+                rows_by_id[str(row["id"])] = row
+        reference_session_id = reference.get("session_id")
+        reference_seq = reference.get("seq")
+        if (
+            isinstance(reference_session_id, str)
+            and reference_session_id
+            and type(reference_seq) is int
+        ):
+            row = conn.execute(
+                f"""
+                SELECT {columns} FROM scroll_events
+                WHERE session_id = ? AND seq = ?
+                """,
+                (reference_session_id, reference_seq),
+            ).fetchone()
+            if row is not None:
+                rows_by_id[str(row["id"])] = row
+    return [
+        {
+            column: rows_by_id[event_id][column]
+            for column in _PROJECT_STATE_QUARANTINE_SCROLL_COLUMNS
+        }
+        for event_id in sorted(rows_by_id)
+    ]
+
+
+def _project_state_quarantine_receipt_material(
+    conn: sqlite3.Connection,
+    card_id: str,
+) -> list[dict[str, Any]]:
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if not {
+        "conflict_resolution_receipts",
+        "conflict_resolution_members",
+        "audit_events",
+    }.issubset(tables):
+        return []
+    receipt_select = ", ".join(
+        f"receipt.{column} AS {column}"
+        for column in _PROJECT_STATE_QUARANTINE_RECEIPT_COLUMNS
+    )
+    receipts = conn.execute(
+        f"""
+        SELECT DISTINCT {receipt_select}
+        FROM conflict_resolution_receipts AS receipt
+        JOIN conflict_resolution_members AS member
+          ON member.receipt_id = receipt.id
+        WHERE member.card_id = ?
+        ORDER BY receipt.id
+        """,
+        (card_id,),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    member_select = ", ".join(
+        _PROJECT_STATE_QUARANTINE_RECEIPT_MEMBER_COLUMNS
+    )
+    audit_select = ", ".join(_PROJECT_STATE_QUARANTINE_AUDIT_COLUMNS)
+    for receipt in receipts:
+        receipt_id = str(receipt["id"])
+        members = conn.execute(
+            f"""
+            SELECT {member_select}
+            FROM conflict_resolution_members
+            WHERE receipt_id = ?
+            ORDER BY member_ordinal, card_id
+            """,
+            (receipt_id,),
+        ).fetchall()
+        audit_row = conn.execute(
+            f"SELECT {audit_select} FROM audit_events WHERE id = ?",
+            (str(receipt["audit_event_id"] or ""),),
+        ).fetchone()
+        output.append(
+            {
+                "receipt": {
+                    column: receipt[column]
+                    for column in _PROJECT_STATE_QUARANTINE_RECEIPT_COLUMNS
+                },
+                "members": [
+                    {
+                        column: member[column]
+                        for column in (
+                            _PROJECT_STATE_QUARANTINE_RECEIPT_MEMBER_COLUMNS
+                        )
+                    }
+                    for member in members
+                ],
+                "resolution_audit": (
+                    {
+                        column: audit_row[column]
+                        for column in _PROJECT_STATE_QUARANTINE_AUDIT_COLUMNS
+                    }
+                    if audit_row is not None
+                    else None
+                ),
+            }
+        )
+    return output
+
+
+def _project_state_quarantine_binding_hash(
+    conn: sqlite3.Connection,
+    card: sqlite3.Row,
+    *,
+    reason: str,
+    predecessor_card_id: str | None,
+) -> str:
+    material = {
+        "schema": PROJECT_STATE_QUARANTINE_SCHEMA,
+        "card": {
+            column: card[column]
+            for column in _PROJECT_STATE_QUARANTINE_CARD_COLUMNS
+        },
+        "source_events": _project_state_quarantine_source_material(conn, card),
+        "conflict_resolution_receipts": (
+            _project_state_quarantine_receipt_material(
+                conn,
+                str(card["id"]),
+            )
+        ),
+        "reason": reason,
+        "predecessor_card_id": predecessor_card_id,
+    }
+    return content_hash(json_dumps(material))
+
+
+def _valid_project_state_quarantine(
+    conn: sqlite3.Connection,
+    card_id: str,
+) -> dict[str, Any] | None:
+    columns = ", ".join(_PROJECT_STATE_QUARANTINE_CARD_COLUMNS)
+    card = conn.execute(
+        f"SELECT {columns} FROM cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if (
+        card is None
+        or str(card["card_type"] or "") != "project_state"
+        or str(card["status"] or "").casefold() != "historical"
+        or str(card["conflict_group"] or "").strip()
+        or str(card["supersedes_card_id"] or "").strip()
+        or str(card["superseded_by_card_id"] or "").strip()
+    ):
+        return None
+    audits = conn.execute(
+        """
+        SELECT id, actor, action, target_type, target_id, payload_json
+        FROM audit_events
+        WHERE action = 'project_state_checkpoint_quarantined'
+          AND target_type = 'card' AND target_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 16
+        """,
+        (card_id,),
+    ).fetchall()
+    for audit_row in audits:
+        if str(audit_row["actor"] or "") != "system":
+            continue
+        payload = json_loads(audit_row["payload_json"], None)
+        if not isinstance(payload, dict):
+            continue
+        reason = payload.get("reason")
+        predecessor_value = payload.get("predecessor_card_id")
+        predecessor_card_id = (
+            str(predecessor_value) if predecessor_value is not None else None
+        )
+        if (
+            payload.get("schema") != PROJECT_STATE_QUARANTINE_SCHEMA
+            or str(payload.get("card_id") or "") != card_id
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            continue
+        expected_hash = _project_state_quarantine_binding_hash(
+            conn,
+            card,
+            reason=reason,
+            predecessor_card_id=predecessor_card_id,
+        )
+        if str(payload.get("card_binding_hash") or "") != expected_hash:
+            continue
+        return {
+            "card_id": card_id,
+            "audit_event_id": str(audit_row["id"]),
+            "reason": reason,
+            "predecessor_card_id": predecessor_card_id,
+            "card_binding_hash": expected_hash,
+        }
+    return None
+
+
 def repair_invalid_project_state_checkpoints(
     root: Path,
     *,
@@ -9023,7 +9433,10 @@ def repair_invalid_project_state_checkpoints(
     limit = max(1, min(int(limit), 1000))
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
     session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
-    clauses = ["card_type = 'project_state'", _current_card_authority_clause("cards")]
+    clauses = [
+        "card_type = 'project_state'",
+        _current_project_state_authority_clause("cards"),
+    ]
     params: list[Any] = []
     if project_id:
         clauses.append("project_id = ?")
@@ -9032,7 +9445,8 @@ def repair_invalid_project_state_checkpoints(
         clauses.append("session_id = ?")
         params.append(session_id)
     select_fields = """
-        id, session_id, project_id, visibility_scope, supersedes_card_id,
+        id, session_id, project_id, visibility_scope, conflict_group,
+        supersedes_card_id,
         length(CAST(title AS BLOB)) AS title_bytes,
         length(CAST(summary AS BLOB)) AS summary_bytes,
         length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
@@ -9113,14 +9527,30 @@ def repair_invalid_project_state_checkpoints(
             if head_id in reactivated:
                 reactivated.remove(head_id)
             now = utc_now()
+            original_conflict_group = str(head["conflict_group"] or "").strip()
             conn.execute(
                 """
                 UPDATE cards SET status = 'historical', supersedes_card_id = NULL,
-                    superseded_by_card_id = NULL, updated_at = ? WHERE id = ?
+                    superseded_by_card_id = NULL, conflict_group = NULL,
+                    updated_at = ? WHERE id = ?
                 """,
                 (now, head_id),
             )
             touched.add(head_id)
+            if original_conflict_group:
+                grouped_rows = conn.execute(
+                    "SELECT id FROM cards WHERE conflict_group = ?",
+                    (original_conflict_group,),
+                ).fetchall()
+                grouped_ids = [str(row["id"]) for row in grouped_rows]
+                conn.execute(
+                    """
+                    UPDATE cards SET conflict_group = NULL, updated_at = ?
+                    WHERE conflict_group = ?
+                    """,
+                    (now, original_conflict_group),
+                )
+                touched.update(grouped_ids)
             if predecessor is not None:
                 predecessor_id = str(predecessor["id"])
                 if conn.execute(
@@ -9132,6 +9562,56 @@ def repair_invalid_project_state_checkpoints(
                 ).rowcount == 1:
                     reactivated.append(predecessor_id)
                     touched.add(predecessor_id)
+            remaining_incoming = conn.execute(
+                """
+                SELECT id FROM cards
+                WHERE superseded_by_card_id = ?
+                ORDER BY id
+                """,
+                (head_id,),
+            ).fetchall()
+            remaining_incoming_ids = [
+                str(row["id"]) for row in remaining_incoming
+            ]
+            if remaining_incoming_ids:
+                placeholders = ", ".join(
+                    "?" for _ in remaining_incoming_ids
+                )
+                conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET status = 'historical', superseded_by_card_id = NULL,
+                        conflict_group = NULL, updated_at = ?
+                    WHERE id IN ({placeholders})
+                      AND superseded_by_card_id = ?
+                    """,
+                    (now, *remaining_incoming_ids, head_id),
+                )
+                touched.update(remaining_incoming_ids)
+            quarantine_columns = ", ".join(
+                _PROJECT_STATE_QUARANTINE_CARD_COLUMNS
+            )
+            quarantined_card = conn.execute(
+                f"SELECT {quarantine_columns} FROM cards WHERE id = ?",
+                (head_id,),
+            ).fetchone()
+            if quarantined_card is None:
+                raise ValueError(
+                    f"quarantined project-state Card disappeared: {head_id}"
+                )
+            record["schema"] = PROJECT_STATE_QUARANTINE_SCHEMA
+            record["card_binding_hash"] = (
+                _project_state_quarantine_binding_hash(
+                    conn,
+                    quarantined_card,
+                    reason=str(record["reason"]),
+                    predecessor_card_id=(
+                        str(record["predecessor_card_id"])
+                        if record["predecessor_card_id"] is not None
+                        else None
+                    ),
+                )
+            )
             audit_event(
                 conn,
                 action="project_state_checkpoint_quarantined",
@@ -9213,7 +9693,7 @@ def _discover_resume_state(
     state_row = conn.execute(
         f"""
         SELECT session_id, project_id, visibility_scope,
-               created_at AS checkpoint_at, id,
+               created_at AS checkpoint_at, id, conflict_group,
                length(CAST(title AS BLOB)) AS title_bytes,
                length(CAST(summary AS BLOB)) AS summary_bytes,
                length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
@@ -9221,13 +9701,14 @@ def _discover_resume_state(
                length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
                length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
         FROM cards
-        WHERE {' AND '.join([*card_clauses, _current_card_authority_clause('cards')])}
+        WHERE {' AND '.join([*card_clauses, _current_project_state_authority_clause('cards')])}
         ORDER BY created_at DESC, rowid DESC
         LIMIT 1
         """,
         tuple(card_params),
     ).fetchone()
     invalid_checkpoint = None
+    authority_ambiguity = None
     if state_row is not None:
         invalid_reason = _project_state_card_integrity_error(
             conn,
@@ -9240,6 +9721,93 @@ def _discover_resume_state(
                 "reason": invalid_reason,
             }
             state_row = None
+        else:
+            selected_scope = normalize_visibility_scope(
+                str(state_row["visibility_scope"] or ""),
+                field="resume checkpoint visibility_scope",
+            )
+            selected_project = str(state_row["project_id"] or "")
+            selected_session = str(state_row["session_id"] or "")
+            if selected_scope == "project":
+                boundary = ("project", selected_project, "")
+                boundary_clause = (
+                    "visibility_scope = 'project' "
+                    "AND coalesce(project_id, '') = ?"
+                )
+                boundary_params: tuple[Any, ...] = (selected_project,)
+            elif selected_scope == "global":
+                boundary = ("global", "", "")
+                boundary_clause = "visibility_scope = 'global'"
+                boundary_params = ()
+            else:
+                boundary = (selected_scope, selected_project, selected_session)
+                boundary_clause = (
+                    "visibility_scope = ? "
+                    "AND coalesce(project_id, '') = ? "
+                    "AND coalesce(session_id, '') = ?"
+                )
+                boundary_params = boundary
+            boundary_scan_limit = 64
+            boundary_heads = conn.execute(
+                f"""
+                SELECT session_id, project_id, visibility_scope,
+                       created_at AS checkpoint_at, id, conflict_group,
+                       length(CAST(title AS BLOB)) AS title_bytes,
+                       length(CAST(summary AS BLOB)) AS summary_bytes,
+                       length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+                       length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+                       length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+                       length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+                FROM cards
+                WHERE card_type = 'project_state'
+                  AND {_current_project_state_authority_clause('cards')}
+                  AND {card_visibility_clause}
+                  AND {boundary_clause}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (
+                    *card_params,
+                    *boundary_params,
+                    boundary_scan_limit + 1,
+                ),
+            ).fetchall()
+            boundary_scan_overflow = len(boundary_heads) > boundary_scan_limit
+            valid_boundary_head_ids: list[str] = []
+            contested_boundary_head_ids: list[str] = []
+            for boundary_head in boundary_heads[:boundary_scan_limit]:
+                boundary_head_id = str(boundary_head["id"])
+                boundary_head_error = _project_state_card_integrity_error(
+                    conn,
+                    boundary_head_id,
+                    size_row=boundary_head,
+                )
+                if boundary_head_error is not None:
+                    continue
+                valid_boundary_head_ids.append(boundary_head_id)
+                if str(boundary_head["conflict_group"] or "").strip():
+                    contested_boundary_head_ids.append(boundary_head_id)
+                if len(valid_boundary_head_ids) >= 2:
+                    break
+            if (
+                len(valid_boundary_head_ids) > 1
+                or contested_boundary_head_ids
+                or boundary_scan_overflow
+            ):
+                authority_ambiguity = {
+                    "boundary": {
+                        "visibility_scope": boundary[0],
+                        "project_id": boundary[1] or None,
+                        "session_id": boundary[2] or None,
+                    },
+                    "current_head_ids": valid_boundary_head_ids,
+                    "contested_head_ids": contested_boundary_head_ids,
+                    "head_count_at_least": len(valid_boundary_head_ids),
+                    "head_list_limit": 2,
+                    "boundary_scan_limit": boundary_scan_limit,
+                    "boundary_scan_overflow": boundary_scan_overflow,
+                }
+                state_row = None
     stale_state_exists = False
     discovery_source = "project_state_card"
     if state_row is None:
@@ -9250,7 +9818,11 @@ def _discover_resume_state(
             ).fetchone()
             is not None
         )
-        if not (stale_state_exists and scoped_resume):
+        if (
+            authority_ambiguity is None
+            and invalid_checkpoint is None
+            and not (stale_state_exists and scoped_resume)
+        ):
             event_visibility_clause, event_params = authorized_visibility_clause()
             event_clauses = [
                 "coalesce(session_id, '') != ''",
@@ -9315,6 +9887,7 @@ def _discover_resume_state(
         "state": dict(state_row) if state_row is not None else None,
         "stale_state_exists": stale_state_exists,
         "invalid_checkpoint": invalid_checkpoint,
+        "authority_ambiguity": authority_ambiguity,
     }
 
 
@@ -10319,6 +10892,23 @@ def resume_latest(
                         "quarantine it before resuming its predecessor"
                     ),
                 }
+            authority_ambiguity = selected.get("authority_ambiguity")
+            if isinstance(authority_ambiguity, dict):
+                return {
+                    "ok": False,
+                    "initialized": True,
+                    "root": str(root),
+                    "reason": "authority_ambiguous",
+                    "resume_mode": resume_mode,
+                    "session_id": requested_session or None,
+                    "project_id": requested_project or None,
+                    "authority_ambiguity": authority_ambiguity,
+                    "resolution_required": True,
+                    "warning": (
+                        "multiple unresolved project-state authority heads are "
+                        "current in the selected boundary"
+                    ),
+                }
             return {
                 "ok": False,
                 "initialized": True,
@@ -10775,6 +11365,78 @@ def semantic_integrity_report(
                 value = str(row["value"])
                 if _partition_value_needs_alias(kind, value):
                     unmigrated_partition_identifiers += 1
+        invalid_project_state_cards: list[dict[str, str]] = []
+        quarantined_project_state_cards: list[dict[str, Any]] = []
+        valid_project_state_quarantines: dict[str, str | None] = {}
+        valid_project_state_agents: dict[str, str] = {}
+        if {
+            "id",
+            "card_type",
+            "session_id",
+            "project_id",
+            "visibility_scope",
+            "title",
+            "summary",
+            "decisions_json",
+            "open_tasks_json",
+            "metadata_json",
+            "source_refs_json",
+        }.issubset(_table_columns(conn, "cards")):
+            project_state_rows = conn.execute(
+                """
+                SELECT id, session_id, project_id, visibility_scope,
+                       length(CAST(title AS BLOB)) AS title_bytes,
+                       length(CAST(summary AS BLOB)) AS summary_bytes,
+                       length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
+                       length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
+                       length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
+                       length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
+                FROM cards
+                WHERE card_type = 'project_state'
+                ORDER BY id
+                """
+            ).fetchall()
+            for project_state_row in project_state_rows:
+                card_id = str(project_state_row["id"])
+                project_state_error = _project_state_card_integrity_error(
+                    conn,
+                    card_id,
+                    size_row=project_state_row,
+                )
+                if project_state_error is None:
+                    agent_id = _project_state_repair_agent_id(
+                        conn,
+                        project_state_row,
+                    )
+                    if agent_id:
+                        valid_project_state_agents[card_id] = agent_id
+                    else:
+                        project_state_error = (
+                            "project-state Card agent evidence is invalid"
+                        )
+                if project_state_error is not None:
+                    quarantine = _valid_project_state_quarantine(conn, card_id)
+                    if quarantine is not None:
+                        quarantined_project_state_cards.append(quarantine)
+                        predecessor_value = quarantine.get(
+                            "predecessor_card_id"
+                        )
+                        valid_project_state_quarantines[card_id] = (
+                            str(predecessor_value)
+                            if predecessor_value is not None
+                            else None
+                        )
+                    else:
+                        invalid_project_state_cards.append(
+                            {"card_id": card_id, "reason": project_state_error}
+                        )
+        authority_integrity = temporal_authority_integrity_report(
+            conn,
+            valid_project_state_agents=valid_project_state_agents,
+            valid_project_state_quarantines=(
+                valid_project_state_quarantines
+            ),
+        )
         checks = {
             "sqlite_integrity_ok": sqlite_integrity_ok,
             "foreign_key_violation_count": len(foreign_key_rows),
@@ -10793,11 +11455,16 @@ def semantic_integrity_report(
             "alias_key_missing": alias_key_missing,
             "alias_internal_id_mismatches": alias_internal_id_mismatches,
             "unmigrated_partition_identifiers": unmigrated_partition_identifiers,
+            "invalid_project_state_cards": len(invalid_project_state_cards),
+            "quarantined_project_state_cards": len(
+                quarantined_project_state_cards
+            ),
+            **authority_integrity["checks"],
         }
         failing_counts = {
             key: value
             for key, value in checks.items()
-            if key not in {"alias_count"}
+            if key not in {"alias_count", "quarantined_project_state_cards"}
             and (
                 (isinstance(value, bool) and not value)
                 or (not isinstance(value, bool) and isinstance(value, int) and value != 0)
@@ -10809,6 +11476,14 @@ def semantic_integrity_report(
             "generated_at": utc_now(),
             "checks": checks,
             "foreign_key_violations": foreign_key_rows[:20],
+            "project_state_integrity_failures": invalid_project_state_cards[:20],
+            "project_state_quarantines": quarantined_project_state_cards[:20],
+            "authority_integrity_samples": authority_integrity["samples"],
+            "retired_conflict_resolution_receipt_ids": (
+                authority_integrity[
+                    "retired_conflict_resolution_receipt_ids"
+                ]
+            ),
             "failing": failing_counts,
         }
     finally:

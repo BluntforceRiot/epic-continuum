@@ -38,13 +38,16 @@
 Epic Continuum 0.3 turns durable memory into a safer daily recovery system:
 
 - **Automatic resume** discovers the newest durable project/session checkpoint;
-  an internal thread ID is optional, and only the newest same-agent checkpoint
-  remains current.
+  an internal thread ID is optional, only the newest same-agent checkpoint
+  remains current, and unresolved independent-agent heads fail closed as
+  `authority_ambiguous` instead of being chosen by timestamp.
 - **Looking Glass planner v2** balances Scroll, Cards, and Cue Recall, preserves
   authority labels, excludes contested/superseded current candidates, and emits
   an explainable selection trace under a hard token budget.
 - **Temporal memory review** can explicitly supersede an old Card or dismiss a
-  false-positive conflict while retaining historical evidence and audit records.
+  false-positive conflict while retaining historical evidence. System-owned
+  receipts bind every resolved member, its authority boundary, and the audit
+  event in the same transaction.
 - **Yarn/Qwythos local assistance** can produce citation-bound, non-authoritative
   recovery briefings through a loopback llama.cpp endpoint. It is optional and
   fails back to the deterministic packet.
@@ -196,15 +199,20 @@ configured project exists. `explicit` mode requires a session or project ID.
 Superseded and unresolved contested Cards remain historical evidence but are not
 eligible to become the current resume checkpoint. Same-agent project checkpoints
 form one temporal chain, so an older task list cannot re-enter the operational
-packet merely because it remains preserved in the Scroll.
+packet merely because it remains preserved in the Scroll. If one authority
+boundary still has multiple validated independent-agent heads, automatic resume
+returns `authority_ambiguous` and no packet; an explicit supersession or merge
+must establish the operational head.
 
 ### Resolve Temporal Memory Conflicts
 
 Conflict detection groups connected competing Cards into one stable review
 unit. Resolution promotes one current Card and preserves the others as
 historical evidence; dismissing clears a false-positive group without deleting
-anything. A bounded content fingerprint keeps periodic detection from recreating
-that exact dismissed conflict unless its membership or evidence changes.
+anything. Each resolution writes a system-owned receipt that binds the exact
+component fingerprint, member set, authority boundary, selected Card, and audit
+event atomically. Periodic detection honors that receipt only while every
+binding still matches; caller-supplied Card metadata cannot dismiss a conflict.
 
 ```powershell
 continuum detect-conflicts --root "$HOME\.continuum"

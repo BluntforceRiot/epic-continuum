@@ -23,10 +23,10 @@ Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The post-review Windows v0.3 source candidate ran 738 CI-equivalent unittest
-checks with 25 environment-gated skips; all 713 executed checks passed on each
-of Python 3.11, 3.12, and 3.13. An independent pytest run passed 715 tests with
-25 skips and 327 subtests. Ruff, mypy across 30 source files, compileall, fixture
+The post-review Windows v0.3 source candidate ran 763 CI-equivalent unittest
+checks with 25 environment-gated skips; all 738 executed checks passed on each
+of Python 3.11, 3.12, and 3.13. An independent pytest run passed 740 tests with
+25 skips and 344 subtests. Ruff, mypy across 31 source files, compileall, fixture
 allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
 passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
 records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
@@ -112,6 +112,11 @@ Release review hardening included:
   bounded and explicitly repairable legacy project state, resilient bounded MCP
   frames, thread-free CLI/MCP imports, and receipt-v2 distributions rebuilt
   twice from the exact canonical source ZIP.
+- final authority-review fixes that refuse timestamp-based selection among
+  unresolved independent-agent heads, replace caller-influenced dismissal state
+  with transactional exact-member resolution receipts, and extend semantic
+  snapshot, restore, pack, and embedded-bundle verification across the complete
+  project-state lineage and payload bindings.
 
 The Python package version is `0.3.0`, and the catalog capability
 `SCHEMA_VERSION` remains `0.2.0`. This feature release uses additive in-place

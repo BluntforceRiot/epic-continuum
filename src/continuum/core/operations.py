@@ -50,6 +50,7 @@ from .store import (
     resolve_stored_uri,
     semantic_integrity_report,
     snapshot,
+    snapshot_manifest_count_comparison,
     load_snapshot_manifest,
     snapshot_alias_key_path,
     snapshot_sidecars_path as store_snapshot_sidecars_path,
@@ -3707,8 +3708,12 @@ def restore_drill(
     audit_result = audit(drill_root, create=False)
     restored_semantic_integrity = semantic_integrity_report(drill_root, create=False)
     restored_schema_version = _schema_version_for_root(drill_root)
-    restored_counts = _catalog_counts_from_db(restored_db)
     expected_counts = dict(selected_manifest["counts"])
+    count_comparison = snapshot_manifest_count_comparison(
+        restored_db,
+        expected_counts,
+    )
+    restored_counts = dict(count_comparison["actual"])
     search_index = audit_search_index(drill_root, create=False)
     recent_proofs = _verify_recent_proof_packs(drill_root, limit=verify_recent_proof_packs, allowed_roots=allowed_roots)
     artifact_ledger = _verify_artifact_ledger(drill_root, relocation_root=root)
@@ -3745,9 +3750,12 @@ def restore_drill(
         },
         {
             "name": "restored_counts_match_snapshot_manifest",
-            "ok": restored_counts == expected_counts,
+            "ok": bool(count_comparison["ok"]),
             "expected_counts": expected_counts,
             "restored_counts": restored_counts,
+            "tolerated_absent_tables": count_comparison[
+                "tolerated_absent_tables"
+            ],
         },
         {
             "name": "semantic_integrity_clean",

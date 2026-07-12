@@ -29,7 +29,17 @@ sessions. Recording a new checkpoint atomically makes every older same-agent
 head historical, while preserving those Cards and Scroll events as evidence.
 Session/private checkpoints supersede only within the same session. Checkpoints
 from different agents retain independent current heads so disagreement remains
-visible instead of being silently overwritten.
+visible instead of being silently overwritten. When a boundary has more than
+one validated independent-agent head, automatic resume returns
+`authority_ambiguous` and no packet; it never promotes one merely because its
+timestamp is newer. An explicit supersession or merge must establish one
+operational authority first.
+
+Temporal conflict dismissal and supersession are Continuum-owned state. A valid
+resolution receipt binds the exact component fingerprint, complete member set,
+authority boundary, selected Card, and system audit event in one transaction.
+Card metadata is evidence only and cannot create, preserve, or alter that
+resolution.
 
 One checkpoint is limited to 12 KiB of canonical serialized state so every
 accepted checkpoint, including escape-dense content, fits the supported

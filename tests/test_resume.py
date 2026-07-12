@@ -27,7 +27,12 @@ from continuum.core.store import (
     resume_latest,
     roll_scroll_segment,
 )
-from continuum.core.workers import detect_conflicts, prune_memory, run_worker_pass
+from continuum.core.workers import (
+    detect_conflicts,
+    prune_memory,
+    resolve_conflict,
+    run_worker_pass,
+)
 
 
 class ResumeLatestTests(unittest.TestCase):
@@ -1675,6 +1680,254 @@ class ResumeLatestTests(unittest.TestCase):
 
             self.assertEqual(detected["conflict_count"], 1, detected)
 
+    def test_immediate_cross_agent_project_heads_fail_closed_until_resolved(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="agent-a-session",
+                agent_id="agent-a",
+                project_id="shared-project",
+                objective="Prepare deployment routing",
+                decisions=["Use alpha routing for deployment"],
+            )
+            second = record_project_state(
+                root,
+                session_id="agent-b-session",
+                agent_id="agent-b",
+                project_id="shared-project",
+                objective="Prepare deployment routing",
+                decisions=["Do not use alpha routing for deployment"],
+            )
+
+            ambiguous = resume_latest(
+                root,
+                project_id="shared-project",
+                model_assist=False,
+            )
+
+            self.assertFalse(ambiguous["ok"], ambiguous)
+            self.assertEqual(ambiguous["reason"], "authority_ambiguous")
+            self.assertTrue(ambiguous["resolution_required"])
+            details = ambiguous["authority_ambiguity"]
+            self.assertEqual(
+                details["boundary"],
+                {
+                    "visibility_scope": "project",
+                    "project_id": "shared-project",
+                    "session_id": None,
+                },
+            )
+            self.assertEqual(
+                set(details["current_head_ids"]),
+                {first["card_id"], second["card_id"]},
+            )
+            self.assertEqual(details["head_count_at_least"], 2)
+            self.assertEqual(details["head_list_limit"], 2)
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+            detected = detect_conflicts(root)
+            self.assertEqual(detected["conflict_count"], 1, detected)
+            grouped_ambiguous = resume_latest(
+                root,
+                project_id="shared-project",
+                model_assist=False,
+            )
+            self.assertFalse(grouped_ambiguous["ok"], grouped_ambiguous)
+            self.assertEqual(
+                grouped_ambiguous["reason"],
+                "authority_ambiguous",
+            )
+            self.assertEqual(
+                set(
+                    grouped_ambiguous["authority_ambiguity"][
+                        "contested_head_ids"
+                    ]
+                ),
+                {first["card_id"], second["card_id"]},
+            )
+            conn = connect(root)
+            try:
+                before_event_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM scroll_events"
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "unresolved conflict"):
+                record_project_state(
+                    root,
+                    session_id="agent-a-follow-up",
+                    agent_id="agent-a",
+                    project_id="shared-project",
+                    objective="Advance without resolving the disagreement",
+                )
+            conn = connect(root)
+            try:
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) FROM scroll_events"
+                        ).fetchone()[0]
+                    ),
+                    before_event_count,
+                )
+            finally:
+                conn.close()
+            resolved = resolve_conflict(
+                root,
+                card_id=second["card_id"],
+                action="supersede",
+            )
+            self.assertTrue(resolved["ok"], resolved)
+
+            resumed = resume_latest(
+                root,
+                project_id="shared-project",
+                model_assist=False,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                second["card_id"],
+            )
+
+    def test_immediate_cross_agent_session_heads_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="shared-session",
+                agent_id="agent-a",
+                project_id="session-project",
+                decisions=["Use alpha routing for deployment"],
+                metadata={"visibility_scope": "session"},
+            )
+            second = record_project_state(
+                root,
+                session_id="shared-session",
+                agent_id="agent-b",
+                project_id="session-project",
+                decisions=["Do not use alpha routing for deployment"],
+                metadata={"visibility_scope": "session"},
+            )
+
+            ambiguous = resume_latest(
+                root,
+                session_id="shared-session",
+                model_assist=False,
+            )
+
+            self.assertFalse(ambiguous["ok"], ambiguous)
+            self.assertEqual(ambiguous["reason"], "authority_ambiguous")
+            details = ambiguous["authority_ambiguity"]
+            self.assertEqual(
+                details["boundary"],
+                {
+                    "visibility_scope": "session",
+                    "project_id": "session-project",
+                    "session_id": "shared-session",
+                },
+            )
+            self.assertEqual(
+                set(details["current_head_ids"]),
+                {first["card_id"], second["card_id"]},
+            )
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_resume_fails_closed_when_selected_boundary_scan_overflows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            invalid_head_ids = []
+            for index in range(64):
+                state = record_project_state(
+                    root,
+                    session_id=f"overflow-session-{index}",
+                    agent_id=f"overflow-agent-{index}",
+                    project_id="overflow-project",
+                    objective=f"Historical independent state {index}",
+                )
+                invalid_head_ids.append(state["card_id"])
+            selected = record_project_state(
+                root,
+                session_id="overflow-selected-session",
+                agent_id="overflow-selected-agent",
+                project_id="overflow-project",
+                objective="VALID OVERFLOW SELECTED CHECKPOINT",
+            )
+            conn = connect(root)
+            try:
+                placeholders = ", ".join("?" for _ in invalid_head_ids)
+                conn.execute(
+                    f"UPDATE cards SET summary = 'invalid' "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(invalid_head_ids),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            ambiguous = resume_latest(
+                root,
+                project_id="overflow-project",
+                model_assist=False,
+            )
+
+            self.assertFalse(ambiguous["ok"], ambiguous)
+            self.assertEqual(ambiguous["reason"], "authority_ambiguous")
+            details = ambiguous["authority_ambiguity"]
+            self.assertEqual(details["current_head_ids"], [selected["card_id"]])
+            self.assertEqual(details["head_count_at_least"], 1)
+            self.assertEqual(details["boundary_scan_limit"], 64)
+            self.assertTrue(details["boundary_scan_overflow"])
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
+    def test_invalid_selected_cross_agent_head_precedes_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="valid-older-session",
+                agent_id="valid-older-agent",
+                project_id="invalid-selected-project",
+                objective="VALID OLDER CHECKPOINT",
+            )
+            invalid = record_project_state(
+                root,
+                session_id="invalid-newer-session",
+                agent_id="invalid-newer-agent",
+                project_id="invalid-selected-project",
+                objective="INVALID NEWER CHECKPOINT",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = 'invalid' WHERE id = ?",
+                    (invalid["card_id"],),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resumed = resume_latest(
+                root,
+                project_id="invalid-selected-project",
+                model_assist=False,
+            )
+
+            self.assertFalse(resumed["ok"], resumed)
+            self.assertEqual(resumed["reason"], "invalid_project_state_checkpoint")
+            self.assertEqual(
+                resumed["invalid_checkpoint"]["checkpoint_id"],
+                invalid["card_id"],
+            )
+            self.assertNotIn("authority_ambiguity", resumed)
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
+
     def test_same_agent_project_state_supersession_keeps_one_operational_head_and_raw_history(
         self,
     ) -> None:
@@ -2551,7 +2804,8 @@ class ResumeLatestTests(unittest.TestCase):
             result = resume_latest(root, project_id="stale-project")
 
             self.assertFalse(result["ok"])
-            self.assertEqual(result["reason"], "no_current_project_state")
+            self.assertEqual(result["reason"], "authority_ambiguous")
+            self.assertTrue(result["resolution_required"])
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
 

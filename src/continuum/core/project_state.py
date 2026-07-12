@@ -29,6 +29,18 @@ MAX_STORED_PROJECT_STATE_METADATA_CONTAINER_MEMBERS = 80
 MAX_PROJECT_STATE_METADATA_KEY_BYTES = 128
 MAX_PROJECT_STATE_METADATA_STRING_BYTES = 2 * 1024
 MAX_PROJECT_STATE_TITLE_BYTES = 512
+PROJECT_STATE_RESERVED_METADATA_KEYS = frozenset(
+    {
+        "conflict_group",
+        "conflict_resolution_id",
+        "conflict_resolution_members",
+        "conflict_resolution_receipt_id",
+        "conflict_resolution_receipts",
+        "dismissed_conflict_components",
+        "superseded_by_card_id",
+        "supersedes_card_id",
+    }
+)
 # Stored checkpoints deliberately retain both immutable Scroll evidence and
 # structured Card fields. Keep their bounded materialization envelope wider
 # than the caller acceptance cap so every accepted checkpoint can be resumed.
@@ -79,6 +91,18 @@ def validate_project_state_metadata(
         return {}
     if not isinstance(value, dict):
         raise ValueError("metadata must be an object")
+    if not enriched:
+        reserved = sorted(
+            str(key)
+            for key in value
+            if isinstance(key, str)
+            and key.casefold() in PROJECT_STATE_RESERVED_METADATA_KEYS
+        )
+        if reserved:
+            raise ValueError(
+                "metadata contains Continuum-reserved temporal field(s): "
+                + ", ".join(reserved)
+            )
 
     maximum_members = (
         MAX_STORED_PROJECT_STATE_METADATA_MEMBERS

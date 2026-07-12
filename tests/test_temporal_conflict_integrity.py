@@ -197,9 +197,47 @@ class TemporalConflictIntegrityTest(unittest.TestCase):
             rows = _card_rows(root, [first, second])
             self.assertTrue(all(row["conflict_group"] is None for row in rows.values()))
             for row in rows.values():
-                entries = json.loads(row["metadata_json"])["dismissed_conflict_components"]
-                self.assertLessEqual(len(entries), 8)
-                self.assertEqual(entries[-1]["fingerprint"], dismissed["dismissal_fingerprint"])
+                self.assertNotIn(
+                    "dismissed_conflict_components",
+                    json.loads(row["metadata_json"]),
+                )
+            conn = connect(root)
+            try:
+                receipt = conn.execute(
+                    "SELECT * FROM conflict_resolution_receipts WHERE id = ?",
+                    (dismissed["resolution_id"],),
+                ).fetchone()
+                member_rows = conn.execute(
+                    """
+                    SELECT card_id, member_ordinal, member_binding_hash
+                    FROM conflict_resolution_members
+                    WHERE receipt_id = ?
+                    ORDER BY member_ordinal
+                    """,
+                    (dismissed["resolution_id"],),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertEqual(receipt["action"], "dismiss")
+            self.assertEqual(
+                receipt["component_fingerprint"],
+                dismissed["dismissal_fingerprint"],
+            )
+            self.assertEqual(receipt["selected_card_id"], first)
+            self.assertEqual(receipt["member_count"], 2)
+            self.assertEqual(
+                [row["card_id"] for row in member_rows],
+                sorted([first, second]),
+            )
+            self.assertEqual(
+                [row["member_ordinal"] for row in member_rows],
+                [0, 1],
+            )
+            self.assertTrue(
+                all(row["member_binding_hash"] for row in member_rows)
+            )
 
             conn = connect(root)
             try:
@@ -215,6 +253,225 @@ class TemporalConflictIntegrityTest(unittest.TestCase):
 
             self.assertEqual(reconsidered["conflict_count"], 1, reconsidered)
             self.assertEqual(reconsidered["suppressed_component_count"], 0, reconsidered)
+
+    def test_matching_card_metadata_without_resolution_receipt_never_suppresses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                first = _create_decision(
+                    conn,
+                    root=root,
+                    title="Metadata-only Route",
+                    summary="Use metadata-only routing for deployment.",
+                )
+                second = _create_decision(
+                    conn,
+                    root=root,
+                    title="Metadata-only Route",
+                    summary="Do not use metadata-only routing for deployment.",
+                )
+                conn.commit()
+                rows = conn.execute(
+                    "SELECT * FROM cards WHERE id IN (?, ?) ORDER BY id",
+                    (first, second),
+                ).fetchall()
+                by_id = {str(row["id"]): row for row in rows}
+                fingerprint = worker_module._conflict_component_fingerprint(
+                    by_id,
+                    [first, second],
+                )
+                metadata = {
+                    "dismissed_conflict_components": [
+                        {
+                            "fingerprint": fingerprint,
+                            "member_count": 2,
+                            "dismissed_at": "caller-value",
+                        }
+                    ]
+                }
+                conn.execute(
+                    "UPDATE cards SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata), first),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            detected = detect_conflicts(root, card_id=first)
+
+            self.assertEqual(detected["conflict_count"], 1, detected)
+            self.assertEqual(detected["suppressed_component_count"], 0, detected)
+            conn = connect(root)
+            try:
+                receipt_count = conn.execute(
+                    "SELECT count(*) AS n FROM conflict_resolution_receipts"
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertEqual(receipt_count, 0)
+
+    def test_dismissal_receipt_is_exact_to_audit_and_complete_member_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                first = _create_decision(
+                    conn,
+                    root=root,
+                    title="Exact Receipt Route",
+                    summary="Use exact receipt routing for deployment.",
+                )
+                second = _create_decision(
+                    conn,
+                    root=root,
+                    title="Exact Receipt Route",
+                    summary="Do not use exact receipt routing for deployment.",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            detect_conflicts(root, card_id=first)
+            dismissed = resolve_conflict(root, card_id=first, action="dismiss")
+
+            conn = connect(root)
+            try:
+                receipt = conn.execute(
+                    "SELECT audit_event_id FROM conflict_resolution_receipts WHERE id = ?",
+                    (dismissed["resolution_id"],),
+                ).fetchone()
+                assert receipt is not None
+                audit_payload = json.loads(
+                    conn.execute(
+                        "SELECT payload_json FROM audit_events WHERE id = ?",
+                        (receipt["audit_event_id"],),
+                    ).fetchone()["payload_json"]
+                )
+                audit_payload["member_count"] = 99
+                conn.execute(
+                    "UPDATE audit_events SET payload_json = ? WHERE id = ?",
+                    (json.dumps(audit_payload), receipt["audit_event_id"]),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            mismatched_audit = detect_conflicts(root, card_id=first)
+            self.assertEqual(mismatched_audit["conflict_count"], 1, mismatched_audit)
+            self.assertEqual(
+                mismatched_audit["suppressed_component_count"],
+                0,
+                mismatched_audit,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                first = _create_decision(
+                    conn,
+                    root=root,
+                    title="Expanded Receipt Route",
+                    summary="Use expanded receipt routing for deployment.",
+                )
+                second = _create_decision(
+                    conn,
+                    root=root,
+                    title="Expanded Receipt Route",
+                    summary="Do not use expanded receipt routing for deployment.",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            detect_conflicts(root, card_id=first)
+            resolve_conflict(root, card_id=first, action="dismiss")
+            conn = connect(root)
+            try:
+                third = _create_decision(
+                    conn,
+                    root=root,
+                    title="Expanded Receipt Route",
+                    summary="Never disable expanded receipt routing for deployment.",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            expanded = detect_conflicts(root, card_id=first)
+            self.assertEqual(expanded["conflict_count"], 1, expanded)
+            self.assertEqual(expanded["suppressed_component_count"], 0, expanded)
+            self.assertEqual(
+                set(expanded["conflicts"][0]["card_ids"]),
+                {first, second, third},
+            )
+
+    def test_resolution_receipt_failure_rolls_back_card_and_audit_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                first = _create_decision(
+                    conn,
+                    root=root,
+                    title="Rollback Receipt Route",
+                    summary="Use rollback receipt routing for deployment.",
+                )
+                second = _create_decision(
+                    conn,
+                    root=root,
+                    title="Rollback Receipt Route",
+                    summary="Do not use rollback receipt routing for deployment.",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            detect_conflicts(root, card_id=first)
+            before = _card_rows(root, [first, second])
+            original_binding_hash = worker_module._conflict_member_binding_hash
+            binding_calls = 0
+
+            def fail_after_first_member(card):
+                nonlocal binding_calls
+                binding_calls += 1
+                if binding_calls == 2:
+                    raise RuntimeError("receipt member write failed")
+                return original_binding_hash(card)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "_conflict_member_binding_hash",
+                    side_effect=fail_after_first_member,
+                ),
+                self.assertRaisesRegex(RuntimeError, "receipt member write failed"),
+            ):
+                resolve_conflict(root, card_id=first, action="dismiss")
+
+            self.assertEqual(binding_calls, 2)
+            self.assertEqual(_card_rows(root, [first, second]), before)
+            conn = connect(root)
+            try:
+                receipt_count = conn.execute(
+                    "SELECT count(*) AS n FROM conflict_resolution_receipts"
+                ).fetchone()["n"]
+                member_count = conn.execute(
+                    "SELECT count(*) AS n FROM conflict_resolution_members"
+                ).fetchone()["n"]
+                resolution_audit_count = conn.execute(
+                    """
+                    SELECT count(*) AS n FROM audit_events
+                    WHERE action = 'librarian_resolve_conflict'
+                    """
+                ).fetchone()["n"]
+            finally:
+                conn.close()
+            self.assertEqual(receipt_count, 0)
+            self.assertEqual(member_count, 0)
+            self.assertEqual(resolution_audit_count, 0)
 
     def test_unscoped_limit_one_progresses_across_ungrouped_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2197,6 +2454,30 @@ class TemporalConflictIntegrityTest(unittest.TestCase):
             self.assertEqual(rows[beta]["superseded_by_card_id"], winner)
             self.assertIn(rows[winner]["supersedes_card_id"], {alpha, beta})
             _assert_temporal_dag(self, rows)
+            conn = connect(root)
+            try:
+                receipt = conn.execute(
+                    "SELECT * FROM conflict_resolution_receipts WHERE id = ?",
+                    (resolved["resolution_id"],),
+                ).fetchone()
+                receipt_members = conn.execute(
+                    """
+                    SELECT card_id FROM conflict_resolution_members
+                    WHERE receipt_id = ? ORDER BY member_ordinal
+                    """,
+                    (resolved["resolution_id"],),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertEqual(receipt["action"], "supersede")
+            self.assertEqual(receipt["selected_card_id"], winner)
+            self.assertEqual(receipt["member_count"], 3)
+            self.assertEqual(
+                [row["card_id"] for row in receipt_members],
+                sorted([alpha, winner, beta]),
+            )
             self.assertEqual(audit(root)["stale_card_sidecars"], 0)
 
             repeated_detection = detect_conflicts(root, card_id=winner)

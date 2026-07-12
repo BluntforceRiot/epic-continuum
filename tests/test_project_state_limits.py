@@ -20,7 +20,11 @@ from continuum.core.store import (
     repair_invalid_project_state_checkpoints,
     resume_latest,
     roll_scroll_segment,
+    semantic_integrity_report,
+    snapshot,
+    sync_card_sidecar,
 )
+from continuum.core.workers import run_worker_pass
 
 
 class ProjectStateLimitTests(unittest.TestCase):
@@ -255,7 +259,11 @@ class ProjectStateLimitTests(unittest.TestCase):
             conn = connect(root)
             try:
                 conn.execute(
-                    "UPDATE cards SET open_tasks_json = ? WHERE id = ?",
+                    """
+                    UPDATE cards
+                    SET open_tasks_json = ?, location_uri = NULL
+                    WHERE id = ?
+                    """,
                     (json.dumps(huge_tasks), invalid["card_id"]),
                 )
                 conn.commit()
@@ -322,12 +330,109 @@ class ProjectStateLimitTests(unittest.TestCase):
             self.assertEqual(rows[invalid["card_id"]]["status"], "historical")
             self.assertIsNone(rows[invalid["card_id"]]["supersedes_card_id"])
             self.assertIsNone(rows[predecessor["card_id"]]["superseded_by_card_id"])
+            semantic = semantic_integrity_report(root)
+            self.assertTrue(semantic["ok"], semantic)
+            self.assertEqual(
+                semantic["checks"]["quarantined_project_state_cards"],
+                1,
+            )
+            snap = snapshot(root, reason="quarantined_checkpoint_repair")
+            self.assertTrue(Path(str(snap["snapshot_uri"])).exists())
+            workers = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=10,
+                maintenance=False,
+            )
+            self.assertTrue(workers["ok"], workers)
+            maintained = semantic_integrity_report(root)
+            self.assertTrue(maintained["ok"], maintained)
+            self.assertEqual(
+                maintained["checks"]["quarantined_project_state_cards"],
+                1,
+            )
             repeated = repair_invalid_project_state_checkpoints(
                 root,
                 project_id="legacy-project",
                 dry_run=False,
             )
             self.assertEqual(repeated["quarantined_count"], 0)
+
+            conn = connect(root)
+            try:
+                source_before = conn.execute(
+                    """
+                    SELECT content, content_hash, metadata_json
+                    FROM scroll_events WHERE id = ?
+                    """,
+                    (invalid["event_id"],),
+                ).fetchone()
+                self.assertIsNotNone(source_before)
+                assert source_before is not None
+                changed_content = "changed quarantined source evidence"
+                changed_metadata = json.loads(source_before["metadata_json"])
+                changed_metadata["agent_id"] = "changed-quarantine-agent"
+                conn.execute(
+                    """
+                    UPDATE scroll_events
+                    SET content = ?, content_hash = ?, metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        changed_content,
+                        store_module.content_hash(changed_content),
+                        json.dumps(changed_metadata, sort_keys=True),
+                        invalid["event_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            changed_source = semantic_integrity_report(root)
+            self.assertFalse(changed_source["ok"], changed_source)
+            self.assertEqual(
+                changed_source["checks"]["invalid_project_state_cards"],
+                1,
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE scroll_events
+                    SET content = ?, content_hash = ?, metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        source_before["content"],
+                        source_before["content_hash"],
+                        source_before["metadata_json"],
+                        invalid["event_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            restored_source = semantic_integrity_report(root)
+            self.assertTrue(restored_source["ok"], restored_source)
+
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET title = title || ' changed' WHERE id = ?",
+                    (invalid["card_id"],),
+                )
+                sync_card_sidecar(root, conn, str(invalid["card_id"]))
+                conn.commit()
+            finally:
+                conn.close()
+            divergent = semantic_integrity_report(root)
+            self.assertFalse(divergent["ok"], divergent)
+            self.assertEqual(
+                divergent["checks"]["invalid_project_state_cards"],
+                1,
+            )
+            with self.assertRaisesRegex(ValueError, "semantic integrity"):
+                snapshot(root, reason="mutated_quarantined_checkpoint")
 
     def test_malformed_metadata_head_uses_bound_scroll_authority_for_repair(
         self,
@@ -493,10 +598,17 @@ class ProjectStateLimitTests(unittest.TestCase):
             finally:
                 conn.close()
             assert predecessor_row is not None
-            self.assertEqual(
-                predecessor_row["superseded_by_card_id"],
-                invalid["card_id"],
-            )
+            self.assertIsNone(predecessor_row["superseded_by_card_id"])
+            conn = connect(root)
+            try:
+                predecessor_status = conn.execute(
+                    "SELECT status FROM cards WHERE id = ?",
+                    (predecessor["card_id"],),
+                ).fetchone()["status"]
+            finally:
+                conn.close()
+            self.assertEqual(predecessor_status, "historical")
+            self.assertTrue(semantic_integrity_report(root)["ok"])
 
     def test_deep_legacy_json_is_invalid_and_quarantines_without_recursion(
         self,

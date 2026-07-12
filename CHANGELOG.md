@@ -23,10 +23,15 @@
   heartbeat and lease validity, sidecar backlog, snapshot, and WAL diagnostics.
 - Added planner-aware ContinuityBench coverage and recovery-focused regression tests.
 - Added stable connected temporal conflict groups and acyclic whole-group
-  resolution. Current Cards can supersede historical peers, while bounded,
-  content-sensitive dismissal receipts prevent periodic detection from undoing
-  a reviewed false positive. Sequential same-agent project checkpoints remain
-  resumable while cross-agent disagreements remain reviewable.
+  resolution. Current Cards can supersede historical peers, while system-owned,
+  exact-member dismissal receipts prevent periodic detection from undoing a
+  reviewed false positive. Resolution receipts bind the complete component,
+  authority boundary, selected Card, audit event, and member evidence in the
+  same transaction; caller metadata cannot create or preserve resolution state.
+  Sequential same-agent project checkpoints remain resumable, while multiple
+  validated independent-agent heads at one boundary return
+  `authority_ambiguous` until an explicit supersession or merge establishes one
+  authority.
 - Added an optional Yarn/Qwythos v3 adapter for a loopback llama.cpp server,
   including schema- and hash-bound cited briefings, strict model identity,
   measurable resource headroom, process-local concurrency plus a recommended
@@ -53,6 +58,19 @@
   malformed pending-job timestamps an explicit unhealthy queue condition. New
   project-state events hash-bind their complete decision and open-task arrays;
   selected checkpoints fail closed if those structured fields later diverge.
+- Extended semantic root verification across current and historical temporal
+  authority state, including checkpoint payload bindings, reciprocal and
+  same-boundary supersession links, acyclic lineage, one same-agent current
+  head, conflict-group closure, and exact resolution receipts. Snapshot,
+  restore-drill, pack-root, and embedded bundle verification now reject temporal
+  authority divergence before producing or accepting recovery artifacts.
+- Bound repaired invalid-checkpoint quarantine to the exact pointerless
+  historical Card and system audit record. A verified quarantine preserves the
+  damaged evidence without keeping semantic verification permanently unhealthy,
+  while any later mutation fails closed again. Repair severs remaining incoming
+  authority links without promoting unproven alternatives and classifies an
+  otherwise exact conflict receipt containing that quarantined member as
+  retired evidence, never as live conflict or resume authority.
 - Added background lease renewal for every queue job type plus unexpired-owner
   commit fencing and durable per-job effect receipts. Reclaimed or replayed jobs
   cannot duplicate database-visible effects. Card sidecar snapshot, atomic file

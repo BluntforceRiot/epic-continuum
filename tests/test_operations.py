@@ -1571,6 +1571,114 @@ class OperationLedgerTest(unittest.TestCase):
             checks = {check["name"]: check for check in result["checks"]}
             self.assertFalse(checks["restored_counts_match_snapshot_manifest"]["ok"])
 
+    def test_pre_receipt_v2_snapshot_count_manifest_remains_restorable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="legacy-snapshot-counts",
+                event_type="message",
+                role="user",
+                content="pre-receipt snapshot compatibility",
+            )
+            snap = snapshot(root, reason="pre_receipt_count_compatibility")
+            snap_path = Path(str(snap["snapshot_uri"]))
+            snapshot_conn = sqlite3.connect(snap_path)
+            try:
+                snapshot_conn.execute("DROP TABLE conflict_resolution_members")
+                snapshot_conn.execute("DROP TABLE conflict_resolution_receipts")
+                snapshot_conn.commit()
+            finally:
+                snapshot_conn.close()
+            manifest_path = snapshot_manifest_path(snap_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["counts"].pop("conflict_resolution_members")
+            manifest["counts"].pop("conflict_resolution_receipts")
+            manifest["snapshot"]["sha256"] = store_module.file_sha256(snap_path)
+            manifest["snapshot"]["size_bytes"] = snap_path.stat().st_size
+            manifest["snapshot_hash"] = manifest["snapshot"]["sha256"]
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE snapshots
+                    SET snapshot_hash = ?, manifest_hash = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        store_module.file_sha256(snap_path),
+                        store_module.file_sha256(manifest_path),
+                        snap["snapshot_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            verification = store_module.verify_snapshot_manifest_for_root(
+                snap_path,
+                root=root,
+                require_catalog_binding=True,
+            )
+            restored = restore_drill(
+                root,
+                snapshot_uri=str(snap_path),
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(verification["ok"], verification)
+            self.assertTrue(restored["ok"], restored)
+            checks = {check["name"]: check for check in restored["checks"]}
+            count_check = checks["restored_counts_match_snapshot_manifest"]
+            self.assertTrue(count_check["ok"], count_check)
+            self.assertEqual(
+                set(count_check["tolerated_absent_tables"]),
+                {
+                    "conflict_resolution_members",
+                    "conflict_resolution_receipts",
+                },
+            )
+
+    def test_current_snapshot_cannot_omit_empty_receipt_table_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="current-snapshot-counts",
+                event_type="message",
+                role="user",
+                content="current snapshot count binding",
+            )
+            snap = snapshot(root, reason="current_count_binding")
+            snap_path = Path(str(snap["snapshot_uri"]))
+            manifest_path = snapshot_manifest_path(snap_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["counts"].pop("conflict_resolution_members")
+            manifest["counts"].pop("conflict_resolution_receipts")
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verification = store_module.verify_snapshot_manifest(
+                snap_path,
+            )
+
+            self.assertFalse(verification["ok"], verification)
+            self.assertTrue(
+                any(
+                    error.get("error") == "snapshot_counts_mismatch"
+                    for error in verification["errors"]
+                ),
+                verification,
+            )
+
     def test_snapshot_creation_rejects_live_scroll_hash_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"

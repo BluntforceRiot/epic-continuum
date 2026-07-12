@@ -14,6 +14,12 @@ from typing import Any, Callable, Iterator
 from .config import config_path, default_config, load_config, retention_policy
 from .operations import operation_lock
 from .permissions import secure_move_file
+from .temporal_authority import (
+    conflict_boundary as _conflict_boundary,
+    conflict_component_fingerprint as _conflict_component_fingerprint,
+    conflict_member_binding_hash as _conflict_member_binding_hash,
+    valid_conflict_resolution_receipt,
+)
 from .store import (
     add_graph_edge,
     audit_event,
@@ -1783,8 +1789,7 @@ def decay_graph_routes(root: Path, *, limit: int = 200, prune_threshold: int = 3
 
 
 _CONFLICT_NEGATION_MARKERS = (" not ", " no ", "never", "disable", "removed")
-_CONFLICT_DISMISSAL_METADATA_KEY = "dismissed_conflict_components"
-_MAX_CONFLICT_DISMISSALS_PER_CARD = 8
+_CONFLICT_RESOLUTION_AUDIT_SCHEMA = "continuum.conflict_resolution.v1"
 _CONFLICT_SCAN_CURSOR_ACTION = "librarian_conflict_scan_cursor"
 _CONFLICT_REVIEW_REQUIRED_ACTION = "librarian_conflict_review_required"
 MAX_CONFLICT_CANDIDATE_CARDS = 512
@@ -2604,17 +2609,6 @@ def _supersession_reaches(edges: dict[str, set[str]], start: str, target: str) -
     return False
 
 
-def _conflict_boundary(card: Any) -> tuple[str, str, str]:
-    scope = str(card["visibility_scope"] or "session")
-    project_id = str(card["project_id"] or "")
-    session_id = str(card["session_id"] or "")
-    if scope == "project" and project_id:
-        return ("project", project_id, "")
-    if scope == "global":
-        return ("global", "", "")
-    return (scope, project_id, session_id)
-
-
 _ASCII_TITLE_LOWER = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "abcdefghijklmnopqrstuvwxyz",
@@ -2654,60 +2648,111 @@ def _conflict_card_types_compatible(left_type: str, right_type: str) -> bool:
     return "project_state" not in card_types or len(card_types) == 1
 
 
-def _conflict_component_fingerprint(by_id: dict[str, Any], member_ids: list[str]) -> str:
-    material = [
-        {
-            "id": member_id,
-            "card_type": str(by_id[member_id]["card_type"] or ""),
-            "title": str(by_id[member_id]["title"] or ""),
-            "summary": str(by_id[member_id]["summary"] or ""),
-            "boundary": list(_conflict_boundary(by_id[member_id])),
-        }
-        for member_id in sorted(member_ids)
-    ]
-    return content_hash(json_dumps({"schema": "continuum.conflict_dismissal.v1", "members": material}))
-
-
 def _conflict_component_is_suppressed(
+    conn: sqlite3.Connection,
     by_id: dict[str, Any],
     member_ids: list[str],
     fingerprint: str,
 ) -> bool:
-    for member_id in member_ids:
-        metadata = json_loads(by_id[member_id]["metadata_json"], {})
-        entries = metadata.get(_CONFLICT_DISMISSAL_METADATA_KEY, []) if isinstance(metadata, dict) else []
-        if not isinstance(entries, list):
-            continue
-        if any(
-            isinstance(entry, dict) and str(entry.get("fingerprint") or "") == fingerprint
-            for entry in entries[-_MAX_CONFLICT_DISMISSALS_PER_CARD:]
-        ):
-            return True
-    return False
-
-
-def _append_conflict_dismissal(
-    metadata_json: str | None,
-    *,
-    fingerprint: str,
-    member_count: int,
-    dismissed_at: str,
-) -> str:
-    metadata = json_loads(metadata_json, {})
-    if not isinstance(metadata, dict):
-        metadata = {}
-    raw_entries = metadata.get(_CONFLICT_DISMISSAL_METADATA_KEY, [])
-    entries = [entry for entry in raw_entries if isinstance(entry, dict)] if isinstance(raw_entries, list) else []
-    entries = [entry for entry in entries if str(entry.get("fingerprint") or "") != fingerprint]
-    entries.append(
-        {
-            "fingerprint": fingerprint,
-            "member_count": int(member_count),
-            "dismissed_at": dismissed_at,
-        }
+    return (
+        valid_conflict_resolution_receipt(
+            conn,
+            action="dismiss",
+            component_fingerprint=fingerprint,
+            by_id=by_id,
+            member_ids=member_ids,
+        )
+        is not None
     )
-    metadata[_CONFLICT_DISMISSAL_METADATA_KEY] = entries[-_MAX_CONFLICT_DISMISSALS_PER_CARD:]
-    return json_dumps(metadata)
+
+
+def _record_conflict_resolution_receipt(
+    conn: sqlite3.Connection,
+    *,
+    action: str,
+    conflict_group: str,
+    selected_card_id: str,
+    member_ids: list[str],
+    by_id: dict[str, Any],
+    component_fingerprint: str,
+) -> str:
+    ordered_ids = sorted(member_ids)
+    boundary = _conflict_boundary(by_id[ordered_ids[0]])
+    resolution_id = unique_id("conflict_resolution")
+    resolved_peer_ids = [
+        member_id for member_id in ordered_ids if member_id != selected_card_id
+    ]
+    audit_payload = {
+        "schema": _CONFLICT_RESOLUTION_AUDIT_SCHEMA,
+        "resolution_id": resolution_id,
+        "resolution": action,
+        "conflict_group": conflict_group,
+        "component_fingerprint": component_fingerprint,
+        "selected_card_id": selected_card_id,
+        "member_card_ids": ordered_ids,
+        "member_count": len(ordered_ids),
+        "resolved_peer_ids": resolved_peer_ids,
+        "boundary": {
+            "visibility_scope": boundary[0],
+            "project_id": boundary[1],
+            "session_id": boundary[2],
+        },
+        "whole_group": True,
+    }
+    audit_event_id = audit_event(
+        conn,
+        action="librarian_resolve_conflict",
+        target_type="card",
+        target_id=selected_card_id,
+        actor="system",
+        payload=audit_payload,
+    )
+    audit_row = conn.execute(
+        "SELECT created_at FROM audit_events WHERE id = ?",
+        (audit_event_id,),
+    ).fetchone()
+    if audit_row is None:
+        raise RuntimeError("conflict resolution audit event was not recorded")
+    audit_created_at = str(audit_row["created_at"] or "")
+    conn.execute(
+        """
+        INSERT INTO conflict_resolution_receipts(
+            id, action, component_fingerprint, conflict_group,
+            visibility_scope, project_id, session_id, selected_card_id,
+            member_count, actor, audit_event_id, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'system', ?, ?)
+        """,
+        (
+            resolution_id,
+            action,
+            component_fingerprint,
+            conflict_group,
+            boundary[0],
+            boundary[1],
+            boundary[2],
+            selected_card_id,
+            len(ordered_ids),
+            audit_event_id,
+            audit_created_at,
+        ),
+    )
+    for ordinal, member_id in enumerate(ordered_ids):
+        conn.execute(
+            """
+            INSERT INTO conflict_resolution_members(
+                receipt_id, card_id, member_ordinal, member_binding_hash
+            )
+            VALUES(?, ?, ?, ?)
+            """,
+            (
+                resolution_id,
+                member_id,
+                ordinal,
+                _conflict_member_binding_hash(by_id[member_id]),
+            ),
+        )
+    return resolution_id
 
 
 def _conflict_adjacency(
@@ -3054,6 +3099,7 @@ def detect_conflicts(
                         "member_ids": member_ids,
                         "fingerprint": fingerprint,
                         "suppressed": _conflict_component_is_suppressed(
+                            conn,
                             by_id,
                             member_ids,
                             fingerprint,
@@ -3577,8 +3623,9 @@ def resolve_conflict(
                 "project_state conflict groups cannot include non-project_state cards"
             )
 
+        all_ids = sorted({card_id, *peer_ids})
+        component_fingerprint = _conflict_component_fingerprint(by_id, all_ids)
         now = utc_now()
-        dismissal_fingerprint: str | None = None
         if action == "supersede":
             reversing = [
                 peer_id
@@ -3617,41 +3664,29 @@ def resolve_conflict(
                 (direct_predecessor, now, card_id),
             )
         else:
-            all_ids = sorted({card_id, *peer_ids})
-            dismissal_fingerprint = _conflict_component_fingerprint(by_id, all_ids)
             for member_id in all_ids:
-                metadata_json = _append_conflict_dismissal(
-                    by_id[member_id]["metadata_json"],
-                    fingerprint=dismissal_fingerprint,
-                    member_count=len(all_ids),
-                    dismissed_at=now,
-                )
                 conn.execute(
                     """
                     UPDATE cards
-                    SET conflict_group = NULL, metadata_json = ?, updated_at = ?
+                    SET conflict_group = NULL, updated_at = ?
                     WHERE id = ?
                     """,
-                    (metadata_json, now, member_id),
+                    (now, member_id),
                 )
             resolved_peer_ids = peer_ids
 
         touched_cards = sorted({card_id, *resolved_peer_ids})
+        resolution_id = _record_conflict_resolution_receipt(
+            conn,
+            action=action,
+            conflict_group=conflict_group,
+            selected_card_id=card_id,
+            member_ids=all_ids,
+            by_id=by_id,
+            component_fingerprint=component_fingerprint,
+        )
         _assert_supersession_dag(conn)
         mark_card_sidecar_outbox(conn, touched_cards, reason=f"conflict_{action}_resolved")
-        audit_event(
-            conn,
-            action="librarian_resolve_conflict",
-            target_type="card",
-            target_id=card_id,
-            payload={
-                "resolution": action,
-                "conflict_group": conflict_group,
-                "resolved_peer_ids": resolved_peer_ids,
-                "whole_group": True,
-                **({"dismissal_fingerprint": dismissal_fingerprint} if dismissal_fingerprint else {}),
-            },
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -3669,7 +3704,13 @@ def resolve_conflict(
         "card_count": len(touched_cards),
         "whole_group": True,
         "supersession_dag": True,
-        **({"dismissal_fingerprint": dismissal_fingerprint} if dismissal_fingerprint else {}),
+        "resolution_id": resolution_id,
+        "component_fingerprint": component_fingerprint,
+        **(
+            {"dismissal_fingerprint": component_fingerprint}
+            if action == "dismiss"
+            else {}
+        ),
     }
 
 

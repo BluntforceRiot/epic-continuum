@@ -33,7 +33,16 @@ visible instead of being silently overwritten. When a boundary has more than
 one validated independent-agent head, automatic resume returns
 `authority_ambiguous` and no packet; it never promotes one merely because its
 timestamp is newer. An explicit supersession or merge must establish one
-operational authority first.
+operational authority first. To supersede compatible independent heads that do
+not form a detected conflict group, select the winner and first invoke the
+resolver without peer IDs. It fails closed and reports the complete required
+peer list (the resume result intentionally shows only a bounded sample). Repeat
+every reported peer ID; the resolver rejects a partial list:
+
+```powershell
+continuum resolve-conflict --root <continuum-root> --card-id <winner-card-id> `
+  --superseded-card-id <peer-card-id> --superseded-card-id <other-peer-card-id>
+```
 
 Temporal conflict dismissal and supersession are Continuum-owned state. A valid
 resolution receipt binds the exact component fingerprint, complete member set,

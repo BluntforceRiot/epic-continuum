@@ -376,7 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_conflicts.add_argument("--card-id")
     p_conflicts.add_argument("--limit", type=int, default=50)
 
-    p_resolve_conflict = sub.add_parser("resolve-conflict", help="Resolve a contested Card group")
+    p_resolve_conflict = sub.add_parser(
+        "resolve-conflict",
+        help="Resolve a contested Card group or explicit project-state authority boundary",
+    )
     p_resolve_conflict.add_argument("--root", required=True)
     p_resolve_conflict.add_argument("--card-id", required=True, help="Card to promote, or any group Card when dismissing")
     p_resolve_conflict.add_argument("--action", choices=["supersede", "dismiss"], default="supersede")
@@ -384,7 +387,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--superseded-card-id",
         action="append",
         default=[],
-        help="Confirm each peer to supersede; repeat for the complete group (omit to supersede every peer; partial groups are rejected)",
+        help=(
+            "Confirm each peer to supersede; repeat for the complete conflict "
+            "group or project-state authority boundary. Ungrouped authority "
+            "heads require the explicit complete list; omit it once to receive "
+            "the required IDs. Partial sets are rejected"
+        ),
     )
 
     p_decay = sub.add_parser("decay-routes", help="Apply Librarian route decay and synaptic pruning")

@@ -242,6 +242,80 @@ class ResumeCliTests(unittest.TestCase):
                 )
             )
 
+    def test_cli_resolves_complete_compatible_authority_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                first_peer = record_project_state(
+                    root,
+                    session_id="cli-authority-peer-a",
+                    agent_id="agent-a",
+                    project_id="cli-authority-project",
+                    objective="Prepare release notes",
+                )
+                second_peer = record_project_state(
+                    root,
+                    session_id="cli-authority-peer-b",
+                    agent_id="agent-b",
+                    project_id="cli-authority-project",
+                    objective="Prepare package metadata",
+                )
+                winner = record_project_state(
+                    root,
+                    session_id="cli-authority-winner",
+                    agent_id="agent-c",
+                    project_id="cli-authority-project",
+                    objective="Prepare final review bundle",
+                )
+                missing_output = io.StringIO()
+                with redirect_stdout(missing_output):
+                    missing_code = cli_main(
+                        [
+                            "resolve-conflict",
+                            "--root",
+                            str(root),
+                            "--card-id",
+                            winner["card_id"],
+                        ]
+                    )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = cli_main(
+                        [
+                            "resolve-conflict",
+                            "--root",
+                            str(root),
+                            "--card-id",
+                            winner["card_id"],
+                            "--superseded-card-id",
+                            first_peer["card_id"],
+                            "--superseded-card-id",
+                            second_peer["card_id"],
+                        ]
+                    )
+
+            missing = json.loads(missing_output.getvalue())
+            self.assertEqual(missing_code, 1, missing)
+            self.assertIn(first_peer["card_id"], missing["error"])
+            self.assertIn(second_peer["card_id"], missing["error"])
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                result["resolution_scope"],
+                "project_state_authority_boundary",
+            )
+            resumed = resume_latest(
+                root,
+                project_id="cli-authority-project",
+                model_assist=False,
+            )
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                winner["card_id"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

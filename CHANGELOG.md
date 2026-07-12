@@ -31,7 +31,9 @@
   Sequential same-agent project checkpoints remain resumable, while multiple
   validated independent-agent heads at one boundary return
   `authority_ambiguous` until an explicit supersession or merge establishes one
-  authority.
+  authority. Compatible independent heads that do not form a text-conflict
+  group can now be reconciled by explicitly confirming the complete current
+  project-state authority boundary; partial boundary resolution is rejected.
 - Added an optional Yarn/Qwythos v3 adapter for a loopback llama.cpp server,
   including schema- and hash-bound cited briefings, strict model identity,
   measurable resource headroom, process-local concurrency plus a recommended

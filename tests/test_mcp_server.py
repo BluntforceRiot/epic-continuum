@@ -509,6 +509,73 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 self.assertIn("must be an array of strings", payload["error"])
                 self.assertFalse(root.exists())
 
+    def test_mcp_resolves_complete_compatible_authority_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                first_peer = record_project_state(
+                    root,
+                    session_id="mcp-authority-peer-a",
+                    agent_id="agent-a",
+                    project_id="mcp-authority-project",
+                    objective="Prepare release notes",
+                )
+                second_peer = record_project_state(
+                    root,
+                    session_id="mcp-authority-peer-b",
+                    agent_id="agent-b",
+                    project_id="mcp-authority-project",
+                    objective="Prepare package metadata",
+                )
+                winner = record_project_state(
+                    root,
+                    session_id="mcp-authority-winner",
+                    agent_id="agent-c",
+                    project_id="mcp-authority-project",
+                    objective="Prepare final review bundle",
+                )
+                missing = call_tool_raw(
+                    "continuum_resolve_conflict",
+                    {
+                        "root": str(root),
+                        "card_id": winner["card_id"],
+                    },
+                )
+                resolved = call_tool(
+                    "continuum_resolve_conflict",
+                    {
+                        "root": str(root),
+                        "card_id": winner["card_id"],
+                        "superseded_card_ids": [
+                            first_peer["card_id"],
+                            second_peer["card_id"],
+                        ],
+                    },
+                )
+                resumed = call_tool(
+                    "continuum_resume_latest",
+                    {
+                        "root": str(root),
+                        "project_id": "mcp-authority-project",
+                        "model_assist": False,
+                    },
+                )
+
+            self.assertTrue(missing["isError"], missing)
+            missing_payload = json.loads(missing["content"][0]["text"])
+            self.assertIn(first_peer["card_id"], missing_payload["error"])
+            self.assertIn(second_peer["card_id"], missing_payload["error"])
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertEqual(
+                resolved["resolution_scope"],
+                "project_state_authority_boundary",
+            )
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                winner["card_id"],
+            )
+
     def test_mcp_secret_partition_warn_and_off_alias_without_crashing(self) -> None:
         for action in ("warn", "off"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:

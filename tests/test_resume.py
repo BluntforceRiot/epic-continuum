@@ -1796,6 +1796,374 @@ class ResumeLatestTests(unittest.TestCase):
                 second["card_id"],
             )
 
+    def test_compatible_independent_heads_require_complete_explicit_resolution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="compatible-agent-a",
+                agent_id="agent-a",
+                project_id="compatible-project",
+                objective="Prepare release notes",
+            )
+            second = record_project_state(
+                root,
+                session_id="compatible-agent-b",
+                agent_id="agent-b",
+                project_id="compatible-project",
+                objective="Prepare package metadata",
+            )
+            winner = record_project_state(
+                root,
+                session_id="compatible-agent-c",
+                agent_id="agent-c",
+                project_id="compatible-project",
+                objective="Prepare final review bundle",
+            )
+            outside = record_project_state(
+                root,
+                session_id="outside-agent",
+                agent_id="outside-agent",
+                project_id="outside-project",
+                objective="Prepare an unrelated project",
+            )
+
+            detected = detect_conflicts(root, card_id=winner["card_id"])
+            ambiguous = resume_latest(
+                root,
+                project_id="compatible-project",
+                model_assist=False,
+            )
+
+            self.assertEqual(detected["conflict_count"], 0, detected)
+            self.assertFalse(ambiguous["ok"], ambiguous)
+            self.assertEqual(ambiguous["reason"], "authority_ambiguous")
+            with self.assertRaisesRegex(ValueError, "card is not contested"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    action="dismiss",
+                    superseded_card_ids=[first["card_id"], second["card_id"]],
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "explicit confirmation",
+            ) as missing_confirmation:
+                resolve_conflict(root, card_id=winner["card_id"])
+            self.assertIn(first["card_id"], str(missing_confirmation.exception))
+            self.assertIn(second["card_id"], str(missing_confirmation.exception))
+            with self.assertRaisesRegex(ValueError, "whole project-state boundary"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    superseded_card_ids=[first["card_id"]],
+                )
+            with self.assertRaisesRegex(ValueError, "selected boundary"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    superseded_card_ids=[
+                        first["card_id"],
+                        second["card_id"],
+                        outside["card_id"],
+                    ],
+                )
+
+            resolved = resolve_conflict(
+                root,
+                card_id=winner["card_id"],
+                superseded_card_ids=[first["card_id"], second["card_id"]],
+            )
+            resumed = resume_latest(
+                root,
+                project_id="compatible-project",
+                model_assist=False,
+            )
+
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertEqual(
+                resolved["resolution_scope"],
+                "project_state_authority_boundary",
+            )
+            self.assertEqual(
+                set(resolved["resolved_peer_ids"]),
+                {first["card_id"], second["card_id"]},
+            )
+            self.assertTrue(store_module.semantic_integrity_report(root)["ok"])
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                winner["card_id"],
+            )
+
+    def test_grouped_project_state_resolution_requires_every_boundary_head(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="grouped-agent-a",
+                agent_id="agent-a",
+                project_id="grouped-project",
+                objective="Prepare deployment routing",
+                decisions=["Use alpha routing"],
+            )
+            winner = record_project_state(
+                root,
+                session_id="grouped-agent-b",
+                agent_id="agent-b",
+                project_id="grouped-project",
+                objective="Prepare deployment routing",
+                decisions=["Do not use alpha routing"],
+            )
+            detected = detect_conflicts(root)
+            self.assertEqual(detected["conflict_count"], 1, detected)
+            independent = record_project_state(
+                root,
+                session_id="grouped-agent-c",
+                agent_id="agent-c",
+                project_id="grouped-project",
+                objective="Prepare release documentation",
+            )
+
+            with self.assertRaisesRegex(ValueError, "explicit confirmation"):
+                resolve_conflict(root, card_id=winner["card_id"])
+            with self.assertRaisesRegex(ValueError, "whole project-state boundary"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    superseded_card_ids=[first["card_id"]],
+                )
+
+            resolved = resolve_conflict(
+                root,
+                card_id=winner["card_id"],
+                superseded_card_ids=[first["card_id"], independent["card_id"]],
+            )
+            resumed = resume_latest(
+                root,
+                project_id="grouped-project",
+                model_assist=False,
+            )
+
+            self.assertEqual(
+                resolved["resolution_scope"],
+                "project_state_authority_boundary",
+            )
+            self.assertTrue(store_module.semantic_integrity_report(root)["ok"])
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(
+                resumed["discovery"]["checkpoint_id"],
+                winner["card_id"],
+            )
+
+    def test_explicit_authority_resolution_rejects_intersecting_group(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="intersecting-agent-a",
+                agent_id="agent-a",
+                project_id="intersecting-project",
+                objective="Prepare release notes",
+            )
+            winner = record_project_state(
+                root,
+                session_id="intersecting-agent-b",
+                agent_id="agent-b",
+                project_id="intersecting-project",
+                objective="Prepare final review bundle",
+            )
+            conn = connect(root)
+            try:
+                note_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Unrelated project note",
+                    summary="Evidence that is not project-state authority.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    session_id="intersecting-note",
+                    project_id="intersecting-project",
+                )
+                conn.execute(
+                    "UPDATE cards SET conflict_group = 'legacy-mixed-group' "
+                    "WHERE id IN (?, ?)",
+                    (first["card_id"], note_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(ValueError, "incomplete conflict group"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    superseded_card_ids=[first["card_id"]],
+                )
+
+            conn = connect(root)
+            try:
+                rows = {
+                    str(row["id"]): row
+                    for row in conn.execute(
+                        "SELECT id, conflict_group, superseded_by_card_id "
+                        "FROM cards WHERE id IN (?, ?, ?)",
+                        (first["card_id"], winner["card_id"], note_id),
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                rows[first["card_id"]]["conflict_group"],
+                "legacy-mixed-group",
+            )
+            self.assertEqual(rows[note_id]["conflict_group"], "legacy-mixed-group")
+            self.assertIsNone(rows[first["card_id"]]["superseded_by_card_id"])
+            self.assertIsNone(rows[winner["card_id"]]["superseded_by_card_id"])
+
+    def test_explicit_authority_resolution_rejects_invalid_project_state(
+        self,
+    ) -> None:
+        for tampered_member in ("peer", "winner"):
+            with self.subTest(tampered_member=tampered_member):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    peer = record_project_state(
+                        root,
+                        session_id="invalid-agent-a",
+                        agent_id="agent-a",
+                        project_id="invalid-resolution-project",
+                        objective="Prepare release notes",
+                    )
+                    winner = record_project_state(
+                        root,
+                        session_id="invalid-agent-b",
+                        agent_id="agent-b",
+                        project_id="invalid-resolution-project",
+                        objective="Prepare final review bundle",
+                    )
+                    target_id = (
+                        peer["card_id"]
+                        if tampered_member == "peer"
+                        else winner["card_id"]
+                    )
+                    conn = connect(root)
+                    try:
+                        conn.execute(
+                            "UPDATE cards SET summary = 'tampered' WHERE id = ?",
+                            (target_id,),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "failed integrity validation",
+                    ):
+                        resolve_conflict(
+                            root,
+                            card_id=winner["card_id"],
+                            superseded_card_ids=[peer["card_id"]],
+                        )
+
+                    conn = connect(root)
+                    try:
+                        rows = {
+                            str(row["id"]): row
+                            for row in conn.execute(
+                                "SELECT id, supersedes_card_id, "
+                                "superseded_by_card_id FROM cards "
+                                "WHERE id IN (?, ?)",
+                                (peer["card_id"], winner["card_id"]),
+                            )
+                        }
+                    finally:
+                        conn.close()
+                    self.assertIsNone(
+                        rows[peer["card_id"]]["superseded_by_card_id"]
+                    )
+                    self.assertIsNone(
+                        rows[winner["card_id"]]["supersedes_card_id"]
+                    )
+
+    def test_explicit_session_authority_resolution_stays_in_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="shared-authority-session",
+                agent_id="agent-a",
+                project_id="session-authority-project",
+                objective="Prepare release notes",
+                metadata={"visibility_scope": "session"},
+            )
+            winner = record_project_state(
+                root,
+                session_id="shared-authority-session",
+                agent_id="agent-b",
+                project_id="session-authority-project",
+                objective="Prepare final review bundle",
+                metadata={"visibility_scope": "session"},
+            )
+            outside = record_project_state(
+                root,
+                session_id="outside-authority-session",
+                agent_id="agent-c",
+                project_id="session-authority-project",
+                objective="Continue an independent session",
+                metadata={"visibility_scope": "session"},
+            )
+
+            ambiguous = resume_latest(
+                root,
+                session_id="shared-authority-session",
+                model_assist=False,
+            )
+            self.assertFalse(ambiguous["ok"], ambiguous)
+            self.assertEqual(ambiguous["reason"], "authority_ambiguous")
+            with self.assertRaisesRegex(ValueError, "selected boundary"):
+                resolve_conflict(
+                    root,
+                    card_id=winner["card_id"],
+                    superseded_card_ids=[first["card_id"], outside["card_id"]],
+                )
+
+            resolved = resolve_conflict(
+                root,
+                card_id=winner["card_id"],
+                superseded_card_ids=[first["card_id"]],
+            )
+            shared = resume_latest(
+                root,
+                session_id="shared-authority-session",
+                model_assist=False,
+            )
+            separate = resume_latest(
+                root,
+                session_id="outside-authority-session",
+                model_assist=False,
+            )
+
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertTrue(shared["ok"], shared)
+            self.assertEqual(
+                shared["discovery"]["checkpoint_id"],
+                winner["card_id"],
+            )
+            self.assertTrue(separate["ok"], separate)
+            self.assertEqual(
+                separate["discovery"]["checkpoint_id"],
+                outside["card_id"],
+            )
+
     def test_immediate_cross_agent_session_heads_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

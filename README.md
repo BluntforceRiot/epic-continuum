@@ -213,10 +213,16 @@ anything. Each resolution writes a system-owned receipt that binds the exact
 component fingerprint, member set, authority boundary, selected Card, and audit
 event atomically. Periodic detection honors that receipt only while every
 binding still matches; caller-supplied Card metadata cannot dismiss a conflict.
+Compatible independent project-state heads may not form a text-conflict group.
+Resolve that ambiguity by naming the winner and explicitly repeating every
+other current head in the authority boundary; partial boundary resolution is
+rejected.
 
 ```powershell
 continuum detect-conflicts --root "$HOME\.continuum"
 continuum resolve-conflict --root "$HOME\.continuum" --card-id <winner-card-id>
+continuum resolve-conflict --root "$HOME\.continuum" --card-id <winner-card-id> `
+  --superseded-card-id <peer-card-id> --superseded-card-id <other-peer-card-id>
 ```
 
 ### Optional Yarn / Qwythos Briefings

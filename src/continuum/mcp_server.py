@@ -1761,7 +1761,9 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         tool_detect_conflicts,
     ),
     "continuum_resolve_conflict": (
-        "Resolve a complete Card conflict group by superseding every peer or dismissing a false positive.",
+        "Resolve a complete Card conflict group or an explicitly confirmed "
+        "project-state authority boundary by superseding every peer; dismissal "
+        "remains limited to a detected false positive.",
         {
             "type": "object",
             "required": ["card_id"],
@@ -1772,7 +1774,13 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "superseded_card_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional confirmation list containing every peer; partial groups are rejected.",
+                    "description": (
+                        "Confirmation list containing every peer. It is optional "
+                        "for a complete detected group, required for ungrouped "
+                        "project-state heads (an omitted list reports the required "
+                        "IDs), and partial groups or authority boundaries are "
+                        "rejected."
+                    ),
                 },
             },
             "additionalProperties": False,

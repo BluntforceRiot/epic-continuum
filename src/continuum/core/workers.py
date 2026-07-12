@@ -21,6 +21,7 @@ from .temporal_authority import (
     valid_conflict_resolution_receipt,
 )
 from .store import (
+    _project_state_card_integrity_error,
     add_graph_edge,
     audit_event,
     canonical_partition_identifier,
@@ -3551,11 +3552,14 @@ def resolve_conflict(
     action: str = "supersede",
     superseded_card_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Resolve an entire contested Card group without deleting its evidence.
+    """Resolve an entire contested Card group or authority boundary.
 
     ``supersede`` promotes ``card_id`` as the current Card and links every peer
-    back to it. ``dismiss`` clears a false-positive annotation. Partial group
-    resolution is rejected because it can fragment temporal authority.
+    back to it. Compatible independent project-state heads may not form a
+    heuristic conflict group, so callers can explicitly confirm every other
+    current head in that authority boundary. ``dismiss`` remains limited to a
+    detected false-positive group. Partial group or boundary resolution is
+    rejected because it can fragment temporal authority.
     """
     if action not in {"supersede", "dismiss"}:
         raise ValueError("action must be supersede or dismiss")
@@ -3566,18 +3570,29 @@ def resolve_conflict(
         conn.execute("BEGIN IMMEDIATE")
         edges = _assert_supersession_dag(conn)
         _rows, by_id, current_ids = _load_temporal_card_state(conn)
-        winner = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+        winner = by_id.get(card_id)
         if winner is None:
             raise ValueError(f"card not found: {card_id}")
         if card_id not in current_ids:
             raise ValueError(f"historical or superseded card cannot win a conflict: {card_id}")
+        requested = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (superseded_card_ids or [])
+                if str(value).strip()
+            )
+        )
         conflict_group = str(winner["conflict_group"] or "").strip()
-        if not conflict_group:
-            raise ValueError(f"card is not contested: {card_id}")
-        peers = conn.execute(
-            "SELECT * FROM cards WHERE conflict_group = ? AND id != ? ORDER BY id",
-            (conflict_group, card_id),
-        ).fetchall()
+        resolution_scope = "conflict_group"
+        peers = (
+            conn.execute(
+                "SELECT rowid AS card_rowid, * FROM cards "
+                "WHERE conflict_group = ? AND id != ? ORDER BY id",
+                (conflict_group, card_id),
+            ).fetchall()
+            if conflict_group
+            else []
+        )
         peer_ids = [str(row["id"]) for row in peers]
         historical_peers = sorted(set(peer_ids) - current_ids)
         if historical_peers:
@@ -3596,20 +3611,6 @@ def resolve_conflict(
                 "conflict group crosses visibility boundaries: "
                 + ", ".join(cross_boundary_peers)
             )
-        requested = list(dict.fromkeys(str(value).strip() for value in (superseded_card_ids or []) if str(value).strip()))
-        if requested:
-            unknown = sorted(set(requested) - set(peer_ids))
-            if unknown:
-                raise ValueError(f"cards are not peers in conflict group {conflict_group}: {', '.join(unknown)}")
-            omitted = sorted(set(peer_ids) - set(requested))
-            if omitted:
-                raise ValueError(
-                    "partial conflict resolution is not allowed; whole group also requires: "
-                    + ", ".join(omitted)
-                )
-        resolved_peer_ids = peer_ids
-        if not peer_ids:
-            raise ValueError(f"conflict group has no peers: {conflict_group}")
         member_card_types = {
             str(row["card_type"] or "").casefold().strip()
             for row in [winner, *peers]
@@ -3623,7 +3624,124 @@ def resolve_conflict(
                 "project_state conflict groups cannot include non-project_state cards"
             )
 
+        winner_card_type = str(winner["card_type"] or "").casefold().strip()
+        if action == "supersede" and winner_card_type == "project_state":
+            authority_peer_ids = sorted(
+                candidate_id
+                for candidate_id in current_ids
+                if candidate_id != card_id
+                and str(by_id[candidate_id]["card_type"] or "").casefold().strip()
+                == "project_state"
+                and _conflict_boundary(by_id[candidate_id]) == winner_boundary
+            )
+            if not conflict_group or set(authority_peer_ids) != set(peer_ids):
+                resolution_scope = "project_state_authority_boundary"
+                if not authority_peer_ids:
+                    raise ValueError(
+                        "project-state authority boundary has no other current "
+                        f"heads: {card_id}"
+                    )
+                if not requested:
+                    raise ValueError(
+                        "project-state authority resolution requires explicit "
+                        "confirmation of every other current head: "
+                        + ", ".join(authority_peer_ids)
+                    )
+                unknown = sorted(set(requested) - set(authority_peer_ids))
+                if unknown:
+                    raise ValueError(
+                        "cards are not current project-state authority peers in "
+                        "the selected boundary: "
+                        + ", ".join(unknown)
+                    )
+                omitted = sorted(set(authority_peer_ids) - set(requested))
+                if omitted:
+                    raise ValueError(
+                        "partial authority resolution is not allowed; the whole "
+                        "project-state boundary also requires: "
+                        + ", ".join(omitted)
+                    )
+                peer_ids = authority_peer_ids
+                peers = [by_id[peer_id] for peer_id in peer_ids]
+                all_authority_ids = sorted({card_id, *peer_ids})
+                authority_id_set = set(all_authority_ids)
+                authority_groups = sorted(
+                    {
+                        str(by_id[member_id]["conflict_group"] or "").strip()
+                        for member_id in all_authority_ids
+                        if str(by_id[member_id]["conflict_group"] or "").strip()
+                    }
+                )
+                for authority_group in authority_groups:
+                    group_member_ids = sorted(
+                        member_id
+                        for member_id, member in by_id.items()
+                        if str(member["conflict_group"] or "").strip()
+                        == authority_group
+                    )
+                    outside_ids = sorted(
+                        set(group_member_ids) - authority_id_set
+                    )
+                    if len(group_member_ids) < 2 or outside_ids:
+                        details = outside_ids or group_member_ids
+                        raise ValueError(
+                            "project-state authority boundary intersects an "
+                            f"incomplete conflict group {authority_group}; "
+                            "resolve or repair the group first: "
+                            + ", ".join(details)
+                        )
+                conflict_group = content_hash(
+                    "continuum_project_state_authority_resolution_v1|"
+                    + "|".join(all_authority_ids)
+                )[:16]
+            elif requested:
+                unknown = sorted(set(requested) - set(peer_ids))
+                if unknown:
+                    raise ValueError(
+                        f"cards are not peers in conflict group {conflict_group}: "
+                        + ", ".join(unknown)
+                    )
+                omitted = sorted(set(peer_ids) - set(requested))
+                if omitted:
+                    raise ValueError(
+                        "partial conflict resolution is not allowed; whole group "
+                        "also requires: "
+                        + ", ".join(omitted)
+                    )
+        else:
+            if not conflict_group:
+                raise ValueError(f"card is not contested: {card_id}")
+            if requested:
+                unknown = sorted(set(requested) - set(peer_ids))
+                if unknown:
+                    raise ValueError(
+                        f"cards are not peers in conflict group {conflict_group}: "
+                        + ", ".join(unknown)
+                    )
+                omitted = sorted(set(peer_ids) - set(requested))
+                if omitted:
+                    raise ValueError(
+                        "partial conflict resolution is not allowed; whole group "
+                        "also requires: "
+                        + ", ".join(omitted)
+                    )
+
+        resolved_peer_ids = peer_ids
+        if not peer_ids:
+            raise ValueError(f"conflict group has no peers: {conflict_group}")
+
         all_ids = sorted({card_id, *peer_ids})
+        if winner_card_type == "project_state":
+            for member_id in all_ids:
+                integrity_error = _project_state_card_integrity_error(
+                    conn,
+                    member_id,
+                )
+                if integrity_error is not None:
+                    raise ValueError(
+                        "project-state authority member failed integrity "
+                        f"validation: {member_id}: {integrity_error}"
+                    )
         component_fingerprint = _conflict_component_fingerprint(by_id, all_ids)
         now = utc_now()
         if action == "supersede":
@@ -3703,6 +3821,7 @@ def resolve_conflict(
         "resolved_peer_ids": resolved_peer_ids,
         "card_count": len(touched_cards),
         "whole_group": True,
+        "resolution_scope": resolution_scope,
         "supersession_dag": True,
         "resolution_id": resolution_id,
         "component_fingerprint": component_fingerprint,

@@ -133,7 +133,12 @@ packet, and the same packet is written to:
 If the requested authority boundary has multiple validated independent-agent
 heads, `continuum_resume_latest` returns `authority_ambiguous` with
 `resolution_required=true` and writes no packet. Resolve or merge the competing
-component before retrying; timestamp recency is not an authority decision.
+component before retrying; timestamp recency is not an authority decision. For
+compatible independent heads that were not grouped by conflict detection, call
+`continuum_resolve_conflict` once with only the selected `card_id`; it fails
+closed and reports the complete required peer list because the resume result
+contains only a bounded sample. Repeat every reported ID in
+`superseded_card_ids`. The complete boundary is required.
 
 ## Tool Surface
 

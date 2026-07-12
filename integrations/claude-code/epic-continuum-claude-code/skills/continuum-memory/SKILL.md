@@ -16,7 +16,7 @@ tools when available:
 - `continuum_cue_recall` for vague memory prompts
 - `continuum_record_project_state` before a handoff or risky change
 - `continuum_memory_health` to inspect queue, capture, storage, and learning state
-- `continuum_detect_conflicts` and `continuum_resolve_conflict` for temporal Card cleanup
+- `continuum_detect_conflicts` and `continuum_resolve_conflict` for complete temporal conflict groups or explicitly confirmed project-state authority boundaries
 - `continuum_yarn_health` before using the optional local Yarn/Qwythos briefing layer
 - `continuum_list_operations`
 - `continuum_recover_operations`

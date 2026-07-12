@@ -36,7 +36,7 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_tier_storage` to apply Archivist storage movement.
 - `continuum_prune_memory` to archive, summarize-only, or forget cards by topic.
 - `continuum_detect_conflicts` to find likely conflicting Cards.
-- `continuum_resolve_conflict` to promote the current Card or dismiss a false-positive conflict without deleting evidence.
+- `continuum_resolve_conflict` to promote the current Card, explicitly reconcile every independent project-state head in one authority boundary, or dismiss a detected false-positive conflict without deleting evidence.
 - `continuum_yarn_health` to check the optional local Qwythos/Yarn endpoint without sending memory.
 - `continuum_decay_routes` to apply Librarian route decay and synaptic pruning.
 - `continuum_run_evals` to run deterministic memory-quality evals.

@@ -589,6 +589,11 @@ class ProjectStateLimitTests(unittest.TestCase):
             self.assertEqual(repaired["quarantined_count"], 1)
             self.assertIsNone(repaired["quarantined"][0]["predecessor_card_id"])
             self.assertEqual(repaired["reactivated_card_ids"], [])
+            self.assertEqual(repaired["retired_peer_count"], 0)
+            self.assertEqual(
+                repaired["detached_peer_card_ids"],
+                [predecessor["card_id"]],
+            )
             conn = connect(root)
             try:
                 predecessor_row = conn.execute(
@@ -607,7 +612,7 @@ class ProjectStateLimitTests(unittest.TestCase):
                 ).fetchone()["status"]
             finally:
                 conn.close()
-            self.assertEqual(predecessor_status, "historical")
+            self.assertEqual(predecessor_status, "pending_librarian_review")
             self.assertTrue(semantic_integrity_report(root)["ok"])
 
     def test_deep_legacy_json_is_invalid_and_quarantines_without_recursion(
@@ -677,7 +682,9 @@ class ProjectStateLimitTests(unittest.TestCase):
                 predecessor["card_id"],
             )
 
-    def test_quarantine_limit_signals_unvalidated_reactivated_chain(self) -> None:
+    def test_applied_quarantine_refuses_a_limit_that_cannot_close_the_chain(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             valid = record_project_state(
@@ -720,32 +727,61 @@ class ProjectStateLimitTests(unittest.TestCase):
             )
             self.assertEqual(preview["quarantined_count"], 1)
             self.assertTrue(preview["has_more"])
-            first_pass = repair_invalid_project_state_checkpoints(
+            conn = connect(root)
+            try:
+                before_refusal = [
+                    tuple(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, supersedes_card_id,
+                               superseded_by_card_id
+                        FROM cards ORDER BY id
+                        """
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            refused = repair_invalid_project_state_checkpoints(
                 root,
                 project_id="paged-project",
                 limit=1,
                 dry_run=False,
             )
-            self.assertEqual(first_pass["quarantined_count"], 1)
-            self.assertEqual(first_pass["reactivated_card_ids"], [invalid_a["card_id"]])
-            self.assertTrue(first_pass["has_more"])
-            second_pass = repair_invalid_project_state_checkpoints(
+            conn = connect(root)
+            try:
+                after_refusal = [
+                    tuple(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, supersedes_card_id,
+                               superseded_by_card_id
+                        FROM cards ORDER BY id
+                        """
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertFalse(refused["ok"], refused)
+            self.assertEqual(refused["quarantined_count"], 0)
+            self.assertEqual(before_refusal, after_refusal)
+            self.assertIn(
+                "repair_limit_cannot_close_authority_boundary",
+                {
+                    issue["type"]
+                    for issue in refused["authority_topology_issues"]
+                },
+            )
+
+            repaired = repair_invalid_project_state_checkpoints(
                 root,
                 project_id="paged-project",
-                limit=1,
+                limit=2,
                 dry_run=False,
             )
-            self.assertEqual(second_pass["quarantined_count"], 1)
-            self.assertEqual(second_pass["reactivated_card_ids"], [valid["card_id"]])
-            self.assertTrue(second_pass["has_more"])
-            final_pass = repair_invalid_project_state_checkpoints(
-                root,
-                project_id="paged-project",
-                limit=1,
-                dry_run=False,
-            )
-            self.assertEqual(final_pass["quarantined_count"], 0)
-            self.assertFalse(final_pass["has_more"])
+            self.assertTrue(repaired["ok"], repaired)
+            self.assertEqual(repaired["quarantined_count"], 2)
+            self.assertEqual(repaired["reactivated_card_ids"], [valid["card_id"]])
+            self.assertFalse(repaired["has_more"])
             resumed = resume_latest(
                 root,
                 project_id="paged-project",
@@ -886,7 +922,7 @@ class ProjectStateLimitTests(unittest.TestCase):
             self.assertEqual(repaired["quarantined_count"], 1)
             self.assertEqual(repaired["reactivated_card_ids"], [predecessor["card_id"]])
 
-    def test_invalid_secondary_cross_agent_state_is_absent_from_resume_and_cue(
+    def test_invalid_secondary_cross_agent_state_blocks_resume_and_cue_excludes_it(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -944,8 +980,18 @@ class ProjectStateLimitTests(unittest.TestCase):
                 model_assist=False,
             )
 
-            self.assertTrue(resumed["ok"], resumed)
-            self.assertEqual(resumed["discovery"]["checkpoint_id"], valid["card_id"])
+            self.assertFalse(resumed["ok"], resumed)
+            self.assertEqual(resumed["reason"], "authority_corrupt")
+            corruption = resumed["authority_corruption"]
+            self.assertEqual(corruption["invalid_checkpoint_count"], 1)
+            self.assertEqual(
+                corruption["invalid_checkpoints"][0]["checkpoint_id"],
+                invalid["card_id"],
+            )
+            self.assertEqual(
+                set(corruption["current_head_ids"]),
+                {invalid["card_id"], valid["card_id"]},
+            )
             recalled_text = json.dumps(recalled, sort_keys=True)
             for marker in (
                 invalid_summary_marker,
@@ -955,7 +1001,6 @@ class ProjectStateLimitTests(unittest.TestCase):
                 "SECONDARY_INVALID_TASK_MARKER",
             ):
                 self.assertNotIn(marker, recalled_text)
-                self.assertNotIn(marker, resumed["packet_text"])
             self.assertNotIn(invalid["card_id"], recalled_text)
             self.assertNotIn(invalid["event_id"], recalled_text)
             related_text = json.dumps(
@@ -965,7 +1010,7 @@ class ProjectStateLimitTests(unittest.TestCase):
             self.assertNotIn("emberwhale", related_text)
             self.assertNotIn("obsidian", related_text)
             self.assertNotIn("plumecipher", related_text)
-            self.assertIn("VALID_SECONDARY_SELECTED_CHECKPOINT", resumed["packet_text"])
+            self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_new_checkpoint_refuses_corrupt_current_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

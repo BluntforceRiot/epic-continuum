@@ -11,19 +11,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.config import default_config, write_config
-from continuum.core.operations import _proof_pack_hash
+from continuum.core.operations import _proof_pack_hash, list_operations
 from continuum.core.store import (
     MAX_RECENT_EVENT_LIMIT,
     _backfill_partition_aliases,
     append_scroll_event,
     connect,
+    create_card,
     ingest_file,
     init_db,
     record_project_state,
     recover_thread,
+    sync_card_sidecars_after_commit,
 )
 from continuum.core.temporal_authority import conflict_component_fingerprint
-from continuum.core.workers import detect_conflicts
+from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT, detect_conflicts
 import continuum.mcp_server as mcp_server_module
 from continuum.mcp_server import MAX_MCP_REQUEST_BYTES, TOOLS, dispatch
 
@@ -418,6 +420,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         compile_props = TOOLS["continuum_compile_context"][1]["properties"]
         search_props = TOOLS["continuum_search"][1]["properties"]
         reindex_props = TOOLS["continuum_reindex_memory"][1]["properties"]
+        prune_props = TOOLS["continuum_prune_memory"][1]["properties"]
 
         self.assertIn("project_id", recover_props)
         self.assertNotIn("model_assist", recover_props)
@@ -438,6 +441,135 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(list(compile_props).count("project_id"), 1)
         for key in ("session_id", "after_seq", "after_rowid", "limit", "batch_size", "dry_run", "promote_exact_memory"):
             self.assertIn(key, reindex_props)
+        self.assertEqual(prune_props["topic"]["minLength"], 1)
+        self.assertEqual(prune_props["limit"]["minimum"], 1)
+        self.assertEqual(prune_props["limit"]["maximum"], MAX_PRUNE_MEMORY_LIMIT)
+        self.assertEqual(prune_props["limit"]["default"], 100)
+
+    def test_mcp_prune_memory_uses_literal_topics_and_bounded_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                percent_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="MCP literal % prune marker",
+                    summary="Only this Card has the percent marker.",
+                    source_refs=[],
+                )
+                plain_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="MCP literal plain prune marker",
+                    summary="This Card must remain active.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, [percent_id, plain_id])
+
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                result = call_tool(
+                    "continuum_prune_memory",
+                    {"root": str(root), "topic": "%", "action": "archive"},
+                )
+                blank = call_tool_raw(
+                    "continuum_prune_memory",
+                    {"root": str(root), "topic": "   ", "all": True},
+                )
+                nul_topic = call_tool_raw(
+                    "continuum_prune_memory",
+                    {"root": str(root), "topic": "\x00"},
+                )
+                oversized = call_tool_raw(
+                    "continuum_prune_memory",
+                    {
+                        "root": str(root),
+                        "topic": "literal",
+                        "limit": MAX_PRUNE_MEMORY_LIMIT + 1,
+                    },
+                )
+
+            self.assertEqual(result["matching_mode"], "literal_substring")
+            self.assertEqual(result["card_ids"], [percent_id])
+            self.assertEqual(result["_operation"]["status"], "succeeded")
+            self.assertTrue(blank["isError"])
+            self.assertIn("whitespace-only", blank["content"][0]["text"])
+            self.assertTrue(nul_topic["isError"])
+            self.assertIn("NUL", nul_topic["content"][0]["text"])
+            self.assertTrue(oversized["isError"])
+            self.assertIn(str(MAX_PRUNE_MEMORY_LIMIT), oversized["content"][0]["text"])
+            conn = connect(root)
+            try:
+                statuses = {
+                    str(row["id"]): str(row["status"])
+                    for row in conn.execute(
+                        "SELECT id, status FROM cards WHERE id IN (?, ?)",
+                        (percent_id, plain_id),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(statuses[percent_id], "archived")
+            self.assertEqual(statuses[plain_id], "pending_librarian_review")
+
+    def test_mcp_prune_memory_protected_failure_records_failed_operation_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="mcp-prune-protected-session",
+                agent_id="mcp-prune-protected-agent",
+                project_id="mcp-prune-protected-project",
+                objective="MCP Protected Authority Marker",
+            )
+            conn = connect(root)
+            try:
+                before = dict(
+                    conn.execute(
+                        "SELECT status, supersedes_card_id, superseded_by_card_id, conflict_group FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                result = call_tool_raw(
+                    "continuum_prune_memory",
+                    {
+                        "root": str(root),
+                        "topic": "MCP Protected Authority Marker",
+                        "action": "forget",
+                    },
+                )
+
+            self.assertTrue(result["isError"])
+            self.assertIn("authority-protected Cards", result["content"][0]["text"])
+            failed = list_operations(root, status="failed", limit=20)
+            prune_operations = [
+                operation
+                for operation in failed["operations"]
+                if operation["operation_type"] == "mcp_prune_memory"
+            ]
+            self.assertEqual(len(prune_operations), 1, failed)
+            self.assertEqual(prune_operations[0]["status"], "failed")
+            conn = connect(root)
+            try:
+                card = dict(
+                    conn.execute(
+                        "SELECT status, supersedes_card_id, superseded_by_card_id, conflict_group FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(card, before)
 
     def test_mcp_secret_partition_block_fails_before_durable_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

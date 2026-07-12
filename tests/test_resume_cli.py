@@ -8,14 +8,17 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import continuum.core.store as store_module
 from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
 from continuum.core.operations import list_operations
 from continuum.core.store import (
     MAX_RECENT_EVENT_LIMIT,
+    connect,
     recover_thread,
     record_project_state,
     resume_latest,
+    sync_card_sidecars_after_commit,
     validate_recent_event_limit,
 )
 
@@ -241,6 +244,250 @@ class ResumeCliTests(unittest.TestCase):
                     item["operation_type"] == "cli_resume_latest" for item in operations
                 )
             )
+
+    def test_applied_repair_fails_its_receipt_for_asymmetric_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                first = record_project_state(
+                    root,
+                    session_id="cli-asymmetric-a",
+                    agent_id="agent-a",
+                    project_id="cli-asymmetric-project",
+                    objective="FIRST CLI AUTHORITY",
+                )
+                second = record_project_state(
+                    root,
+                    session_id="cli-asymmetric-b",
+                    agent_id="agent-b",
+                    project_id="cli-asymmetric-project",
+                    objective="SECOND CLI AUTHORITY",
+                )
+                conn = connect(root)
+                try:
+                    conn.execute(
+                        "UPDATE cards SET superseded_by_card_id = ? WHERE id = ?",
+                        (second["card_id"], first["card_id"]),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                sync_card_sidecars_after_commit(root, [first["card_id"]])
+                conn = connect(root)
+                try:
+                    before = [
+                        tuple(row)
+                        for row in conn.execute(
+                            """
+                            SELECT id, supersedes_card_id, superseded_by_card_id
+                            FROM cards WHERE id IN (?, ?) ORDER BY id
+                            """,
+                            (first["card_id"], second["card_id"]),
+                        ).fetchall()
+                    ]
+                finally:
+                    conn.close()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = cli_main(
+                        [
+                            "repair-project-state-checkpoints",
+                            "--root",
+                            str(root),
+                            "--project-id",
+                            "cli-asymmetric-project",
+                            "--apply",
+                        ]
+                    )
+
+            result = json.loads(output.getvalue())
+            conn = connect(root)
+            try:
+                after = [
+                    tuple(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, supersedes_card_id, superseded_by_card_id
+                        FROM cards WHERE id IN (?, ?) ORDER BY id
+                        """,
+                        (first["card_id"], second["card_id"]),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            repair_operations = [
+                item
+                for item in list_operations(root)["operations"]
+                if item["operation_type"]
+                == "cli_repair_project_state_checkpoints"
+            ]
+            self.assertEqual(code, 1, result)
+            self.assertFalse(result["ok"])
+            self.assertIn("repair refused", result["error"])
+            self.assertEqual(before, after)
+            self.assertTrue(repair_operations)
+            self.assertEqual(repair_operations[0]["status"], "failed")
+
+    def test_applied_repair_fails_receipt_after_committed_sidecar_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                damaged = record_project_state(
+                    root,
+                    session_id="cli-sidecar-failure",
+                    agent_id="cli-sidecar-agent",
+                    project_id="cli-sidecar-project",
+                )
+                conn = connect(root)
+                try:
+                    conn.execute(
+                        "UPDATE cards SET summary = summary || ' damaged' "
+                        "WHERE id = ?",
+                        (damaged["card_id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                sync_card_sidecars_after_commit(root, [damaged["card_id"]])
+                failed_sync = {
+                    "ok": False,
+                    "synced": 0,
+                    "deferred": 1,
+                    "failed": 1,
+                    "failures": [
+                        {
+                            "card_id": damaged["card_id"],
+                            "error": "injected CLI sidecar failure",
+                        }
+                    ],
+                }
+                output = io.StringIO()
+                with (
+                    patch(
+                        "continuum.core.store.sync_card_sidecars_after_commit",
+                        return_value=failed_sync,
+                    ),
+                    redirect_stdout(output),
+                ):
+                    code = cli_main(
+                        [
+                            "repair-project-state-checkpoints",
+                            "--root",
+                            str(root),
+                            "--project-id",
+                            "cli-sidecar-project",
+                            "--apply",
+                        ]
+                    )
+
+            result = json.loads(output.getvalue())
+            operations = [
+                item
+                for item in list_operations(root)["operations"]
+                if item["operation_type"]
+                == "cli_repair_project_state_checkpoints"
+            ]
+            self.assertEqual(code, 1, result)
+            self.assertFalse(result["ok"], result)
+            self.assertIn("catalog repair committed", result["error"])
+            self.assertTrue(operations)
+            self.assertEqual(operations[0]["status"], "failed")
+            self.assertEqual(
+                operations[0]["cursor"]["phase"],
+                "project_state_catalog_repair_committed_postflight_failed",
+            )
+            self.assertTrue(
+                operations[0]["cursor"]["catalog_repair_committed"]
+            )
+            conn = connect(root)
+            try:
+                status = conn.execute(
+                    "SELECT status FROM cards WHERE id = ?",
+                    (damaged["card_id"],),
+                ).fetchone()["status"]
+            finally:
+                conn.close()
+            self.assertEqual(status, "historical")
+
+    def test_applied_repair_fails_receipt_after_semantic_postflight_false(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                damaged = record_project_state(
+                    root,
+                    session_id="cli-postflight-false",
+                    agent_id="cli-postflight-agent",
+                    project_id="cli-postflight-project",
+                )
+                conn = connect(root)
+                try:
+                    conn.execute(
+                        "UPDATE cards SET summary = summary || ' damaged' "
+                        "WHERE id = ?",
+                        (damaged["card_id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                sync_card_sidecars_after_commit(root, [damaged["card_id"]])
+                real_semantic_report = store_module.semantic_integrity_report
+                transaction_report_count = 0
+                injected = False
+
+                def semantic_report(*args: object, **kwargs: object) -> dict[str, object]:
+                    nonlocal transaction_report_count, injected
+                    report = real_semantic_report(*args, **kwargs)
+                    if kwargs.get("conn") is not None:
+                        transaction_report_count += 1
+                    elif transaction_report_count >= 2 and not injected:
+                        injected = True
+                        return {
+                            **report,
+                            "ok": False,
+                            "failing": {"injected_postflight_failure": 1},
+                        }
+                    return report
+
+                output = io.StringIO()
+                with (
+                    patch.object(
+                        store_module,
+                        "semantic_integrity_report",
+                        side_effect=semantic_report,
+                    ),
+                    redirect_stdout(output),
+                ):
+                    code = cli_main(
+                        [
+                            "repair-project-state-checkpoints",
+                            "--root",
+                            str(root),
+                            "--project-id",
+                            "cli-postflight-project",
+                            "--apply",
+                        ]
+                    )
+
+            result = json.loads(output.getvalue())
+            operation = next(
+                item
+                for item in list_operations(root)["operations"]
+                if item["operation_type"]
+                == "cli_repair_project_state_checkpoints"
+            )
+            self.assertEqual(code, 1, result)
+            self.assertIn("catalog repair committed", result["error"])
+            self.assertEqual(operation["status"], "failed")
+            self.assertEqual(
+                operation["cursor"]["phase"],
+                "project_state_catalog_repair_committed_postflight_failed",
+            )
+            self.assertTrue(operation["cursor"]["catalog_repair_committed"])
+            self.assertFalse(operation["cursor"]["post_repair_semantic_ok"])
 
     def test_cli_resolves_complete_compatible_authority_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

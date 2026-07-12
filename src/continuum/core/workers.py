@@ -43,6 +43,7 @@ from .store import (
     resolve_stored_uri,
     roll_scroll_segment,
     segment_hash_material,
+    semantic_integrity_report,
     snapshot,
     sync_card_sidecar,
     sync_card_sidecars_after_commit,
@@ -58,6 +59,10 @@ ACTIVE_JOB_STATUS = "running"
 PENDING_JOB_STATUS = "pending"
 DEFAULT_BACKLOG_RECONCILE_LIMIT = 5000
 MAX_BACKLOG_RECONCILE_LIMIT = 10000
+DEFAULT_PRUNE_MEMORY_LIMIT = 100
+MAX_PRUNE_MEMORY_LIMIT = 1000
+PRUNE_MEMORY_LITERAL_MATCHING_MODE = "literal_substring"
+PRUNE_MEMORY_GLOBAL_MATCHING_MODE = "explicit_global"
 DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
 # A single notification may represent an arbitrarily large per-session backlog
 # because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
@@ -3934,55 +3939,419 @@ def apply_storage_tiering(root: Path, *, dry_run: bool = False, limit: int = 100
         conn.close()
 
 
+_PRUNE_MEMORY_PROTECTED_CARD_SQL = """
+(
+    lower(trim(coalesce(candidate.card_type, ''))) = 'project_state'
+    OR trim(coalesce(candidate.conflict_group, '')) != ''
+    OR trim(coalesce(candidate.supersedes_card_id, '')) != ''
+    OR trim(coalesce(candidate.superseded_by_card_id, '')) != ''
+    OR candidate.id IN (
+        SELECT trim(authority_peer.supersedes_card_id)
+        FROM cards AS authority_peer
+        WHERE trim(coalesce(authority_peer.supersedes_card_id, '')) != ''
+        UNION
+        SELECT trim(authority_peer.superseded_by_card_id)
+        FROM cards AS authority_peer
+        WHERE trim(coalesce(authority_peer.superseded_by_card_id, '')) != ''
+    )
+)
+"""
+
+
+def validate_prune_memory_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("prune-memory limit must be an integer")
+    if value < 1 or value > MAX_PRUNE_MEMORY_LIMIT:
+        raise ValueError(f"prune-memory limit must be between 1 and {MAX_PRUNE_MEMORY_LIMIT}")
+    return value
+
+
+def validate_prune_memory_scope(
+    topic: str | None,
+    *,
+    allow_global: bool,
+) -> tuple[str | None, str]:
+    if not isinstance(allow_global, bool):
+        raise ValueError("allow_global must be a boolean")
+    if topic is None:
+        if not allow_global:
+            raise ValueError("prune_memory requires a topic unless allow_global=True")
+        return None, PRUNE_MEMORY_GLOBAL_MATCHING_MODE
+    if not isinstance(topic, str):
+        raise ValueError("prune-memory topic must be a string")
+    normalized_topic = topic.strip()
+    if not normalized_topic:
+        raise ValueError("prune-memory topic must not be empty or whitespace-only")
+    if "\x00" in normalized_topic:
+        raise ValueError("prune-memory topic must not contain NUL characters")
+    return normalized_topic, PRUNE_MEMORY_LITERAL_MATCHING_MODE
+
+
+def _prune_memory_match_sql(topic: str | None) -> tuple[str, tuple[str, ...]]:
+    if topic is None:
+        return "1 = 1", ()
+    return (
+        """
+        (
+            instr(lower(coalesce(candidate.title, '')), lower(?)) > 0
+            OR instr(lower(coalesce(candidate.summary, '')), lower(?)) > 0
+            OR EXISTS (
+                SELECT 1
+                FROM json_each(
+                    CASE
+                        WHEN json_valid(candidate.topics_json)
+                        THEN candidate.topics_json
+                        ELSE '[]'
+                    END
+                ) AS topic_item
+                WHERE topic_item.type = 'text'
+                  AND instr(lower(CAST(topic_item.value AS TEXT)), lower(?)) > 0
+            )
+        )
+        """,
+        (topic, topic, topic),
+    )
+
+
+def _restore_prune_memory_rows(
+    root: Path,
+    original_rows: list[dict[str, Any]],
+    *,
+    expected_rows: list[dict[str, Any]],
+    failure_reason: str,
+) -> dict[str, Any]:
+    card_ids = [str(row["id"]) for row in original_rows]
+    original_by_id = {str(row["id"]): row for row in original_rows}
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cas_mismatches: list[str] = []
+        for expected in expected_rows:
+            current = conn.execute(
+                """
+                SELECT card.status, card.metadata_json, card.updated_at,
+                       card.location_uri, outbox.generation AS sidecar_generation
+                FROM cards AS card
+                LEFT JOIN card_sidecar_outbox AS outbox ON outbox.card_id = card.id
+                WHERE card.id = ?
+                """,
+                (expected["id"],),
+            ).fetchone()
+            if current is None or any(
+                current[field] != expected[field]
+                for field in (
+                    "status",
+                    "metadata_json",
+                    "updated_at",
+                    "location_uri",
+                    "sidecar_generation",
+                )
+            ):
+                cas_mismatches.append(str(expected["id"]))
+        if cas_mismatches:
+            conn.rollback()
+            return {
+                "ok": False,
+                "restored": False,
+                "cas_mismatch_card_ids": sorted(cas_mismatches),
+                "reason": "Card state changed after prune commit",
+            }
+
+        for card_id in card_ids:
+            row = original_by_id[card_id]
+            restored = conn.execute(
+                """
+                UPDATE cards
+                SET status = ?, metadata_json = ?, updated_at = ?, location_uri = ?
+                WHERE id = ?
+                """,
+                (
+                    row["status"],
+                    row["metadata_json"],
+                    row["updated_at"],
+                    row["location_uri"],
+                    row["id"],
+                ),
+            )
+            if restored.rowcount != 1:
+                raise RuntimeError(f"unable to restore pruned Card row: {row['id']}")
+        audit_event(
+            conn,
+            action="librarian_prune_memory_rolled_back",
+            target_type="cards",
+            target_id=None,
+            payload={"card_ids": card_ids, "failure_reason": failure_reason},
+        )
+        mark_card_sidecar_outbox(conn, card_ids, reason="memory_prune_rolled_back")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    sidecar_sync = sync_card_sidecars_after_commit(root, card_ids)
+    semantic_integrity = semantic_integrity_report(root, create=False)
+    return {
+        "ok": bool(sidecar_sync.get("ok")) and bool(semantic_integrity.get("ok")),
+        "restored": True,
+        "cas_mismatch_card_ids": [],
+        "sidecar_sync": sidecar_sync,
+        "semantic_integrity": semantic_integrity,
+    }
+
+
 def prune_memory(
     root: Path,
     *,
     topic: str | None = None,
     action: str = "archive",
     dry_run: bool = False,
-    limit: int = 100,
+    limit: int = DEFAULT_PRUNE_MEMORY_LIMIT,
     allow_global: bool = False,
 ) -> dict[str, Any]:
     if action not in {"archive", "summarize_only", "forget"}:
         raise ValueError("action must be archive, summarize_only, or forget")
-    if not topic and not allow_global:
-        raise ValueError("prune_memory requires a topic unless allow_global=True")
+    normalized_topic, matching_mode = validate_prune_memory_scope(topic, allow_global=allow_global)
+    validated_limit = validate_prune_memory_limit(limit)
+    match_sql, match_params = _prune_memory_match_sql(normalized_topic)
     init_db(root)
     conn = connect(root)
+    transaction_started = False
+    original_rows: list[dict[str, Any]] = []
+    applied_rows: list[dict[str, Any]] = []
     try:
-        pattern = f"%{topic}%" if topic else "%"
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            preflight_integrity = semantic_integrity_report(root, create=False, conn=conn)
+            if not preflight_integrity.get("ok"):
+                raise ValueError(
+                    "prune-memory preflight failed: semantic integrity is not clean: "
+                    f"{preflight_integrity.get('failing')}"
+                )
+
         rows = conn.execute(
-            """
-            SELECT id, title, summary, topics_json, metadata_json
-            FROM cards
-            WHERE status != 'pruned'
-              AND (title LIKE ? OR summary LIKE ? OR topics_json LIKE ?)
-            ORDER BY salience ASC, updated_at ASC
+            f"""
+            SELECT candidate.id, candidate.status, candidate.metadata_json,
+                   candidate.updated_at, candidate.location_uri
+            FROM cards AS candidate
+            WHERE candidate.status != 'pruned'
+              AND {match_sql}
+              AND NOT {_PRUNE_MEMORY_PROTECTED_CARD_SQL}
+            ORDER BY candidate.salience ASC, candidate.updated_at ASC
             LIMIT ?
             """,
-            (pattern, pattern, pattern, max(1, int(limit))),
+            (*match_params, validated_limit),
         ).fetchall()
+        protected_scan = conn.execute(
+            f"""
+            SELECT candidate.id
+            FROM cards AS candidate
+            WHERE candidate.status != 'pruned'
+              AND {match_sql}
+              AND {_PRUNE_MEMORY_PROTECTED_CARD_SQL}
+            ORDER BY candidate.id
+            LIMIT ?
+            """,
+            (*match_params, MAX_PRUNE_MEMORY_LIMIT + 1),
+        ).fetchall()
+        protected_count_is_lower_bound = len(protected_scan) > MAX_PRUNE_MEMORY_LIMIT
+        protected_count = len(protected_scan)
+        protected_ids = [str(row["id"]) for row in protected_scan[:20]]
+        eligible_ids = [str(row["id"]) for row in rows]
+        targeted_protected_cards = normalized_topic is not None and protected_count > 0
+        base_result = {
+            "ok": True,
+            "dry_run": dry_run,
+            "action": action,
+            "topic": normalized_topic,
+            "normalized_topic": normalized_topic,
+            "matching_mode": matching_mode,
+            "limit": validated_limit,
+            "global_scope": normalized_topic is None,
+            "protected_card_count": protected_count,
+            "protected_card_count_is_lower_bound": protected_count_is_lower_bound,
+            "protected_card_count_at_least": (
+                MAX_PRUNE_MEMORY_LIMIT + 1 if protected_count_is_lower_bound else protected_count
+            ),
+            "protected_card_ids": protected_ids,
+        }
+        if targeted_protected_cards:
+            if dry_run:
+                return {
+                    **base_result,
+                    "blocked": True,
+                    "block_reason": "topic matches authority-protected Cards",
+                    "eligible_card_count": len(eligible_ids),
+                    "eligible_card_ids": eligible_ids,
+                    "card_count": 0,
+                    "card_ids": [],
+                }
+            raise ValueError(
+                "prune-memory topic matches authority-protected Cards; use the dedicated "
+                "project-state or conflict operation instead"
+            )
+
+        if dry_run:
+            return {
+                **base_result,
+                "blocked": False,
+                "card_count": len(eligible_ids),
+                "card_ids": eligible_ids,
+            }
+
+        if not rows:
+            conn.rollback()
+            transaction_started = False
+            return {
+                **base_result,
+                "blocked": False,
+                "card_count": 0,
+                "card_ids": [],
+                "semantic_integrity_ok": True,
+            }
+
+        original_rows = [dict(row) for row in rows]
         target_status = {"archive": "archived", "summarize_only": "summary_only", "forget": "pruned"}[action]
         now = utc_now()
-        touched: list[str] = []
         for row in rows:
-            touched.append(row["id"])
-            if dry_run:
-                continue
             metadata = json_loads(row["metadata_json"], {})
-            metadata.setdefault("prune_history", []).append({"action": action, "topic": topic, "at": now})
+            metadata.setdefault("prune_history", []).append(
+                {"action": action, "topic": normalized_topic, "matching_mode": matching_mode, "at": now}
+            )
             conn.execute(
                 "UPDATE cards SET status = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
                 (target_status, json_dumps(metadata), now, row["id"]),
             )
-        if not dry_run:
-            audit_event(conn, action="librarian_prune_memory", target_type="cards", target_id=None, payload={"action": action, "topic": topic, "card_ids": touched})
-            mark_card_sidecar_outbox(conn, touched, reason="memory_pruned")
-            conn.commit()
-            sync_card_sidecars_after_commit(root, touched)
-        return {"ok": True, "dry_run": dry_run, "action": action, "topic": topic, "card_count": len(touched), "card_ids": touched}
+        audit_event(
+            conn,
+            action="librarian_prune_memory",
+            target_type="cards",
+            target_id=None,
+            payload={
+                "action": action,
+                "topic": normalized_topic,
+                "matching_mode": matching_mode,
+                "card_ids": eligible_ids,
+                "protected_card_count": protected_count,
+            },
+        )
+        mark_card_sidecar_outbox(conn, eligible_ids, reason="memory_pruned")
+        applied_rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT card.id, card.status, card.metadata_json, card.updated_at,
+                       card.location_uri, outbox.generation AS sidecar_generation
+                FROM cards AS card
+                LEFT JOIN card_sidecar_outbox AS outbox ON outbox.card_id = card.id
+                WHERE card.id IN ({','.join('?' for _ in eligible_ids)})
+                ORDER BY card.id
+                """,
+                eligible_ids,
+            ).fetchall()
+        ]
+        catalog_postcondition = semantic_integrity_report(
+            root,
+            create=False,
+            conn=conn,
+            check_card_sidecars=False,
+        )
+        if not catalog_postcondition.get("ok"):
+            raise RuntimeError(
+                "prune-memory postcondition failed before commit: "
+                f"{catalog_postcondition.get('failing')}"
+            )
+        conn.commit()
+        transaction_started = False
+    except Exception:
+        if transaction_started and conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
+
+    try:
+        sidecar_sync = sync_card_sidecars_after_commit(root, eligible_ids)
+    except Exception as exc:
+        sidecar_sync = {
+            "ok": False,
+            "synced": 0,
+            "deferred": len(eligible_ids),
+            "failed": len(eligible_ids),
+            "failures": [
+                {
+                    "card_id": None,
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            ],
+            "raised": True,
+        }
+    try:
+        postflight_integrity = semantic_integrity_report(root, create=False)
+    except Exception as exc:
+        postflight_integrity = {
+            "ok": False,
+            "failing": {"postflight_exception": 1},
+            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            "raised": True,
+        }
+    if not sidecar_sync.get("ok") or not postflight_integrity.get("ok"):
+        failure_reasons: list[str] = []
+        if not sidecar_sync.get("ok"):
+            failure_reasons.append("sidecar synchronization failed")
+        if not postflight_integrity.get("ok"):
+            failure_reasons.append(
+                "semantic integrity is not clean: "
+                f"{postflight_integrity.get('failing')}"
+            )
+        failure_reason = "; ".join(failure_reasons)
+        failed_sidecar_ids = {
+            str(failure.get("card_id"))
+            for failure in sidecar_sync.get("failures", [])
+            if failure.get("card_id")
+        }
+        unknown_sidecar_failure = not sidecar_sync.get("ok") and not failed_sidecar_ids
+        expected_rows: list[dict[str, Any]] = []
+        for applied in applied_rows:
+            expected = dict(applied)
+            card_id = str(expected["id"])
+            sidecar_failed = unknown_sidecar_failure or card_id in failed_sidecar_ids
+            if not sidecar_failed:
+                sidecar_path = card_sidecar_path(root, card_id)
+                if sidecar_path is not None:
+                    expected["location_uri"] = continuum_uri(root, sidecar_path)
+                expected["sidecar_generation"] = None
+            expected_rows.append(expected)
+        rollback_result = _restore_prune_memory_rows(
+            root,
+            original_rows,
+            expected_rows=expected_rows,
+            failure_reason=failure_reason,
+        )
+        if rollback_result.get("ok"):
+            rollback_message = "Card mutations were rolled back"
+        elif rollback_result.get("restored"):
+            rollback_message = (
+                "Card mutations were restored, but rollback verification did not complete"
+            )
+        else:
+            rollback_message = (
+                "Card mutations were not rolled back because their committed state changed"
+            )
+        raise RuntimeError(
+            f"prune-memory postcondition failed; {rollback_message}: "
+            f"{failure_reason}; rollback_ok={rollback_result.get('ok')}"
+        )
+    return {
+        **base_result,
+        "blocked": False,
+        "card_count": len(eligible_ids),
+        "card_ids": eligible_ids,
+        "semantic_integrity_ok": True,
+    }
 
 
 def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:

@@ -84,6 +84,8 @@ from .core.store import (
     validate_recent_event_limit,
 )
 from .core.workers import (
+    DEFAULT_PRUNE_MEMORY_LIMIT,
+    MAX_PRUNE_MEMORY_LIMIT,
     apply_storage_tiering,
     decay_graph_routes,
     detect_conflicts,
@@ -93,6 +95,8 @@ from .core.workers import (
     resolve_conflict,
     run_worker_pass,
     serve_workers,
+    validate_prune_memory_limit,
+    validate_prune_memory_scope,
 )
 from .core.safety import redact_text_secrets, scan_text_for_secrets
 from .core.writer_claim import claim_writer, writer_claim_status
@@ -363,13 +367,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_tier.add_argument("--dry-run", action="store_true")
     p_tier.add_argument("--limit", type=int, default=100)
 
-    p_prune = sub.add_parser("prune-memory", help="Archive, summarize-only, or prune cards by topic")
+    p_prune = sub.add_parser(
+        "prune-memory",
+        help="Archive, summarize-only, or prune ordinary Cards by literal topic substring",
+    )
     p_prune.add_argument("--root", required=True)
-    p_prune.add_argument("--topic")
+    p_prune.add_argument(
+        "--topic",
+        help="Literal substring matched in Card title, summary, or topics (%%, _, and \\ are literal)",
+    )
     p_prune.add_argument("--action", choices=["archive", "summarize_only", "forget"], default="archive")
     p_prune.add_argument("--dry-run", action="store_true")
-    p_prune.add_argument("--all", action="store_true", help="Allow pruning across all topics when --topic is omitted")
-    p_prune.add_argument("--limit", type=int, default=100)
+    p_prune.add_argument(
+        "--all",
+        action="store_true",
+        help="Explicitly allow global topic scope when --topic is omitted; authority-linked Cards remain protected",
+    )
+    p_prune.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_PRUNE_MEMORY_LIMIT,
+        help=f"Maximum ordinary Cards to change (1-{MAX_PRUNE_MEMORY_LIMIT})",
+    )
 
     p_conflicts = sub.add_parser("detect-conflicts", help="Detect likely conflicting cards")
     p_conflicts.add_argument("--root", required=True)
@@ -423,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_repair_state = sub.add_parser(
         "repair-project-state-checkpoints",
-        help="Find or quarantine invalid current project-state checkpoints",
+        help="Inspect raw project-state boundaries and quarantine repairable corruption",
     )
     p_repair_state.add_argument("--root", required=True)
     p_repair_state.add_argument("--project-id")
@@ -911,6 +930,37 @@ def _main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
                 dry_run=False,
             )
+            if result.get("ok") is False:
+                catalog_committed = bool(
+                    result.get("catalog_repair_committed")
+                )
+                operation.cursor(
+                    {
+                        "phase": (
+                            "project_state_catalog_repair_committed_postflight_failed"
+                            if catalog_committed
+                            else "project_state_repair_refused"
+                        ),
+                        "catalog_repair_committed": catalog_committed,
+                        "sidecar_sync": result.get("sidecar_sync"),
+                        "post_repair_semantic_ok": result.get(
+                            "post_repair_semantic_ok"
+                        ),
+                        "authority_topology_issue_count": result.get(
+                            "authority_topology_issue_count"
+                        ),
+                    }
+                )
+                if catalog_committed:
+                    raise RuntimeError(
+                        "project-state catalog repair committed, but required "
+                        "sidecar synchronization or postflight verification "
+                        "failed and remains deferred"
+                    )
+                raise ValueError(
+                    "project-state checkpoint repair refused because the "
+                    "authority boundary cannot be repaired automatically"
+                )
             operation.cursor(
                 {
                     "phase": "invalid_project_state_quarantined",
@@ -1312,11 +1362,29 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "prune-memory":
         assert root is not None
+        normalized_topic, _matching_mode = validate_prune_memory_scope(args.topic, allow_global=args.all)
+        prune_limit = validate_prune_memory_limit(args.limit)
         if args.dry_run:
-            return emit_result(prune_memory(root, topic=args.topic, action=args.action, dry_run=True, limit=args.limit, allow_global=args.all))
+            return emit_result(
+                prune_memory(
+                    root,
+                    topic=normalized_topic,
+                    action=args.action,
+                    dry_run=True,
+                    limit=prune_limit,
+                    allow_global=args.all,
+                )
+            )
 
         def action(operation: OperationGuard) -> dict[str, Any]:
-            result = prune_memory(root, topic=args.topic, action=args.action, dry_run=False, limit=args.limit, allow_global=args.all)
+            result = prune_memory(
+                root,
+                topic=normalized_topic,
+                action=args.action,
+                dry_run=False,
+                limit=prune_limit,
+                allow_global=args.all,
+            )
             operation.cursor({"phase": "memory_pruned", "action": result.get("action"), "card_count": result.get("card_count")})
             return result
 
@@ -1325,7 +1393,13 @@ def _main(argv: list[str] | None = None) -> int:
                 root,
                 operation_type="cli_prune_memory",
                 title="Prune Epic Continuum memory cards",
-                intent={"topic": args.topic, "action": args.action, "limit": args.limit, "allow_global": args.all},
+                intent={
+                    "topic": normalized_topic,
+                    "matching_mode": _matching_mode,
+                    "action": args.action,
+                    "limit": prune_limit,
+                    "allow_global": args.all,
+                },
                 snapshot_policy="auto",
                 snapshot_reason="pruning mutates card status/projection state",
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],

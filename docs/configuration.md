@@ -152,10 +152,22 @@ archives, marks summary-only, or prunes Cards by topic. These commands write
 audit events; they do not delete raw evidence unless a future destructive policy
 explicitly allows it.
 
-`prune-memory --action forget` prunes Card projections from active recall. It
-does not erase Scroll rows, Library originals, reader editions, or proof
-evidence. Omitting `--topic` requires `--all` so global pruning is always
-explicit.
+`prune-memory --action forget` prunes ordinary Card projections from active
+recall. Topic matching is a normalized literal substring across the Card title,
+summary, and decoded topic values; `%`, `_`, and `\` have no wildcard meaning.
+Empty or whitespace-only topics are rejected. Omitting `--topic` requires `--all`, so a
+true global topic scope is always explicit. The `limit` is bounded from 1 through
+1000 in the core API, CLI, and MCP schema/handler, and dry-run results identify
+the matching mode and normalized topic.
+
+Generic pruning cannot change project-state Cards, unresolved conflict-group
+members, or any Card participating in a supersession relationship. A targeted
+topic that matches one of those protected Cards is blocked atomically; global
+scope excludes and reports protected matches. Use the dedicated project-state
+and conflict operations for temporal authority changes. Every applied prune
+starts from a clean semantic-integrity report and must pass its catalog and
+sidecar postconditions before its public operation can succeed. It does not
+erase Scroll rows, Library originals, reader editions, or proof evidence.
 
 ## Learning Policy
 

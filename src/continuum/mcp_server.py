@@ -73,6 +73,8 @@ from .core.store import (
     validate_partition_identifier,
 )
 from .core.workers import (
+    DEFAULT_PRUNE_MEMORY_LIMIT,
+    MAX_PRUNE_MEMORY_LIMIT,
     apply_storage_tiering,
     decay_graph_routes,
     detect_conflicts,
@@ -80,6 +82,8 @@ from .core.workers import (
     prune_memory,
     resolve_conflict,
     run_worker_pass,
+    validate_prune_memory_limit,
+    validate_prune_memory_scope,
 )
 
 
@@ -906,11 +910,14 @@ def tool_tier_storage(args: JSON) -> Any:
 
 def tool_prune_memory(args: JSON) -> Any:
     root = root_arg(args)
-    topic = optional_str(args, "topic")
+    topic_value = args.get("topic")
+    if topic_value is not None and not isinstance(topic_value, str):
+        raise ValueError("topic must be a string")
     action_name = optional_str(args, "action") or "archive"
     dry_run = optional_bool(args, "dry_run", False)
-    limit = optional_int(args, "limit", 100)
+    limit = validate_prune_memory_limit(optional_int(args, "limit", DEFAULT_PRUNE_MEMORY_LIMIT))
     allow_global = optional_bool(args, "all", False)
+    topic, matching_mode = validate_prune_memory_scope(topic_value, allow_global=allow_global)
     if dry_run:
         return prune_memory(root, topic=topic, action=action_name, dry_run=True, limit=limit, allow_global=allow_global)
 
@@ -923,7 +930,13 @@ def tool_prune_memory(args: JSON) -> Any:
         root,
         operation_type="mcp_prune_memory",
         title="Prune Epic Continuum memory cards",
-        intent={"topic": topic, "action": action_name, "limit": limit, "allow_global": allow_global},
+        intent={
+            "topic": topic,
+            "matching_mode": matching_mode,
+            "action": action_name,
+            "limit": limit,
+            "allow_global": allow_global,
+        },
         snapshot_policy="auto",
         snapshot_reason="pruning mutates card status/projection state",
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
@@ -1736,16 +1749,28 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         tool_tier_storage,
     ),
     "continuum_prune_memory": (
-        "Archive, summarize-only, or prune cards by topic.",
+        "Archive, summarize-only, or prune ordinary Cards by literal topic substring; authority-linked Cards are protected.",
         {
             "type": "object",
             "properties": {
                 "root": {"type": "string"},
-                "topic": {"type": "string"},
+                "topic": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Non-blank literal substring; %, _, and \\ have no wildcard meaning.",
+                },
                 "action": {"type": "string", "enum": ["archive", "summarize_only", "forget"]},
                 "dry_run": {"type": "boolean"},
-                "all": {"type": "boolean", "description": "Allow pruning across all topics when topic is omitted."},
-                "limit": {"type": "integer"},
+                "all": {
+                    "type": "boolean",
+                    "description": "Explicitly allow global topic scope when topic is omitted; authority-linked Cards remain protected.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_PRUNE_MEMORY_LIMIT,
+                    "default": DEFAULT_PRUNE_MEMORY_LIMIT,
+                },
             },
             "additionalProperties": False,
         },

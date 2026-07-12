@@ -284,7 +284,7 @@ continuum record-project-state \
   --open-task "Have another agent review the package"
 ```
 
-Another agent can later recover that state through Cue Recall, `recover-thread --project-id`, or a bounded Looking Glass packet. A newer project-scoped checkpoint from the same agent supersedes its older checkpoint even across sessions; session/private checkpoints stay session-bound, and other agents keep independent current heads. This is the core design claim: agents should share durable local project state instead of trapping memory inside separate chats.
+Another agent can later recover that state through Cue Recall, `recover-thread --project-id`, or a bounded Looking Glass packet. A newer project-scoped checkpoint from the same agent supersedes its older checkpoint even across sessions; session/private checkpoints stay bound to the same project and session, and other agents keep independent current heads. This is the core design claim: agents should share durable local project state instead of trapping memory inside separate chats.
 
 ## Review Relay
 
@@ -479,6 +479,23 @@ The command is designed to be repeatable. It rebuilds derived routes with non-in
 When a root-wide backfill returns `next_cursor.after_rowid`, pass that value back
 as `--after-rowid` for the next page. `--after-seq` is session-local and is only
 valid together with `--session-id`.
+
+### Safe Card Pruning
+
+`prune-memory` matches a literal topic substring; `%`, `_`, and `\` are ordinary
+characters rather than wildcards. A global topic scope requires `--all`, and the
+bounded `--limit` accepts values from 1 through 1000.
+
+```bash
+continuum prune-memory --root ./.continuum-demo --topic "obsolete draft" --dry-run
+continuum prune-memory --root ./.continuum-demo --topic "obsolete draft" --action archive
+```
+
+Generic pruning cannot change project-state Cards, unresolved conflict-group
+members, or Cards participating in supersession. Move authority with
+`record-project-state`, reconcile a complete boundary with `resolve-conflict`,
+or repair an invalid checkpoint with `repair-project-state-checkpoints`; v0.3
+does not provide an incidental or text-matched way to retire project authority.
 
 ## Benchmarks
 

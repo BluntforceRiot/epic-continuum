@@ -27,10 +27,11 @@ The checkpoint is written to the Scroll as an ordered event and to a project-sco
 Project-scoped checkpoints from one agent form a single temporal chain across
 sessions. Recording a new checkpoint atomically makes every older same-agent
 head historical, while preserving those Cards and Scroll events as evidence.
-Session/private checkpoints supersede only within the same session. Checkpoints
-from different agents retain independent current heads so disagreement remains
-visible instead of being silently overwritten. When a boundary has more than
-one validated independent-agent head, automatic resume returns
+Session/private checkpoints supersede only within the same project and session
+boundary. Checkpoints from different agents retain independent current heads so
+disagreement remains visible instead of being silently overwritten. When a
+boundary has more than one validated independent-agent head, automatic resume
+returns
 `authority_ambiguous` and no packet; it never promotes one merely because its
 timestamp is newer. An explicit supersession or merge must establish one
 operational authority first. To supersede compatible independent heads that do
@@ -43,6 +44,16 @@ every reported peer ID; the resolver rejects a partial list:
 continuum resolve-conflict --root <continuum-root> --card-id <winner-card-id> `
   --superseded-card-id <peer-card-id> --superseded-card-id <other-peer-card-id>
 ```
+
+Resume validates the complete bounded raw boundary before declaring it unique.
+Malformed competing or hidden payloads, asymmetric or cross-boundary pointers,
+unsupported edges, invalid conflict relationships or receipts, and scan
+overflow return `authority_corrupt` rather than removing a competing Card from
+consideration. A selected latest head that itself fails checkpoint validation
+retains the compatibility result `invalid_project_state_checkpoint`. Checkpoint
+repair uses the same raw-boundary view and refuses partial or unrepairable
+mutations. Exact source identity also detects a changed Card type, while modern
+Scroll-plus-graph evidence detects a missing derived authority Card.
 
 Temporal conflict dismissal and supersession are Continuum-owned state. A valid
 resolution receipt binds the exact component fingerprint, complete member set,

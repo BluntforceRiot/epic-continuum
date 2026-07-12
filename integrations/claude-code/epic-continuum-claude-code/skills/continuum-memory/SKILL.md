@@ -16,6 +16,8 @@ tools when available:
 - `continuum_cue_recall` for vague memory prompts
 - `continuum_record_project_state` before a handoff or risky change
 - `continuum_memory_health` to inspect queue, capture, storage, and learning state
+- `continuum_prune_memory` only for bounded literal-topic lifecycle changes to
+  ordinary Cards, never project-state, conflict-group, or supersession authority
 - `continuum_detect_conflicts` and `continuum_resolve_conflict` for complete temporal conflict groups or explicitly confirmed project-state authority boundaries
 - `continuum_yarn_health` before using the optional local Yarn/Qwythos briefing layer
 - `continuum_list_operations`
@@ -35,6 +37,13 @@ When a session id is known, use `continuum_recover_thread`. Otherwise use
 `continuum_resume_latest` with the best-known project id. Respect the configured
 resume mode: explicit mode requires a supplied session or project, while latest
 project mode uses only its configured project scope.
+
+Resume must inspect the complete requested project-state authority boundary and
+fail closed if a malformed payload, link, group, unsupported edge, exact
+source-bound Card-type mismatch, or proven missing derived Card would make a
+competing Card disappear. Use project-state replacement, complete conflict
+resolution, or checkpoint repair for authority changes; generic topic pruning is
+not an authority-retirement operation.
 
 Treat the Scroll as the ordered source of prior work. Cards and recovery packets
 are compact views over it, not replacements for it. For a handoff, record a

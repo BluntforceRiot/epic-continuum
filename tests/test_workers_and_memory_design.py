@@ -27,8 +27,10 @@ from continuum.core.store import (
     enqueue_job,
     init_db,
     ingest_file,
+    record_project_state,
     resolve_stored_uri,
     roll_scroll_segment,
+    semantic_integrity_report,
     sync_card_sidecars_after_commit,
     upsert_graph_node,
 )
@@ -1841,12 +1843,509 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.commit()
             finally:
                 conn.close()
+            sync_card_sidecars_after_commit(root, [card_id])
 
             with self.assertRaisesRegex(ValueError, "requires a topic"):
                 prune_memory(root, action="archive")
 
             result = prune_memory(root, action="archive", allow_global=True)
             self.assertEqual(result["card_ids"], [card_id])
+
+    def test_prune_memory_treats_metacharacters_as_literal_substrings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_ids: dict[str, list[str]] = {}
+                for marker, label in (("%", "percent"), ("_", "underscore"), ("\\", "escape")):
+                    card_ids[marker] = [
+                        create_card(
+                            conn,
+                            root=root,
+                            card_type="note",
+                            title=f"Literal title {marker} marker",
+                            summary=f"Only the {label} title Card contains its marker.",
+                            source_refs=[],
+                            topics=[f"Literal {label} title"],
+                        ),
+                        create_card(
+                            conn,
+                            root=root,
+                            card_type="note",
+                            title=f"Literal {label} summary Card",
+                            summary=f"Literal summary {marker} marker",
+                            source_refs=[],
+                            topics=[f"Literal {label} summary"],
+                        ),
+                        create_card(
+                            conn,
+                            root=root,
+                            card_type="note",
+                            title=f"Literal {label} topic Card",
+                            summary=f"Only the {label} topics Card contains its marker.",
+                            source_refs=[],
+                            topics=[f"Literal topic {marker} marker"],
+                        ),
+                    ]
+                plain_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Literal prune marker plain",
+                    summary="This Card has no literal metacharacter marker.",
+                    source_refs=[],
+                    topics=["Literal plain"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(
+                root,
+                [plain_id, *(card_id for marker_ids in card_ids.values() for card_id in marker_ids)],
+            )
+
+            for marker, expected_ids in card_ids.items():
+                with self.subTest(marker=marker):
+                    result = prune_memory(root, topic=f"  {marker}  ", dry_run=True)
+                    self.assertEqual(result["matching_mode"], "literal_substring")
+                    self.assertEqual(result["normalized_topic"], marker)
+                    self.assertEqual(set(result["card_ids"]), set(expected_ids))
+
+            applied = prune_memory(root, topic="%", action="archive")
+            self.assertEqual(set(applied["card_ids"]), set(card_ids["%"]), applied)
+            conn = connect_existing(root)
+            try:
+                statuses = {
+                    str(row["id"]): str(row["status"])
+                    for row in conn.execute("SELECT id, status FROM cards").fetchall()
+                }
+            finally:
+                conn.close()
+            for card_id in card_ids["%"]:
+                self.assertEqual(statuses[card_id], "archived")
+            for card_id in [*card_ids["_"], *card_ids["\\"]]:
+                self.assertEqual(statuses[card_id], "pending_librarian_review")
+            self.assertEqual(statuses[plain_id], "pending_librarian_review")
+
+    def test_prune_memory_matches_decoded_topic_values_not_json_escapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            topic_values = {
+                "café": "unicode",
+                'quote"here': "quote",
+                "line\nhere": "newline",
+                "back\\slash": "backslash",
+            }
+            conn = connect(root)
+            try:
+                card_ids = {
+                    topic: create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"Decoded topic {label} Card",
+                        summary=f"Only the decoded {label} topic carries its value.",
+                        source_refs=[],
+                        topics=[topic],
+                    )
+                    for topic, label in topic_values.items()
+                }
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, list(card_ids.values()))
+
+            for topic, card_id in card_ids.items():
+                with self.subTest(topic=repr(topic)):
+                    result = prune_memory(root, topic=topic, dry_run=True)
+                    self.assertEqual(result["card_ids"], [card_id])
+
+            self.assertEqual(
+                prune_memory(root, topic="\\", dry_run=True)["card_ids"],
+                [card_ids["back\\slash"]],
+            )
+            self.assertEqual(prune_memory(root, topic="\\u", dry_run=True)["card_ids"], [])
+            self.assertEqual(prune_memory(root, topic="\\n", dry_run=True)["card_ids"], [])
+
+    def test_prune_memory_rejects_blank_topics_and_out_of_range_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            for blank in ("", "   ", "\t\r\n"):
+                with self.subTest(topic=repr(blank)):
+                    with self.assertRaisesRegex(ValueError, "must not be empty or whitespace-only"):
+                        prune_memory(root, topic=blank, allow_global=True)
+            with self.assertRaisesRegex(ValueError, "NUL"):
+                prune_memory(root, topic="\x00")
+            for invalid_limit in (0, worker_module.MAX_PRUNE_MEMORY_LIMIT + 1, True):
+                with self.subTest(limit=invalid_limit):
+                    with self.assertRaisesRegex(ValueError, "prune-memory limit"):
+                        prune_memory(root, topic="literal", limit=invalid_limit)
+            self.assertFalse(root.exists())
+
+    def test_prune_memory_rejects_unclean_prestate_without_mutating_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Unclean Preflight Prune Marker",
+                    summary="The pending sidecar makes this preflight incomplete.",
+                    source_refs=[],
+                )
+                before = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(ValueError, "semantic integrity is not clean"):
+                prune_memory(root, topic="Unclean Preflight", action="forget")
+
+            conn = connect_existing(root)
+            try:
+                after = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(after, before)
+
+    def test_prune_memory_protects_project_state_conflicts_and_global_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="prune-protected-session",
+                agent_id="prune-protected-agent",
+                project_id="prune-protected-project",
+                objective="Protected Authority Predecessor Marker",
+            )
+            current_state = record_project_state(
+                root,
+                session_id="prune-protected-session",
+                agent_id="prune-protected-agent",
+                project_id="prune-protected-project",
+                objective="Protected Authority Current Marker",
+            )
+            conn = connect(root)
+            try:
+                conflict_a = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Protected Live Conflict Alpha Marker",
+                    summary="Opposing live conflict member alpha.",
+                    source_refs=[],
+                    session_id="conflict-session",
+                )
+                conflict_b = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Protected Live Conflict Beta Marker",
+                    summary="Opposing live conflict member beta.",
+                    source_refs=[],
+                    session_id="conflict-session",
+                )
+                ordinary = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Ordinary Global Prune Marker",
+                    summary="Eligible ordinary Card.",
+                    source_refs=[],
+                )
+                supersession_predecessor = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Protected Ordinary Supersession Predecessor Marker",
+                    summary="Historical ordinary authority predecessor.",
+                    source_refs=[],
+                    session_id="ordinary-authority-session",
+                )
+                supersession_successor = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Protected Ordinary Supersession Successor Marker",
+                    summary="Current ordinary authority successor.",
+                    source_refs=[],
+                    session_id="ordinary-authority-session",
+                )
+                group = "conflict_prune_protection"
+                conn.execute(
+                    "UPDATE cards SET conflict_group = ? WHERE id IN (?, ?)",
+                    (group, conflict_a, conflict_b),
+                )
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET status = 'superseded', superseded_by_card_id = ?
+                    WHERE id = ?
+                    """,
+                    (supersession_successor, supersession_predecessor),
+                )
+                conn.execute(
+                    "UPDATE cards SET supersedes_card_id = ? WHERE id = ?",
+                    (supersession_predecessor, supersession_successor),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(
+                root,
+                [
+                    conflict_a,
+                    conflict_b,
+                    ordinary,
+                    supersession_predecessor,
+                    supersession_successor,
+                ],
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            protected_card_ids = [
+                state["card_id"],
+                current_state["card_id"],
+                conflict_a,
+                conflict_b,
+                supersession_predecessor,
+                supersession_successor,
+            ]
+            conn = connect_existing(root)
+            try:
+                protected_before = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        f"""
+                        SELECT id, status, conflict_group, supersedes_card_id, superseded_by_card_id
+                        FROM cards
+                        WHERE id IN ({','.join('?' for _ in protected_card_ids)})
+                        """,
+                        protected_card_ids,
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+
+            state_dry_run = prune_memory(root, topic="Protected Authority Current Marker", dry_run=True)
+            self.assertTrue(state_dry_run["blocked"])
+            self.assertIn(current_state["card_id"], state_dry_run["protected_card_ids"])
+            with self.assertRaisesRegex(ValueError, "authority-protected Cards"):
+                prune_memory(root, topic="Protected Authority Current Marker", action="forget")
+            with self.assertRaisesRegex(ValueError, "authority-protected Cards"):
+                prune_memory(root, topic="Protected Live Conflict Alpha Marker", action="archive")
+            with self.assertRaisesRegex(ValueError, "authority-protected Cards"):
+                prune_memory(root, topic="Protected Ordinary Supersession Successor Marker", action="archive")
+            with self.assertRaisesRegex(ValueError, "authority-protected Cards"):
+                prune_memory(root, topic="Protected Ordinary Supersession Predecessor Marker", action="archive")
+
+            global_result = prune_memory(root, action="archive", allow_global=True)
+            self.assertEqual(global_result["matching_mode"], "explicit_global")
+            self.assertGreaterEqual(global_result["protected_card_count"], 6)
+            self.assertEqual(global_result["card_ids"], [ordinary])
+            conn = connect_existing(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, conflict_group, supersedes_card_id, superseded_by_card_id
+                        FROM cards
+                        WHERE id IN (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            state["card_id"],
+                            current_state["card_id"],
+                            conflict_a,
+                            conflict_b,
+                            ordinary,
+                            supersession_predecessor,
+                            supersession_successor,
+                        ),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            for card_id in protected_card_ids:
+                self.assertEqual(rows[card_id], protected_before[card_id])
+            self.assertEqual(rows[ordinary]["status"], "archived")
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_prune_memory_compensates_postflight_and_sidecar_sync_failures(self) -> None:
+        for failure_mode in (
+            "postflight",
+            "postflight_exception",
+            "sidecar_sync",
+            "sidecar_sync_exception",
+            "rollback_sync_failure",
+        ):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                init_db(root)
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"Compensating Prune {failure_mode}",
+                        summary="The original row and sidecar must survive a failed prune.",
+                        source_refs=[],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                sync_card_sidecars_after_commit(root, [card_id])
+                conn = connect_existing(root)
+                try:
+                    original = dict(
+                        conn.execute(
+                            "SELECT status, metadata_json, updated_at, location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()
+                    )
+                finally:
+                    conn.close()
+
+                if failure_mode.startswith("postflight"):
+                    real_report = worker_module.semantic_integrity_report
+                    report_calls = 0
+
+                    def report_with_failed_postflight(*args, **kwargs):
+                        nonlocal report_calls
+                        report_calls += 1
+                        if report_calls == 3:
+                            if failure_mode == "postflight_exception":
+                                raise RuntimeError("simulated postflight exception")
+                            return {"ok": False, "failing": {"simulated_postflight": 1}}
+                        return real_report(*args, **kwargs)
+
+                    failure_patch = patch.object(
+                        worker_module,
+                        "semantic_integrity_report",
+                        side_effect=report_with_failed_postflight,
+                    )
+                else:
+                    real_sync = worker_module.sync_card_sidecars_after_commit
+                    sync_calls = 0
+
+                    def sync_with_first_failure(*args, **kwargs):
+                        nonlocal sync_calls
+                        sync_calls += 1
+                        if failure_mode == "rollback_sync_failure" and sync_calls <= 2:
+                            return {"ok": False, "synced": 0, "deferred": 1, "failed": 1, "failures": []}
+                        if sync_calls == 1:
+                            if failure_mode == "sidecar_sync_exception":
+                                raise RuntimeError("simulated sidecar sync exception")
+                            return {"ok": False, "synced": 0, "deferred": 1, "failed": 1, "failures": []}
+                        return real_sync(*args, **kwargs)
+
+                    failure_patch = patch.object(
+                        worker_module,
+                        "sync_card_sidecars_after_commit",
+                        side_effect=sync_with_first_failure,
+                    )
+
+                expected_message = (
+                    "restored, but rollback verification did not complete"
+                    if failure_mode == "rollback_sync_failure"
+                    else "Card mutations were rolled back"
+                )
+                with failure_patch, self.assertRaisesRegex(RuntimeError, expected_message):
+                    prune_memory(root, topic=failure_mode, action="forget")
+
+                conn = connect_existing(root)
+                try:
+                    restored = dict(
+                        conn.execute(
+                            "SELECT status, metadata_json, updated_at, location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(restored, original)
+                self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_prune_memory_compensation_does_not_overwrite_an_intervening_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Prune Compensation CAS Marker",
+                    summary="An intervening writer must win over compensation.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, [card_id])
+
+            real_report = worker_module.semantic_integrity_report
+            report_calls = 0
+
+            def report_with_intervening_write(*args, **kwargs):
+                nonlocal report_calls
+                report_calls += 1
+                if report_calls == 3:
+                    writer = connect(root)
+                    try:
+                        row = writer.execute(
+                            "SELECT metadata_json FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()
+                        metadata = json.loads(str(row["metadata_json"]))
+                        metadata["intervening_writer"] = "preserve-me"
+                        writer.execute(
+                            "UPDATE cards SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                            (json.dumps(metadata, sort_keys=True), "2999-01-01T00:00:00Z", card_id),
+                        )
+                        writer.commit()
+                    finally:
+                        writer.close()
+                    return {"ok": False, "failing": {"simulated_postflight": 1}}
+                return real_report(*args, **kwargs)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "semantic_integrity_report",
+                    side_effect=report_with_intervening_write,
+                ),
+                self.assertRaisesRegex(RuntimeError, "were not rolled back because their committed state changed"),
+            ):
+                prune_memory(root, topic="CAS Marker", action="forget")
+
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT status, metadata_json, updated_at FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row["status"], "pruned")
+            self.assertEqual(row["updated_at"], "2999-01-01T00:00:00Z")
+            self.assertEqual(json.loads(str(row["metadata_json"]))["intervening_writer"], "preserve-me")
 
     def test_route_decay_respects_minimum_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2108,6 +2607,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.commit()
             finally:
                 conn.close()
+            sync_card_sidecars_after_commit(root, [card_id])
 
             dry = prune_memory(root, topic="Zephyr", action="archive", dry_run=True)
             actual = prune_memory(root, topic="Zephyr", action="archive")

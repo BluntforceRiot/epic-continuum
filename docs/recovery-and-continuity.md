@@ -76,8 +76,8 @@ readable, while a marked checkpoint with divergent structured state fails closed
 Same-agent project-scoped checkpoints form one atomic temporal chain across
 sessions. Only the newest head is operational; its predecessors remain
 historical evidence and are excluded from recent Scroll and Cue Recall sections
-of a resume packet. Session/private chains remain session-bound, and different
-agents keep independent current heads.
+of a resume packet. Session/private chains remain bound to the same project and
+session boundary, and different agents keep independent current heads.
 
 ## Ambiguous Authority
 
@@ -86,8 +86,21 @@ make one authoritative. If automatic resume validates more than one current
 head at the requested project/session boundary, it returns
 `authority_ambiguous`, sets `resolution_required`, and writes no recovery
 packet. Explicitly supersede or merge the competing component, then retry
-resume. A bounded scan that cannot prove there is only one head also fails
-closed with the same result.
+resume. Before classifying those heads, resume reconstructs the complete bounded
+raw authority boundary. Invalid checkpoint payloads, asymmetric or
+cross-boundary links, unsupported edges, incomplete conflict relationships,
+invalid receipts, and scan overflow fail closed and write no recovery packet.
+Boundary or topology corruption, including an invalid competing or hidden
+member, returns `authority_corrupt` and sets `repair_required`. For compatibility,
+a selected latest head that itself fails checkpoint validation retains the more
+specific `invalid_project_state_checkpoint` result described below. A damaged
+Card cannot disappear from the decision merely because its pointers or payload
+are malformed.
+Boundary membership is also recovered from the exact bounded project-state
+Scroll source, including legacy session/sequence references, so changing only a
+Card's scope, project, session, or declared type cannot hide it from resume or
+repair. For modern checkpoints, matching Scroll and graph bindings also expose a
+missing derived Card as authority corruption instead of silently erasing it.
 
 Recovery packets only include evidence visible to the requested session/project
 scope. Pending queue jobs are included only when their referenced Card, segment,
@@ -99,6 +112,9 @@ from the coordinates of the checkpoint it discovers. A project-only request
 cannot acquire session-visible evidence, and a session-only request cannot use a
 discovered project identifier to read project-visible evidence. Checkpoint
 selection applies the same rule before any recovery packet is built.
+When one requested capability exposes several independent boundaries, selection
+ranks their live boundary candidates; a newer clean boundary with no current
+head cannot hide a usable live checkpoint in another boundary.
 
 The selected checkpoint is a mandatory Planner candidate. Its identifier,
 title/content, summary, decisions, open tasks, scope, and source references are
@@ -120,8 +136,8 @@ limits or its source-binding integrity checks returns
 `invalid_project_state_checkpoint`, writes no recovery packet, and does not
 silently fall back to an older state.
 
-Preview the affected heads, then apply the quarantine when the result is
-correct:
+Preview the complete raw requested boundary, then apply the quarantine when the
+result is correct:
 
 ```bash
 continuum repair-project-state-checkpoints \
@@ -134,18 +150,62 @@ continuum repair-project-state-checkpoints \
   --apply
 ```
 
-Apply mode preserves the invalid Card as historical evidence and restores only
-a reciprocal, same-authority predecessor. The repair writes a system audit that
+A project-only repair scope also includes exact source-bound session/private
+checkpoint evidence associated with that project. Supply `--session-id` as well
+when the repair must be constrained to one session boundary.
+
+Repair never begins from the current-head predicate it is trying to validate.
+It reports hidden, invalid, current, and topology-linked Cards from the bounded
+raw boundary. Apply mode refuses an unrepairable topology or a limit too small
+to close the invalid set atomically; its guarded receipt is failed and the Card
+rows remain unchanged. A successful mutation must pass the semantic catalog
+postcondition in the same transaction.
+
+Catalog authority changes commit before their derived Card sidecars are
+refreshed. If that post-commit refresh or the full semantic postflight fails,
+repair returns `ok: false` with `catalog_repair_committed: true`, the
+`sidecar_sync` result, and `post_repair_semantic_integrity`; the guarded CLI
+receipt is failed and explicitly records that this was not an atomic refusal.
+The durable sidecar outbox remains available for normal worker maintenance;
+after reconciliation, run strict root verification before resuming.
+
+`authority_boundaries` describes the inspected pre-repair state. Preview and
+apply both disclose any additional non-direct predecessors that would be retired
+through `retired_peer_count`, `retired_peer_card_ids`, and `retired_peers`, and
+any unproven current peers whose bad link would be removed through
+`detached_peer_count`, `detached_peer_card_ids`, and `detached_peers`. Successful
+apply also returns the verified clean state in
+`post_repair_authority_boundaries`; dry-run leaves that field empty. The guarded
+operation receipt preserves the same result fields.
+
+An unreceipted non-current project-state topological head is authority
+corruption. Repair converts it to an exact pointerless historical quarantine
+receipt and, when safe, reactivates its reciprocal predecessor.
+
+When exact source identity proves that a checkpoint Card's declared type drifted,
+repair restores the source-proven project-state type as part of placing that Card
+in historical quarantine; it never promotes the damaged Card. A strongly proven
+modern source whose derived Card is missing is reported as unrepairable, because
+repair cannot safely invent the deleted authority payload.
+
+Successful apply mode preserves the invalid Card as historical evidence and
+restores only a reciprocal, same-authority predecessor. The repair writes a system audit that
 hash-binds the exact pointerless quarantined Card authority/payload state, its
 bound Scroll source event, and the original integrity error. Derived placement,
 recall, and sidecar-location fields remain maintainable, so semantic
 verification and snapshots can proceed while any later mutation of
 that evidence fails closed again. Any related receipt, member, and original
 resolution-audit rows are included in the quarantine binding. Remaining
-incoming authority links are severed without promoting an unproven alternative;
-exact conflict receipts that
-contain the quarantined Card remain preserved but are treated as retired
-evidence. Run repair again while `has_more` is true.
+incoming links are partitioned by durable evidence. Only a receipt- or
+audit-proven non-direct predecessor is retired and quarantined. An unproven
+current peer has the bad pointer detached while remaining current authority, so
+resume can expose any resulting ambiguity; an unproven non-current peer causes
+an atomic refusal because its prior status cannot be reconstructed safely. Exact
+conflict receipts that contain the quarantined Card remain preserved but are
+treated as retired evidence. If a preview reports `has_more` solely because the
+requested limit is too small, increase `--limit` (up to 1000) so the complete
+invalid set can be quarantined together. A reported topology or scan overflow is
+a hard bounded refusal and cannot be cleared by increasing the limit.
 
 ## Upgrade Backfill
 

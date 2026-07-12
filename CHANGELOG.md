@@ -6,6 +6,11 @@
   with strict personal resume modes, canonical partition lookup, immutable
   checkpoint ordering, guarded CLI recovery receipts, and discovery limited to
   project/session state that the recovery packet can actually render.
+- Resume and checkpoint repair now inspect the complete bounded raw
+  project-state authority boundary before classifying any Card as a current
+  head. Invalid payloads, malformed or cross-boundary links, incomplete conflict
+  groups, unsupported edges, and scan overflow fail closed instead of allowing a
+  corrupt Card to disappear from the authority decision.
 - Made same-agent project-state checkpoints one atomic temporal authority chain:
   only the newest checkpoint is current, while predecessors remain historical
   evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint
@@ -22,6 +27,12 @@
 - Expanded memory health telemetry with queue age, segmentation lag, running-job
   heartbeat and lease validity, sidecar backlog, snapshot, and WAL diagnostics.
 - Added planner-aware ContinuityBench coverage and recovery-focused regression tests.
+- Made Card pruning a bounded literal-substring operation across core, CLI, and
+  MCP: SQL metacharacters remain literal, blank topics and out-of-range limits
+  are rejected, and global topic scope still requires explicit authorization.
+  Project-state Cards, conflict-group members, and supersession participants are
+  outside generic pruning, while applied operations enforce semantic pre- and
+  postconditions before their receipts can succeed.
 - Added stable connected temporal conflict groups and acyclic whole-group
   resolution. Current Cards can supersede historical peers, while system-owned,
   exact-member dismissal receipts prevent periodic detection from undoing a
@@ -70,9 +81,15 @@
   historical Card and system audit record. A verified quarantine preserves the
   damaged evidence without keeping semantic verification permanently unhealthy,
   while any later mutation fails closed again. Repair severs remaining incoming
-  authority links without promoting unproven alternatives and classifies an
-  otherwise exact conflict receipt containing that quarantined member as
-  retired evidence, never as live conflict or resume authority.
+  authority links without promoting unproven alternatives, reports every
+  additionally retired or detached peer, and classifies an otherwise exact
+  conflict receipt containing that quarantined member as retired evidence,
+  never as live conflict or resume authority. Unproven current peers remain
+  current after their bad pointer is detached. Exact Scroll and graph bindings
+  also keep Card-type drift or a missing derived checkpoint Card from silently
+  erasing authority. A post-commit sidecar or semantic verification failure now
+  fails the guarded operation with an explicit `catalog_repair_committed` result
+  instead of reporting an unverified repair as successful.
 - Added background lease renewal for every queue job type plus unexpired-owner
   commit fencing and durable per-job effect receipts. Reclaimed or replayed jobs
   cannot duplicate database-visible effects. Card sidecar snapshot, atomic file

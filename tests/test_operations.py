@@ -27,14 +27,18 @@ from continuum.core.store import (
     compile_context,
     connect,
     connect_existing,
+    create_card,
     enforce_snapshot_retention,
     ingest_file,
     init_db,
     record_artifact,
+    record_project_state,
     roll_scroll_segment,
     snapshot,
     snapshot_manifest_path,
+    sync_card_sidecars_after_commit,
 )
+from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT
 from continuum.core.operations import (
     OperationGuard,
     SNAPSHOT_COUNT_TABLES,
@@ -91,6 +95,26 @@ def make_link_like_dir(testcase: unittest.TestCase, link: Path, target: Path) ->
 
 
 class OperationLedgerTest(unittest.TestCase):
+    def test_cli_prune_memory_help_renders_literal_metacharacters(self) -> None:
+        package_root = Path(store_module.__file__).resolve().parents[2]
+        environment = os.environ.copy()
+        existing_pythonpath = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part
+            for part in (str(package_root), existing_pythonpath)
+            if part
+        )
+        completed = subprocess.run(
+            [sys.executable, "-m", "continuum", "prune-memory", "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("(%, _, and \\ are literal)", completed.stdout)
+
     def test_operation_id_cannot_escape_receipt_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -707,6 +731,149 @@ class OperationLedgerTest(unittest.TestCase):
                     proof = json.loads(Path(result["_operation"]["proof_pack_uri"]).read_text(encoding="utf-8"))
                     self.assertEqual(proof["catalog_proof_mode"], "snapshot")
                     self.assertIn("sqlite_backup", [item.get("kind") for item in proof["path_substitutions"]])
+
+    def test_cli_prune_memory_literal_scope_limits_and_protected_failure_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                marker_ids = {
+                    marker: create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"CLI literal {marker} prune marker",
+                        summary=f"Only the {label} CLI Card has this marker.",
+                        source_refs=[],
+                    )
+                    for marker, label in (("%", "percent"), ("_", "underscore"), ("\\", "escape"))
+                }
+                plain_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="CLI literal plain prune marker",
+                    summary="This ordinary Card must remain active.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, [*marker_ids.values(), plain_id])
+
+            for marker, expected_id in marker_ids.items():
+                with self.subTest(marker=marker):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        code = cli_main(
+                            [
+                                "prune-memory",
+                                "--root",
+                                str(root),
+                                "--topic",
+                                marker,
+                                "--dry-run",
+                            ]
+                        )
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(code, 0, result)
+                    self.assertEqual(result["matching_mode"], "literal_substring")
+                    self.assertEqual(result["card_ids"], [expected_id])
+
+            applied_output = io.StringIO()
+            with redirect_stdout(applied_output):
+                applied_code = cli_main(
+                    [
+                        "prune-memory",
+                        "--root",
+                        str(root),
+                        "--topic",
+                        "%",
+                        "--action",
+                        "archive",
+                    ]
+                )
+            applied = json.loads(applied_output.getvalue())
+            self.assertEqual(applied_code, 0, applied)
+            self.assertEqual(applied["card_ids"], [marker_ids["%"]])
+            self.assertEqual(applied["_operation"]["status"], "succeeded")
+
+            for arguments, expected_error in (
+                (["--topic", "   ", "--all"], "whitespace-only"),
+                (
+                    ["--topic", "literal", "--limit", str(MAX_PRUNE_MEMORY_LIMIT + 1)],
+                    str(MAX_PRUNE_MEMORY_LIMIT),
+                ),
+            ):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = cli_main(["prune-memory", "--root", str(root), *arguments])
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, 1, result)
+                self.assertFalse(result["ok"])
+                self.assertIn(expected_error, result["error"])
+
+            state = record_project_state(
+                root,
+                session_id="cli-prune-protected-session",
+                agent_id="cli-prune-protected-agent",
+                project_id="cli-prune-protected-project",
+                objective="CLI Protected Authority Marker",
+            )
+            conn = connect(root)
+            try:
+                state_before = dict(
+                    conn.execute(
+                        "SELECT status, supersedes_card_id, superseded_by_card_id, conflict_group FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            protected_output = io.StringIO()
+            with redirect_stdout(protected_output):
+                protected_code = cli_main(
+                    [
+                        "prune-memory",
+                        "--root",
+                        str(root),
+                        "--topic",
+                        "CLI Protected Authority Marker",
+                        "--action",
+                        "forget",
+                    ]
+                )
+            protected = json.loads(protected_output.getvalue())
+            self.assertEqual(protected_code, 1, protected)
+            self.assertIn("authority-protected Cards", protected["error"])
+            failed = list_operations(root, status="failed", limit=20)
+            prune_failures = [
+                operation
+                for operation in failed["operations"]
+                if operation["operation_type"] == "cli_prune_memory"
+            ]
+            self.assertEqual(len(prune_failures), 1, failed)
+            self.assertEqual(prune_failures[0]["status"], "failed")
+            conn = connect(root)
+            try:
+                statuses = {
+                    str(row["id"]): str(row["status"])
+                    for row in conn.execute("SELECT id, status FROM cards").fetchall()
+                }
+                state_after = dict(
+                    conn.execute(
+                        "SELECT status, supersedes_card_id, superseded_by_card_id, conflict_group FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(statuses[marker_ids["%"]], "archived")
+            self.assertEqual(statuses[marker_ids["_"]], "pending_librarian_review")
+            self.assertEqual(statuses[marker_ids["\\"]], "pending_librarian_review")
+            self.assertEqual(statuses[plain_id], "pending_librarian_review")
+            self.assertEqual(state_after, state_before)
 
     def test_doctor_reports_healthy_initialized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

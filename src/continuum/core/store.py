@@ -34,7 +34,12 @@ from .safety import (
     scan_text_for_secrets,
     scan_value_for_secrets,
 )
-from .temporal_authority import temporal_authority_integrity_report
+from .temporal_authority import (
+    CONFLICT_DISMISSAL_METADATA_KEY,
+    _conflict_resolution_receipt_error,
+    conflict_boundary,
+    temporal_authority_integrity_report,
+)
 from .units import format_size, parse_size
 from .writer_claim import WriterClaimError, ensure_writer_claim, writer_claim_status
 
@@ -44,6 +49,7 @@ from .writer_claim import WriterClaimError, ensure_writer_claim, writer_claim_st
 # labels. 0.2.0 adds partition aliases, sidecar outbox, graph source rows, and
 # stricter recovery evidence.
 SCHEMA_VERSION = "0.2.0"
+ProjectStateRow = sqlite3.Row | dict[str, Any]
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/\\-]{1,}")
@@ -8685,7 +8691,7 @@ def _project_state_card_limit_error(
     conn: sqlite3.Connection,
     card_id: str,
     *,
-    size_row: sqlite3.Row | None = None,
+    size_row: ProjectStateRow | None = None,
 ) -> str | None:
     if size_row is None:
         size_row = conn.execute(
@@ -8820,7 +8826,7 @@ def _project_state_card_integrity_error(
     conn: sqlite3.Connection,
     card_id: str,
     *,
-    size_row: sqlite3.Row | None = None,
+    size_row: ProjectStateRow | None = None,
 ) -> str | None:
     """Validate one bounded project-state Card and its lossless Scroll source."""
 
@@ -9006,7 +9012,7 @@ def _valid_visible_current_project_state_ids(
 
 def _project_state_repair_agent_id(
     conn: sqlite3.Connection,
-    row: sqlite3.Row,
+    row: ProjectStateRow,
 ) -> str | None:
     """Recover one checkpoint agent without evaluating untrusted JSON in SQL.
 
@@ -9016,6 +9022,49 @@ def _project_state_repair_agent_id(
     event, while ambiguous or conflicting evidence restores no predecessor.
     """
 
+    if "card_type" in row.keys():
+        observed_card_type = str(row["card_type"] or "")
+    else:
+        card_type_row = conn.execute(
+            "SELECT card_type FROM cards WHERE id = ?",
+            (str(row["id"]),),
+        ).fetchone()
+        observed_card_type = (
+            str(card_type_row["card_type"] or "")
+            if card_type_row is not None
+            else ""
+        )
+    source_proven_type_drift = False
+    if observed_card_type != "project_state":
+        legacy_source_rows, legacy_source_overflow = (
+            _source_bound_project_state_rows(
+                conn,
+                source_visibility_clause="cards.id = ?",
+                source_visibility_params=(str(row["id"]),),
+                limit=1,
+            )
+        )
+        legacy_source_proven = not legacy_source_overflow and any(
+            str(source_row["id"]) == str(row["id"])
+            for source_row in legacy_source_rows
+        )
+        modern_source_rows, modern_source_overflow = (
+            _source_proven_project_state_card_rows(
+                conn,
+                source_visibility_clause="1 = 1",
+                source_visibility_params=(),
+                limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+            )
+        )
+        source_proven_type_drift = legacy_source_proven or (
+            not modern_source_overflow
+            and any(
+                str(source_row["id"]) == str(row["id"])
+                for source_row in modern_source_rows
+            )
+        )
+        if not source_proven_type_drift:
+            return None
     metadata_bytes = int(row["metadata_bytes"] or 0)
     source_refs_bytes = int(row["source_refs_bytes"] or 0)
     card_metadata: Any = {}
@@ -9023,8 +9072,7 @@ def _project_state_repair_agent_id(
         metadata_row = conn.execute(
             """
             SELECT metadata_json FROM cards
-            WHERE id = ? AND card_type = 'project_state'
-              AND length(CAST(metadata_json AS BLOB)) <= ?
+            WHERE id = ? AND length(CAST(metadata_json AS BLOB)) <= ?
             """,
             (str(row["id"]), MAX_STORED_PROJECT_STATE_METADATA_BYTES),
         ).fetchone()
@@ -9047,8 +9095,7 @@ def _project_state_repair_agent_id(
         source_refs_row = conn.execute(
             """
             SELECT source_refs_json FROM cards
-            WHERE id = ? AND card_type = 'project_state'
-              AND length(CAST(source_refs_json AS BLOB)) <= ?
+            WHERE id = ? AND length(CAST(source_refs_json AS BLOB)) <= ?
             """,
             (str(row["id"]), MAX_STORED_PROJECT_STATE_BYTES),
         ).fetchone()
@@ -9418,6 +9465,1591 @@ def _valid_project_state_quarantine(
     return None
 
 
+def _record_project_state_quarantine(
+    conn: sqlite3.Connection,
+    *,
+    card_id: str,
+    reason: str,
+    predecessor_card_id: str | None,
+) -> dict[str, Any]:
+    quarantine_columns = ", ".join(_PROJECT_STATE_QUARANTINE_CARD_COLUMNS)
+    quarantined_card = conn.execute(
+        f"SELECT {quarantine_columns} FROM cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if quarantined_card is None:
+        raise ValueError(f"quarantined project-state Card disappeared: {card_id}")
+    record: dict[str, Any] = {
+        "card_id": card_id,
+        "reason": reason[:512],
+        "predecessor_card_id": predecessor_card_id,
+        "schema": PROJECT_STATE_QUARANTINE_SCHEMA,
+    }
+    record["card_binding_hash"] = _project_state_quarantine_binding_hash(
+        conn,
+        quarantined_card,
+        reason=str(record["reason"]),
+        predecessor_card_id=predecessor_card_id,
+    )
+    audit_event(
+        conn,
+        action="project_state_checkpoint_quarantined",
+        target_type="card",
+        target_id=card_id,
+        payload=record,
+    )
+    return record
+
+
+PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT = 256
+PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT = 512
+PROJECT_STATE_REPAIR_SCAN_LIMIT = 1000
+
+
+def _project_state_authority_select_fields(table: str = "cards") -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        raise ValueError(f"unsafe Card table alias: {table}")
+    return f"""
+        {table}.rowid AS card_rowid, {table}.id, {table}.card_type,
+        {table}.title, {table}.summary, {table}.status,
+        {table}.session_id, {table}.project_id, {table}.visibility_scope,
+        {table}.conflict_group, {table}.supersedes_card_id,
+        {table}.superseded_by_card_id, {table}.created_at,
+        length(CAST({table}.title AS BLOB)) AS title_bytes,
+        length(CAST({table}.summary AS BLOB)) AS summary_bytes,
+        length(CAST({table}.decisions_json AS BLOB)) AS decisions_bytes,
+        length(CAST({table}.open_tasks_json AS BLOB)) AS open_tasks_bytes,
+        length(CAST({table}.metadata_json AS BLOB)) AS metadata_bytes,
+        length(CAST({table}.source_refs_json AS BLOB)) AS source_refs_bytes
+    """
+
+
+_PROJECT_STATE_AUTHORITY_SELECT_FIELDS = _project_state_authority_select_fields()
+
+
+def _project_state_authority_boundary(row: ProjectStateRow) -> tuple[str, str, str]:
+    scope = normalize_visibility_scope(
+        str(row["visibility_scope"] or ""),
+        field="project-state authority visibility_scope",
+    )
+    project_id = str(row["project_id"] or "")
+    session_id = str(row["session_id"] or "")
+    if scope == "project":
+        return (scope, project_id, "")
+    if scope == "global":
+        return (scope, "", "")
+    return (scope, project_id, session_id)
+
+
+def _project_state_boundary_sql(
+    boundary: tuple[str, str, str],
+    *,
+    table: str = "cards",
+) -> tuple[str, tuple[Any, ...]]:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        raise ValueError(f"unsafe Card table alias: {table}")
+    scope, project_id, session_id = boundary
+    if scope == "project":
+        return (
+            f"{table}.visibility_scope = 'project' "
+            f"AND coalesce({table}.project_id, '') = ?",
+            (project_id,),
+        )
+    if scope == "global":
+        return (
+            f"{table}.visibility_scope = 'global' "
+            f"AND coalesce({table}.project_id, '') = ''",
+            (),
+        )
+    return (
+        f"{table}.visibility_scope = ? "
+        f"AND coalesce({table}.project_id, '') = ? "
+        f"AND coalesce({table}.session_id, '') = ?",
+        (scope, project_id, session_id),
+    )
+
+
+def _project_state_boundary_rows(
+    conn: sqlite3.Connection,
+    boundary: tuple[str, str, str],
+    *,
+    limit: int = PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+) -> list[sqlite3.Row]:
+    boundary_sql, boundary_params = _project_state_boundary_sql(boundary)
+    return conn.execute(
+        f"""
+        SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
+        FROM cards
+        WHERE card_type = 'project_state' AND {boundary_sql}
+        ORDER BY created_at DESC, card_rowid DESC
+        LIMIT ?
+        """,
+        (*boundary_params, int(limit) + 1),
+    ).fetchall()
+
+
+def _source_bound_project_state_deterministic_identity_proven(
+    row: ProjectStateRow,
+) -> bool:
+    """Prove a source-bound Card ID from bounded durable coordinate candidates."""
+
+    card_metadata = json_loads(
+        (
+            row["bounded_card_metadata_json"]
+            if "bounded_card_metadata_json" in row.keys()
+            else None
+        ),
+        {},
+    )
+    source_metadata = json_loads(
+        (
+            row["bounded_source_metadata_json"]
+            if "bounded_source_metadata_json" in row.keys()
+            else None
+        ),
+        {},
+    )
+    source_refs = json_loads(
+        (
+            row["bounded_source_refs_json"]
+            if "bounded_source_refs_json" in row.keys()
+            else None
+        ),
+        None,
+    )
+    card_metadata = card_metadata if isinstance(card_metadata, dict) else {}
+    source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+    reference_session = ""
+    if (
+        isinstance(source_refs, list)
+        and len(source_refs) == 1
+        and isinstance(source_refs[0], dict)
+    ):
+        reference_session = str(source_refs[0].get("session_id") or "")
+    coordinate_candidates: list[tuple[str, str, str]] = []
+
+    def add_candidate(scope_value: Any, project_value: Any, session_value: Any) -> None:
+        try:
+            scope = normalize_visibility_scope(
+                str(scope_value or ""),
+                field="project-state deterministic identity visibility_scope",
+            )
+        except ValueError:
+            return
+        project_id = str(project_value or "")
+        session_id = str(session_value or "")
+        effective_scope = (
+            "project" if project_id and scope == "global" else scope
+        )
+        candidate = (effective_scope, project_id, session_id)
+        if candidate not in coordinate_candidates:
+            coordinate_candidates.append(candidate)
+
+    for metadata in (source_metadata, card_metadata):
+        add_candidate(
+            metadata.get("visibility_scope"),
+            metadata.get("project_id"),
+            metadata.get("session_id") or reference_session,
+        )
+    add_candidate(
+        row["visibility_scope"],
+        row["project_id"],
+        row["session_id"] or reference_session,
+    )
+    add_candidate(
+        row["source_visibility_scope"],
+        row["source_project_id"],
+        row["source_session_id"] or reference_session,
+    )
+    event_id = str(row["bound_source_event_id"] or "")
+    source_seq = int(row["source_seq"])
+    for visibility_scope, project_id, session_id in coordinate_candidates:
+        expected_card_id = stable_id(
+            "card",
+            visibility_scope,
+            session_id,
+            project_id,
+            "project_state",
+            str(row["title"] or ""),
+            content_hash(str(row["summary"] or "")),
+            json_dumps(
+                [
+                    {
+                        "event_id": event_id,
+                        "session_id": session_id,
+                        "seq": source_seq,
+                    }
+                ]
+            ),
+        )
+        if str(row["id"]) == expected_card_id:
+            return True
+    return False
+
+
+def _source_bound_project_state_rows(
+    conn: sqlite3.Connection,
+    *,
+    source_visibility_clause: str,
+    source_visibility_params: tuple[Any, ...],
+    limit: int,
+) -> tuple[list[sqlite3.Row], bool]:
+    """Find Cards through authorized bound Scroll events, not Card scope fields."""
+
+    rows = conn.execute(
+        f"""
+        SELECT {_project_state_authority_select_fields('cards')},
+               source.id AS bound_source_event_id,
+               source.visibility_scope AS source_visibility_scope,
+               source.session_id AS source_session_id,
+               source.project_id AS source_project_id,
+               source.seq AS source_seq,
+               length(CAST(source.metadata_json AS BLOB))
+                   AS source_metadata_bytes,
+               CASE
+                   WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
+                   THEN source.metadata_json
+                   ELSE NULL
+               END AS bounded_source_metadata_json,
+               CASE
+                   WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
+                   THEN cards.metadata_json
+                   ELSE NULL
+               END AS bounded_card_metadata_json,
+               CASE
+                   WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                   THEN cards.source_refs_json
+                   ELSE NULL
+               END AS bounded_source_refs_json
+        FROM cards
+        JOIN json_each(
+            CASE
+                WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                 AND json_valid(cards.source_refs_json)
+                THEN cards.source_refs_json
+                ELSE '[]'
+            END
+        ) AS source_ref
+        JOIN scroll_events AS source
+         ON source.event_type = 'project_state'
+         AND (
+                source.id = json_extract(
+                    CASE
+                        WHEN source_ref.type = 'object' THEN source_ref.value
+                        ELSE '{{}}'
+                    END,
+                    '$.event_id'
+                )
+             OR (
+                    json_type(
+                        CASE
+                            WHEN source_ref.type = 'object'
+                            THEN source_ref.value
+                            ELSE '{{}}'
+                        END,
+                        '$.event_id'
+                ) IS NULL
+                AND source.seq = json_extract(
+                        CASE
+                            WHEN source_ref.type = 'object'
+                            THEN source_ref.value
+                            ELSE '{{}}'
+                        END,
+                        '$.seq'
+                    )
+                AND (
+                    source.session_id = json_extract(
+                            CASE
+                                WHEN source_ref.type = 'object'
+                                THEN source_ref.value
+                                ELSE '{{}}'
+                            END,
+                            '$.session_id'
+                        )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM graph_edge_sources AS legacy_graph_source
+                        WHERE length(
+                                CAST(legacy_graph_source.source_ref_json AS BLOB)
+                              ) <= {MAX_STORED_PROJECT_STATE_BYTES}
+                          AND json_valid(
+                                legacy_graph_source.source_ref_json
+                              )
+                          AND json_extract(
+                                legacy_graph_source.source_ref_json,
+                                '$.event_id'
+                              ) = source.id
+                          AND json_extract(
+                                legacy_graph_source.source_ref_json,
+                                '$.card_id'
+                              ) = cards.id
+                    )
+                    OR (
+                        NOT EXISTS (
+                            SELECT 1
+                            FROM scroll_events AS exact_legacy_source
+                            WHERE exact_legacy_source.event_type = 'project_state'
+                              AND exact_legacy_source.session_id = json_extract(
+                                    CASE
+                                        WHEN source_ref.type = 'object'
+                                        THEN source_ref.value
+                                        ELSE '{{}}'
+                                    END,
+                                    '$.session_id'
+                                  )
+                              AND exact_legacy_source.seq = source.seq
+                        )
+                        AND length(CAST(cards.metadata_json AS BLOB))
+                            <= {MAX_STORED_PROJECT_STATE_METADATA_BYTES}
+                        AND length(CAST(source.metadata_json AS BLOB))
+                            <= {MAX_STORED_PROJECT_STATE_BYTES}
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.source_type'
+                            ) = 'project_state'
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(source.metadata_json)
+                                    THEN source.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.source_type'
+                            ) = 'project_state'
+                        AND coalesce(json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.agent_id'
+                            ), '') != ''
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.agent_id'
+                            ) = json_extract(
+                                CASE
+                                    WHEN json_valid(source.metadata_json)
+                                    THEN source.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.agent_id'
+                            )
+                        AND coalesce(json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.project_id'
+                            ), '') != ''
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.project_id'
+                            ) = json_extract(
+                                CASE
+                                    WHEN json_valid(source.metadata_json)
+                                    THEN source.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.project_id'
+                            )
+                        AND coalesce(json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.state_payload_hash'
+                            ), '') != ''
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.state_payload_hash'
+                            ) = json_extract(
+                                CASE
+                                    WHEN json_valid(source.metadata_json)
+                                    THEN source.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.state_payload_hash'
+                            )
+                        AND json_extract(
+                                CASE
+                                    WHEN json_valid(cards.metadata_json)
+                                    THEN cards.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.visibility_scope'
+                            ) = json_extract(
+                                CASE
+                                    WHEN json_valid(source.metadata_json)
+                                    THEN source.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.visibility_scope'
+                            )
+                    )
+                )
+             )
+         )
+        WHERE json_array_length(
+                CASE
+                    WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                     AND json_valid(cards.source_refs_json)
+                    THEN cards.source_refs_json
+                    ELSE '[]'
+                END
+              ) = 1
+          AND {source_visibility_clause}
+        ORDER BY cards.created_at DESC, cards.rowid DESC, source.id
+        LIMIT ?
+        """,
+        (
+            MAX_STORED_PROJECT_STATE_BYTES,
+            MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            *source_visibility_params,
+            int(limit) + 1,
+        ),
+    ).fetchall()
+    raw_scan_overflow = len(rows) > int(limit)
+    exact_rows: list[sqlite3.Row] = []
+    for row in rows:
+        if int(row["source_refs_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES:
+            if str(row["card_type"] or "") == "project_state":
+                exact_rows.append(row)
+            continue
+        source_refs = json_loads(row["bounded_source_refs_json"], None)
+        if (
+            isinstance(source_refs, list)
+            and len(source_refs) == 1
+            and isinstance(source_refs[0], dict)
+        ):
+            reference = source_refs[0]
+            event_id = str(reference.get("event_id") or "")
+            if event_id:
+                if event_id == str(row["bound_source_event_id"] or ""):
+                    expected_card_id = stable_id(
+                        "card",
+                        str(row["visibility_scope"] or ""),
+                        str(row["session_id"] or ""),
+                        str(row["project_id"] or ""),
+                        "project_state",
+                        str(row["title"] or ""),
+                        content_hash(str(row["summary"] or "")),
+                        json_dumps(
+                            [
+                                {
+                                    "event_id": str(
+                                        row["bound_source_event_id"] or ""
+                                    ),
+                                    "session_id": str(
+                                        row["source_session_id"] or ""
+                                    ),
+                                    "seq": int(row["source_seq"]),
+                                }
+                            ]
+                        ),
+                    )
+                    if (
+                        str(row["card_type"] or "") == "project_state"
+                        or str(row["id"]) == expected_card_id
+                        or _source_bound_project_state_deterministic_identity_proven(
+                            row
+                        )
+                        or _project_state_graph_source_binding_proven(
+                            conn,
+                            event_id=str(row["bound_source_event_id"] or ""),
+                            expected_card_id=str(row["id"]),
+                        )
+                    ):
+                        exact_rows.append(row)
+            elif reference.get("seq") == row["source_seq"]:
+                reference_session = str(reference.get("session_id") or "")
+                source_session = str(row["source_session_id"] or "")
+                graph_binding_proven = (
+                    _project_state_graph_source_binding_proven(
+                        conn,
+                        event_id=str(row["bound_source_event_id"] or ""),
+                        expected_card_id=str(row["id"]),
+                    )
+                )
+                deterministic_identity_proven = (
+                    _source_bound_project_state_deterministic_identity_proven(
+                        row
+                    )
+                )
+                if (
+                    not reference_session
+                    or (
+                        reference_session != source_session
+                        and not graph_binding_proven
+                        and not deterministic_identity_proven
+                    )
+                ):
+                    continue
+                expected_card_id = stable_id(
+                    "card",
+                    str(row["visibility_scope"] or ""),
+                    str(row["session_id"] or ""),
+                    str(row["project_id"] or ""),
+                    "project_state",
+                    str(row["title"] or ""),
+                    content_hash(str(row["summary"] or "")),
+                    json_dumps(
+                        [
+                                {
+                                    "event_id": str(
+                                        row["bound_source_event_id"] or ""
+                                    ),
+                                    "session_id": reference_session,
+                                    "seq": int(row["source_seq"]),
+                                }
+                        ]
+                    ),
+                )
+                if (
+                    str(row["card_type"] or "") == "project_state"
+                    or str(row["id"]) == expected_card_id
+                    or deterministic_identity_proven
+                ):
+                    exact_rows.append(row)
+    return exact_rows, raw_scan_overflow
+
+
+def _project_state_source_authority_boundary(
+    row: ProjectStateRow,
+) -> tuple[str, str, str]:
+    scope = normalize_visibility_scope(
+        str(row["source_visibility_scope"] or ""),
+        field="project-state source visibility_scope",
+    )
+    project_id = str(row["source_project_id"] or "")
+    session_id = str(row["source_session_id"] or "")
+    if scope == "project":
+        return (scope, project_id, "")
+    if scope == "global":
+        return (scope, "", "")
+    if not project_id and int(row["source_metadata_bytes"] or 0) <= (
+        MAX_STORED_PROJECT_STATE_BYTES
+    ):
+        source_metadata = json_loads(
+            row["bounded_source_metadata_json"],
+            None,
+        )
+        if isinstance(source_metadata, dict):
+            project_id = str(source_metadata.get("project_id") or "")
+    if not project_id and int(row["metadata_bytes"] or 0) <= (
+        MAX_STORED_PROJECT_STATE_METADATA_BYTES
+    ):
+        card_metadata = json_loads(
+            row["bounded_card_metadata_json"],
+            None,
+        )
+        if isinstance(card_metadata, dict):
+            project_id = str(card_metadata.get("project_id") or "")
+    if not project_id:
+        project_id = str(row["project_id"] or "")
+    return (scope, project_id, session_id)
+
+
+def _project_state_graph_source_binding_proven(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    expected_card_id: str,
+) -> bool:
+    """Require one exact, bounded normalized graph source for modern authority."""
+
+    if not {
+        "edge_id",
+        "source_ref_key",
+        "source_ref_json",
+    }.issubset(_table_columns(conn, "graph_edge_sources")):
+        return False
+    expected_source_ref = {
+        "event_id": event_id,
+        "card_id": expected_card_id,
+    }
+    expected_source_ref_key = _source_ref_identity(expected_source_ref)
+    row = conn.execute(
+        """
+        SELECT source_ref_key, source_ref_json
+        FROM graph_edge_sources
+        WHERE source_ref_key = ?
+          AND length(CAST(source_ref_json AS BLOB)) <= ?
+          AND json_extract(
+                CASE
+                    WHEN json_valid(source_ref_json) THEN source_ref_json
+                    ELSE '{}'
+                END,
+                '$.event_id'
+              ) = ?
+          AND json_extract(
+                CASE
+                    WHEN json_valid(source_ref_json) THEN source_ref_json
+                    ELSE '{}'
+                END,
+                '$.card_id'
+              ) = ?
+        ORDER BY edge_id
+        LIMIT 1
+        """,
+        (
+            expected_source_ref_key,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            event_id,
+            expected_card_id,
+        ),
+    ).fetchone()
+    if row is None:
+        return False
+    source_ref = json_loads(row["source_ref_json"], None)
+    return bool(
+        isinstance(source_ref, dict)
+        and str(source_ref.get("event_id") or "") == event_id
+        and str(source_ref.get("card_id") or "") == expected_card_id
+        and _source_ref_identity(source_ref) == str(row["source_ref_key"])
+    )
+
+
+def _proven_project_state_source_event_rows(
+    conn: sqlite3.Connection,
+    *,
+    source_visibility_clause: str,
+    source_visibility_params: tuple[Any, ...],
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return modern source events that deterministically bind a Card identity."""
+
+    rows = conn.execute(
+        f"""
+        SELECT source.rowid AS source_rowid,
+               source.id AS bound_source_event_id,
+               source.visibility_scope AS source_visibility_scope,
+               source.session_id AS source_session_id,
+               source.project_id AS source_project_id,
+               source.seq AS source_seq,
+               source.content AS source_content,
+               source.created_at AS source_created_at,
+               length(CAST(source.content AS BLOB)) AS source_content_bytes,
+               length(CAST(source.metadata_json AS BLOB))
+                   AS source_metadata_bytes,
+               source.metadata_json AS bounded_source_metadata_json
+        FROM scroll_events AS source
+        WHERE source.event_type = 'project_state'
+          AND length(CAST(source.content AS BLOB)) <= ?
+          AND length(CAST(source.metadata_json AS BLOB)) <= ?
+          AND json_extract(
+                CASE
+                    WHEN json_valid(source.metadata_json)
+                    THEN source.metadata_json
+                    ELSE '{{}}'
+                END,
+                '$.source_type'
+              ) = 'project_state'
+          AND coalesce(json_extract(
+                CASE
+                    WHEN json_valid(source.metadata_json)
+                    THEN source.metadata_json
+                    ELSE '{{}}'
+                END,
+                '$.state_payload_hash'
+              ), '') != ''
+          AND {source_visibility_clause}
+        ORDER BY source.created_at DESC, source.rowid DESC
+        LIMIT ?
+        """,
+        (
+            MAX_STORED_PROJECT_STATE_BYTES,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            *source_visibility_params,
+            int(limit) + 1,
+        ),
+    ).fetchall()
+    scan_overflow = len(rows) > int(limit)
+    proven: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = json_loads(row["bounded_source_metadata_json"], None)
+        if not isinstance(metadata, dict):
+            continue
+        agent_id = str(metadata.get("agent_id") or "")
+        metadata_project_id = str(metadata.get("project_id") or "")
+        source_project_id = str(row["source_project_id"] or "")
+        project_id = source_project_id or metadata_project_id
+        payload_hash = str(metadata.get("state_payload_hash") or "")
+        source_content = str(row["source_content"] or "")
+        source_lines = source_content.splitlines()
+        if (
+            not agent_id
+            or not project_id
+            or (
+                source_project_id
+                and metadata_project_id
+                and source_project_id != metadata_project_id
+            )
+            or _project_state_payload_marker_hash(source_content) != payload_hash
+            or len(source_lines) < 2
+            or source_lines[1] != f"Agent: {agent_id}"
+        ):
+            continue
+        try:
+            source_scope = normalize_visibility_scope(
+                str(row["source_visibility_scope"] or ""),
+                field="project-state source visibility_scope",
+            )
+        except ValueError:
+            continue
+        effective_scope = (
+            "project"
+            if project_id and source_scope == "global"
+            else source_scope
+        )
+        source_ref = {
+            "event_id": str(row["bound_source_event_id"]),
+            "session_id": str(row["source_session_id"] or ""),
+            "seq": int(row["source_seq"]),
+        }
+        expected_card_id = stable_id(
+            "card",
+            effective_scope,
+            str(row["source_session_id"] or ""),
+            project_id,
+            "project_state",
+            f"{project_id} project state from {agent_id}",
+            content_hash(summarize_text(source_content, limit=900)),
+            json_dumps([source_ref]),
+        )
+        if not _project_state_graph_source_binding_proven(
+            conn,
+            event_id=str(row["bound_source_event_id"]),
+            expected_card_id=expected_card_id,
+        ):
+            continue
+        proven.append(
+            {
+                **dict(row),
+                "expected_card_id": expected_card_id,
+                "expected_visibility_scope": effective_scope,
+                "expected_project_id": project_id,
+                "expected_session_id": str(row["source_session_id"] or ""),
+            }
+        )
+    return proven, scan_overflow
+
+
+def _source_proven_project_state_card_rows(
+    conn: sqlite3.Connection,
+    *,
+    source_visibility_clause: str,
+    source_visibility_params: tuple[Any, ...],
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch authority Cards by graph-proven source-derived deterministic ID."""
+
+    source_rows, source_scan_overflow = _proven_project_state_source_event_rows(
+        conn,
+        source_visibility_clause=source_visibility_clause,
+        source_visibility_params=source_visibility_params,
+        limit=limit,
+    )
+    output: list[dict[str, Any]] = []
+    for source_row in source_rows:
+        card = conn.execute(
+            f"""
+            SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS},
+                   CASE
+                       WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
+                       THEN cards.metadata_json
+                       ELSE NULL
+                   END AS bounded_card_metadata_json,
+                   CASE
+                       WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                       THEN cards.source_refs_json
+                       ELSE NULL
+                   END AS bounded_source_refs_json
+            FROM cards
+            WHERE cards.id = ?
+            """,
+            (
+                MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+                MAX_STORED_PROJECT_STATE_BYTES,
+                str(source_row["expected_card_id"]),
+            ),
+        ).fetchone()
+        if card is None:
+            continue
+        output.append({**dict(card), **source_row})
+    output.sort(
+        key=lambda row: (
+            str(row["created_at"] or ""),
+            int(row["card_rowid"]),
+        ),
+        reverse=True,
+    )
+    return output[: int(limit) + 1], source_scan_overflow
+
+
+def _orphan_project_state_source_events(
+    conn: sqlite3.Connection,
+    *,
+    source_visibility_clause: str,
+    source_visibility_params: tuple[Any, ...],
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    proven_rows, scan_overflow = _proven_project_state_source_event_rows(
+        conn,
+        source_visibility_clause=source_visibility_clause,
+        source_visibility_params=source_visibility_params,
+        limit=limit,
+    )
+    expected_ids = sorted(
+        {str(row["expected_card_id"]) for row in proven_rows}
+    )
+    existing_ids: set[str] = set()
+    if expected_ids:
+        placeholders = ", ".join("?" for _ in expected_ids)
+        existing_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM cards WHERE id IN ({placeholders})",
+                tuple(expected_ids),
+            ).fetchall()
+        }
+    return (
+        [
+            row
+            for row in proven_rows
+            if str(row["expected_card_id"]) not in existing_ids
+        ],
+        scan_overflow,
+    )
+
+
+def _project_state_boundary_proven_edges(
+    conn: sqlite3.Connection,
+    *,
+    by_id: dict[str, ProjectStateRow],
+    valid_agents: dict[str, str],
+    allowed_divergent_member_ids: frozenset[str] = frozenset(),
+) -> tuple[set[tuple[str, str]], bool, list[dict[str, Any]]]:
+    """Return exact receipt/audit-proven fan-in edges for one bounded boundary."""
+
+    if not by_id:
+        return set(), False, []
+    card_ids = sorted(by_id)
+    placeholders = ", ".join("?" for _ in card_ids)
+    proven: set[tuple[str, str]] = set()
+    proof_overflow = False
+    proof_issues: list[dict[str, Any]] = []
+    valid_dismissal_members: dict[str, set[str]] = {}
+
+    audit_rows = conn.execute(
+        f"""
+        SELECT actor, target_id, payload_json,
+               length(CAST(payload_json AS BLOB)) AS payload_bytes
+        FROM audit_events
+        WHERE action = 'project_state_superseded'
+          AND target_type = 'card'
+          AND target_id IN ({placeholders})
+        ORDER BY created_at, id
+        LIMIT ?
+        """,
+        (*card_ids, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+    ).fetchall()
+    if len(audit_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+        proof_overflow = True
+    for audit_row in audit_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+        if int(audit_row["payload_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES:
+            continue
+        successor_id = str(audit_row["target_id"] or "")
+        successor = by_id.get(successor_id)
+        payload = json_loads(audit_row["payload_json"], None)
+        if successor is None or not isinstance(payload, dict):
+            continue
+        authority = payload.get("authority")
+        predecessor_ids = payload.get("superseded_card_ids")
+        direct_predecessor = str(payload.get("direct_predecessor_card_id") or "")
+        if (
+            not isinstance(authority, dict)
+            or not isinstance(predecessor_ids, list)
+            or not predecessor_ids
+            or len(predecessor_ids) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+            or not all(isinstance(value, str) and value for value in predecessor_ids)
+            or len(predecessor_ids) != len(set(predecessor_ids))
+            or direct_predecessor not in predecessor_ids
+            or any(predecessor_id not in by_id for predecessor_id in predecessor_ids)
+        ):
+            continue
+        boundary = conflict_boundary(successor)
+        agent_id = valid_agents.get(successor_id)
+        stored_boundary = (
+            str(authority.get("visibility_scope") or ""),
+            str(authority.get("project_id") or ""),
+            str(authority.get("session_id") or ""),
+        )
+        if (
+            not agent_id
+            or str(audit_row["actor"] or "") != agent_id
+            or str(authority.get("agent_id") or "") != agent_id
+            or stored_boundary != boundary
+            or str(successor["supersedes_card_id"] or "") != direct_predecessor
+            or any(
+                conflict_boundary(by_id[predecessor_id]) != boundary
+                or valid_agents.get(predecessor_id) != agent_id
+                or str(by_id[predecessor_id]["superseded_by_card_id"] or "")
+                != successor_id
+                for predecessor_id in predecessor_ids
+            )
+        ):
+            continue
+        proven.update(
+            (predecessor_id, successor_id)
+            for predecessor_id in predecessor_ids
+            if predecessor_id != direct_predecessor
+        )
+
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    receipt_tables = {
+        "conflict_resolution_receipts",
+        "conflict_resolution_members",
+    }
+    present_receipt_tables = receipt_tables.intersection(tables)
+    if present_receipt_tables and present_receipt_tables != receipt_tables:
+        proof_issues.append(
+            {
+                "type": "incomplete_conflict_resolution_receipt_schema",
+                "present_tables": sorted(present_receipt_tables),
+            }
+        )
+    elif receipt_tables.issubset(tables):
+        orphan_member_rows = conn.execute(
+            f"""
+            SELECT member.receipt_id, member.card_id
+            FROM conflict_resolution_members AS member
+            LEFT JOIN conflict_resolution_receipts AS receipt
+              ON receipt.id = member.receipt_id
+            WHERE receipt.id IS NULL
+              AND member.card_id IN ({placeholders})
+            ORDER BY member.receipt_id, member.card_id
+            LIMIT ?
+            """,
+            (*card_ids, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+        ).fetchall()
+        if len(orphan_member_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+            proof_overflow = True
+        for orphan_row in orphan_member_rows[
+            :PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+        ]:
+            proof_issues.append(
+                {
+                    "type": "orphan_conflict_resolution_member",
+                    "receipt_id": str(orphan_row["receipt_id"] or ""),
+                    "card_id": str(orphan_row["card_id"] or ""),
+                }
+            )
+        receipt_rows = conn.execute(
+            f"""
+            SELECT DISTINCT receipt.*
+            FROM conflict_resolution_receipts AS receipt
+            LEFT JOIN conflict_resolution_members AS member
+              ON member.receipt_id = receipt.id
+            WHERE receipt.selected_card_id IN ({placeholders})
+               OR member.card_id IN ({placeholders})
+            ORDER BY receipt.created_at, receipt.id
+            LIMIT ?
+            """,
+            (
+                *card_ids,
+                *card_ids,
+                PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
+            ),
+        ).fetchall()
+        if len(receipt_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+            proof_overflow = True
+        for receipt_row in receipt_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+            receipt_id = str(receipt_row["id"] or "")
+            member_rows = conn.execute(
+                """
+                SELECT card_id
+                FROM conflict_resolution_members
+                WHERE receipt_id = ?
+                ORDER BY member_ordinal, card_id
+                LIMIT ?
+                """,
+                (receipt_id, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+            ).fetchall()
+            if len(member_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+                proof_overflow = True
+                continue
+            member_ids = [str(row["card_id"] or "") for row in member_rows]
+            receipt_by_id = dict(by_id)
+            missing_member_ids = sorted(set(member_ids) - set(receipt_by_id))
+            if missing_member_ids:
+                missing_placeholders = ", ".join(
+                    "?" for _ in missing_member_ids
+                )
+                outside_member_rows = conn.execute(
+                    f"""
+                    SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
+                    FROM cards
+                    WHERE id IN ({missing_placeholders})
+                    """,
+                    tuple(missing_member_ids),
+                ).fetchall()
+                receipt_by_id.update(
+                    {str(row["id"]): row for row in outside_member_rows}
+                )
+            quarantined_members = frozenset(
+                member_id
+                for member_id in member_ids
+                if member_id in receipt_by_id
+                and _valid_project_state_quarantine(conn, member_id) is not None
+            )
+            allowed_divergent_members = frozenset(
+                member_id
+                for member_id in member_ids
+                if member_id in allowed_divergent_member_ids
+                or member_id in quarantined_members
+            )
+            receipt_error = _conflict_resolution_receipt_error(
+                conn,
+                receipt_row,
+                by_id=receipt_by_id,
+                allowed_divergent_member_ids=allowed_divergent_members,
+                allow_supersession_topology_divergence=bool(
+                    allowed_divergent_members
+                ),
+            )
+            if receipt_error is not None:
+                proof_issues.append(
+                    {
+                        "type": "invalid_conflict_resolution_receipt",
+                        "receipt_id": receipt_id,
+                        "reason": receipt_error,
+                        "card_ids": member_ids,
+                    }
+                )
+                continue
+            action = str(receipt_row["action"] or "")
+            fingerprint = str(receipt_row["component_fingerprint"] or "")
+            selected_id = str(receipt_row["selected_card_id"] or "")
+            if action == "supersede":
+                proven.update(
+                    (member_id, selected_id)
+                    for member_id in member_ids
+                    if member_id != selected_id
+                    and member_id in by_id
+                    and selected_id in by_id
+                )
+            elif action == "dismiss":
+                valid_dismissal_members.setdefault(fingerprint, set()).update(
+                    member_ids
+                )
+
+    for card_id, row in by_id.items():
+        if int(row["metadata_bytes"] or 0) > MAX_STORED_PROJECT_STATE_METADATA_BYTES:
+            continue
+        metadata_row = conn.execute(
+            "SELECT metadata_json FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        metadata = (
+            json_loads(metadata_row["metadata_json"], None)
+            if metadata_row is not None
+            else None
+        )
+        entries = (
+            metadata.get(CONFLICT_DISMISSAL_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            proof_issues.append(
+                {
+                    "type": "unproven_conflict_dismissal",
+                    "card_id": card_id,
+                    "reason": "malformed dismissal metadata",
+                }
+            )
+            continue
+        for entry in entries:
+            fingerprint = (
+                str(entry.get("fingerprint") or "")
+                if isinstance(entry, dict)
+                else ""
+            )
+            if card_id not in valid_dismissal_members.get(fingerprint, set()):
+                proof_issues.append(
+                    {
+                        "type": "unproven_conflict_dismissal",
+                        "card_id": card_id,
+                        "fingerprint": fingerprint,
+                    }
+                )
+    return proven, proof_overflow, proof_issues
+
+
+def _bounded_cycle_members(edges: dict[str, set[str]]) -> list[str]:
+    incoming = {card_id: 0 for card_id in edges}
+    for targets in edges.values():
+        for target in targets:
+            if target in incoming:
+                incoming[target] += 1
+    ready = sorted(card_id for card_id, count in incoming.items() if count == 0)
+    visited = 0
+    while ready:
+        card_id = ready.pop()
+        visited += 1
+        for target in sorted(edges.get(card_id, ())):
+            if target not in incoming:
+                continue
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                ready.append(target)
+    if visited == len(edges):
+        return []
+    return sorted(card_id for card_id, count in incoming.items() if count > 0)
+
+
+def _project_state_authority_boundary_report(
+    conn: sqlite3.Connection,
+    boundary: tuple[str, str, str],
+) -> dict[str, Any]:
+    """Reconstruct and validate one complete, bounded authority boundary."""
+
+    rows = _project_state_boundary_rows(conn, boundary)
+    overflow = len(rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+    bounded_rows = rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]
+    by_id: dict[str, ProjectStateRow] = {
+        str(row["id"]): row for row in bounded_rows
+    }
+    invalid_checkpoints: list[dict[str, str]] = []
+    quarantined_ids: set[str] = set()
+    valid_agents: dict[str, str] = {}
+    for row in bounded_rows:
+        card_id = str(row["id"])
+        if _valid_project_state_quarantine(conn, card_id) is not None:
+            quarantined_ids.add(card_id)
+            continue
+        integrity_error = _project_state_card_integrity_error(
+            conn,
+            card_id,
+            size_row=row,
+        )
+        if integrity_error is not None:
+            invalid_checkpoints.append(
+                {"checkpoint_id": card_id, "reason": integrity_error[:512]}
+            )
+            continue
+        agent_id = _project_state_repair_agent_id(conn, row)
+        if not agent_id:
+            invalid_checkpoints.append(
+                {
+                    "checkpoint_id": card_id,
+                    "reason": "project-state Card agent evidence is invalid",
+                }
+            )
+            continue
+        valid_agents[card_id] = agent_id
+
+    issues: list[dict[str, Any]] = []
+    issue_keys: set[str] = set()
+
+    def add_issue(issue_type: str, **details: Any) -> None:
+        issue = {"type": issue_type, **details}
+        issue_key = json_dumps(issue)
+        if issue_key not in issue_keys:
+            issue_keys.add(issue_key)
+            issues.append(issue)
+
+    if overflow:
+        add_issue(
+            "boundary_scan_overflow",
+            boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        )
+    proven_edges, proof_overflow, proof_issues = (
+        _project_state_boundary_proven_edges(
+            conn,
+            by_id=by_id,
+            valid_agents=valid_agents,
+            allowed_divergent_member_ids=frozenset(
+                str(item["checkpoint_id"])
+                for item in invalid_checkpoints
+            ),
+        )
+    )
+    for proof_issue in proof_issues:
+        add_issue(
+            str(proof_issue.get("type") or "invalid_authority_proof"),
+            **{
+                key: value
+                for key, value in proof_issue.items()
+                if key != "type"
+            },
+        )
+    if proof_overflow:
+        add_issue(
+            "authority_proof_scan_overflow",
+            boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        )
+
+    card_ids = sorted(by_id)
+    outside_rows: list[sqlite3.Row] = []
+    if card_ids:
+        placeholders = ", ".join("?" for _ in card_ids)
+        outside_rows = conn.execute(
+            f"""
+            SELECT id, card_type, visibility_scope, session_id, project_id,
+                   supersedes_card_id, superseded_by_card_id
+            FROM cards
+            WHERE id NOT IN ({placeholders})
+              AND (
+                    supersedes_card_id IN ({placeholders})
+                 OR superseded_by_card_id IN ({placeholders})
+              )
+            ORDER BY id
+            LIMIT ?
+            """,
+            (
+                *card_ids,
+                *card_ids,
+                *card_ids,
+                PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
+            ),
+        ).fetchall()
+        if len(outside_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+            add_issue(
+                "incoming_authority_link_scan_overflow",
+                boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+            )
+        for outside_row in outside_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+            add_issue(
+                "cross_boundary_or_type_authority_link",
+                card_id=str(outside_row["id"]),
+                card_type=str(outside_row["card_type"] or ""),
+                supersedes_card_id=(
+                    str(outside_row["supersedes_card_id"] or "") or None
+                ),
+                superseded_by_card_id=(
+                    str(outside_row["superseded_by_card_id"] or "") or None
+                ),
+            )
+
+    edges: dict[str, set[str]] = {card_id: set() for card_id in by_id}
+    referenced_predecessors: set[str] = set()
+    for card_id, authority_row in by_id.items():
+        predecessor_id = str(
+            authority_row["supersedes_card_id"] or ""
+        ).strip()
+        successor_id = str(
+            authority_row["superseded_by_card_id"] or ""
+        ).strip()
+        if predecessor_id:
+            referenced_predecessors.add(predecessor_id)
+            predecessor = by_id.get(predecessor_id)
+            if predecessor is None:
+                target = conn.execute(
+                    "SELECT card_type FROM cards WHERE id = ?",
+                    (predecessor_id,),
+                ).fetchone()
+                add_issue(
+                    "missing_or_cross_boundary_predecessor",
+                    card_id=card_id,
+                    predecessor_id=predecessor_id,
+                    target_exists=target is not None,
+                )
+            else:
+                edges[predecessor_id].add(card_id)
+                if (
+                    str(predecessor["superseded_by_card_id"] or "").strip()
+                    != card_id
+                ):
+                    add_issue(
+                        "supersession_asymmetric_link",
+                        predecessor_id=predecessor_id,
+                        successor_id=card_id,
+                        missing="predecessor_backlink",
+                    )
+                predecessor_agent = valid_agents.get(predecessor_id)
+                successor_agent = valid_agents.get(card_id)
+                if (
+                    predecessor_agent
+                    and successor_agent
+                    and predecessor_agent != successor_agent
+                    and (predecessor_id, card_id) not in proven_edges
+                ):
+                    add_issue(
+                        "unproven_cross_agent_project_state_edge",
+                        predecessor_id=predecessor_id,
+                        successor_id=card_id,
+                    )
+        if successor_id:
+            successor = by_id.get(successor_id)
+            if successor is None:
+                target = conn.execute(
+                    "SELECT card_type FROM cards WHERE id = ?",
+                    (successor_id,),
+                ).fetchone()
+                add_issue(
+                    "missing_or_cross_boundary_successor",
+                    card_id=card_id,
+                    successor_id=successor_id,
+                    target_exists=target is not None,
+                )
+            else:
+                edges[card_id].add(successor_id)
+                direct_predecessor = str(
+                    successor["supersedes_card_id"] or ""
+                ).strip()
+                if (
+                    direct_predecessor != card_id
+                    and (card_id, successor_id) not in proven_edges
+                ):
+                    add_issue(
+                        "supersession_asymmetric_link",
+                        predecessor_id=card_id,
+                        successor_id=successor_id,
+                        missing="successor_forward_link",
+                    )
+                predecessor_agent = valid_agents.get(card_id)
+                successor_agent = valid_agents.get(successor_id)
+                if (
+                    predecessor_agent
+                    and successor_agent
+                    and predecessor_agent != successor_agent
+                    and (card_id, successor_id) not in proven_edges
+                ):
+                    add_issue(
+                        "unproven_cross_agent_project_state_edge",
+                        predecessor_id=card_id,
+                        successor_id=successor_id,
+                    )
+
+    cycle_members = _bounded_cycle_members(edges)
+    if cycle_members:
+        add_issue("supersession_cycle", card_ids=cycle_members)
+    current_head_ids = sorted(
+        card_id
+        for card_id, row in by_id.items()
+        if card_id not in quarantined_ids
+        and str(row["status"] or "").casefold() not in NON_CURRENT_CARD_STATUSES
+        and not str(row["superseded_by_card_id"] or "").strip()
+        and card_id not in referenced_predecessors
+    )
+    current_head_set = set(current_head_ids)
+    unproven_retired_ids = sorted(
+        card_id
+        for card_id, row in by_id.items()
+        if card_id not in quarantined_ids
+        and str(row["status"] or "").casefold() in NON_CURRENT_CARD_STATUSES
+        and not str(row["superseded_by_card_id"] or "").strip()
+        and card_id not in referenced_predecessors
+    )
+    if unproven_retired_ids:
+        add_issue(
+            "unproven_project_state_retirement",
+            card_ids=unproven_retired_ids,
+            statuses={
+                card_id: str(by_id[card_id]["status"] or "")
+                for card_id in unproven_retired_ids
+            },
+        )
+    heads_by_agent: dict[str, list[str]] = {}
+    for card_id in current_head_ids:
+        agent_id = valid_agents.get(card_id)
+        if agent_id:
+            heads_by_agent.setdefault(agent_id, []).append(card_id)
+    for agent_id, agent_head_ids in sorted(heads_by_agent.items()):
+        if len(agent_head_ids) > 1:
+            add_issue(
+                "multiple_same_agent_project_state_heads",
+                agent_id=agent_id,
+                card_ids=sorted(agent_head_ids),
+            )
+
+    grouped_ids: dict[str, list[str]] = {}
+    for card_id, grouped_authority_row in by_id.items():
+        raw_group = grouped_authority_row["conflict_group"]
+        group = str(raw_group or "").strip()
+        if raw_group is not None and not group:
+            add_issue("invalid_blank_conflict_group", card_id=card_id)
+        elif group:
+            grouped_ids.setdefault(group, []).append(card_id)
+    for group, boundary_member_ids in sorted(grouped_ids.items()):
+        group_rows = conn.execute(
+            """
+            SELECT id, card_type, status, visibility_scope, session_id, project_id
+            FROM cards
+            WHERE conflict_group = ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (group, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+        ).fetchall()
+        if len(group_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+            add_issue(
+                "conflict_group_scan_overflow",
+                conflict_group=group,
+                boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+            )
+            continue
+        group_member_ids = [str(group_row["id"]) for group_row in group_rows]
+        if len(group_member_ids) < 2:
+            add_issue(
+                "invalid_conflict_group",
+                conflict_group=group,
+                reason="group has fewer than two members",
+                card_ids=group_member_ids,
+            )
+        if set(group_member_ids) != set(boundary_member_ids):
+            add_issue(
+                "invalid_conflict_group",
+                conflict_group=group,
+                reason="group crosses authority boundary or Card type",
+                card_ids=group_member_ids,
+            )
+        if any(member_id not in current_head_set for member_id in group_member_ids):
+            add_issue(
+                "invalid_conflict_group",
+                conflict_group=group,
+                reason="group contains a historical or superseded Card",
+                card_ids=group_member_ids,
+            )
+
+    contested_head_ids = sorted(
+        card_id
+        for card_id in current_head_ids
+        if str(by_id[card_id]["conflict_group"] or "").strip()
+    )
+    return {
+        "ok": not overflow and not invalid_checkpoints and not issues,
+        "boundary": {
+            "visibility_scope": boundary[0],
+            "project_id": boundary[1] or None,
+            "session_id": boundary[2] or None,
+        },
+        "card_count": len(bounded_rows),
+        "boundary_scan_limit": PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        "boundary_scan_overflow": overflow,
+        "invalid_checkpoint_count": len(invalid_checkpoints),
+        "invalid_checkpoints": invalid_checkpoints[:20],
+        "topology_issue_count": len(issues),
+        "topology_issues": issues[:20],
+        "_topology_issues_all": issues,
+        "current_head_ids": current_head_ids,
+        "contested_head_ids": contested_head_ids,
+        "_rows_by_id": by_id,
+        "_proven_edges": proven_edges,
+    }
+
+
+def _public_project_state_authority_report(report: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in report.items() if not key.startswith("_")}
+
+
+def _annotate_source_bound_authority_issue(
+    conn: sqlite3.Connection,
+    report: dict[str, Any],
+    row: ProjectStateRow,
+    *,
+    issue_type: str,
+) -> None:
+    card_id = str(row["id"])
+    if issue_type == "source_bound_card_type_mismatch":
+        reason = (
+            "project-state Card type differs from its exact project_state "
+            f"source event: {str(row['card_type'] or '')}"
+        )
+    elif issue_type == "source_bound_invalid_source_authority_boundary":
+        reason = (
+            "project-state Card's exact source event has an invalid "
+            "authority boundary"
+        )
+    else:
+        reason = _project_state_card_integrity_error(
+            conn,
+            card_id,
+            size_row=row,
+        ) or "project-state Card boundary differs from its bound source event"
+    report["_rows_by_id"][card_id] = row
+    existing_invalid_ids = {
+        str(item["checkpoint_id"])
+        for item in report["invalid_checkpoints"]
+    }
+    if card_id not in existing_invalid_ids:
+        report["invalid_checkpoint_count"] += 1
+        report["invalid_checkpoints"].append(
+            {"checkpoint_id": card_id, "reason": reason[:512]}
+        )
+        report["invalid_checkpoints"] = report["invalid_checkpoints"][:20]
+    issue = {
+        "type": issue_type,
+        "card_id": card_id,
+        "bound_source_event_id": str(row["bound_source_event_id"] or ""),
+    }
+    if issue_type == "source_bound_card_type_mismatch":
+        issue["observed_card_type"] = str(row["card_type"] or "")
+    if not any(
+        existing.get("type") == issue_type
+        and existing.get("card_id") == card_id
+        for existing in report["_topology_issues_all"]
+    ):
+        report["_topology_issues_all"].append(issue)
+        report["topology_issue_count"] += 1
+    report["topology_issues"] = report["_topology_issues_all"][:20]
+    report["card_count"] = len(report["_rows_by_id"])
+    report["ok"] = False
+
+
+def _annotate_orphan_project_state_source_event(
+    report: dict[str, Any],
+    orphan: dict[str, Any],
+) -> None:
+    issue = {
+        "type": "orphan_project_state_source_event",
+        "bound_source_event_id": str(orphan["bound_source_event_id"]),
+        "expected_card_id": str(orphan["expected_card_id"]),
+    }
+    report.setdefault("orphan_project_state_source_events", []).append(issue)
+    report["orphan_project_state_source_event_count"] = len(
+        report["orphan_project_state_source_events"]
+    )
+    report["_topology_issues_all"].append(issue)
+    report["topology_issue_count"] += 1
+    report["topology_issues"] = report["_topology_issues_all"][:20]
+    report["_latest_source_event_order"] = max(
+        report.get("_latest_source_event_order", ("", -1)),
+        (
+            str(orphan["source_created_at"] or ""),
+            int(orphan["source_rowid"]),
+        ),
+    )
+    report["ok"] = False
+
+
 def repair_invalid_project_state_checkpoints(
     root: Path,
     *,
@@ -9426,17 +11058,14 @@ def repair_invalid_project_state_checkpoints(
     limit: int = 100,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Quarantine invalid current heads and restore their direct predecessors."""
+    """Scan complete authority boundaries and quarantine invalid checkpoints."""
 
     if not is_initialized(root):
         return {"ok": False, "initialized": False, "quarantined_count": 0}
     limit = max(1, min(int(limit), 1000))
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
     session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
-    clauses = [
-        "card_type = 'project_state'",
-        _current_project_state_authority_clause("cards"),
-    ]
+    clauses = ["card_type = 'project_state'"]
     params: list[Any] = []
     if project_id:
         clauses.append("project_id = ?")
@@ -9444,74 +11073,649 @@ def repair_invalid_project_state_checkpoints(
     if session_id:
         clauses.append("session_id = ?")
         params.append(session_id)
-    select_fields = """
-        id, session_id, project_id, visibility_scope, conflict_group,
-        supersedes_card_id,
-        length(CAST(title AS BLOB)) AS title_bytes,
-        length(CAST(summary AS BLOB)) AS summary_bytes,
-        length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
-        length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
-        length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
-        length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
-    """
+    select_fields = _PROJECT_STATE_AUTHORITY_SELECT_FIELDS
     conn = connect(root)
     quarantined: list[dict[str, Any]] = []
     reactivated: list[str] = []
+    retired_peers: list[dict[str, Any]] = []
+    detached_peers: list[dict[str, Any]] = []
     touched: set[str] = set()
-    heads: list[sqlite3.Row] = []
+    scanned_rows: list[ProjectStateRow] = []
+    authority_reports: list[dict[str, Any]] = []
+    post_repair_authority_boundaries: list[dict[str, Any]] = []
+    catalog_repair_committed = False
+    sidecar_sync: dict[str, Any] | None = None
+    post_repair_semantic_integrity: dict[str, Any] | None = None
+    post_repair_semantic_error = False
+    has_more = False
+    semantic_precondition: dict[str, Any] | None = None
     try:
         if not dry_run:
             conn.execute("BEGIN IMMEDIATE")
-        heads = conn.execute(
+            semantic_precondition = semantic_integrity_report(
+                root,
+                conn=conn,
+                check_card_sidecars=False,
+            )
+        direct_seed_rows = conn.execute(
             f"""
             SELECT {select_fields} FROM cards
             WHERE {' AND '.join(clauses)}
             ORDER BY created_at DESC, rowid DESC LIMIT ?
             """,
-            (*params, limit + 1),
+            (*params, PROJECT_STATE_REPAIR_SCAN_LIMIT + 1),
         ).fetchall()
-        pending = list(heads[:limit])
+        source_clauses: list[str] = ["1 = 1"]
+        source_params: list[Any] = []
+        if project_id:
+            source_clauses.append(
+                """
+                (
+                    coalesce(source.project_id, '') = ?
+                    OR (
+                        source.visibility_scope IN ('session', 'private')
+                        AND json_extract(
+                            CASE
+                                WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
+                                 AND json_valid(source.metadata_json)
+                                THEN source.metadata_json
+                                ELSE '{}'
+                            END,
+                            '$.project_id'
+                        ) = ?
+                    )
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
+                             AND json_valid(cards.metadata_json)
+                            THEN cards.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.project_id'
+                    ) = ?
+                    OR coalesce(cards.project_id, '') = ?
+                )
+                """
+            )
+            source_params.extend(
+                [
+                    project_id,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    project_id,
+                    MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+                    project_id,
+                    project_id,
+                ]
+            )
+        if session_id:
+            source_clauses.append(
+                """
+                (
+                    coalesce(source.session_id, '') = ?
+                    OR coalesce(cards.session_id, '') = ?
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                             AND json_valid(cards.source_refs_json)
+                            THEN cards.source_refs_json
+                            ELSE '[]'
+                        END,
+                        '$[0].session_id'
+                    ) = ?
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
+                             AND json_valid(cards.metadata_json)
+                            THEN cards.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.session_id'
+                    ) = ?
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
+                             AND json_valid(source.metadata_json)
+                            THEN source.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.session_id'
+                    ) = ?
+                )
+                """
+            )
+            source_params.extend(
+                [
+                    session_id,
+                    session_id,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    session_id,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    session_id,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    session_id,
+                ]
+            )
+        legacy_source_seed_rows, legacy_source_scan_overflow = (
+            _source_bound_project_state_rows(
+            conn,
+            source_visibility_clause=" AND ".join(source_clauses),
+            source_visibility_params=tuple(source_params),
+            limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+            )
+        )
+        orphan_source_clauses: list[str] = ["1 = 1"]
+        orphan_source_params: list[Any] = []
+        if project_id:
+            orphan_source_clauses.append(
+                """
+                (
+                    coalesce(source.project_id, '') = ?
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
+                             AND json_valid(source.metadata_json)
+                            THEN source.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.project_id'
+                    ) = ?
+                )
+                """
+            )
+            orphan_source_params.extend(
+                [project_id, MAX_STORED_PROJECT_STATE_BYTES, project_id]
+            )
+        if session_id:
+            orphan_source_clauses.append(
+                "coalesce(source.session_id, '') = ?"
+            )
+            orphan_source_params.append(session_id)
+        proven_source_seed_rows, proven_source_scan_overflow = (
+            _source_proven_project_state_card_rows(
+                conn,
+                source_visibility_clause=" AND ".join(
+                    orphan_source_clauses
+                ),
+                source_visibility_params=tuple(orphan_source_params),
+                limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+            )
+        )
+        merged_source_seed_rows: dict[str, ProjectStateRow] = {}
+        for legacy_row in legacy_source_seed_rows:
+            merged_source_seed_rows[str(legacy_row["id"])] = legacy_row
+        for proven_row in proven_source_seed_rows:
+            merged_source_seed_rows[str(proven_row["id"])] = proven_row
+        source_seed_rows: list[ProjectStateRow] = list(
+            merged_source_seed_rows.values()
+        )
+        orphan_source_events, orphan_source_scan_overflow = (
+            _orphan_project_state_source_events(
+                conn,
+                source_visibility_clause=" AND ".join(
+                    orphan_source_clauses
+                ),
+                source_visibility_params=tuple(orphan_source_params),
+                limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+            )
+        )
+        direct_seed_ids = {
+            str(row["id"])
+            for row in direct_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+        }
+        seed_rows_by_id: dict[str, ProjectStateRow] = {
+            str(row["id"]): row
+            for row in direct_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+        }
+        seed_rows_by_id.update(
+            {
+                str(row["id"]): row
+                for row in source_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+            }
+        )
+        seed_rows = list(seed_rows_by_id.values())
+        seed_scan_overflow = (
+            len(direct_seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
+            or len(source_seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
+            or len(seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
+            or legacy_source_scan_overflow
+            or proven_source_scan_overflow
+            or orphan_source_scan_overflow
+        )
+        boundaries: set[tuple[str, str, str]] = set()
+        source_boundary_seed_issues: list[dict[str, Any]] = []
+        rows_by_id: dict[str, ProjectStateRow] = dict(seed_rows_by_id)
+        for seed_row in seed_rows:
+            seed_id = str(seed_row["id"])
+            if seed_id not in direct_seed_ids:
+                continue
+            try:
+                boundaries.add(_project_state_authority_boundary(seed_row))
+            except ValueError:
+                pass
+        source_boundaries_by_card_id: dict[str, tuple[str, str, str]] = {}
+        for source_seed_row in source_seed_rows:
+            source_card_id = str(source_seed_row["id"])
+            try:
+                source_boundary = _project_state_source_authority_boundary(
+                    source_seed_row
+                )
+            except ValueError as exc:
+                if source_card_id not in direct_seed_ids:
+                    source_boundary_seed_issues.append(
+                        {
+                            "type": "invalid_source_authority_boundary",
+                            "card_id": source_card_id,
+                            "bound_source_event_id": str(
+                                source_seed_row["bound_source_event_id"] or ""
+                            ),
+                            "reason": str(exc)[:512],
+                        }
+                    )
+                continue
+            source_boundaries_by_card_id[source_card_id] = source_boundary
+            boundaries.add(source_boundary)
+        orphan_boundaries: list[
+            tuple[tuple[str, str, str], dict[str, Any]]
+        ] = []
+        for orphan in orphan_source_events:
+            try:
+                orphan_boundary = (
+                    str(orphan["expected_visibility_scope"]),
+                    str(orphan["expected_project_id"]),
+                    (
+                        ""
+                        if str(orphan["expected_visibility_scope"])
+                        in {"project", "global"}
+                        else str(orphan["expected_session_id"])
+                    ),
+                )
+                boundaries.add(orphan_boundary)
+                orphan_boundaries.append((orphan_boundary, orphan))
+            except (TypeError, ValueError) as exc:
+                source_boundary_seed_issues.append(
+                    {
+                        "type": "invalid_source_authority_boundary",
+                        "bound_source_event_id": str(
+                            orphan["bound_source_event_id"] or ""
+                        ),
+                        "reason": str(exc)[:512],
+                    }
+                )
+        reports_by_boundary: dict[
+            tuple[str, str, str], dict[str, Any]
+        ] = {}
+        for boundary in sorted(boundaries):
+            report = _project_state_authority_boundary_report(conn, boundary)
+            reports_by_boundary[boundary] = report
+            authority_reports.append(report)
+            rows_by_id.update(report["_rows_by_id"])
+        for source_seed_row in source_seed_rows:
+            source_card_id = str(source_seed_row["id"])
+            matched_source_boundary = source_boundaries_by_card_id.get(
+                source_card_id
+            )
+            if matched_source_boundary is None:
+                continue
+            issue_type = None
+            if str(source_seed_row["card_type"] or "") != "project_state":
+                issue_type = "source_bound_card_type_mismatch"
+            else:
+                try:
+                    card_boundary = _project_state_authority_boundary(
+                        source_seed_row
+                    )
+                except ValueError:
+                    card_boundary = None
+                if card_boundary != matched_source_boundary:
+                    issue_type = "source_bound_authority_boundary_mismatch"
+            if (
+                issue_type is not None
+                and _valid_project_state_quarantine(
+                    conn,
+                    source_card_id,
+                )
+                is None
+            ):
+                _annotate_source_bound_authority_issue(
+                    conn,
+                    reports_by_boundary[matched_source_boundary],
+                    source_seed_row,
+                    issue_type=issue_type,
+                )
+        for orphan_boundary, orphan in orphan_boundaries:
+            _annotate_orphan_project_state_source_event(
+                reports_by_boundary[orphan_boundary],
+                orphan,
+            )
+        scanned_rows = sorted(
+            rows_by_id.values(),
+            key=lambda row: (
+                str(row["created_at"] or ""),
+                int(row["card_rowid"]),
+            ),
+            reverse=True,
+        )
+        source_seed_rows_by_id = {
+            str(row["id"]): row for row in source_seed_rows
+        }
+
+        def repair_integrity_error(candidate: ProjectStateRow) -> str | None:
+            candidate_id = str(candidate["id"])
+            source_bound = source_seed_rows_by_id.get(candidate_id)
+            if (
+                source_bound is not None
+                and str(source_bound["card_type"] or "") != "project_state"
+            ):
+                return (
+                    "project-state Card type differs from its exact "
+                    "project_state source event: "
+                    + str(source_bound["card_type"] or "")
+                )
+            return _project_state_card_integrity_error(
+                conn,
+                candidate_id,
+                size_row=candidate,
+            )
+
+        invalid_candidate_ids: set[str] = set()
+        for candidate in scanned_rows:
+            candidate_id = str(candidate["id"])
+            if _valid_project_state_quarantine(conn, candidate_id) is not None:
+                continue
+            if repair_integrity_error(candidate) is not None:
+                invalid_candidate_ids.add(candidate_id)
+        referenced_predecessor_ids = {
+            str(row["supersedes_card_id"])
+            for row in conn.execute(
+                """
+                SELECT supersedes_card_id FROM cards
+                WHERE coalesce(supersedes_card_id, '') != ''
+                """
+            ).fetchall()
+        }
+        retirement_candidate_ids = {
+            str(candidate["id"])
+            for candidate in scanned_rows
+            if _valid_project_state_quarantine(
+                conn,
+                str(candidate["id"]),
+            )
+            is None
+            and str(candidate["status"] or "").casefold()
+            in NON_CURRENT_CARD_STATUSES
+            and not str(candidate["superseded_by_card_id"] or "").strip()
+            and str(candidate["id"]) not in referenced_predecessor_ids
+        }
+        repair_candidate_ids = invalid_candidate_ids | retirement_candidate_ids
+
+        def recover_repair_predecessor(
+            head: ProjectStateRow,
+        ) -> sqlite3.Row | None:
+            head_id = str(head["id"])
+            head_agent_id = _project_state_repair_agent_id(conn, head)
+            predecessor_id = str(head["supersedes_card_id"] or "")
+            if (
+                not predecessor_id
+                or predecessor_id in repair_candidate_ids
+                or head_agent_id is None
+            ):
+                return None
+            candidate = conn.execute(
+                f"""
+                SELECT {select_fields} FROM cards
+                WHERE id = ? AND card_type = 'project_state'
+                  AND superseded_by_card_id = ?
+                """,
+                (predecessor_id, head_id),
+            ).fetchone()
+            if candidate is None:
+                return None
+            head_boundary = source_boundaries_by_card_id.get(head_id)
+            if head_boundary is None:
+                try:
+                    head_boundary = _project_state_authority_boundary(head)
+                except ValueError:
+                    return None
+            try:
+                candidate_boundary = _project_state_authority_boundary(candidate)
+            except ValueError:
+                return None
+            if (
+                candidate_boundary != head_boundary
+                or _project_state_repair_agent_id(conn, candidate)
+                != head_agent_id
+            ):
+                return None
+            return candidate
+
+        def issue_card_ids(issue: dict[str, Any]) -> set[str]:
+            referenced: set[str] = set()
+            for key, value in issue.items():
+                if key.endswith("_id") and isinstance(value, str) and value:
+                    referenced.add(value)
+                elif key.endswith("_ids") and isinstance(value, list):
+                    referenced.update(
+                        str(item) for item in value if isinstance(item, str) and item
+                    )
+            return referenced
+
+        unrepairable_topology: list[dict[str, Any]] = list(
+            source_boundary_seed_issues
+        )
+        for report in authority_reports:
+            for issue in report["_topology_issues_all"]:
+                if not issue_card_ids(issue).intersection(repair_candidate_ids):
+                    unrepairable_topology.append(
+                        {"boundary": report["boundary"], **issue}
+                    )
+        if seed_scan_overflow:
+            unrepairable_topology.append(
+                {
+                    "type": "repair_scan_overflow",
+                    "repair_scan_limit": PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                }
+            )
+        for invalid_id in sorted(repair_candidate_ids):
+            direct_successors = conn.execute(
+                """
+                SELECT id
+                FROM cards
+                WHERE supersedes_card_id = ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (invalid_id, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+            ).fetchall()
+            if len(direct_successors) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+                unrepairable_topology.append(
+                    {
+                        "type": "invalid_predecessor_successor_scan_overflow",
+                        "card_id": invalid_id,
+                    }
+                )
+                continue
+            for successor_row in direct_successors:
+                successor_id = str(successor_row["id"])
+                if successor_id in repair_candidate_ids:
+                    continue
+                fan_in_rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM cards
+                    WHERE superseded_by_card_id = ? AND id != ?
+                    ORDER BY id
+                    LIMIT 2
+                    """,
+                    (successor_id, invalid_id),
+                ).fetchall()
+                if fan_in_rows:
+                    unrepairable_topology.append(
+                        {
+                            "type": "invalid_predecessor_has_proven_fan_in",
+                            "card_ids": [
+                                invalid_id,
+                                successor_id,
+                                *[str(row["id"]) for row in fan_in_rows],
+                            ],
+                        }
+                    )
+        repair_proven_authority_edges: set[tuple[str, str]] = set()
+        for report in authority_reports:
+            report_rows = report["_rows_by_id"]
+            proof_agents = {
+                card_id: agent_id
+                for card_id, proof_row in report_rows.items()
+                if (
+                    agent_id := _project_state_repair_agent_id(
+                        conn,
+                        proof_row,
+                    )
+                )
+            }
+            repair_edges, repair_proof_overflow, _repair_proof_issues = (
+                _project_state_boundary_proven_edges(
+                    conn,
+                    by_id=report_rows,
+                    valid_agents=proof_agents,
+                    allowed_divergent_member_ids=frozenset(
+                        repair_candidate_ids
+                    ),
+                )
+            )
+            repair_proven_authority_edges.update(repair_edges)
+            if repair_proof_overflow:
+                unrepairable_topology.append(
+                    {
+                        "type": "repair_authority_proof_scan_overflow",
+                        "boundary": report["boundary"],
+                    }
+                )
+        planned_predecessors: dict[str, sqlite3.Row] = {}
+        planned_retired_peer_rows: dict[str, list[sqlite3.Row]] = {}
+        planned_detached_peer_rows: dict[str, list[sqlite3.Row]] = {}
+        planned_peer_ids: set[str] = set()
+        proven_authority_edges = repair_proven_authority_edges
+        for head in scanned_rows:
+            head_id = str(head["id"])
+            if head_id not in repair_candidate_ids:
+                continue
+            predecessor = recover_repair_predecessor(head)
+            predecessor_id = (
+                str(predecessor["id"]) if predecessor is not None else ""
+            )
+            if predecessor is not None:
+                planned_predecessors[head_id] = predecessor
+            incoming_rows = conn.execute(
+                """
+                SELECT id, card_type, status FROM cards
+                WHERE superseded_by_card_id = ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (
+                    head_id,
+                    PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
+                ),
+            ).fetchall()
+            if len(incoming_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
+                unrepairable_topology.append(
+                    {
+                        "type": "retired_peer_scan_overflow",
+                        "card_id": head_id,
+                        "retired_peer_scan_limit": (
+                            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+                        ),
+                    }
+                )
+                continue
+            peer_rows = [
+                row
+                for row in incoming_rows
+                if str(row["id"]) != predecessor_id
+                and str(row["id"]) not in repair_candidate_ids
+            ]
+            proven_peer_rows = [
+                row
+                for row in peer_rows
+                if (str(row["id"]), head_id) in proven_authority_edges
+            ]
+            unproven_peer_rows = [
+                row
+                for row in peer_rows
+                if (str(row["id"]), head_id) not in proven_authority_edges
+            ]
+            noncurrent_unproven_peer_ids = sorted(
+                str(row["id"])
+                for row in unproven_peer_rows
+                if str(row["status"] or "").casefold()
+                in NON_CURRENT_CARD_STATUSES
+            )
+            if noncurrent_unproven_peer_ids:
+                unrepairable_topology.append(
+                    {
+                        "type": "unproven_noncurrent_peer_restoration_unknown",
+                        "card_id": head_id,
+                        "peer_card_ids": noncurrent_unproven_peer_ids,
+                    }
+                )
+                continue
+            duplicate_peer_ids = {
+                str(row["id"])
+                for row in peer_rows
+                if str(row["id"]) in planned_peer_ids
+            }
+            if duplicate_peer_ids:
+                unrepairable_topology.append(
+                    {
+                        "type": "retired_peer_has_multiple_invalid_successors",
+                        "card_id": head_id,
+                        "retired_peer_card_ids": sorted(duplicate_peer_ids),
+                    }
+                )
+                continue
+            planned_retired_peer_rows[head_id] = proven_peer_rows
+            planned_detached_peer_rows[head_id] = unproven_peer_rows
+            planned_peer_ids.update(str(row["id"]) for row in peer_rows)
+        if len(planned_peer_ids) > PROJECT_STATE_REPAIR_SCAN_LIMIT:
+            unrepairable_topology.append(
+                {
+                    "type": "retired_peer_scan_overflow",
+                    "retired_peer_count_at_least": len(planned_peer_ids),
+                    "retired_peer_scan_limit": PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                }
+            )
+        if not dry_run and len(repair_candidate_ids) > limit:
+            unrepairable_topology.append(
+                {
+                    "type": "repair_limit_cannot_close_authority_boundary",
+                    "invalid_checkpoint_count": len(repair_candidate_ids),
+                    "requested_limit": limit,
+                }
+            )
+
+        pending = list(scanned_rows)
         visited: set[str] = set()
-        while pending and len(quarantined) < limit:
+        while (
+            pending
+            and len(quarantined) < limit
+            and not unrepairable_topology
+        ):
             head = pending.pop(0)
             head_id = str(head["id"])
             if head_id in visited:
                 continue
             visited.add(head_id)
-            error = _project_state_card_integrity_error(
-                conn,
-                head_id,
-                size_row=head,
-            )
+            if _valid_project_state_quarantine(conn, head_id) is not None:
+                continue
+            error = repair_integrity_error(head)
+            if error is None and head_id in retirement_candidate_ids:
+                error = (
+                    "project-state Card lifecycle retirement lacks a durable "
+                    f"quarantine receipt: {str(head['status'] or '')}"
+                )
             if error is None:
                 continue
-            predecessor = None
-            head_agent_id = _project_state_repair_agent_id(conn, head)
-            predecessor_id = str(head["supersedes_card_id"] or "")
-            if predecessor_id and predecessor_id not in visited:
-                candidate = conn.execute(
-                    f"""
-                    SELECT {select_fields} FROM cards
-                    WHERE id = ? AND card_type = 'project_state'
-                      AND superseded_by_card_id = ?
-                    """,
-                    (predecessor_id, head_id),
-                ).fetchone()
-                if candidate is not None and (
-                    head_agent_id is not None
-                    and str(candidate["project_id"] or "")
-                    == str(head["project_id"] or "")
-                    and str(candidate["visibility_scope"] or "")
-                    == str(head["visibility_scope"] or "")
-                    and _project_state_repair_agent_id(conn, candidate)
-                    == head_agent_id
-                    and (
-                        str(head["visibility_scope"] or "") == "project"
-                        or str(candidate["session_id"] or "")
-                        == str(head["session_id"] or "")
-                    )
-                ):
-                    predecessor = candidate
+            predecessor = planned_predecessors.get(head_id)
             record = {
                 "card_id": head_id,
                 "reason": error[:512],
@@ -9520,6 +11724,24 @@ def repair_invalid_project_state_checkpoints(
                 ),
             }
             quarantined.append(record)
+            peer_rows = planned_retired_peer_rows.get(head_id, [])
+            detached_peer_rows = planned_detached_peer_rows.get(head_id, [])
+            retired_peers.extend(
+                {
+                    "card_id": str(peer_row["id"]),
+                    "card_type": str(peer_row["card_type"] or ""),
+                    "retired_while_quarantining_card_id": head_id,
+                }
+                for peer_row in peer_rows
+            )
+            detached_peers.extend(
+                {
+                    "card_id": str(peer_row["id"]),
+                    "card_type": str(peer_row["card_type"] or ""),
+                    "detached_from_invalid_successor_card_id": head_id,
+                }
+                for peer_row in detached_peer_rows
+            )
             if predecessor is not None:
                 pending.insert(0, predecessor)
             if dry_run:
@@ -9530,13 +11752,39 @@ def repair_invalid_project_state_checkpoints(
             original_conflict_group = str(head["conflict_group"] or "").strip()
             conn.execute(
                 """
-                UPDATE cards SET status = 'historical', supersedes_card_id = NULL,
+                UPDATE cards SET card_type = 'project_state',
+                    status = 'historical', supersedes_card_id = NULL,
                     superseded_by_card_id = NULL, conflict_group = NULL,
                     updated_at = ? WHERE id = ?
                 """,
                 (now, head_id),
             )
             touched.add(head_id)
+            direct_successor_rows = conn.execute(
+                """
+                SELECT id, card_type FROM cards
+                WHERE supersedes_card_id = ?
+                ORDER BY id
+                """,
+                (head_id,),
+            ).fetchall()
+            direct_successor_ids = [
+                str(row["id"]) for row in direct_successor_rows
+            ]
+            if direct_successor_ids:
+                successor_placeholders = ", ".join(
+                    "?" for _ in direct_successor_ids
+                )
+                conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET supersedes_card_id = NULL, updated_at = ?
+                    WHERE id IN ({successor_placeholders})
+                      AND supersedes_card_id = ?
+                    """,
+                    (now, *direct_successor_ids, head_id),
+                )
+                touched.update(direct_successor_ids)
             if original_conflict_group:
                 grouped_rows = conn.execute(
                     "SELECT id FROM cards WHERE conflict_group = ?",
@@ -9562,17 +11810,8 @@ def repair_invalid_project_state_checkpoints(
                 ).rowcount == 1:
                     reactivated.append(predecessor_id)
                     touched.add(predecessor_id)
-            remaining_incoming = conn.execute(
-                """
-                SELECT id FROM cards
-                WHERE superseded_by_card_id = ?
-                ORDER BY id
-                """,
-                (head_id,),
-            ).fetchall()
-            remaining_incoming_ids = [
-                str(row["id"]) for row in remaining_incoming
-            ]
+            remaining_incoming = peer_rows
+            remaining_incoming_ids = [str(row["id"]) for row in peer_rows]
             if remaining_incoming_ids:
                 placeholders = ", ".join(
                     "?" for _ in remaining_incoming_ids
@@ -9580,69 +11819,212 @@ def repair_invalid_project_state_checkpoints(
                 conn.execute(
                     f"""
                     UPDATE cards
-                    SET status = 'historical', superseded_by_card_id = NULL,
-                        conflict_group = NULL, updated_at = ?
+                    SET status = 'historical', supersedes_card_id = NULL,
+                        superseded_by_card_id = NULL, conflict_group = NULL,
+                        updated_at = ?
                     WHERE id IN ({placeholders})
                       AND superseded_by_card_id = ?
                     """,
                     (now, *remaining_incoming_ids, head_id),
                 )
                 touched.update(remaining_incoming_ids)
-            quarantine_columns = ", ".join(
-                _PROJECT_STATE_QUARANTINE_CARD_COLUMNS
-            )
-            quarantined_card = conn.execute(
-                f"SELECT {quarantine_columns} FROM cards WHERE id = ?",
-                (head_id,),
-            ).fetchone()
-            if quarantined_card is None:
-                raise ValueError(
-                    f"quarantined project-state Card disappeared: {head_id}"
+                for incoming_row in remaining_incoming:
+                    if str(incoming_row["card_type"] or "") != "project_state":
+                        continue
+                    _record_project_state_quarantine(
+                        conn,
+                        card_id=str(incoming_row["id"]),
+                        reason=(
+                            "project-state predecessor retired while "
+                            f"quarantining invalid successor {head_id}"
+                        ),
+                        predecessor_card_id=None,
+                    )
+            detached_peer_ids = [
+                str(row["id"]) for row in detached_peer_rows
+            ]
+            if detached_peer_ids:
+                detached_placeholders = ", ".join(
+                    "?" for _ in detached_peer_ids
                 )
-            record["schema"] = PROJECT_STATE_QUARANTINE_SCHEMA
-            record["card_binding_hash"] = (
-                _project_state_quarantine_binding_hash(
-                    conn,
-                    quarantined_card,
-                    reason=str(record["reason"]),
-                    predecessor_card_id=(
-                        str(record["predecessor_card_id"])
-                        if record["predecessor_card_id"] is not None
-                        else None
-                    ),
+                conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET superseded_by_card_id = NULL, updated_at = ?
+                    WHERE id IN ({detached_placeholders})
+                      AND superseded_by_card_id = ?
+                    """,
+                    (now, *detached_peer_ids, head_id),
                 )
-            )
-            audit_event(
+                touched.update(detached_peer_ids)
+            recorded_quarantine = _record_project_state_quarantine(
                 conn,
-                action="project_state_checkpoint_quarantined",
-                target_type="card",
-                target_id=head_id,
-                payload=record,
+                card_id=head_id,
+                reason=str(record["reason"]),
+                predecessor_card_id=(
+                    str(record["predecessor_card_id"])
+                    if record["predecessor_card_id"] is not None
+                    else None
+                ),
             )
-        if not dry_run:
+            record.update(
+                {
+                    key: value
+                    for key, value in recorded_quarantine.items()
+                    if key not in {"card_id", "reason", "predecessor_card_id"}
+                }
+            )
+        repaired_candidate_ids = {
+            str(record["card_id"]) for record in quarantined
+        }
+        remaining_invalid_count = len(
+            repair_candidate_ids - repaired_candidate_ids
+        )
+        has_more = bool(
+            seed_scan_overflow
+            or remaining_invalid_count
+        )
+        if not dry_run and not unrepairable_topology:
             if touched:
                 mark_card_sidecar_outbox(
                     conn,
                     sorted(touched),
                     reason="project_state_checkpoint_quarantined",
                 )
+            semantic_postcondition = semantic_integrity_report(
+                root,
+                conn=conn,
+                check_card_sidecars=False,
+            )
+            precondition_checks = (
+                semantic_precondition.get("checks", {})
+                if isinstance(semantic_precondition, dict)
+                else {}
+            )
+            postcondition_checks = semantic_postcondition.get("checks", {})
+            semantic_regressions: dict[str, Any] = {}
+            for check_name, post_value in postcondition_checks.items():
+                if check_name in {
+                    "alias_count",
+                    "quarantined_project_state_cards",
+                }:
+                    continue
+                pre_value = precondition_checks.get(check_name)
+                if (
+                    isinstance(post_value, bool)
+                    and post_value is False
+                    and pre_value is not False
+                ) or (
+                    isinstance(post_value, int)
+                    and not isinstance(post_value, bool)
+                    and post_value > int(pre_value or 0)
+                ):
+                    semantic_regressions[check_name] = {
+                        "before": pre_value,
+                        "after": post_value,
+                    }
+            post_repair_reports = [
+                _project_state_authority_boundary_report(conn, boundary)
+                for boundary in sorted(boundaries)
+            ]
+            post_repair_authority_boundaries = [
+                _public_project_state_authority_report(report)
+                for report in post_repair_reports
+            ]
+            boundary_postcondition_failures = [
+                _public_project_state_authority_report(report)
+                for report in post_repair_reports
+                if not report["ok"]
+            ]
+            if semantic_regressions or boundary_postcondition_failures:
+                raise ValueError(
+                    "project-state checkpoint repair failed its authority "
+                    "postcondition: "
+                    + json_dumps(
+                        {
+                            "semantic_regressions": semantic_regressions,
+                            "boundary_failures": boundary_postcondition_failures,
+                        }
+                    )
+                )
             conn.commit()
+            catalog_repair_committed = True
     except Exception:
         if conn.in_transaction:
             conn.rollback()
         raise
     finally:
         conn.close()
-    if touched:
-        sync_card_sidecars_after_commit(root, sorted(touched))
+    if catalog_repair_committed:
+        try:
+            sidecar_sync = sync_card_sidecars_after_commit(root, sorted(touched))
+        except Exception as exc:
+            sidecar_sync = {
+                "ok": False,
+                "synced": 0,
+                "deferred": len(touched),
+                "failed": len(touched),
+                "failures": [{"card_id": None, "error": str(exc)}],
+            }
+        try:
+            post_repair_semantic_integrity = semantic_integrity_report(root)
+        except Exception as exc:
+            post_repair_semantic_error = True
+            post_repair_semantic_integrity = {
+                "ok": False,
+                "initialized": True,
+                "error": str(exc),
+            }
+    retired_peers = sorted(retired_peers, key=lambda item: str(item["card_id"]))
+    detached_peers = sorted(detached_peers, key=lambda item: str(item["card_id"]))
     return {
-        "ok": True,
+        "ok": (
+            not unrepairable_topology
+            and (sidecar_sync is None or sidecar_sync.get("ok") is True)
+            and not post_repair_semantic_error
+            and (
+                post_repair_semantic_integrity is None
+                or post_repair_semantic_integrity.get("ok") is True
+            )
+        ),
         "initialized": True,
         "dry_run": bool(dry_run),
         "quarantined_count": len(quarantined),
         "quarantined": quarantined,
         "reactivated_card_ids": reactivated,
-        "has_more": len(heads) > limit or bool(pending),
+        "retired_peer_count": len(retired_peers),
+        "retired_peer_card_ids": [
+            str(item["card_id"]) for item in retired_peers
+        ],
+        "retired_peers": retired_peers,
+        "detached_peer_count": len(detached_peers),
+        "detached_peer_card_ids": [
+            str(item["card_id"]) for item in detached_peers
+        ],
+        "detached_peers": detached_peers,
+        "has_more": has_more,
+        "authority_topology_issue_count": len(unrepairable_topology),
+        "authority_topology_issues": unrepairable_topology[:20],
+        "authority_boundaries": [
+            _public_project_state_authority_report(report)
+            for report in authority_reports
+        ],
+        "post_repair_authority_boundaries": (
+            post_repair_authority_boundaries if not dry_run else []
+        ),
+        "catalog_repair_committed": catalog_repair_committed,
+        "sidecar_sync": sidecar_sync,
+        "sidecar_sync_deferred": bool(
+            catalog_repair_committed
+            and sidecar_sync is not None
+            and sidecar_sync.get("ok") is False
+        ),
+        "post_repair_semantic_integrity": post_repair_semantic_integrity,
+        "post_repair_semantic_ok": (
+            post_repair_semantic_integrity.get("ok")
+            if post_repair_semantic_integrity is not None
+            else None
+        ),
     }
 
 
@@ -9684,129 +12066,603 @@ def _discover_resume_state(
             [],
         )
 
+    def boundary_is_authorized(boundary: tuple[str, str, str]) -> bool:
+        scope, project_id, session_id = boundary
+        if requested_session and requested_project:
+            return (
+                scope == "session" and session_id == requested_session
+            ) or (
+                scope == "project" and project_id == requested_project
+            )
+        if requested_session:
+            return scope == "session" and session_id == requested_session
+        if requested_project:
+            return scope == "project" and project_id == requested_project
+        return (
+            scope == "session"
+            or (scope == "project" and bool(project_id))
+            or (scope == "global" and not project_id)
+        )
+
+    def durable_requested_boundary(
+        row: ProjectStateRow,
+    ) -> tuple[str, str, str] | None:
+        card_metadata = json_loads(
+            (
+                row["bounded_card_metadata_json"]
+                if "bounded_card_metadata_json" in row.keys()
+                else None
+            ),
+            {},
+        )
+        source_metadata = json_loads(
+            (
+                row["bounded_source_metadata_json"]
+                if "bounded_source_metadata_json" in row.keys()
+                else None
+            ),
+            {},
+        )
+        card_metadata = card_metadata if isinstance(card_metadata, dict) else {}
+        source_metadata = (
+            source_metadata if isinstance(source_metadata, dict) else {}
+        )
+        source_refs = json_loads(
+            (
+                row["bounded_source_refs_json"]
+                if "bounded_source_refs_json" in row.keys()
+                else None
+            ),
+            None,
+        )
+        durable_session = ""
+        if (
+            isinstance(source_refs, list)
+            and len(source_refs) == 1
+            and isinstance(source_refs[0], dict)
+        ):
+            durable_session = str(source_refs[0].get("session_id") or "")
+        for metadata in (source_metadata, card_metadata):
+            durable_visibility = str(metadata.get("visibility_scope") or "")
+            durable_project = str(metadata.get("project_id") or "")
+            metadata_session = str(
+                metadata.get("session_id") or durable_session
+            )
+            if durable_visibility == "project" and durable_project and (
+                not requested_project or durable_project == requested_project
+            ):
+                if not requested_session or requested_project:
+                    return ("project", durable_project, "")
+            if durable_visibility == "session" and metadata_session and (
+                not requested_session or metadata_session == requested_session
+            ):
+                if not requested_project or requested_session:
+                    return ("session", durable_project, metadata_session)
+        return None
+
     card_visibility_clause, card_params = authorized_visibility_clause()
     card_clauses = [
         "card_type = 'project_state'",
         "coalesce(session_id, '') != ''",
         card_visibility_clause,
     ]
-    state_row = conn.execute(
-        f"""
-        SELECT session_id, project_id, visibility_scope,
-               created_at AS checkpoint_at, id, conflict_group,
-               length(CAST(title AS BLOB)) AS title_bytes,
-               length(CAST(summary AS BLOB)) AS summary_bytes,
-               length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
-               length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
-               length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
-               length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
-        FROM cards
-        WHERE {' AND '.join([*card_clauses, _current_project_state_authority_clause('cards')])}
-        ORDER BY created_at DESC, rowid DESC
-        LIMIT 1
-        """,
-        tuple(card_params),
-    ).fetchone()
+    state_row: sqlite3.Row | dict[str, Any] | None = None
+    selected_candidate: sqlite3.Row | None = None
+    selected_boundary_report: dict[str, Any] | None = None
     invalid_checkpoint = None
     authority_ambiguity = None
-    if state_row is not None:
+    authority_corruption = None
+
+    direct_seed_rows = conn.execute(
+        f"""
+        SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
+        FROM cards
+        WHERE {' AND '.join(card_clauses)}
+        ORDER BY created_at DESC, card_rowid DESC
+        LIMIT ?
+        """,
+        (*card_params, PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT + 1),
+    ).fetchall()
+    source_visibility_clause, source_visibility_params = (
+        authorized_visibility_clause("source")
+    )
+    legacy_anchor_clauses: list[str] = []
+    legacy_anchor_params: list[Any] = []
+    card_authority_clause, card_authority_params = (
+        authorized_visibility_clause("cards")
+    )
+    legacy_anchor_clauses.append(card_authority_clause)
+    legacy_anchor_params.extend(card_authority_params)
+    if requested_project:
+        for metadata_owner in ("cards", "source"):
+            legacy_anchor_clauses.append(
+                f"""
+                (
+                    json_extract(
+                        CASE
+                            WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                             AND json_valid({metadata_owner}.metadata_json)
+                            THEN {metadata_owner}.metadata_json
+                            ELSE '{{}}'
+                        END,
+                        '$.visibility_scope'
+                    ) = 'project'
+                    AND json_extract(
+                        CASE
+                            WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                             AND json_valid({metadata_owner}.metadata_json)
+                            THEN {metadata_owner}.metadata_json
+                            ELSE '{{}}'
+                        END,
+                        '$.project_id'
+                    ) = ?
+                )
+                """
+            )
+            legacy_anchor_params.extend(
+                [
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    requested_project,
+                ]
+            )
+    if requested_session:
+        legacy_anchor_clauses.append(
+            """
+            (
+                json_extract(
+                    CASE
+                        WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                         AND json_valid(cards.source_refs_json)
+                        THEN cards.source_refs_json
+                        ELSE '[]'
+                    END,
+                    '$[0].session_id'
+                ) = ?
+                AND (
+                    json_extract(
+                        CASE
+                            WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
+                             AND json_valid(cards.metadata_json)
+                            THEN cards.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.visibility_scope'
+                    ) = 'session'
+                    OR json_extract(
+                        CASE
+                            WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
+                             AND json_valid(source.metadata_json)
+                            THEN source.metadata_json
+                            ELSE '{}'
+                        END,
+                        '$.visibility_scope'
+                    ) = 'session'
+                )
+            )
+            """
+        )
+        legacy_anchor_params.extend(
+            [
+                MAX_STORED_PROJECT_STATE_BYTES,
+                requested_session,
+                MAX_STORED_PROJECT_STATE_BYTES,
+                MAX_STORED_PROJECT_STATE_BYTES,
+            ]
+        )
+        for metadata_owner in ("source", "cards"):
+            legacy_anchor_clauses.append(
+                f"""
+                (
+                    json_extract(
+                        CASE
+                            WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                             AND json_valid({metadata_owner}.metadata_json)
+                            THEN {metadata_owner}.metadata_json
+                            ELSE '{{}}'
+                        END,
+                        '$.visibility_scope'
+                    ) = 'session'
+                    AND json_extract(
+                        CASE
+                            WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                             AND json_valid({metadata_owner}.metadata_json)
+                            THEN {metadata_owner}.metadata_json
+                            ELSE '{{}}'
+                        END,
+                        '$.session_id'
+                    ) = ?
+                )
+                """
+            )
+            legacy_anchor_params.extend(
+                [
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    requested_session,
+                ]
+            )
+    if not requested_project and not requested_session:
+        for metadata_owner in ("source", "cards"):
+            legacy_anchor_clauses.append(
+                f"""
+                (
+                    (
+                        json_extract(
+                            CASE
+                                WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                                 AND json_valid({metadata_owner}.metadata_json)
+                                THEN {metadata_owner}.metadata_json
+                                ELSE '{{}}'
+                            END,
+                            '$.visibility_scope'
+                        ) = 'project'
+                        AND coalesce(json_extract(
+                            CASE
+                                WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                                 AND json_valid({metadata_owner}.metadata_json)
+                                THEN {metadata_owner}.metadata_json
+                                ELSE '{{}}'
+                            END,
+                            '$.project_id'
+                        ), '') != ''
+                    )
+                    OR (
+                        json_extract(
+                            CASE
+                                WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                                 AND json_valid({metadata_owner}.metadata_json)
+                                THEN {metadata_owner}.metadata_json
+                                ELSE '{{}}'
+                            END,
+                            '$.visibility_scope'
+                        ) = 'session'
+                        AND (
+                            coalesce(json_extract(
+                                CASE
+                                    WHEN length(CAST(cards.source_refs_json AS BLOB)) <= ?
+                                     AND json_valid(cards.source_refs_json)
+                                    THEN cards.source_refs_json
+                                    ELSE '[]'
+                                END,
+                                '$[0].session_id'
+                            ), '') != ''
+                            OR coalesce(json_extract(
+                                CASE
+                                    WHEN length(CAST({metadata_owner}.metadata_json AS BLOB)) <= ?
+                                     AND json_valid({metadata_owner}.metadata_json)
+                                    THEN {metadata_owner}.metadata_json
+                                    ELSE '{{}}'
+                                END,
+                                '$.session_id'
+                            ), '') != ''
+                        )
+                    )
+                )
+                """
+            )
+            legacy_anchor_params.extend(
+                [
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                    MAX_STORED_PROJECT_STATE_BYTES,
+                ]
+            )
+    legacy_source_visibility_clause = (
+        f"(({source_visibility_clause}) OR "
+        f"({' OR '.join(legacy_anchor_clauses)}))"
+    )
+    legacy_source_visibility_params = (
+        *source_visibility_params,
+        *legacy_anchor_params,
+    )
+    legacy_source_seed_rows, legacy_source_scan_overflow = (
+        _source_bound_project_state_rows(
+            conn,
+            source_visibility_clause=legacy_source_visibility_clause,
+            source_visibility_params=tuple(legacy_source_visibility_params),
+            limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+        )
+    )
+    proven_source_seed_rows, proven_source_scan_overflow = (
+        _source_proven_project_state_card_rows(
+            conn,
+            source_visibility_clause=source_visibility_clause,
+            source_visibility_params=tuple(source_visibility_params),
+            limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+        )
+    )
+    source_seed_rows_by_id: dict[str, ProjectStateRow] = {}
+    for legacy_row in legacy_source_seed_rows:
+        source_seed_rows_by_id[str(legacy_row["id"])] = legacy_row
+    for proven_row in proven_source_seed_rows:
+        source_seed_rows_by_id[str(proven_row["id"])] = proven_row
+    source_seed_rows: list[ProjectStateRow] = list(
+        source_seed_rows_by_id.values()
+    )
+    orphan_source_events, orphan_source_scan_overflow = (
+        _orphan_project_state_source_events(
+            conn,
+            source_visibility_clause=source_visibility_clause,
+            source_visibility_params=tuple(source_visibility_params),
+            limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+        )
+    )
+    seed_rows_by_id: dict[str, ProjectStateRow] = {
+        str(row["id"]): row
+        for row in direct_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
+    }
+    seed_rows_by_id.update(
+        {
+            str(row["id"]): row
+            for row in source_seed_rows[
+                :PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
+            ]
+        }
+    )
+    seed_rows = list(seed_rows_by_id.values())
+    seed_overflow = (
+        len(direct_seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
+        or len(source_seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
+        or legacy_source_scan_overflow
+        or proven_source_scan_overflow
+        or len(seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
+        or orphan_source_scan_overflow
+    )
+    if seed_overflow:
+        authority_corruption = {
+            "ok": False,
+            "reason": "authorized_boundary_scan_overflow",
+            "authorized_boundary_scan_limit": (
+                PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
+            ),
+        }
+    else:
+        boundaries: set[tuple[str, str, str]] = {
+            _project_state_authority_boundary(row) for row in direct_seed_rows
+        }
+        source_boundary_issues: dict[
+            tuple[str, str, str], list[tuple[ProjectStateRow, str]]
+        ] = {}
+        for source_seed_row in source_seed_rows:
+            try:
+                source_boundary = _project_state_source_authority_boundary(
+                    source_seed_row
+                )
+            except ValueError:
+                source_boundary = None
+            try:
+                card_boundary = _project_state_authority_boundary(
+                    source_seed_row
+                )
+            except ValueError:
+                card_boundary = None
+            durable_boundary = durable_requested_boundary(source_seed_row)
+            graph_identity_proven = (
+                _project_state_graph_source_binding_proven(
+                    conn,
+                    event_id=str(
+                        source_seed_row["bound_source_event_id"] or ""
+                    ),
+                    expected_card_id=str(source_seed_row["id"]),
+                )
+            )
+            source_identity_proven = (
+                graph_identity_proven
+                or _source_bound_project_state_deterministic_identity_proven(
+                    source_seed_row
+                )
+            )
+            claimed_issue_boundaries: list[tuple[str, str, str]] = []
+            if (
+                source_boundary is not None
+                and boundary_is_authorized(source_boundary)
+            ):
+                claimed_issue_boundaries.append(source_boundary)
+            if (
+                source_identity_proven
+                and card_boundary is not None
+                and boundary_is_authorized(card_boundary)
+            ):
+                claimed_issue_boundaries.append(card_boundary)
+            if (
+                source_identity_proven
+                and durable_boundary is not None
+                and boundary_is_authorized(durable_boundary)
+            ):
+                claimed_issue_boundaries.append(durable_boundary)
+            claimed_issue_boundaries = list(
+                dict.fromkeys(claimed_issue_boundaries)
+            )
+            if not claimed_issue_boundaries or (
+                _valid_project_state_quarantine(
+                    conn,
+                    str(source_seed_row["id"]),
+                )
+                is not None
+            ):
+                continue
+            for claimed_boundary in claimed_issue_boundaries:
+                issue_types: list[str] = []
+                if source_boundary is None:
+                    issue_types.append(
+                        "source_bound_invalid_source_authority_boundary"
+                    )
+                elif (
+                    source_boundary != claimed_boundary
+                    or card_boundary != source_boundary
+                ):
+                    issue_types.append(
+                        "source_bound_authority_boundary_mismatch"
+                    )
+                if str(source_seed_row["card_type"] or "") != "project_state":
+                    issue_types.append("source_bound_card_type_mismatch")
+                if not issue_types:
+                    continue
+                boundaries.add(claimed_boundary)
+                for issue_type in issue_types:
+                    source_boundary_issues.setdefault(
+                        claimed_boundary,
+                        [],
+                    ).append((source_seed_row, issue_type))
+        orphan_boundaries: list[
+            tuple[tuple[str, str, str], dict[str, Any]]
+        ] = []
+        for orphan in orphan_source_events:
+            orphan_boundary = (
+                str(orphan["expected_visibility_scope"]),
+                str(orphan["expected_project_id"]),
+                (
+                    ""
+                    if str(orphan["expected_visibility_scope"])
+                    in {"project", "global"}
+                    else str(orphan["expected_session_id"])
+                ),
+            )
+            boundaries.add(orphan_boundary)
+            orphan_boundaries.append((orphan_boundary, orphan))
+        reports_by_boundary = {
+            boundary: _project_state_authority_boundary_report(conn, boundary)
+            for boundary in sorted(boundaries)
+        }
+        for boundary, issue_rows in source_boundary_issues.items():
+            report = reports_by_boundary[boundary]
+            for issue_row, issue_type in issue_rows:
+                _annotate_source_bound_authority_issue(
+                    conn,
+                    report,
+                    issue_row,
+                    issue_type=issue_type,
+                )
+        for orphan_boundary, orphan in orphan_boundaries:
+            _annotate_orphan_project_state_source_event(
+                reports_by_boundary[orphan_boundary],
+                orphan,
+            )
+        reports = [reports_by_boundary[boundary] for boundary in sorted(boundaries)]
+        report_candidates: list[
+            tuple[tuple[str, int], dict[str, Any], sqlite3.Row]
+        ] = []
+        for report in reports:
+            candidate_rows = [
+                report["_rows_by_id"][card_id]
+                for card_id in report["current_head_ids"]
+            ]
+            if not candidate_rows:
+                continue
+            newest_row = max(
+                candidate_rows,
+                key=lambda row: (
+                    str(row["created_at"] or ""),
+                    int(row["card_rowid"]),
+                ),
+            )
+            report_candidates.append(
+                (
+                    (
+                        str(newest_row["created_at"] or ""),
+                        int(newest_row["card_rowid"]),
+                    ),
+                    report,
+                    newest_row,
+                )
+            )
+        if report_candidates:
+            _, selected_boundary_report, selected_candidate = max(
+                report_candidates,
+                key=lambda item: item[0],
+            )
+        elif reports and scoped_resume:
+            newest_report = max(
+                reports,
+                key=lambda report: max(
+                    (
+                        str(row["created_at"] or ""),
+                        int(row["card_rowid"]),
+                    )
+                    for row in report["_rows_by_id"].values()
+                )
+                if report["_rows_by_id"]
+                else report.get(
+                    "_latest_source_event_order",
+                    ("", -1),
+                ),
+            )
+            if not newest_report["ok"]:
+                selected_boundary_report = newest_report
+                if newest_report["_rows_by_id"]:
+                    selected_candidate = max(
+                        newest_report["_rows_by_id"].values(),
+                        key=lambda row: (
+                            str(row["created_at"] or ""),
+                            int(row["card_rowid"]),
+                        ),
+                    )
+                else:
+                    authority_corruption = (
+                        _public_project_state_authority_report(newest_report)
+                    )
+
+    if selected_candidate is not None and selected_boundary_report is not None:
+        boundary_report = selected_boundary_report
         invalid_reason = _project_state_card_integrity_error(
             conn,
-            str(state_row["id"]),
-            size_row=state_row,
+            str(selected_candidate["id"]),
+            size_row=selected_candidate,
         )
-        if invalid_reason is not None:
+        has_source_bound_boundary_mismatch = any(
+            issue.get("type")
+            in {
+                "source_bound_authority_boundary_mismatch",
+                "source_bound_card_type_mismatch",
+                "source_bound_invalid_source_authority_boundary",
+            }
+            for issue in boundary_report["_topology_issues_all"]
+        )
+        if (
+            invalid_reason is not None
+            and not has_source_bound_boundary_mismatch
+            and _valid_project_state_quarantine(
+                conn,
+                str(selected_candidate["id"]),
+            )
+            is None
+        ):
             invalid_checkpoint = {
-                "checkpoint_id": str(state_row["id"]),
+                "checkpoint_id": str(selected_candidate["id"]),
                 "reason": invalid_reason,
             }
             state_row = None
         else:
-            selected_scope = normalize_visibility_scope(
-                str(state_row["visibility_scope"] or ""),
-                field="resume checkpoint visibility_scope",
-            )
-            selected_project = str(state_row["project_id"] or "")
-            selected_session = str(state_row["session_id"] or "")
-            if selected_scope == "project":
-                boundary = ("project", selected_project, "")
-                boundary_clause = (
-                    "visibility_scope = 'project' "
-                    "AND coalesce(project_id, '') = ?"
+            current_head_ids = list(boundary_report["current_head_ids"])
+            contested_head_ids = list(boundary_report["contested_head_ids"])
+            if not boundary_report["ok"]:
+                authority_corruption = _public_project_state_authority_report(
+                    boundary_report
                 )
-                boundary_params: tuple[Any, ...] = (selected_project,)
-            elif selected_scope == "global":
-                boundary = ("global", "", "")
-                boundary_clause = "visibility_scope = 'global'"
-                boundary_params = ()
-            else:
-                boundary = (selected_scope, selected_project, selected_session)
-                boundary_clause = (
-                    "visibility_scope = ? "
-                    "AND coalesce(project_id, '') = ? "
-                    "AND coalesce(session_id, '') = ?"
-                )
-                boundary_params = boundary
-            boundary_scan_limit = 64
-            boundary_heads = conn.execute(
-                f"""
-                SELECT session_id, project_id, visibility_scope,
-                       created_at AS checkpoint_at, id, conflict_group,
-                       length(CAST(title AS BLOB)) AS title_bytes,
-                       length(CAST(summary AS BLOB)) AS summary_bytes,
-                       length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
-                       length(CAST(open_tasks_json AS BLOB)) AS open_tasks_bytes,
-                       length(CAST(metadata_json AS BLOB)) AS metadata_bytes,
-                       length(CAST(source_refs_json AS BLOB)) AS source_refs_bytes
-                FROM cards
-                WHERE card_type = 'project_state'
-                  AND {_current_project_state_authority_clause('cards')}
-                  AND {card_visibility_clause}
-                  AND {boundary_clause}
-                ORDER BY created_at DESC, rowid DESC
-                LIMIT ?
-                """,
-                (
-                    *card_params,
-                    *boundary_params,
-                    boundary_scan_limit + 1,
-                ),
-            ).fetchall()
-            boundary_scan_overflow = len(boundary_heads) > boundary_scan_limit
-            valid_boundary_head_ids: list[str] = []
-            contested_boundary_head_ids: list[str] = []
-            for boundary_head in boundary_heads[:boundary_scan_limit]:
-                boundary_head_id = str(boundary_head["id"])
-                boundary_head_error = _project_state_card_integrity_error(
-                    conn,
-                    boundary_head_id,
-                    size_row=boundary_head,
-                )
-                if boundary_head_error is not None:
-                    continue
-                valid_boundary_head_ids.append(boundary_head_id)
-                if str(boundary_head["conflict_group"] or "").strip():
-                    contested_boundary_head_ids.append(boundary_head_id)
-                if len(valid_boundary_head_ids) >= 2:
-                    break
-            if (
-                len(valid_boundary_head_ids) > 1
-                or contested_boundary_head_ids
-                or boundary_scan_overflow
-            ):
+                state_row = None
+            elif len(current_head_ids) > 1 or contested_head_ids:
                 authority_ambiguity = {
-                    "boundary": {
-                        "visibility_scope": boundary[0],
-                        "project_id": boundary[1] or None,
-                        "session_id": boundary[2] or None,
-                    },
-                    "current_head_ids": valid_boundary_head_ids,
-                    "contested_head_ids": contested_boundary_head_ids,
-                    "head_count_at_least": len(valid_boundary_head_ids),
-                    "head_list_limit": 2,
-                    "boundary_scan_limit": boundary_scan_limit,
-                    "boundary_scan_overflow": boundary_scan_overflow,
+                    "boundary": boundary_report["boundary"],
+                    "current_head_ids": current_head_ids,
+                    "contested_head_ids": contested_head_ids,
+                    "head_count_at_least": len(current_head_ids),
+                    "head_list_limit": (
+                        PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+                    ),
+                    "boundary_scan_limit": (
+                        PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+                    ),
+                    "boundary_scan_overflow": False,
                 }
+                state_row = None
+            elif current_head_ids:
+                head_row = boundary_report["_rows_by_id"][current_head_ids[0]]
+                state_row = dict(head_row)
+                state_row["checkpoint_at"] = head_row["created_at"]
+            else:
                 state_row = None
     stale_state_exists = False
     discovery_source = "project_state_card"
@@ -9820,6 +12676,7 @@ def _discover_resume_state(
         )
         if (
             authority_ambiguity is None
+            and authority_corruption is None
             and invalid_checkpoint is None
             and not (stale_state_exists and scoped_resume)
         ):
@@ -9888,6 +12745,7 @@ def _discover_resume_state(
         "stale_state_exists": stale_state_exists,
         "invalid_checkpoint": invalid_checkpoint,
         "authority_ambiguity": authority_ambiguity,
+        "authority_corruption": authority_corruption,
     }
 
 
@@ -10892,6 +13750,24 @@ def resume_latest(
                         "quarantine it before resuming its predecessor"
                     ),
                 }
+            authority_corruption = selected.get("authority_corruption")
+            if isinstance(authority_corruption, dict):
+                return {
+                    "ok": False,
+                    "initialized": True,
+                    "root": str(root),
+                    "reason": "authority_corrupt",
+                    "resume_mode": resume_mode,
+                    "session_id": requested_session or None,
+                    "project_id": requested_project or None,
+                    "authority_corruption": authority_corruption,
+                    "repair_required": True,
+                    "repair_command": "repair-project-state-checkpoints --apply",
+                    "warning": (
+                        "project-state authority topology or evidence is invalid; "
+                        "repair it before resuming"
+                    ),
+                }
             authority_ambiguity = selected.get("authority_ambiguity")
             if isinstance(authority_ambiguity, dict):
                 return {
@@ -11250,6 +14126,7 @@ def semantic_integrity_report(
     *,
     create: bool = False,
     conn: sqlite3.Connection | None = None,
+    check_card_sidecars: bool = True,
 ) -> dict[str, Any]:
     if create:
         init_db(root)
@@ -11298,7 +14175,17 @@ def semantic_integrity_report(
                 legacy_actual = content_hash(segment_hash_material(events, legacy=True))
                 if actual != expected_hash and legacy_actual != expected_hash:
                     segment_hash_mismatches += 1
-        sidecar_audit = audit_card_sidecars(root, conn)
+        sidecar_audit = (
+            audit_card_sidecars(root, conn)
+            if check_card_sidecars
+            else {
+                "orphan_card_sidecars": 0,
+                "missing_card_sidecars": 0,
+                "malformed_card_sidecars": 0,
+                "stale_card_sidecars": 0,
+                "divergent_card_sidecars": 0,
+            }
+        )
         malformed_graph_sources = 0
         graph_source_key_mismatches = 0
         graph_source_missing_references = 0
@@ -11369,6 +14256,11 @@ def semantic_integrity_report(
         quarantined_project_state_cards: list[dict[str, Any]] = []
         valid_project_state_quarantines: dict[str, str | None] = {}
         valid_project_state_agents: dict[str, str] = {}
+        unproven_project_state_retirements: list[dict[str, str]] = []
+        source_bound_card_type_mismatches: list[dict[str, str]] = []
+        orphan_project_state_source_events: list[dict[str, str]] = []
+        source_bound_project_state_scan_overflow = False
+        orphan_project_state_source_scan_overflow = False
         if {
             "id",
             "card_type",
@@ -11384,7 +14276,9 @@ def semantic_integrity_report(
         }.issubset(_table_columns(conn, "cards")):
             project_state_rows = conn.execute(
                 """
-                SELECT id, session_id, project_id, visibility_scope,
+                SELECT id, card_type, session_id, project_id,
+                       visibility_scope, status,
+                       supersedes_card_id, superseded_by_card_id,
                        length(CAST(title AS BLOB)) AS title_bytes,
                        length(CAST(summary AS BLOB)) AS summary_bytes,
                        length(CAST(decisions_json AS BLOB)) AS decisions_bytes,
@@ -11396,8 +14290,91 @@ def semantic_integrity_report(
                 ORDER BY id
                 """
             ).fetchall()
+            legacy_source_bound_rows, legacy_source_scan_overflow = (
+                _source_bound_project_state_rows(
+                    conn,
+                    source_visibility_clause="1 = 1",
+                    source_visibility_params=(),
+                    limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                )
+            )
+            proven_source_bound_rows, proven_source_scan_overflow = (
+                _source_proven_project_state_card_rows(
+                    conn,
+                    source_visibility_clause="1 = 1",
+                    source_visibility_params=(),
+                    limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                )
+            )
+            source_bound_rows_by_id: dict[str, ProjectStateRow] = {}
+            for row in legacy_source_bound_rows:
+                source_bound_rows_by_id[str(row["id"])] = row
+            for row in proven_source_bound_rows:
+                source_bound_rows_by_id[str(row["id"])] = row
+            source_bound_rows: list[ProjectStateRow] = list(
+                source_bound_rows_by_id.values()
+            )
+            source_bound_project_state_scan_overflow = (
+                len(source_bound_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
+                or legacy_source_scan_overflow
+                or proven_source_scan_overflow
+            )
+            for source_bound_row in source_bound_rows[
+                :PROJECT_STATE_REPAIR_SCAN_LIMIT
+            ]:
+                if str(source_bound_row["card_type"] or "") == "project_state":
+                    continue
+                mismatch = {
+                    "type": "source_bound_card_type_mismatch",
+                    "card_id": str(source_bound_row["id"]),
+                    "observed_card_type": str(
+                        source_bound_row["card_type"] or ""
+                    ),
+                    "bound_source_event_id": str(
+                        source_bound_row["bound_source_event_id"] or ""
+                    ),
+                }
+                source_bound_card_type_mismatches.append(mismatch)
+                invalid_project_state_cards.append(
+                    {
+                        "card_id": mismatch["card_id"],
+                        "reason": (
+                            "project-state Card type differs from its exact "
+                            "project_state source event: "
+                            + mismatch["observed_card_type"]
+                        ),
+                    }
+                )
+            orphan_rows, orphan_project_state_source_scan_overflow = (
+                _orphan_project_state_source_events(
+                    conn,
+                    source_visibility_clause="1 = 1",
+                    source_visibility_params=(),
+                    limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                )
+            )
+            orphan_project_state_source_events = [
+                {
+                    "type": "orphan_project_state_source_event",
+                    "bound_source_event_id": str(
+                        row["bound_source_event_id"]
+                    ),
+                    "expected_card_id": str(row["expected_card_id"]),
+                }
+                for row in orphan_rows
+            ]
             for project_state_row in project_state_rows:
                 card_id = str(project_state_row["id"])
+                quarantine = _valid_project_state_quarantine(conn, card_id)
+                if quarantine is not None:
+                    quarantined_project_state_cards.append(quarantine)
+                    predecessor_value = quarantine.get("predecessor_card_id")
+                    valid_project_state_quarantines[card_id] = (
+                        str(predecessor_value)
+                        if predecessor_value is not None
+                        else None
+                    )
+                    continue
                 project_state_error = _project_state_card_integrity_error(
                     conn,
                     card_id,
@@ -11415,21 +14392,35 @@ def semantic_integrity_report(
                             "project-state Card agent evidence is invalid"
                         )
                 if project_state_error is not None:
-                    quarantine = _valid_project_state_quarantine(conn, card_id)
-                    if quarantine is not None:
-                        quarantined_project_state_cards.append(quarantine)
-                        predecessor_value = quarantine.get(
-                            "predecessor_card_id"
-                        )
-                        valid_project_state_quarantines[card_id] = (
-                            str(predecessor_value)
-                            if predecessor_value is not None
-                            else None
-                        )
-                    else:
-                        invalid_project_state_cards.append(
-                            {"card_id": card_id, "reason": project_state_error}
-                        )
+                    invalid_project_state_cards.append(
+                        {"card_id": card_id, "reason": project_state_error}
+                    )
+            referenced_project_state_predecessors = {
+                str(row["supersedes_card_id"])
+                for row in conn.execute(
+                    """
+                    SELECT supersedes_card_id FROM cards
+                    WHERE coalesce(supersedes_card_id, '') != ''
+                    """
+                ).fetchall()
+            }
+            for project_state_row in project_state_rows:
+                card_id = str(project_state_row["id"])
+                if (
+                    card_id not in valid_project_state_quarantines
+                    and str(project_state_row["status"] or "").casefold()
+                    in NON_CURRENT_CARD_STATUSES
+                    and not str(
+                        project_state_row["superseded_by_card_id"] or ""
+                    ).strip()
+                    and card_id not in referenced_project_state_predecessors
+                ):
+                    unproven_project_state_retirements.append(
+                        {
+                            "card_id": card_id,
+                            "status": str(project_state_row["status"] or ""),
+                        }
+                    )
         authority_integrity = temporal_authority_integrity_report(
             conn,
             valid_project_state_agents=valid_project_state_agents,
@@ -11437,6 +14428,12 @@ def semantic_integrity_report(
                 valid_project_state_quarantines
             ),
         )
+        authority_integrity["checks"][
+            "unproven_project_state_retirements"
+        ] = len(unproven_project_state_retirements)
+        authority_integrity["samples"][
+            "unproven_project_state_retirements"
+        ] = unproven_project_state_retirements[:20]
         checks = {
             "sqlite_integrity_ok": sqlite_integrity_ok,
             "foreign_key_violation_count": len(foreign_key_rows),
@@ -11456,6 +14453,18 @@ def semantic_integrity_report(
             "alias_internal_id_mismatches": alias_internal_id_mismatches,
             "unmigrated_partition_identifiers": unmigrated_partition_identifiers,
             "invalid_project_state_cards": len(invalid_project_state_cards),
+            "source_bound_card_type_mismatches": len(
+                source_bound_card_type_mismatches
+            ),
+            "source_bound_project_state_scan_overflow": int(
+                source_bound_project_state_scan_overflow
+            ),
+            "orphan_project_state_source_events": len(
+                orphan_project_state_source_events
+            ),
+            "orphan_project_state_source_scan_overflow": int(
+                orphan_project_state_source_scan_overflow
+            ),
             "quarantined_project_state_cards": len(
                 quarantined_project_state_cards
             ),
@@ -11478,6 +14487,12 @@ def semantic_integrity_report(
             "foreign_key_violations": foreign_key_rows[:20],
             "project_state_integrity_failures": invalid_project_state_cards[:20],
             "project_state_quarantines": quarantined_project_state_cards[:20],
+            "source_bound_project_state_failures": (
+                source_bound_card_type_mismatches[:20]
+            ),
+            "orphan_project_state_source_events": (
+                orphan_project_state_source_events[:20]
+            ),
             "authority_integrity_samples": authority_integrity["samples"],
             "retired_conflict_resolution_receipt_ids": (
                 authority_integrity[

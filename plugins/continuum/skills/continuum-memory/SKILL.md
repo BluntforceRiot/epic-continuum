@@ -34,7 +34,9 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_run_workers` to run one Scribe/Librarian/Archivist worker pass.
 - `continuum_memory_health` to inspect capture, queue, storage, and learning health.
 - `continuum_tier_storage` to apply Archivist storage movement.
-- `continuum_prune_memory` to archive, summarize-only, or forget cards by topic.
+- `continuum_prune_memory` to archive, summarize-only, or forget ordinary Cards
+  by bounded literal topic substring. It must not change project-state,
+  conflict-group, or supersession authority.
 - `continuum_detect_conflicts` to find likely conflicting Cards.
 - `continuum_resolve_conflict` to promote the current Card, explicitly reconcile every independent project-state head in one authority boundary, or dismiss a detected false-positive conflict without deleting evidence.
 - `continuum_yarn_health` to check the optional local Qwythos/Yarn endpoint without sending memory.
@@ -75,7 +77,12 @@ requested project cannot be inferred and choosing the latest state would be unsa
 Respect the configured resume mode: `explicit` requires a supplied session or
 project, while `latest_project` requires a supplied or configured default
 project and must not silently fall back to unrelated global state. Never promote
-a superseded or unresolved contested Card as the current checkpoint.
+a superseded or unresolved contested Card as the current checkpoint. Fail closed
+when any Card in the complete requested authority boundary has an invalid
+payload, malformed topology, incomplete conflict relationship, or unsupported
+edge, including an exact source-bound Card-type mismatch or a proven missing
+derived Card; corruption must not remove a competing Card from the resume
+decision.
 
 The recovery result includes:
 

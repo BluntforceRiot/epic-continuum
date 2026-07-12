@@ -43,6 +43,10 @@ exports/review_bridge/jobs/review_.../
     subject/...
 ```
 
+The `exports/review_bridge/jobs` tree is durable recovery evidence. Root
+restore drills copy it alongside the catalog snapshot and verify every
+immutable artifact-ledger binding before the rehearsal can succeed.
+
 For a single-file subject, Continuum copies the file unchanged instead of wrapping it in another ZIP. That
 keeps the reviewed package SHA-256 equal to the original file SHA-256.
 

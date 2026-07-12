@@ -11,6 +11,11 @@
   head. Invalid payloads, malformed or cross-boundary links, incomplete conflict
   groups, unsupported edges, and scan overflow fail closed instead of allowing a
   corrupt Card to disappear from the authority decision.
+- Restore drills now preserve the durable review-relay `jobs` tree, so review
+  packets, capsules, findings, and receipts referenced by the artifact ledger
+  survive a root restore and verify by hash in the disposable rehearsal. Strict
+  root and restore checks now verify the complete immutable artifact ledger
+  instead of silently stopping at the newest 500 rows.
 - Made same-agent project-state checkpoints one atomic temporal authority chain:
   only the newest checkpoint is current, while predecessors remain historical
   evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint

@@ -87,6 +87,7 @@ RESTORE_DRILL_DURABLE_REL_PATHS = (
     Path("exports/operation_receipts"),
     Path("exports/operation_recovery"),
     Path("exports/recovery_drills"),
+    Path("exports/review_bridge/jobs"),
     Path("exports/restore_drills"),
     Path("exports/thread_recovery"),
 )
@@ -2891,7 +2892,7 @@ def _snapshot_manifest(snapshot_path: Path) -> dict[str, Any]:
 def _verify_artifact_ledger(
     root: Path,
     *,
-    limit: int = 500,
+    limit: int | None = None,
     relocation_root: Path | None = None,
 ) -> dict[str, Any]:
     if not is_initialized(root):
@@ -2929,16 +2930,17 @@ def _verify_artifact_ledger(
                 "relocated": 0,
                 "proof_archive": proof_archive,
             }
-        rows = conn.execute(
-            """
-            SELECT id, kind, uri, sha256, size_bytes
-            FROM artifacts
-            WHERE immutable = 1
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (max(1, int(limit)),),
-        ).fetchall()
+        query = """
+        SELECT id, kind, uri, sha256, size_bytes
+        FROM artifacts
+        WHERE immutable = 1
+        ORDER BY created_at DESC
+        """
+        parameters: tuple[int, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters = (max(1, int(limit)),)
+        rows = conn.execute(query, parameters).fetchall()
         for row in rows:
             if is_internal_absolute_uri(evidence_root, str(row["uri"])):
                 absolute_internal_uris.append(str(row["uri"]))

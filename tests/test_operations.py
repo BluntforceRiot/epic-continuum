@@ -42,6 +42,7 @@ from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT
 from continuum.core.operations import (
     OperationGuard,
     SNAPSHOT_COUNT_TABLES,
+    _verify_artifact_ledger,
     _proof_pack_hash,
     _stable_json_hash,
     append_operation_event,
@@ -1540,6 +1541,116 @@ class OperationLedgerTest(unittest.TestCase):
                 Path(copied_verification["verification_root"]).resolve(strict=False),
                 Path(result["drill_root"]).resolve(strict=False),
             )
+
+    def test_restore_drill_preserves_review_bridge_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            review_artifact = (
+                root
+                / "exports"
+                / "review_bridge"
+                / "jobs"
+                / "review_restore_fixture"
+                / "findings"
+                / "findings-001.json"
+            )
+            payload = b'{"review_complete":true}\n'
+            review_artifact.parent.mkdir(parents=True, exist_ok=True)
+            review_artifact.write_bytes(payload)
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="review_findings_json",
+                    uri=root_uri(root, review_artifact),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                    size_bytes=len(payload),
+                    immutable=True,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            snap = snapshot(root, reason="review_bridge_restore")
+
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertIn("exports/review_bridge/jobs", result["copied_durable_paths"])
+            restored_artifact = (
+                Path(result["drill_root"])
+                / review_artifact.relative_to(root)
+            )
+            self.assertEqual(restored_artifact.read_bytes(), payload)
+            self.assertTrue(result["artifact_ledger"]["ok"], result["artifact_ledger"])
+            self.assertEqual(result["artifact_ledger"]["missing"], 0)
+
+    def test_restore_drill_checks_artifact_ledger_beyond_500_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            artifact_dir = (
+                root
+                / "exports"
+                / "review_bridge"
+                / "jobs"
+                / "review_large_ledger_fixture"
+                / "findings"
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            oldest_artifact: Path | None = None
+            oldest_artifact_id: str | None = None
+            conn = connect(root)
+            try:
+                for index in range(501):
+                    artifact = artifact_dir / f"finding-{index:03d}.json"
+                    payload = f'{{"finding":{index}}}\n'.encode()
+                    artifact.write_bytes(payload)
+                    artifact_id = record_artifact(
+                        conn,
+                        kind="review_findings_json",
+                        uri=root_uri(root, artifact),
+                        sha256=hashlib.sha256(payload).hexdigest(),
+                        size_bytes=len(payload),
+                        immutable=True,
+                    )
+                    if index == 0:
+                        oldest_artifact = artifact
+                        oldest_artifact_id = artifact_id
+                assert oldest_artifact_id is not None
+                conn.execute(
+                    "UPDATE artifacts SET created_at = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00+00:00", oldest_artifact_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            snap = snapshot(root, reason="large_artifact_ledger_restore")
+            assert oldest_artifact is not None
+            oldest_uri = root_uri(root, oldest_artifact)
+            oldest_artifact.unlink()
+
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertFalse(result["ok"], result["checks"])
+            ledger = result["artifact_ledger"]
+            self.assertFalse(ledger["ok"], ledger)
+            self.assertEqual(ledger["row_count"], 501)
+            self.assertEqual(ledger["missing"], 1)
+            self.assertEqual(ledger["missing_artifacts"][0]["uri"], oldest_uri)
+
+            source_ledger = _verify_artifact_ledger(root)
+            self.assertFalse(source_ledger["ok"], source_ledger)
+            self.assertEqual(source_ledger["row_count"], 501)
+            self.assertEqual(source_ledger["missing"], 1)
 
     def test_restore_drill_uses_source_bound_archive_without_transplanting_machine_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - 2026-07-11
+## 0.3.0 - 2026-07-13
 
 - Added automatic latest-state resume discovery for the CLI and MCP surface,
   with strict personal resume modes, canonical partition lookup, immutable

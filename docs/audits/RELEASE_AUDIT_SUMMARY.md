@@ -23,16 +23,15 @@ Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The post-review Windows v0.3 source candidate ran 763 CI-equivalent unittest
-checks with 25 environment-gated skips; all 738 executed checks passed on each
-of Python 3.11, 3.12, and 3.13. An independent pytest run passed 740 tests with
-25 skips and 344 subtests. Ruff, mypy across 31 source files, compileall, fixture
-allowlist validation, wheel/sdist builds, Twine checks, and clean installs also
-passed. Deterministic release runs covered 20 ContinuityBench cases (1,200
-records and no v0.3 gate failures), five FaultBench cases, ScaleBench at 10 and
-100 events, and five EricMemoryBench cases (80 records). Recovery, strict root
-verification, restore, pack, and bundle verification passed from clean wheel and
-source-distribution installs.
+The final pre-release Windows v0.3 source tree ran in four disjoint pytest
+partitions: 930 tests passed, 26 environment- or optional-feature skips remained
+explicit, and 583 subtests passed. WSL on Python 3.12 independently ran the full
+Review Relay partition: 158 tests and 133 subtests passed with no skips. Ruff,
+mypy across 31 source files, compileall, fixture allowlist validation, and Git
+diff integrity checks passed. The canonical wheel and source distribution were
+reproduced from separate source-ZIP extractions, rebound by the release
+finalizer's two additional clean rebuilds, accepted by Twine, and exercised by
+clean installed-package `init` and `status` runs outside the repository.
 
 Release review hardening included:
 

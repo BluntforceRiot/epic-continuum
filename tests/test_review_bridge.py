@@ -23,7 +23,8 @@ from continuum.core.review_bridge import (
 )
 from continuum.core.permissions import posix_permissions_supported
 from continuum.core import review_bridge as review_bridge_module
-from continuum.core.operations import _verify_artifact_ledger
+from continuum.core.operations import _verify_artifact_ledger, restore_drill
+from continuum.core.store import snapshot
 from continuum.mcp_server import TOOLS, dispatch
 
 
@@ -808,7 +809,7 @@ class ReviewBridgeTest(unittest.TestCase):
             request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
             status = review_job_status(root, job_id=job["job_id"])
             payload = valid_review_payload({**request, **status})
-            Path(request["packet_uri"]).write_text("# Mutated packet\n", encoding="utf-8")
+            (root / Path(request["packet_uri"])).write_text("# Mutated packet\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "review-packet.md changed after job creation"):
                 ingest_reserved_response(root, job, json.dumps(payload))
@@ -992,7 +993,190 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertEqual(second_path.name, "response-002.raw.txt")
             self.assertNotEqual(first_path, second_path)
             self.assertIn(str(second_path), handoff)
-            self.assertEqual(Path(status["browser_response_uri"]), second_path)
+            self.assertEqual(Path(status["browser_response_uri"]).resolve(), second_path.resolve())
+
+    def test_restored_legacy_job_rebases_to_active_root_and_never_mutates_original(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            original_root = base / "original" / "continuum"
+            relocated_root = base / "unrelated" / "restored-continuum"
+            subject = base / "subject" / "release.zip"
+            subject.parent.mkdir(parents=True)
+            with zipfile.ZipFile(subject, "w") as archive:
+                archive.writestr("README.md", "# Restorable review subject\n")
+
+            job = create_review_job(
+                original_root,
+                subject_path=subject,
+                prompt="Review the restored release evidence.",
+                transport="manual",
+            )
+            first = review_browser_attempt_start(original_root, job_id=job["job_id"])
+            self.assertTrue(Path(first["response_uri"]).is_relative_to(original_root))
+            request_path = Path(job["request_uri"])
+            status_path = Path(job["status_uri"])
+            stored_request = json.loads(request_path.read_text(encoding="utf-8"))
+            stored_status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertLessEqual(
+                {key for key in review_bridge_module.STATUS_MUTABLE_KEYS if key.endswith("_uri")},
+                review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS,
+            )
+            self.assertLessEqual(
+                {"job_dir", "manual_handoff_uri", "snapshot_subject_path", "attempt_uri"},
+                review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS,
+            )
+            self.assertTrue(Path(stored_request["root"]).is_absolute())
+            self.assertTrue(Path(stored_request["subject_path"]).is_absolute())
+            self.assertFalse(Path(stored_request["snapshot_subject_path"]).is_absolute())
+            self.assertNotIn("job_dir", stored_request)
+            self.assertNotIn("manual_handoff_uri", stored_request)
+            for payload in (stored_request, stored_status):
+                for key in review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS:
+                    value = payload.get(key)
+                    if value not in (None, ""):
+                        self.assertFalse(Path(str(value)).is_absolute(), key)
+
+            snap = snapshot(original_root, reason="review_relay_relocation")
+            restored = restore_drill(
+                original_root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+            self.assertTrue(restored["ok"], restored["checks"])
+            review_bridge_module.shutil.copytree(Path(restored["drill_root"]), relocated_root)
+
+            relocated_job_dir = review_bridge_module.review_job_dir(relocated_root, job["job_id"])
+            relocated_request_path = relocated_job_dir / review_bridge_module.REVIEW_REQUEST_NAME
+            relocated_status_path = relocated_job_dir / review_bridge_module.REVIEW_STATUS_NAME
+            legacy_request = json.loads(relocated_request_path.read_text(encoding="utf-8"))
+            legacy_status = json.loads(relocated_status_path.read_text(encoding="utf-8"))
+            for payload_index, payload in enumerate((legacy_request, legacy_status)):
+                for key in review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS:
+                    value = payload.get(key)
+                    if value not in (None, ""):
+                        if payload_index == 0:
+                            payload[key] = (
+                                "/lost/linux/root/"
+                                + Path(str(value)).as_posix()
+                            )
+                        else:
+                            payload[key] = str(
+                                original_root / Path(str(value))
+                            )
+            relocated_request_path.write_text(json.dumps(legacy_request), encoding="utf-8")
+            relocated_status_path.write_text(json.dumps(legacy_status), encoding="utf-8")
+
+            sealed_original = base / "sealed-original"
+            Path(job["job_dir"]).rename(sealed_original)
+            original_job_dir = sealed_original
+            original_bytes = {
+                path.relative_to(original_job_dir).as_posix(): path.read_bytes()
+                for path in original_job_dir.rglob("*")
+                if path.is_file()
+            }
+
+            second = review_browser_attempt_start(relocated_root, job_id=job["job_id"])
+            self.assertTrue(Path(second["response_uri"]).is_relative_to(relocated_root))
+            request = review_bridge_module._load_request(relocated_root, job["job_id"])
+            status = review_job_status(relocated_root, job_id=job["job_id"])
+            payload = valid_review_payload({**request, **status})
+            Path(second["response_uri"]).write_text(json.dumps(payload), encoding="utf-8")
+            receipt = ingest_review_result(
+                relocated_root,
+                job_id=job["job_id"],
+                result_path=Path(second["response_uri"]),
+            )
+
+            self.assertTrue(receipt["ok"])
+            self.assertTrue(Path(receipt["ingest_receipt_uri"]).is_relative_to(relocated_root))
+            self.assertEqual(
+                original_bytes,
+                {
+                    path.relative_to(original_job_dir).as_posix(): path.read_bytes()
+                    for path in original_job_dir.rglob("*")
+                    if path.is_file()
+                },
+            )
+            final_status = json.loads(relocated_status_path.read_text(encoding="utf-8"))
+            for key in review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS:
+                value = final_status.get(key)
+                if value not in (None, ""):
+                    self.assertFalse(Path(str(value)).is_absolute(), key)
+            final_runtime_status = review_job_status(relocated_root, job_id=job["job_id"])
+            stored_attempt = json.loads(Path(final_runtime_status["last_attempt_uri"]).read_text(encoding="utf-8"))
+            stored_receipt = json.loads(Path(receipt["ingest_receipt_uri"]).read_text(encoding="utf-8"))
+            for record in (stored_attempt, stored_receipt):
+                for key in review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS:
+                    value = record.get(key)
+                    if value not in (None, ""):
+                        self.assertFalse(Path(str(value)).is_absolute(), key)
+
+    def test_relative_root_create_reserve_and_ingest_keeps_internal_references_relocatable(
+        self,
+    ) -> None:
+        previous_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            try:
+                os.chdir(base)
+                relative_root = Path("relative-continuum")
+                subject = Path("subject")
+                subject.mkdir()
+                (subject / "README.md").write_text(
+                    "# Relative-root review subject\n",
+                    encoding="utf-8",
+                )
+
+                job = create_review_job(
+                    relative_root,
+                    subject_path=subject,
+                    prompt="Review the relative-root release evidence.",
+                    transport="manual",
+                )
+                attempt = review_browser_attempt_start(
+                    relative_root,
+                    job_id=job["job_id"],
+                )
+                request = review_bridge_module._load_request(
+                    relative_root,
+                    job["job_id"],
+                )
+                status = review_job_status(relative_root, job_id=job["job_id"])
+                response_path = Path(attempt["response_uri"])
+                response_path.write_text(
+                    json.dumps(valid_review_payload({**request, **status})),
+                    encoding="utf-8",
+                )
+                receipt = ingest_review_result(
+                    relative_root,
+                    job_id=job["job_id"],
+                    result_path=response_path,
+                )
+
+                active_root = relative_root.resolve()
+                self.assertTrue(response_path.resolve().is_relative_to(active_root))
+                self.assertTrue(
+                    Path(receipt["ingest_receipt_uri"])
+                    .resolve()
+                    .is_relative_to(active_root)
+                )
+                job_dir = review_bridge_module.review_job_dir(
+                    relative_root,
+                    job["job_id"],
+                )
+                for record_path in (
+                    job_dir / review_bridge_module.REVIEW_REQUEST_NAME,
+                    job_dir / review_bridge_module.REVIEW_STATUS_NAME,
+                    Path(status["last_attempt_uri"]),
+                    Path(receipt["ingest_receipt_uri"]),
+                ):
+                    record = json.loads(record_path.read_text(encoding="utf-8"))
+                    for key in review_bridge_module.INTERNAL_JOB_REFERENCE_KEYS:
+                        value = record.get(key)
+                        if value not in (None, ""):
+                            self.assertFalse(Path(str(value)).is_absolute(), key)
+            finally:
+                os.chdir(previous_cwd)
 
     def test_concurrent_browser_attempt_reservations_are_serialized(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -1221,7 +1405,10 @@ class ReviewBridgeTest(unittest.TestCase):
             interrupted_status = json.loads(Path(interrupted["status_uri"]).read_text(encoding="utf-8"))
             self.assertEqual(interrupted["status"], "ingesting")
             self.assertEqual(interrupted["accepted_ingest_count"], 0)
-            self.assertEqual(interrupted_status["pending_response_json_uri"], str(response_json_path))
+            self.assertEqual(
+                interrupted_status["pending_response_json_uri"],
+                review_bridge_module._job_reference_uri(root, job["job_id"], response_json_path),
+            )
 
             receipt = ingest_review_result(root, job_id=job["job_id"], result_path=response_path)
             final_status = review_job_status(root, job_id=job["job_id"])
@@ -1750,7 +1937,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 self.assertIn("--query", command)
                 query = command[command.index("--query") + 1]
                 self.assertIn(request["packet_sha256"], query)
-                self.assertIn(request["packet_uri"], query)
+                self.assertIn(str((root / Path(request["packet_uri"])).resolve()), query)
                 self.assertNotIn("# Hermes subject", query)
                 return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
 

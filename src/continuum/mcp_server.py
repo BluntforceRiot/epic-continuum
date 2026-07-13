@@ -59,6 +59,7 @@ from .core.store import (
     init_db,
     recover_thread,
     record_project_state,
+    repair_invalid_project_state_checkpoints,
     resume_latest,
     rebuild_search_index,
     redact_legacy_secrets,
@@ -93,6 +94,7 @@ PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION,)
 MAX_MCP_REQUEST_BYTES = 256 * 1024
 MAX_MCP_JSON_DEPTH = 64
+MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
 
 
 def default_root() -> Path:
@@ -204,6 +206,38 @@ def optional_bool(args: JSON, key: str, default: bool = False) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be a boolean")
     return value
+
+
+def validate_project_state_repair_request(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    all_projects: bool,
+    limit: int,
+) -> int:
+    """Reject ambiguous or unbounded checkpoint repair before artifacts exist."""
+
+    for field, value in (
+        ("project_id", project_id),
+        ("session_id", session_id),
+    ):
+        if value is not None and not value.strip():
+            raise ValueError(f"checkpoint repair {field} must be non-empty")
+    if all_projects and (project_id is not None or session_id is not None):
+        raise ValueError(
+            "checkpoint repair all=true cannot be combined with project_id or "
+            "session_id"
+        )
+    if not all_projects and project_id is None and session_id is None:
+        raise ValueError(
+            "checkpoint repair requires project_id, session_id, or explicit all=true"
+        )
+    if isinstance(limit, bool) or not 1 <= int(limit) <= MAX_PROJECT_STATE_REPAIR_LIMIT:
+        raise ValueError(
+            "checkpoint repair limit must be between 1 and "
+            f"{MAX_PROJECT_STATE_REPAIR_LIMIT}"
+        )
+    return int(limit)
 
 
 def optional_metadata(args: JSON) -> JSON | None:
@@ -611,6 +645,106 @@ def tool_resume_latest(args: JSON) -> Any:
         snapshot_policy="none",
         snapshot_reason="resume packet is an export over existing evidence",
         result_touched_paths=lambda result: [result["packet_uri"]] if result.get("packet_uri") else [],
+        action=action,
+    )
+
+
+def tool_repair_project_state_checkpoints(args: JSON) -> Any:
+    project_id_value = optional_str(args, "project_id")
+    session_id_value = optional_str(args, "session_id")
+    all_projects = optional_bool(args, "all", False)
+    include_session_scoped = optional_bool(args, "include_session_scoped", False)
+    include_private = optional_bool(args, "include_private", False)
+    apply = optional_bool(args, "apply", False)
+    limit = validate_project_state_repair_request(
+        project_id=project_id_value,
+        session_id=session_id_value,
+        all_projects=all_projects,
+        limit=optional_int(args, "limit", 100),
+    )
+    root = root_arg(args)
+    project_id = validate_public_partition_arg(
+        root, "project_id", project_id_value
+    )
+    session_id = validate_public_partition_arg(
+        root, "session_id", session_id_value
+    )
+    if not apply:
+        return repair_invalid_project_state_checkpoints(
+            root,
+            project_id=project_id,
+            session_id=session_id,
+            all_projects=all_projects,
+            include_session_scoped=include_session_scoped,
+            include_private=include_private,
+            limit=limit,
+            dry_run=True,
+        )
+
+    def action(operation: OperationGuard) -> JSON:
+        result = repair_invalid_project_state_checkpoints(
+            root,
+            project_id=project_id,
+            session_id=session_id,
+            all_projects=all_projects,
+            include_session_scoped=include_session_scoped,
+            include_private=include_private,
+            limit=limit,
+            dry_run=False,
+        )
+        if result.get("ok") is False:
+            catalog_committed = bool(result.get("catalog_repair_committed"))
+            operation.cursor(
+                {
+                    "phase": (
+                        "project_state_catalog_repair_committed_postflight_failed"
+                        if catalog_committed
+                        else "project_state_repair_refused"
+                    ),
+                    "catalog_repair_committed": catalog_committed,
+                    "sidecar_sync": result.get("sidecar_sync"),
+                    "post_repair_semantic_ok": result.get(
+                        "post_repair_semantic_ok"
+                    ),
+                    "authority_topology_issue_count": result.get(
+                        "authority_topology_issue_count"
+                    ),
+                }
+            )
+            if catalog_committed:
+                raise RuntimeError(
+                    "project-state catalog repair committed, but required "
+                    "sidecar synchronization or postflight verification "
+                    "failed and remains deferred"
+                )
+            raise ValueError(
+                "project-state checkpoint repair refused because the authority "
+                "boundary cannot be repaired automatically"
+            )
+        operation.cursor(
+            {
+                "phase": "invalid_project_state_quarantined",
+                "quarantined_count": result.get("quarantined_count"),
+            }
+        )
+        return result
+
+    return guarded_tool(
+        root,
+        operation_type="mcp_repair_project_state_checkpoints",
+        title="Repair invalid project-state checkpoints",
+        intent={
+            "session_id": public_partition_label(session_id),
+            "project_id": public_partition_label(project_id),
+            "all_projects": all_projects,
+            "include_session_scoped": include_session_scoped,
+            "include_private": include_private,
+            "apply": True,
+            "limit": limit,
+        },
+        snapshot_policy="auto",
+        snapshot_reason="checkpoint quarantine changes Card authority pointers",
+        touched_paths=[root / "catalog" / "catalog.sqlite3"],
         action=action,
     )
 
@@ -1569,6 +1703,47 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         },
         tool_resume_latest,
     ),
+    "continuum_repair_project_state_checkpoints": (
+        "Preview or apply quarantine repair to an explicitly scoped project-state boundary.",
+        {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string"},
+                "project_id": {
+                    "type": "string",
+                    "description": "Project scope; may be combined with session_id for one exact boundary.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Exact session scope, including that session's private checkpoint evidence.",
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "Explicit root-wide scope; cannot be combined with project_id or session_id.",
+                },
+                "include_session_scoped": {
+                    "type": "boolean",
+                    "description": "Expand project/root scope to session-visible checkpoints.",
+                },
+                "include_private": {
+                    "type": "boolean",
+                    "description": "Expand project/root scope to private checkpoints.",
+                },
+                "apply": {
+                    "type": "boolean",
+                    "description": "Apply the previewed repair; false or omitted is read-only preview.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_PROJECT_STATE_REPAIR_LIMIT,
+                    "default": 100,
+                },
+            },
+            "additionalProperties": False,
+        },
+        tool_repair_project_state_checkpoints,
+    ),
     "continuum_yarn_health": (
         "Probe the configured local Yarn/Qwythos OpenAI-compatible endpoint without sending memory.",
         {
@@ -2116,6 +2291,7 @@ IDEMPOTENT_MUTATING_TOOLS = {
 
 DESTRUCTIVE_TOOLS = {
     "continuum_prune_memory",
+    "continuum_repair_project_state_checkpoints",
     "continuum_redact_legacy_secrets",
     "continuum_tier_storage",
 }

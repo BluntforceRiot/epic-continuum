@@ -825,15 +825,18 @@ class ResumeLatestTests(unittest.TestCase):
                     conn.close()
                 sync_card_sidecars_after_commit(root, [str(damaged["card_id"])])
 
+                repair_kwargs = {"project_id": "boundary-chain-project"}
+                if scope == "session":
+                    repair_kwargs["session_id"] = session_id
                 preview = store_module.repair_invalid_project_state_checkpoints(
                     root,
-                    project_id="boundary-chain-project",
                     dry_run=True,
+                    **repair_kwargs,
                 )
                 applied = store_module.repair_invalid_project_state_checkpoints(
                     root,
-                    project_id="boundary-chain-project",
                     dry_run=False,
+                    **repair_kwargs,
                 )
                 resume_kwargs = {"project_id": "boundary-chain-project"}
                 if scope == "session":
@@ -1160,7 +1163,7 @@ class ResumeLatestTests(unittest.TestCase):
                         current["card_id"],
                     )
 
-    def test_ordinary_source_noise_overflow_fails_resume_and_repair_closed(
+    def test_ordinary_source_noise_does_not_truncate_authority_verification(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1230,11 +1233,6 @@ class ResumeLatestTests(unittest.TestCase):
                     ],
                 )
                 conn.commit()
-                before = conn.execute(
-                    "SELECT card_type, project_id, status, supersedes_card_id, "
-                    "superseded_by_card_id FROM cards WHERE id = ?",
-                    (hidden["card_id"],),
-                ).fetchone()
             finally:
                 conn.close()
             sync_card_sidecars_after_commit(root, [str(hidden["card_id"])])
@@ -1249,35 +1247,20 @@ class ResumeLatestTests(unittest.TestCase):
                 project_id="source-noise-project",
                 dry_run=True,
             )
-            applied = store_module.repair_invalid_project_state_checkpoints(
-                root,
-                project_id="source-noise-project",
-                dry_run=False,
-            )
-            conn = connect(root)
-            try:
-                after = conn.execute(
-                    "SELECT card_type, project_id, status, supersedes_card_id, "
-                    "superseded_by_card_id FROM cards WHERE id = ?",
-                    (hidden["card_id"],),
-                ).fetchone()
-            finally:
-                conn.close()
-
             self.assertFalse(blocked["ok"], blocked)
             self.assertEqual(blocked["reason"], "authority_corrupt")
-            self.assertEqual(
-                blocked["authority_corruption"]["reason"],
-                "authorized_boundary_scan_overflow",
-            )
-            self.assertFalse(preview["ok"], preview)
-            self.assertFalse(applied["ok"], applied)
+            authority = blocked["authority_corruption"]
+            self.assertFalse(authority["boundary_scan_overflow"], authority)
             self.assertIn(
-                "repair_scan_overflow",
-                {issue["type"] for issue in applied["authority_topology_issues"]},
+                "source_bound_authority_boundary_mismatch",
+                {issue["type"] for issue in authority["topology_issues"]},
             )
-            self.assertEqual(applied["quarantined_count"], 0)
-            self.assertEqual(tuple(before), tuple(after))
+            self.assertTrue(preview["ok"], preview)
+            self.assertEqual(preview["quarantined_count"], 1)
+            self.assertNotIn(
+                "repair_scan_overflow",
+                {issue["type"] for issue in preview["authority_topology_issues"]},
+            )
 
     def test_source_coordinate_drift_cannot_hide_original_authority(self) -> None:
         cases = (
@@ -1400,6 +1383,7 @@ class ResumeLatestTests(unittest.TestCase):
                     root,
                     project_id="coordinate-project",
                     session_id=(session_id if scope == "session" else None),
+                    include_private=(name == "P4_type_source_private"),
                     dry_run=True,
                 )
 
@@ -1422,6 +1406,7 @@ class ResumeLatestTests(unittest.TestCase):
                             root,
                             project_id="coordinate-project",
                             session_id=(session_id if scope == "session" else None),
+                            include_private=(name == "P4_type_source_private"),
                             dry_run=False,
                         )
                     )
@@ -4220,7 +4205,7 @@ class ResumeLatestTests(unittest.TestCase):
             )
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
-    def test_resume_fails_closed_when_selected_boundary_scan_overflows(self) -> None:
+    def test_boundary_page_size_does_not_truncate_corruption_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             invalid_head_ids = []
@@ -4266,8 +4251,10 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertFalse(ambiguous["ok"], ambiguous)
             self.assertEqual(ambiguous["reason"], "authority_corrupt")
             details = ambiguous["authority_corruption"]
-            self.assertEqual(details["boundary_scan_limit"], 64)
-            self.assertTrue(details["boundary_scan_overflow"])
+            self.assertIsNone(details["boundary_scan_limit"])
+            self.assertEqual(details["boundary_scan_page_size"], 64)
+            self.assertFalse(details["boundary_scan_overflow"])
+            self.assertEqual(details["invalid_checkpoint_count"], 64)
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_invalid_selected_cross_agent_head_precedes_ambiguity(self) -> None:
@@ -4680,15 +4667,10 @@ class ResumeLatestTests(unittest.TestCase):
                     session_id="source-bound-session",
                     model_assist=False,
                 )
-                repair_scope = (
-                    {"project_id": "source-bound-session-project"}
-                    if mutation == "project_moved"
-                    else {"session_id": "source-bound-session"}
-                )
                 repaired = store_module.repair_invalid_project_state_checkpoints(
                     root,
+                    session_id="source-bound-session",
                     dry_run=False,
-                    **repair_scope,
                 )
                 resumed = resume_latest(
                     root,

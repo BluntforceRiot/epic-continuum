@@ -104,6 +104,7 @@ from .integrations.hermes_adapter import install_hermes_adapter
 
 
 ABSOLUTE_PATH_RE = re.compile(r"(?i)(?:[A-Z]:[\\/][^\s\"'<>|]+|/[^\s\"'<>]+)")
+MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
 
 
 def redact_cli_error_message(message: str) -> str:
@@ -149,6 +150,38 @@ def prevalidate_cli_partition(root: Path, kind: str, value: str | None) -> str |
         return redact_text_secrets(text)
     validate_partition_identifier(kind, text)
     return text
+
+
+def validate_project_state_repair_request(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    all_projects: bool,
+    limit: int,
+) -> int:
+    """Reject ambiguous or unbounded checkpoint repair before artifacts exist."""
+
+    for option, value in (
+        ("--project-id", project_id),
+        ("--session-id", session_id),
+    ):
+        if value is not None and not value.strip():
+            raise ValueError(f"checkpoint repair {option} must be non-empty")
+    if all_projects and (project_id is not None or session_id is not None):
+        raise ValueError(
+            "checkpoint repair --all cannot be combined with --project-id or "
+            "--session-id"
+        )
+    if not all_projects and project_id is None and session_id is None:
+        raise ValueError(
+            "checkpoint repair requires --project-id, --session-id, or explicit --all"
+        )
+    if isinstance(limit, bool) or not 1 <= int(limit) <= MAX_PROJECT_STATE_REPAIR_LIMIT:
+        raise ValueError(
+            "checkpoint repair limit must be between 1 and "
+            f"{MAX_PROJECT_STATE_REPAIR_LIMIT}"
+        )
+    return int(limit)
 
 
 def guarded_result(
@@ -447,7 +480,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair_state.add_argument("--root", required=True)
     p_repair_state.add_argument("--project-id")
     p_repair_state.add_argument("--session-id")
-    p_repair_state.add_argument("--limit", type=int, default=100)
+    p_repair_state.add_argument(
+        "--all",
+        dest="all_projects",
+        action="store_true",
+        help="Explicitly inspect every eligible project-state boundary",
+    )
+    p_repair_state.add_argument(
+        "--include-session-scoped",
+        action="store_true",
+        help="Expand project/root scope to session-visible checkpoints",
+    )
+    p_repair_state.add_argument(
+        "--include-private",
+        action="store_true",
+        help="Expand project/root scope to private checkpoints",
+    )
+    p_repair_state.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help=f"Maximum repair candidates to apply (1..{MAX_PROJECT_STATE_REPAIR_LIMIT})",
+    )
     p_repair_state.add_argument("--apply", action="store_true")
 
     p_audit = sub.add_parser("audit", help="Run safety/status audit")
@@ -909,6 +963,12 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "repair-project-state-checkpoints":
         assert root is not None
+        repair_limit = validate_project_state_repair_request(
+            project_id=args.project_id,
+            session_id=args.session_id,
+            all_projects=args.all_projects,
+            limit=args.limit,
+        )
         safe_session_id = prevalidate_cli_partition(root, "session_id", args.session_id)
         safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
         if not args.apply:
@@ -917,7 +977,10 @@ def _main(argv: list[str] | None = None) -> int:
                     root,
                     session_id=args.session_id,
                     project_id=args.project_id,
-                    limit=args.limit,
+                    all_projects=args.all_projects,
+                    include_session_scoped=args.include_session_scoped,
+                    include_private=args.include_private,
+                    limit=repair_limit,
                     dry_run=True,
                 )
             )
@@ -927,7 +990,10 @@ def _main(argv: list[str] | None = None) -> int:
                 root,
                 session_id=args.session_id,
                 project_id=args.project_id,
-                limit=args.limit,
+                all_projects=args.all_projects,
+                include_session_scoped=args.include_session_scoped,
+                include_private=args.include_private,
+                limit=repair_limit,
                 dry_run=False,
             )
             if result.get("ok") is False:
@@ -977,7 +1043,11 @@ def _main(argv: list[str] | None = None) -> int:
                 intent={
                     "session_id": safe_session_id,
                     "project_id": safe_project_id,
-                    "limit": args.limit,
+                    "all_projects": args.all_projects,
+                    "include_session_scoped": args.include_session_scoped,
+                    "include_private": args.include_private,
+                    "apply": True,
+                    "limit": repair_limit,
                 },
                 snapshot_policy="auto",
                 snapshot_reason="checkpoint quarantine changes Card authority pointers",

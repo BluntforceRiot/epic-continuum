@@ -420,6 +420,12 @@ continuum repair-project-state-checkpoints --root ./.continuum-demo --project-id
 continuum repair-project-state-checkpoints --root ./.continuum-demo --project-id epic-continuum --apply
 ```
 
+Checkpoint repair always requires a project, session, or explicit `--all` scope.
+Project/root scope does not inspect session-scoped or private checkpoints unless
+`--include-session-scoped` or `--include-private` is supplied. MCP agents have
+the same guarded preview/apply capability through
+`continuum_repair_project_state_checkpoints`.
+
 See [Recovery And Continuity](docs/recovery-and-continuity.md) for the failure
 and repair behavior.
 

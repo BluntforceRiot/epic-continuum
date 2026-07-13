@@ -45,15 +45,18 @@ continuum resolve-conflict --root <continuum-root> --card-id <winner-card-id> `
   --superseded-card-id <peer-card-id> --superseded-card-id <other-peer-card-id>
 ```
 
-Resume validates the complete bounded raw boundary before declaring it unique.
+Resume validates the complete raw boundary in bounded database pages before
+declaring it unique.
 Malformed competing or hidden payloads, asymmetric or cross-boundary pointers,
-unsupported edges, invalid conflict relationships or receipts, and scan
-overflow return `authority_corrupt` rather than removing a competing Card from
-consideration. A selected latest head that itself fails checkpoint validation
-retains the compatibility result `invalid_project_state_checkpoint`. Checkpoint
-repair uses the same raw-boundary view and refuses partial or unrepairable
-mutations. Exact source identity also detects a changed Card type, while modern
-Scroll-plus-graph evidence detects a missing derived authority Card.
+unsupported edges, and invalid conflict relationships or receipts return
+`authority_corrupt` rather than removing a competing Card from consideration.
+Page sizes bound each database read, not the valid lifetime of a project or
+shared root. A selected latest head that itself fails checkpoint validation
+retains the compatibility result `invalid_project_state_checkpoint`.
+Checkpoint repair uses the same raw-boundary view and refuses partial or
+unrepairable mutations. Exact source identity also detects a changed Card type,
+while modern Scroll-plus-graph evidence detects a missing derived authority
+Card.
 
 Temporal conflict dismissal and supersession are Continuum-owned state. A valid
 resolution receipt binds the exact component fingerprint, complete member set,

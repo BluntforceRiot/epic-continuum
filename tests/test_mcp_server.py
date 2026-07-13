@@ -332,6 +332,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("continuum_append_event", names)
         self.assertIn("continuum_recover_thread", names)
         self.assertIn("continuum_resume_latest", names)
+        self.assertIn("continuum_repair_project_state_checkpoints", names)
         self.assertIn("continuum_yarn_health", names)
         self.assertIn("continuum_resolve_conflict", names)
         self.assertIn("continuum_optimize_config", names)
@@ -351,6 +352,11 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertFalse(tools["continuum_import_mempalace"]["annotations"]["destructiveHint"])
         self.assertFalse(tools["continuum_rebuild_search_index"]["annotations"]["destructiveHint"])
         self.assertTrue(tools["continuum_prune_memory"]["annotations"]["destructiveHint"])
+        self.assertTrue(
+            tools["continuum_repair_project_state_checkpoints"]["annotations"][
+                "destructiveHint"
+            ]
+        )
         self.assertFalse(tools["continuum_status"]["annotations"]["openWorldHint"])
         self.assertFalse(tools["continuum_doctor"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_import_mempalace"]["annotations"]["openWorldHint"])
@@ -421,6 +427,9 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         search_props = TOOLS["continuum_search"][1]["properties"]
         reindex_props = TOOLS["continuum_reindex_memory"][1]["properties"]
         prune_props = TOOLS["continuum_prune_memory"][1]["properties"]
+        repair_props = TOOLS["continuum_repair_project_state_checkpoints"][1][
+            "properties"
+        ]
 
         self.assertIn("project_id", recover_props)
         self.assertNotIn("model_assist", recover_props)
@@ -445,6 +454,171 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(prune_props["limit"]["minimum"], 1)
         self.assertEqual(prune_props["limit"]["maximum"], MAX_PRUNE_MEMORY_LIMIT)
         self.assertEqual(prune_props["limit"]["default"], 100)
+        for key in (
+            "project_id",
+            "session_id",
+            "all",
+            "include_session_scoped",
+            "include_private",
+            "apply",
+            "limit",
+        ):
+            self.assertIn(key, repair_props)
+        self.assertEqual(repair_props["limit"]["minimum"], 1)
+        self.assertEqual(
+            repair_props["limit"]["maximum"],
+            mcp_server_module.MAX_PROJECT_STATE_REPAIR_LIMIT,
+        )
+        self.assertEqual(repair_props["limit"]["default"], 100)
+
+    def test_mcp_checkpoint_repair_requires_explicit_scope_before_artifacts(
+        self,
+    ) -> None:
+        cases = (
+            ({"apply": True}, "requires project_id, session_id, or explicit all=true"),
+            (
+                {"all": True, "project_id": "ambiguous-project", "apply": True},
+                "all=true cannot be combined",
+            ),
+            (
+                {"project_id": "bounded-project", "limit": 1001, "apply": True},
+                "limit must be between 1 and 1000",
+            ),
+        )
+        for arguments, expected_error in cases:
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                    response = call_tool_raw(
+                        "continuum_repair_project_state_checkpoints",
+                        {"root": str(root), **arguments},
+                    )
+
+                self.assertTrue(response["isError"], response)
+                payload = json.loads(response["content"][0]["text"])
+                self.assertIn(expected_error, payload["error"])
+                self.assertFalse(root.exists())
+
+    def test_mcp_checkpoint_repair_preview_apply_share_scope_and_receipt_flags(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            mock_result = {
+                "ok": True,
+                "quarantined_count": 0,
+                "quarantined": [],
+            }
+            common_args = {
+                "root": str(root),
+                "all": True,
+                "include_session_scoped": True,
+                "include_private": True,
+                "limit": 37,
+            }
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    mcp_server_module,
+                    "repair_invalid_project_state_checkpoints",
+                    return_value=mock_result,
+                ) as repair,
+            ):
+                preview = call_tool(
+                    "continuum_repair_project_state_checkpoints",
+                    common_args,
+                )
+                applied = call_tool(
+                    "continuum_repair_project_state_checkpoints",
+                    {**common_args, "apply": True},
+                )
+
+            self.assertNotIn("_operation", preview)
+            self.assertEqual(applied["_operation"]["status"], "succeeded")
+            self.assertEqual(repair.call_count, 2)
+            preview_kwargs = repair.call_args_list[0].kwargs
+            apply_kwargs = repair.call_args_list[1].kwargs
+            self.assertTrue(preview_kwargs.pop("dry_run"))
+            self.assertFalse(apply_kwargs.pop("dry_run"))
+            self.assertEqual(preview_kwargs, apply_kwargs)
+            self.assertEqual(
+                preview_kwargs,
+                {
+                    "project_id": None,
+                    "session_id": None,
+                    "all_projects": True,
+                    "include_session_scoped": True,
+                    "include_private": True,
+                    "limit": 37,
+                },
+            )
+            operation = next(
+                item
+                for item in list_operations(root)["operations"]
+                if item["operation_type"]
+                == "mcp_repair_project_state_checkpoints"
+            )
+            receipt = json.loads(
+                Path(operation["export_receipt_uri"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                receipt["intent"],
+                {
+                    "session_id": None,
+                    "project_id": None,
+                    "all_projects": True,
+                    "include_session_scoped": True,
+                    "include_private": True,
+                    "apply": True,
+                    "limit": 37,
+                    "preflight_snapshot_policy": "auto",
+                    "preflight_snapshot_reason": (
+                        "checkpoint quarantine changes Card authority pointers"
+                    ),
+                },
+            )
+
+    def test_mcp_checkpoint_repair_refusal_fails_guarded_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    mcp_server_module,
+                    "repair_invalid_project_state_checkpoints",
+                    return_value={
+                        "ok": False,
+                        "catalog_repair_committed": False,
+                        "authority_topology_issue_count": 1,
+                    },
+                ),
+            ):
+                response = call_tool_raw(
+                    "continuum_repair_project_state_checkpoints",
+                    {
+                        "root": str(root),
+                        "project_id": "refused-project",
+                        "apply": True,
+                    },
+                )
+
+            self.assertTrue(response["isError"], response)
+            payload = json.loads(response["content"][0]["text"])
+            self.assertIn("repair refused", payload["error"])
+            operation = next(
+                item
+                for item in list_operations(root, status="failed")["operations"]
+                if item["operation_type"]
+                == "mcp_repair_project_state_checkpoints"
+            )
+            self.assertEqual(operation["status"], "failed")
+            self.assertEqual(
+                operation["cursor"]["phase"],
+                "project_state_repair_refused",
+            )
+            self.assertFalse(operation["cursor"]["catalog_repair_committed"])
 
     def test_mcp_prune_memory_uses_literal_topics_and_bounded_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1170,6 +1344,10 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                         "continuum_doctor": {"root": root, "verify_recent_proof_packs": 0, "scan_secrets": False},
                         "continuum_tier_storage": {"root": root, "dry_run": True},
                         "continuum_prune_memory": {"root": root, "dry_run": True, "all": True},
+                        "continuum_repair_project_state_checkpoints": {
+                            "root": root,
+                            "all": True,
+                        },
                         "continuum_verify_proof_pack": {"root": root, "path": proof_path},
                         "continuum_verify_root": {
                             "root": root,

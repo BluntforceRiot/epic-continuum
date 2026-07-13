@@ -245,6 +245,121 @@ class ResumeCliTests(unittest.TestCase):
                 )
             )
 
+    def test_checkpoint_repair_requires_explicit_scope_before_artifacts(self) -> None:
+        cases = (
+            ([], "requires --project-id, --session-id, or explicit --all"),
+            (["--project-id", ""], "--project-id must be non-empty"),
+            (["--session-id", "   "], "--session-id must be non-empty"),
+            (
+                ["--all", "--project-id", "ambiguous-project"],
+                "--all cannot be combined",
+            ),
+            (
+                ["--project-id", "bounded-project", "--limit", "1001"],
+                "limit must be between 1 and 1000",
+            ),
+        )
+        for extra_args, expected_error in cases:
+            with self.subTest(extra_args=extra_args), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = cli_main(
+                        [
+                            "repair-project-state-checkpoints",
+                            "--root",
+                            str(root),
+                            *extra_args,
+                            "--apply",
+                        ]
+                    )
+
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, 1, result)
+                self.assertIn(expected_error, result["error"])
+                self.assertFalse(root.exists())
+
+    def test_checkpoint_repair_preview_apply_share_scope_and_receipt_flags(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            store_module.init_db(root)
+            preview_output = io.StringIO()
+            apply_output = io.StringIO()
+            mock_result = {
+                "ok": True,
+                "quarantined_count": 0,
+                "quarantined": [],
+            }
+            common_args = [
+                "repair-project-state-checkpoints",
+                "--root",
+                str(root),
+                "--all",
+                "--include-session-scoped",
+                "--include-private",
+                "--limit",
+                "37",
+            ]
+            with patch(
+                "continuum.cli.repair_invalid_project_state_checkpoints",
+                return_value=mock_result,
+            ) as repair:
+                with redirect_stdout(preview_output):
+                    preview_code = cli_main(common_args)
+                with redirect_stdout(apply_output):
+                    apply_code = cli_main([*common_args, "--apply"])
+
+            preview = json.loads(preview_output.getvalue())
+            applied = json.loads(apply_output.getvalue())
+            self.assertEqual(preview_code, 0, preview)
+            self.assertEqual(apply_code, 0, applied)
+            self.assertNotIn("_operation", preview)
+            self.assertEqual(applied["_operation"]["status"], "succeeded")
+            self.assertEqual(repair.call_count, 2)
+            preview_kwargs = repair.call_args_list[0].kwargs
+            apply_kwargs = repair.call_args_list[1].kwargs
+            self.assertTrue(preview_kwargs.pop("dry_run"))
+            self.assertFalse(apply_kwargs.pop("dry_run"))
+            self.assertEqual(preview_kwargs, apply_kwargs)
+            self.assertEqual(
+                preview_kwargs,
+                {
+                    "session_id": None,
+                    "project_id": None,
+                    "all_projects": True,
+                    "include_session_scoped": True,
+                    "include_private": True,
+                    "limit": 37,
+                },
+            )
+            operation = next(
+                item
+                for item in list_operations(root)["operations"]
+                if item["operation_type"]
+                == "cli_repair_project_state_checkpoints"
+            )
+            receipt = json.loads(
+                Path(operation["export_receipt_uri"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                receipt["intent"],
+                {
+                    "session_id": None,
+                    "project_id": None,
+                    "all_projects": True,
+                    "include_session_scoped": True,
+                    "include_private": True,
+                    "apply": True,
+                    "limit": 37,
+                    "preflight_snapshot_policy": "auto",
+                    "preflight_snapshot_reason": (
+                        "checkpoint quarantine changes Card authority pointers"
+                    ),
+                },
+            )
+
     def test_applied_repair_fails_its_receipt_for_asymmetric_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

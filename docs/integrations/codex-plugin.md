@@ -140,6 +140,13 @@ closed and reports the complete required peer list because the resume result
 contains only a bounded sample. Repeat every reported ID in
 `superseded_card_ids`. The complete boundary is required.
 
+If resume instead reports `repair_required`, call
+`continuum_repair_project_state_checkpoints` in preview mode first. Supply a
+project, session, or explicit global scope; root-wide scope requires `all=true`,
+and project/root scans include session-scoped or private checkpoints only when
+their separate opt-in flags are true. Apply with the identical arguments plus
+`apply=true`, then verify the successful operation receipt before resuming.
+
 ## Tool Surface
 
 - `continuum_init`
@@ -152,6 +159,7 @@ contains only a bounded sample. Repeat every reported ID in
 - `continuum_compile_context`
 - `continuum_recover_thread`
 - `continuum_resume_latest`
+- `continuum_repair_project_state_checkpoints`
 - `continuum_cue_recall`
 - `continuum_record_project_state`
 - `continuum_search`

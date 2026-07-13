@@ -102,6 +102,7 @@ class AdapterKitTest(unittest.TestCase):
 
         for expected in (
             "continuum_resume_latest",
+            "continuum_repair_project_state_checkpoints",
             "continuum_memory_health",
             "continuum_detect_conflicts",
             "continuum_resolve_conflict",

@@ -86,10 +86,12 @@ make one authoritative. If automatic resume validates more than one current
 head at the requested project/session boundary, it returns
 `authority_ambiguous`, sets `resolution_required`, and writes no recovery
 packet. Explicitly supersede or merge the competing component, then retry
-resume. Before classifying those heads, resume reconstructs the complete bounded
-raw authority boundary. Invalid checkpoint payloads, asymmetric or
+resume. Before classifying those heads, resume reconstructs the complete raw
+authority boundary in bounded database pages. Invalid checkpoint payloads,
+asymmetric or
 cross-boundary links, unsupported edges, incomplete conflict relationships,
-invalid receipts, and scan overflow fail closed and write no recovery packet.
+and invalid receipts fail closed and write no recovery packet. The complete
+boundary is read in bounded pages, so page size does not cap valid history.
 Boundary or topology corruption, including an invalid competing or hidden
 member, returns `authority_corrupt` and sets `repair_required`. For compatibility,
 a selected latest head that itself fails checkpoint validation retains the more
@@ -150,9 +152,37 @@ continuum repair-project-state-checkpoints \
   --apply
 ```
 
-A project-only repair scope also includes exact source-bound session/private
-checkpoint evidence associated with that project. Supply `--session-id` as well
-when the repair must be constrained to one session boundary.
+Repair requires `--project-id`, `--session-id`, or explicit `--all`; an omitted
+scope is rejected before operation artifacts are created. `--all` cannot be
+combined with a project or session selector. Project and root-wide scopes inspect
+project-visible checkpoints by default. Expand them deliberately with
+`--include-session-scoped` and, separately, `--include-private`. An exact
+`--session-id` authorizes that session boundary, including its session/private
+checkpoint evidence; combine it with `--project-id` when both coordinates are
+known.
+
+For explicit maintenance across the entire root, preview and apply the identical
+capability scope:
+
+```bash
+continuum repair-project-state-checkpoints \
+  --root ./.continuum-demo \
+  --all \
+  --include-session-scoped \
+  --include-private
+
+continuum repair-project-state-checkpoints \
+  --root ./.continuum-demo \
+  --all \
+  --include-session-scoped \
+  --include-private \
+  --apply
+```
+
+MCP callers use `continuum_repair_project_state_checkpoints` with the same
+`project_id`, `session_id`, `all`, `include_session_scoped`, `include_private`,
+`limit`, and `apply` fields. Omit `apply` or set it to false for preview. Applied
+CLI and MCP operation receipts record every scope and expansion flag.
 
 Repair never begins from the current-head predicate it is trying to validate.
 It reports hidden, invalid, current, and topology-linked Cards from the bounded
@@ -204,8 +234,9 @@ an atomic refusal because its prior status cannot be reconstructed safely. Exact
 conflict receipts that contain the quarantined Card remain preserved but are
 treated as retired evidence. If a preview reports `has_more` solely because the
 requested limit is too small, increase `--limit` (up to 1000) so the complete
-invalid set can be quarantined together. A reported topology or scan overflow is
-a hard bounded refusal and cannot be cleared by increasing the limit.
+invalid set can be quarantined together. A reported topology refusal cannot be
+cleared by increasing the limit. Authority scans page through the complete
+eligible scope instead of treating catalog size as corruption.
 
 ## Upgrade Backfill
 

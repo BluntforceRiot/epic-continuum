@@ -25,6 +25,8 @@ Use the Epic Continuum MCP tools when they are available:
 - `continuum_compile_context` to build a token-bounded Looking Glass context packet.
 - `continuum_recover_thread` to generate a crash-recovery packet.
 - `continuum_resume_latest` to discover and recover the newest durable project/session state when a thread id is unknown.
+- `continuum_repair_project_state_checkpoints` to preview or apply an explicitly
+  scoped quarantine repair when resume reports `repair_required`.
 - `continuum_cue_recall` to recover buried ideas from loose prompts when the user cannot remember exact wording.
 - `continuum_record_project_state` to leave a durable project checkpoint for other agents.
 - `continuum_ingest_file` to archive local files into the Library.
@@ -83,6 +85,15 @@ payload, malformed topology, incomplete conflict relationship, or unsupported
 edge, including an exact source-bound Card-type mismatch or a proven missing
 derived Card; corruption must not remove a competing Card from the resume
 decision.
+
+When resume reports `repair_required`, preview
+`continuum_repair_project_state_checkpoints` before applying it. Always supply a
+`project_id`, a `session_id`, or explicit `all=true`; never convert an omitted
+scope into root-wide repair. Project/root scope does not include session-scoped
+or private checkpoints unless `include_session_scoped` or `include_private` is
+explicitly true. An exact `session_id` authorizes that session boundary. Reuse
+the identical scope flags for preview and `apply=true`, then inspect the guarded
+operation receipt and post-repair verification before retrying resume.
 
 The recovery result includes:
 

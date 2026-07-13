@@ -45,7 +45,13 @@ exports/review_bridge/jobs/review_.../
 
 The `exports/review_bridge/jobs` tree is durable recovery evidence. Root
 restore drills copy it alongside the catalog snapshot and verify every
-immutable artifact-ledger binding before the rehearsal can succeed.
+immutable artifact-ledger binding before the rehearsal can succeed. Internal
+job references are stored relative to the Continuum root and are resolved only
+through the active job directory. A restored job can therefore reserve a new
+browser attempt and ingest its response after the original root is gone.
+Legacy absolute job references are rebased only when the same in-job evidence
+exists under the active root (and its recorded hash matches when available);
+they are never used to read or write through the old root.
 
 For a single-file subject, Continuum copies the file unchanged instead of wrapping it in another ZIP. That
 keeps the reviewed package SHA-256 equal to the original file SHA-256.
@@ -74,9 +80,16 @@ reported in `status.json`, `manual-handoff.md`, the mutable latest `browser-hand
 should use the immutable numbered handoff returned as `browser_handoff_uri` after `review-browser-attempt-start`.
 
 Only `review-capsule.zip` is intended to be uploaded or shared with the reviewer. The local job files
-(`request.json`, `status.json`, and `manual-handoff.md`) may contain local paths so Codex can resume,
-ingest, and run `review-check-current` on the original machine. The capsule's public request and source
-manifest use path-neutral `subject/` references instead.
+(`request.json`, `status.json`, and `manual-handoff.md`) may identify the original external subject so
+`review-check-current` can compare it when it remains available. References to copied Review Relay
+evidence are root-relative and relocatable. The capsule's public request and source manifest use
+path-neutral `subject/` references instead.
+
+The absolute `root` value in `request.json` is origin provenance only and is
+never resolved to access job evidence. `subject_path` deliberately names the
+external source so `review-check-current` can perform an optional live-source
+comparison; attempt reservation and result ingest depend only on the frozen,
+root-confined job evidence.
 
 The packet contains the review objective, Git snapshot, file manifest, selected text excerpts, coverage
 metadata, and optional diff material. Direct OpenAI-compatible review is a packet-only review. If the packet

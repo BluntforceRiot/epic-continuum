@@ -154,6 +154,51 @@ LEGACY_STATUS_IMMUTABLE_KEYS = {
     "review_capsule_uri",
     "review_capsule_sha256",
 }
+INTERNAL_JOB_REFERENCE_KEYS = {
+    "job_dir",
+    "snapshot_subject_path",
+    "subject_archive_uri",
+    "inner_archive_manifest_uri",
+    "subject_manifest_uri",
+    "request_uri",
+    "status_uri",
+    "packet_uri",
+    "prompt_uri",
+    "schema_uri",
+    "secret_allowlist_report_uri",
+    "review_capsule_uri",
+    "manual_handoff_uri",
+    "browser_handoff_uri",
+    "browser_handoff_latest_uri",
+    "browser_response_uri",
+    "browser_attempt_uri",
+    "last_attempt_uri",
+    "last_response_uri",
+    "raw_response_uri",
+    "reviewer_content_uri",
+    "findings_uri",
+    "findings_markdown_uri",
+    "ingest_receipt_uri",
+    "pending_response_json_uri",
+    "pending_findings_uri",
+    "pending_findings_markdown_uri",
+    "pending_ingest_receipt_uri",
+    "response_uri",
+    "attempt_uri",
+}
+# `root` is origin provenance and is never dereferenced as a job artifact.
+# `subject_path` deliberately identifies the external source for the optional
+# review-check-current comparison. Neither field is a durable internal job
+# reference, and attempt/ingest operations do not depend on either one.
+INTERNAL_JOB_REFERENCE_HASH_KEYS = {
+    "subject_archive_uri": "subject_archive_sha256",
+    "inner_archive_manifest_uri": "inner_archive_manifest_sha256",
+    "packet_uri": "packet_sha256",
+    "prompt_uri": "prompt_sha256",
+    "schema_uri": "schema_sha256",
+    "secret_allowlist_report_uri": "secret_allowlist_report_sha256",
+    "review_capsule_uri": "review_capsule_sha256",
+}
 STRICT_REVIEW_EXCLUSION_REASONS = {
     "non_regular_file",
     "path_outside_subject",
@@ -317,6 +362,116 @@ def _root_uri(root: Path, path: Path) -> str:
         return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
     except ValueError:
         return str(path.resolve(strict=False))
+
+
+def _job_reference_uri(root: Path, job_id: str, path: Path | str) -> str:
+    """Store a Review Relay reference relative to its active Continuum root."""
+    root_path = Path(root).resolve(strict=False)
+    job_path = review_job_dir(root_path, job_id).resolve(strict=False)
+    candidate = Path(str(path))
+    if not candidate.is_absolute():
+        cwd_candidate = candidate.resolve(strict=False)
+        try:
+            cwd_candidate.relative_to(job_path)
+        except (OSError, ValueError):
+            candidate = root_path / candidate
+        else:
+            candidate = cwd_candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(job_path)
+        return resolved.relative_to(root_path).as_posix()
+    except (OSError, ValueError) as exc:
+        raise ReviewBridgeError(f"review job reference escapes the active job root: {path}") from exc
+
+
+def _legacy_job_reference_candidate(root: Path, job_id: str, value: Path | str) -> Path:
+    """Map a legacy absolute job path to the same evidence location under root."""
+    parts = tuple(part for part in re.split(r"[\\/]+", str(value)) if part)
+    marker = ("exports", "review_bridge", "jobs", _safe_job_id(job_id))
+    marker_folded = tuple(part.casefold() for part in marker)
+    match_index: int | None = None
+    for index in range(0, len(parts) - len(marker) + 1):
+        if tuple(part.casefold() for part in parts[index : index + len(marker)]) == marker_folded:
+            match_index = index
+    if match_index is None:
+        raise ReviewBridgeError("legacy review job reference does not identify this job")
+    suffix = parts[match_index + len(marker) :]
+    if not suffix or any(part in {"", ".", ".."} for part in suffix):
+        raise ReviewBridgeError("legacy review job reference has no safe in-job evidence path")
+    return review_job_dir(root, job_id).joinpath(*suffix)
+
+
+def _resolve_job_reference(
+    root: Path,
+    job_id: str,
+    key: str,
+    value: Path | str,
+    *,
+    evidence: dict[str, Any],
+) -> Path:
+    """Resolve only through the active root, including legacy absolute references."""
+    root_path = Path(root).resolve(strict=False)
+    job_path = review_job_dir(root_path, job_id).resolve(strict=False)
+    raw_value = str(value)
+    stored = Path(raw_value)
+    foreign_absolute = bool(
+        re.match(r"^[A-Za-z]:[\\/]", raw_value)
+        or raw_value.startswith("\\\\")
+        or raw_value.startswith("/")
+    )
+    legacy_external = False
+    if stored.is_absolute() and not foreign_absolute:
+        try:
+            stored.resolve(strict=False).relative_to(job_path)
+            candidate = stored
+        except (OSError, ValueError):
+            candidate = _legacy_job_reference_candidate(root_path, job_id, stored)
+            legacy_external = True
+    elif foreign_absolute:
+        candidate = _legacy_job_reference_candidate(root_path, job_id, raw_value)
+        legacy_external = True
+    else:
+        candidate = root_path / stored
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(job_path)
+    except (OSError, ValueError) as exc:
+        raise ReviewBridgeError(f"review job reference escapes the active job root: {key}") from exc
+    if legacy_external:
+        if not resolved.exists() or resolved.is_symlink():
+            raise ReviewBridgeError(f"legacy review job reference has no matching in-job evidence: {key}")
+        hash_key = INTERNAL_JOB_REFERENCE_HASH_KEYS.get(key)
+        expected_hash = str(evidence.get(hash_key) or "") if hash_key else ""
+        if expected_hash:
+            if not resolved.is_file() or file_sha256(resolved) != expected_hash:
+                raise ReviewBridgeError(f"legacy review job reference evidence hash mismatch: {key}")
+    return resolved
+
+
+def _stored_job_record(root: Path, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    stored = dict(payload)
+    for key in INTERNAL_JOB_REFERENCE_KEYS:
+        value = stored.get(key)
+        if value not in (None, ""):
+            stored[key] = _job_reference_uri(root, job_id, value)
+    return stored
+
+
+def _materialized_job_record(
+    root: Path,
+    job_id: str,
+    payload: dict[str, Any],
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    materialized = dict(payload)
+    bindings = {**payload, **(evidence or {})}
+    for key in INTERNAL_JOB_REFERENCE_KEYS:
+        value = materialized.get(key)
+        if value not in (None, ""):
+            materialized[key] = str(_resolve_job_reference(root, job_id, key, value, evidence=bindings))
+    return materialized
 
 
 def _sha256_text(text: str) -> str:
@@ -2048,14 +2203,20 @@ def _trusted_review_objective(job: dict[str, Any]) -> str:
 
 
 def _write_status(root: Path, job_id: str, status: dict[str, Any]) -> None:
-    secure_write_text(review_job_dir(root, job_id) / REVIEW_STATUS_NAME, json_dumps(status))
+    secure_write_text(
+        review_job_dir(root, job_id) / REVIEW_STATUS_NAME,
+        json_dumps(_stored_job_record(root, job_id, status)),
+    )
 
 
 def _load_request(root: Path, job_id: str) -> dict[str, Any]:
     request_path = review_job_dir(root, job_id) / REVIEW_REQUEST_NAME
     if not request_path.exists():
         raise ReviewBridgeError(f"review job not found: {job_id}")
-    return json.loads(request_path.read_text(encoding="utf-8"))
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise ReviewBridgeError("review request is malformed")
+    return _materialized_job_record(root, job_id, request)
 
 
 def _canonical_review_status(
@@ -2082,7 +2243,8 @@ def _load_status(root: Path, job_id: str) -> dict[str, Any]:
     if not isinstance(status, dict):
         raise ReviewBridgeError("review status is malformed")
     request = _load_request(root, job_id)
-    canonical, migrated = _canonical_review_status(request, status)
+    materialized_status = _materialized_job_record(root, job_id, status, evidence=request)
+    canonical, migrated = _canonical_review_status(request, materialized_status)
     if not migrated:
         return canonical
     safe_job_id = _safe_job_id(job_id)
@@ -2093,7 +2255,8 @@ def _load_status(root: Path, job_id: str) -> dict[str, Any]:
         if not isinstance(current, dict):
             raise ReviewBridgeError("review status is malformed")
         current_request = _load_request(root, safe_job_id)
-        canonical, migrated = _canonical_review_status(current_request, current)
+        materialized_current = _materialized_job_record(root, safe_job_id, current, evidence=current_request)
+        canonical, migrated = _canonical_review_status(current_request, materialized_current)
         if migrated:
             _write_status(root, safe_job_id, canonical)
         return canonical
@@ -2114,9 +2277,9 @@ def _next_attempt_path(job_dir: Path) -> Path:
     return attempts_dir / f"attempt-{len(existing) + 1:03d}.json"
 
 
-def _write_attempt(job_dir: Path, payload: dict[str, Any]) -> Path:
+def _write_attempt(root: Path, job_id: str, job_dir: Path, payload: dict[str, Any]) -> Path:
     path = _next_attempt_path(job_dir)
-    secure_write_text(path, json_dumps(payload))
+    secure_write_text(path, json_dumps(_stored_job_record(root, job_id, payload)))
     return path
 
 
@@ -2520,7 +2683,7 @@ def create_review_job(
     )
     if generated_findings:
         _raise_secret_scan_block(generated_findings, cleanup_dir=job_dir)
-    secure_write_text(request_path, json_dumps(request))
+    secure_write_text(request_path, json_dumps(_stored_job_record(root, job_id, request)))
     capsule_path, capsule_sha256 = _write_review_capsule(
         job_dir,
         request,
@@ -2559,7 +2722,7 @@ def create_review_job(
     request["review_capsule_uri"] = str(capsule_path)
     request["review_capsule_sha256"] = capsule_sha256
     request["browser_handoff_uri"] = str(browser_handoff_path)
-    secure_write_text(request_path, json_dumps(request))
+    secure_write_text(request_path, json_dumps(_stored_job_record(root, job_id, request)))
     status = {
         "status": "prepared",
         "updated_at": utc_now(),
@@ -2581,7 +2744,7 @@ def create_review_job(
         _raise_secret_scan_block(prompt_findings, cleanup_dir=job_dir)
     secure_write_text(prompt_path, prompt_text)
     request["prompt_sha256"] = file_sha256(prompt_path)
-    secure_write_text(request_path, json_dumps(request))
+    secure_write_text(request_path, json_dumps(_stored_job_record(root, job_id, request)))
     job_for_handoff = _merge_job_state(request, status)
     browser_handoff_text = _browser_handoff_text(job_for_handoff)
     browser_findings = _scan_review_text_for_secrets(
@@ -2737,6 +2900,8 @@ def _review_browser_attempt_start_locked(root: Path, *, job_id: str) -> dict[str
             )
             secure_write_text(previous_path, json_dumps(previous_payload))
     attempt_uri = _write_attempt(
+        root,
+        job_id,
         job_dir,
         {
             "attempt": attempt_number,
@@ -2998,6 +3163,8 @@ def run_review_job(
             job["error"] = str(exc)
             job["error_type"] = type(exc).__name__
             attempt_uri = _write_attempt(
+                root,
+                job_id,
                 job_dir,
                 {
                     "attempt": attempt_count,
@@ -3021,6 +3188,8 @@ def run_review_job(
         job["error"] = str(exc)
         job["error_type"] = type(exc).__name__
         attempt_uri = _write_attempt(
+            root,
+            job_id,
             job_dir,
             {
                 "attempt": attempt_count,
@@ -3043,6 +3212,8 @@ def run_review_job(
     if content_path is not None:
         job["reviewer_content_uri"] = str(content_path)
     attempt_uri = _write_attempt(
+        root,
+        job_id,
         job_dir,
         {
             "attempt": attempt_count,
@@ -3569,9 +3740,9 @@ def _ingest_review_result_locked(
         }
         if reserved_attempt_uri:
             attempt_uri = Path(reserved_attempt_uri)
-            secure_write_text(attempt_uri, json_dumps(attempt_payload))
+            secure_write_text(attempt_uri, json_dumps(_stored_job_record(root, job_id, attempt_payload)))
         else:
-            attempt_uri = _write_attempt(job_dir, attempt_payload)
+            attempt_uri = _write_attempt(root, job_id, job_dir, attempt_payload)
         failed_job["attempt_count"] = failed_attempt_number
         failed_job["last_attempt_uri"] = str(attempt_uri)
         failed_job["accepted_ingest_count"] = 0
@@ -3603,7 +3774,7 @@ def _ingest_review_result_locked(
     }
     if resuming_ingest:
         for key, expected in pending_paths.items():
-            if job.get(key) != expected:
+            if not _same_path(job.get(key), Path(expected)):
                 raise ReviewBridgeError(f"review ingest resume metadata mismatch: {key}")
         pending_ingested_at = str(job.get("pending_ingested_at") or "")
         if not pending_ingested_at:
@@ -3645,7 +3816,7 @@ def _ingest_review_result_locked(
         "findings_sha256": file_sha256(findings_path),
         "operation_id": bound_operation_id,
     }
-    secure_write_text(receipt_path, json_dumps(receipt))
+    secure_write_text(receipt_path, json_dumps(_stored_job_record(root, job_id, receipt)))
 
     with connect(root) as conn:
         for path, kind in (
@@ -3693,17 +3864,21 @@ def _ingest_review_result_locked(
         secure_write_text(
             attempt_uri,
             json_dumps(
-                {
-                    "attempt": int(job.get("attempt_count") or 0),
-                    "transport": "browser",
-                    "started_at": None,
-                    "finished_at": job["updated_at"],
-                    "status": "ingested",
-                    "raw_response_uri": str(raw_response_path),
-                    "response_uri": str(response_json_path),
-                    "findings_uri": str(findings_path),
-                    "ingest_receipt_uri": str(receipt_path),
-                }
+                _stored_job_record(
+                    root,
+                    job_id,
+                    {
+                        "attempt": int(job.get("attempt_count") or 0),
+                        "transport": "browser",
+                        "started_at": None,
+                        "finished_at": job["updated_at"],
+                        "status": "ingested",
+                        "raw_response_uri": str(raw_response_path),
+                        "response_uri": str(response_json_path),
+                        "findings_uri": str(findings_path),
+                        "ingest_receipt_uri": str(receipt_path),
+                    },
+                )
             ),
         )
         job["last_attempt_uri"] = str(attempt_uri)

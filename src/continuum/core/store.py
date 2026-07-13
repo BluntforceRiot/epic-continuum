@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -9501,9 +9502,103 @@ def _record_project_state_quarantine(
     return record
 
 
+# These values are page/work-window sizes, not lifetime catalog ceilings.  Full
+# authority maintenance walks every page; unscoped interactive discovery uses
+# one newest-first window and then validates the selected boundary completely.
 PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT = 256
 PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT = 512
 PROJECT_STATE_REPAIR_SCAN_LIMIT = 1000
+MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
+PROJECT_STATE_REPAIR_VISIBILITY_SCOPES = (
+    "global",
+    "project",
+    "session",
+    "private",
+)
+
+
+def validate_project_state_repair_limit(value: int) -> int:
+    """Return one strict, bounded project-state repair apply limit."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_PROJECT_STATE_REPAIR_LIMIT
+    ):
+        raise ValueError(
+            "checkpoint repair limit must be between 1 and "
+            f"{MAX_PROJECT_STATE_REPAIR_LIMIT}"
+        )
+    return value
+
+
+def validate_project_state_repair_scope(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    all_projects: bool,
+) -> None:
+    """Require one explicit repair boundary without ambiguous root expansion."""
+
+    if not isinstance(all_projects, bool):
+        raise ValueError("checkpoint repair all_projects must be a boolean")
+    for field, value in (
+        ("project_id", project_id),
+        ("session_id", session_id),
+    ):
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ValueError(f"checkpoint repair {field} must be non-empty")
+    if all_projects and (project_id is not None or session_id is not None):
+        raise ValueError(
+            "checkpoint repair all_projects cannot be combined with project_id "
+            "or session_id"
+        )
+    if not all_projects and project_id is None and session_id is None:
+        raise ValueError(
+            "checkpoint repair requires project_id, session_id, or explicit "
+            "all_projects"
+        )
+
+
+def _fetch_rows_in_pages(
+    cursor: sqlite3.Cursor,
+    *,
+    page_size: int,
+) -> list[sqlite3.Row]:
+    """Drain a stable SQLite cursor in bounded pages without truncating it."""
+
+    bounded_page_size = max(1, int(page_size))
+    rows: list[sqlite3.Row] = []
+    while page := cursor.fetchmany(bounded_page_size):
+        rows.extend(page)
+    return rows
+
+
+def _existing_card_ids(
+    conn: sqlite3.Connection,
+    card_ids: Iterable[str],
+) -> set[str]:
+    """Resolve arbitrarily many Card IDs without relying on SQLite's bind cap."""
+
+    unique_ids = sorted(set(card_ids))
+    existing: set[str] = set()
+    for offset in range(0, len(unique_ids), PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT):
+        page = unique_ids[
+            offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+        ]
+        if not page:
+            continue
+        placeholders = ", ".join("?" for _ in page)
+        existing.update(
+            str(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM cards WHERE id IN ({placeholders})",
+                tuple(page),
+            ).fetchall()
+        )
+    return existing
 
 
 def _project_state_authority_select_fields(table: str = "cards") -> str:
@@ -9576,16 +9671,16 @@ def _project_state_boundary_rows(
     limit: int = PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
 ) -> list[sqlite3.Row]:
     boundary_sql, boundary_params = _project_state_boundary_sql(boundary)
-    return conn.execute(
+    cursor = conn.execute(
         f"""
         SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
         FROM cards
         WHERE card_type = 'project_state' AND {boundary_sql}
         ORDER BY created_at DESC, card_rowid DESC
-        LIMIT ?
         """,
-        (*boundary_params, int(limit) + 1),
-    ).fetchall()
+        boundary_params,
+    )
+    return _fetch_rows_in_pages(cursor, page_size=limit)
 
 
 def _source_bound_project_state_deterministic_identity_proven(
@@ -9693,13 +9788,27 @@ def _source_bound_project_state_rows(
     source_visibility_clause: str,
     source_visibility_params: tuple[Any, ...],
     limit: int,
+    complete: bool = True,
 ) -> tuple[list[sqlite3.Row], bool]:
     """Find Cards through authorized bound Scroll events, not Card scope fields."""
 
-    rows = conn.execute(
+    limit_sql = "" if complete else "LIMIT ?"
+    query_params: tuple[Any, ...] = (
+        MAX_STORED_PROJECT_STATE_BYTES,
+        MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+        MAX_STORED_PROJECT_STATE_BYTES,
+        MAX_STORED_PROJECT_STATE_BYTES,
+        MAX_STORED_PROJECT_STATE_BYTES,
+        *source_visibility_params,
+    )
+    if not complete:
+        query_params = (*query_params, int(limit) + 1)
+    cursor = conn.execute(
         f"""
         SELECT {_project_state_authority_select_fields('cards')},
+               source.rowid AS source_rowid,
                source.id AS bound_source_event_id,
+               source.created_at AS source_created_at,
                source.visibility_scope AS source_visibility_scope,
                source.session_id AS source_session_id,
                source.project_id AS source_project_id,
@@ -9917,19 +10026,16 @@ def _source_bound_project_state_rows(
               ) = 1
           AND {source_visibility_clause}
         ORDER BY cards.created_at DESC, cards.rowid DESC, source.id
-        LIMIT ?
+        {limit_sql}
         """,
-        (
-            MAX_STORED_PROJECT_STATE_BYTES,
-            MAX_STORED_PROJECT_STATE_METADATA_BYTES,
-            MAX_STORED_PROJECT_STATE_BYTES,
-            MAX_STORED_PROJECT_STATE_BYTES,
-            MAX_STORED_PROJECT_STATE_BYTES,
-            *source_visibility_params,
-            int(limit) + 1,
-        ),
-    ).fetchall()
-    raw_scan_overflow = len(rows) > int(limit)
+        query_params,
+    )
+    rows = (
+        _fetch_rows_in_pages(cursor, page_size=limit)
+        if complete
+        else cursor.fetchall()
+    )
+    raw_scan_overflow = not complete and len(rows) > int(limit)
     exact_rows: list[sqlite3.Row] = []
     for row in rows:
         if int(row["source_refs_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES:
@@ -10136,10 +10242,19 @@ def _proven_project_state_source_event_rows(
     source_visibility_clause: str,
     source_visibility_params: tuple[Any, ...],
     limit: int,
+    complete: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Return modern source events that deterministically bind a Card identity."""
 
-    rows = conn.execute(
+    limit_sql = "" if complete else "LIMIT ?"
+    query_params: tuple[Any, ...] = (
+        MAX_STORED_PROJECT_STATE_BYTES,
+        MAX_STORED_PROJECT_STATE_BYTES,
+        *source_visibility_params,
+    )
+    if not complete:
+        query_params = (*query_params, int(limit) + 1)
+    cursor = conn.execute(
         f"""
         SELECT source.rowid AS source_rowid,
                source.id AS bound_source_event_id,
@@ -10175,16 +10290,16 @@ def _proven_project_state_source_event_rows(
               ), '') != ''
           AND {source_visibility_clause}
         ORDER BY source.created_at DESC, source.rowid DESC
-        LIMIT ?
+        {limit_sql}
         """,
-        (
-            MAX_STORED_PROJECT_STATE_BYTES,
-            MAX_STORED_PROJECT_STATE_BYTES,
-            *source_visibility_params,
-            int(limit) + 1,
-        ),
-    ).fetchall()
-    scan_overflow = len(rows) > int(limit)
+        query_params,
+    )
+    rows = (
+        _fetch_rows_in_pages(cursor, page_size=limit)
+        if complete
+        else cursor.fetchall()
+    )
+    scan_overflow = not complete and len(rows) > int(limit)
     proven: list[dict[str, Any]] = []
     for row in rows:
         metadata = json_loads(row["bounded_source_metadata_json"], None)
@@ -10261,6 +10376,7 @@ def _source_proven_project_state_card_rows(
     source_visibility_clause: str,
     source_visibility_params: tuple[Any, ...],
     limit: int,
+    complete: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Fetch authority Cards by graph-proven source-derived deterministic ID."""
 
@@ -10269,6 +10385,7 @@ def _source_proven_project_state_card_rows(
         source_visibility_clause=source_visibility_clause,
         source_visibility_params=source_visibility_params,
         limit=limit,
+        complete=complete,
     )
     output: list[dict[str, Any]] = []
     for source_row in source_rows:
@@ -10304,7 +10421,10 @@ def _source_proven_project_state_card_rows(
         ),
         reverse=True,
     )
-    return output[: int(limit) + 1], source_scan_overflow
+    return (
+        output if complete else output[: int(limit) + 1],
+        source_scan_overflow,
+    )
 
 
 def _orphan_project_state_source_events(
@@ -10313,26 +10433,19 @@ def _orphan_project_state_source_events(
     source_visibility_clause: str,
     source_visibility_params: tuple[Any, ...],
     limit: int,
+    complete: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     proven_rows, scan_overflow = _proven_project_state_source_event_rows(
         conn,
         source_visibility_clause=source_visibility_clause,
         source_visibility_params=source_visibility_params,
         limit=limit,
+        complete=complete,
     )
     expected_ids = sorted(
         {str(row["expected_card_id"]) for row in proven_rows}
     )
-    existing_ids: set[str] = set()
-    if expected_ids:
-        placeholders = ", ".join("?" for _ in expected_ids)
-        existing_ids = {
-            str(row["id"])
-            for row in conn.execute(
-                f"SELECT id FROM cards WHERE id IN ({placeholders})",
-                tuple(expected_ids),
-            ).fetchall()
-        }
+    existing_ids = _existing_card_ids(conn, expected_ids)
     return (
         [
             row
@@ -10350,33 +10463,39 @@ def _project_state_boundary_proven_edges(
     valid_agents: dict[str, str],
     allowed_divergent_member_ids: frozenset[str] = frozenset(),
 ) -> tuple[set[tuple[str, str]], bool, list[dict[str, Any]]]:
-    """Return exact receipt/audit-proven fan-in edges for one bounded boundary."""
+    """Return exact receipt/audit-proven fan-in edges for one complete boundary."""
 
     if not by_id:
         return set(), False, []
     card_ids = sorted(by_id)
-    placeholders = ", ".join("?" for _ in card_ids)
     proven: set[tuple[str, str]] = set()
+    # Retained in the return shape for compatibility. Complete page walks do
+    # not convert catalog size into an authority failure.
     proof_overflow = False
     proof_issues: list[dict[str, Any]] = []
     valid_dismissal_members: dict[str, set[str]] = {}
 
-    audit_rows = conn.execute(
-        f"""
-        SELECT actor, target_id, payload_json,
-               length(CAST(payload_json AS BLOB)) AS payload_bytes
-        FROM audit_events
-        WHERE action = 'project_state_superseded'
-          AND target_type = 'card'
-          AND target_id IN ({placeholders})
-        ORDER BY created_at, id
-        LIMIT ?
-        """,
-        (*card_ids, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
-    ).fetchall()
-    if len(audit_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-        proof_overflow = True
-    for audit_row in audit_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+    audit_rows: list[sqlite3.Row] = []
+    for offset in range(0, len(card_ids), PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT):
+        card_page = card_ids[
+            offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+        ]
+        placeholders = ", ".join("?" for _ in card_page)
+        audit_rows.extend(
+            conn.execute(
+                f"""
+                SELECT actor, target_id, payload_json,
+                       length(CAST(payload_json AS BLOB)) AS payload_bytes
+                FROM audit_events
+                WHERE action = 'project_state_superseded'
+                  AND target_type = 'card'
+                  AND target_id IN ({placeholders})
+                ORDER BY created_at, id
+                """,
+                tuple(card_page),
+            ).fetchall()
+        )
+    for audit_row in audit_rows:
         if int(audit_row["payload_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES:
             continue
         successor_id = str(audit_row["target_id"] or "")
@@ -10391,7 +10510,6 @@ def _project_state_boundary_proven_edges(
             not isinstance(authority, dict)
             or not isinstance(predecessor_ids, list)
             or not predecessor_ids
-            or len(predecessor_ids) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
             or not all(isinstance(value, str) and value for value in predecessor_ids)
             or len(predecessor_ids) != len(set(predecessor_ids))
             or direct_predecessor not in predecessor_ids
@@ -10443,24 +10561,45 @@ def _project_state_boundary_proven_edges(
             }
         )
     elif receipt_tables.issubset(tables):
-        orphan_member_rows = conn.execute(
-            f"""
-            SELECT member.receipt_id, member.card_id
-            FROM conflict_resolution_members AS member
-            LEFT JOIN conflict_resolution_receipts AS receipt
-              ON receipt.id = member.receipt_id
-            WHERE receipt.id IS NULL
-              AND member.card_id IN ({placeholders})
-            ORDER BY member.receipt_id, member.card_id
-            LIMIT ?
-            """,
-            (*card_ids, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
-        ).fetchall()
-        if len(orphan_member_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-            proof_overflow = True
-        for orphan_row in orphan_member_rows[
-            :PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
-        ]:
+        orphan_member_rows: list[sqlite3.Row] = []
+        receipt_rows_by_id: dict[str, sqlite3.Row] = {}
+        for offset in range(
+            0,
+            len(card_ids),
+            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        ):
+            card_page = card_ids[
+                offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+            ]
+            placeholders = ", ".join("?" for _ in card_page)
+            orphan_member_rows.extend(
+                conn.execute(
+                    f"""
+                    SELECT member.receipt_id, member.card_id
+                    FROM conflict_resolution_members AS member
+                    LEFT JOIN conflict_resolution_receipts AS receipt
+                      ON receipt.id = member.receipt_id
+                    WHERE receipt.id IS NULL
+                      AND member.card_id IN ({placeholders})
+                    ORDER BY member.receipt_id, member.card_id
+                    """,
+                    tuple(card_page),
+                ).fetchall()
+            )
+            for receipt_row in conn.execute(
+                f"""
+                SELECT DISTINCT receipt.*
+                FROM conflict_resolution_receipts AS receipt
+                LEFT JOIN conflict_resolution_members AS member
+                  ON member.receipt_id = receipt.id
+                WHERE receipt.selected_card_id IN ({placeholders})
+                   OR member.card_id IN ({placeholders})
+                ORDER BY receipt.created_at, receipt.id
+                """,
+                (*card_page, *card_page),
+            ).fetchall():
+                receipt_rows_by_id[str(receipt_row["id"])] = receipt_row
+        for orphan_row in orphan_member_rows:
             proof_issues.append(
                 {
                     "type": "orphan_conflict_resolution_member",
@@ -10468,26 +10607,11 @@ def _project_state_boundary_proven_edges(
                     "card_id": str(orphan_row["card_id"] or ""),
                 }
             )
-        receipt_rows = conn.execute(
-            f"""
-            SELECT DISTINCT receipt.*
-            FROM conflict_resolution_receipts AS receipt
-            LEFT JOIN conflict_resolution_members AS member
-              ON member.receipt_id = receipt.id
-            WHERE receipt.selected_card_id IN ({placeholders})
-               OR member.card_id IN ({placeholders})
-            ORDER BY receipt.created_at, receipt.id
-            LIMIT ?
-            """,
-            (
-                *card_ids,
-                *card_ids,
-                PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
-            ),
-        ).fetchall()
-        if len(receipt_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-            proof_overflow = True
-        for receipt_row in receipt_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+        receipt_rows = sorted(
+            receipt_rows_by_id.values(),
+            key=lambda row: (str(row["created_at"] or ""), str(row["id"])),
+        )
+        for receipt_row in receipt_rows:
             receipt_id = str(receipt_row["id"] or "")
             member_rows = conn.execute(
                 """
@@ -10495,28 +10619,34 @@ def _project_state_boundary_proven_edges(
                 FROM conflict_resolution_members
                 WHERE receipt_id = ?
                 ORDER BY member_ordinal, card_id
-                LIMIT ?
                 """,
-                (receipt_id, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+                (receipt_id,),
             ).fetchall()
-            if len(member_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-                proof_overflow = True
-                continue
             member_ids = [str(row["card_id"] or "") for row in member_rows]
             receipt_by_id = dict(by_id)
             missing_member_ids = sorted(set(member_ids) - set(receipt_by_id))
             if missing_member_ids:
-                missing_placeholders = ", ".join(
-                    "?" for _ in missing_member_ids
-                )
-                outside_member_rows = conn.execute(
-                    f"""
-                    SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
-                    FROM cards
-                    WHERE id IN ({missing_placeholders})
-                    """,
-                    tuple(missing_member_ids),
-                ).fetchall()
+                outside_member_rows: list[sqlite3.Row] = []
+                for offset in range(
+                    0,
+                    len(missing_member_ids),
+                    PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+                ):
+                    member_page = missing_member_ids[
+                        offset : offset
+                        + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+                    ]
+                    missing_placeholders = ", ".join("?" for _ in member_page)
+                    outside_member_rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
+                            FROM cards
+                            WHERE id IN ({missing_placeholders})
+                            """,
+                            tuple(member_page),
+                        ).fetchall()
+                    )
                 receipt_by_id.update(
                     {str(row["id"]): row for row in outside_member_rows}
                 )
@@ -10638,18 +10768,16 @@ def _project_state_authority_boundary_report(
     conn: sqlite3.Connection,
     boundary: tuple[str, str, str],
 ) -> dict[str, Any]:
-    """Reconstruct and validate one complete, bounded authority boundary."""
+    """Reconstruct and validate one complete authority boundary in pages."""
 
     rows = _project_state_boundary_rows(conn, boundary)
-    overflow = len(rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
-    bounded_rows = rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]
     by_id: dict[str, ProjectStateRow] = {
-        str(row["id"]): row for row in bounded_rows
+        str(row["id"]): row for row in rows
     }
     invalid_checkpoints: list[dict[str, str]] = []
     quarantined_ids: set[str] = set()
     valid_agents: dict[str, str] = {}
-    for row in bounded_rows:
+    for row in rows:
         card_id = str(row["id"])
         if _valid_project_state_quarantine(conn, card_id) is not None:
             quarantined_ids.add(card_id)
@@ -10685,11 +10813,6 @@ def _project_state_authority_boundary_report(
             issue_keys.add(issue_key)
             issues.append(issue)
 
-    if overflow:
-        add_issue(
-            "boundary_scan_overflow",
-            boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
-        )
     proven_edges, proof_overflow, proof_issues = (
         _project_state_boundary_proven_edges(
             conn,
@@ -10719,33 +10842,32 @@ def _project_state_authority_boundary_report(
     card_ids = sorted(by_id)
     outside_rows: list[sqlite3.Row] = []
     if card_ids:
-        placeholders = ", ".join("?" for _ in card_ids)
-        outside_rows = conn.execute(
-            f"""
-            SELECT id, card_type, visibility_scope, session_id, project_id,
-                   supersedes_card_id, superseded_by_card_id
-            FROM cards
-            WHERE id NOT IN ({placeholders})
-              AND (
-                    supersedes_card_id IN ({placeholders})
-                 OR superseded_by_card_id IN ({placeholders})
-              )
-            ORDER BY id
-            LIMIT ?
-            """,
-            (
-                *card_ids,
-                *card_ids,
-                *card_ids,
-                PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
-            ),
-        ).fetchall()
-        if len(outside_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-            add_issue(
-                "incoming_authority_link_scan_overflow",
-                boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
-            )
-        for outside_row in outside_rows[:PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT]:
+        outside_by_id: dict[str, sqlite3.Row] = {}
+        for offset in range(
+            0,
+            len(card_ids),
+            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        ):
+            card_page = card_ids[
+                offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+            ]
+            placeholders = ", ".join("?" for _ in card_page)
+            for linked_row in conn.execute(
+                f"""
+                SELECT id, card_type, visibility_scope, session_id, project_id,
+                       supersedes_card_id, superseded_by_card_id
+                FROM cards
+                WHERE supersedes_card_id IN ({placeholders})
+                   OR superseded_by_card_id IN ({placeholders})
+                ORDER BY id
+                """,
+                (*card_page, *card_page),
+            ).fetchall():
+                linked_id = str(linked_row["id"])
+                if linked_id not in by_id:
+                    outside_by_id[linked_id] = linked_row
+        outside_rows = [outside_by_id[card_id] for card_id in sorted(outside_by_id)]
+        for outside_row in outside_rows:
             add_issue(
                 "cross_boundary_or_type_authority_link",
                 card_id=str(outside_row["id"]),
@@ -10905,17 +11027,9 @@ def _project_state_authority_boundary_report(
             FROM cards
             WHERE conflict_group = ?
             ORDER BY id
-            LIMIT ?
             """,
-            (group, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+            (group,),
         ).fetchall()
-        if len(group_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-            add_issue(
-                "conflict_group_scan_overflow",
-                conflict_group=group,
-                boundary_scan_limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
-            )
-            continue
         group_member_ids = [str(group_row["id"]) for group_row in group_rows]
         if len(group_member_ids) < 2:
             add_issue(
@@ -10945,15 +11059,16 @@ def _project_state_authority_boundary_report(
         if str(by_id[card_id]["conflict_group"] or "").strip()
     )
     return {
-        "ok": not overflow and not invalid_checkpoints and not issues,
+        "ok": not invalid_checkpoints and not issues,
         "boundary": {
             "visibility_scope": boundary[0],
             "project_id": boundary[1] or None,
             "session_id": boundary[2] or None,
         },
-        "card_count": len(bounded_rows),
-        "boundary_scan_limit": PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
-        "boundary_scan_overflow": overflow,
+        "card_count": len(rows),
+        "boundary_scan_limit": None,
+        "boundary_scan_page_size": PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        "boundary_scan_overflow": False,
         "invalid_checkpoint_count": len(invalid_checkpoints),
         "invalid_checkpoints": invalid_checkpoints[:20],
         "topology_issue_count": len(issues),
@@ -11055,18 +11170,68 @@ def repair_invalid_project_state_checkpoints(
     *,
     project_id: str | None = None,
     session_id: str | None = None,
+    all_projects: bool = False,
+    include_session_scoped: bool = False,
+    include_private: bool = False,
     limit: int = 100,
     dry_run: bool = True,
 ) -> dict[str, Any]:
     """Scan complete authority boundaries and quarantine invalid checkpoints."""
 
+    validate_project_state_repair_scope(
+        project_id=project_id,
+        session_id=session_id,
+        all_projects=all_projects,
+    )
+    limit = validate_project_state_repair_limit(limit)
+    if not isinstance(include_session_scoped, bool):
+        raise ValueError("checkpoint repair include_session_scoped must be a boolean")
+    if not isinstance(include_private, bool):
+        raise ValueError("checkpoint repair include_private must be a boolean")
+    authorized_visibility_scopes = ["global", "project"]
+    if session_id is not None:
+        authorized_visibility_scopes = list(PROJECT_STATE_REPAIR_VISIBILITY_SCOPES)
+    else:
+        if include_session_scoped:
+            authorized_visibility_scopes.append("session")
+        if include_private:
+            authorized_visibility_scopes.append("private")
+    repair_scope: dict[str, Any] = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "all_projects": all_projects,
+        "include_session_scoped": include_session_scoped,
+        "include_private": include_private,
+        "authorized_visibility_scopes": authorized_visibility_scopes,
+        "limit": limit,
+    }
+    full_root_visibility = bool(
+        all_projects
+        and authorized_visibility_scopes
+        == list(PROJECT_STATE_REPAIR_VISIBILITY_SCOPES)
+    )
     if not is_initialized(root):
-        return {"ok": False, "initialized": False, "quarantined_count": 0}
-    limit = max(1, min(int(limit), 1000))
+        return {
+            "ok": False,
+            "initialized": False,
+            "quarantined_count": 0,
+            "repair_scope": repair_scope,
+        }
     project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
     session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
-    clauses = ["card_type = 'project_state'"]
-    params: list[Any] = []
+    repair_scope["project_id"] = project_id
+    repair_scope["session_id"] = session_id
+    visibility_placeholders = ", ".join(
+        "?" for _ in authorized_visibility_scopes
+    )
+    clauses = [
+        "card_type = 'project_state'",
+        (
+            f"(visibility_scope IN ({visibility_placeholders}) OR "
+            "visibility_scope NOT IN ('global', 'project', 'session', 'private'))"
+        ),
+    ]
+    params: list[Any] = list(authorized_visibility_scopes)
     if project_id:
         clauses.append("project_id = ?")
         params.append(project_id)
@@ -11097,24 +11262,32 @@ def repair_invalid_project_state_checkpoints(
                 conn=conn,
                 check_card_sidecars=False,
             )
-        direct_seed_rows = conn.execute(
+        direct_seed_cursor = conn.execute(
             f"""
             SELECT {select_fields} FROM cards
             WHERE {' AND '.join(clauses)}
-            ORDER BY created_at DESC, rowid DESC LIMIT ?
+            ORDER BY created_at DESC, rowid DESC
             """,
-            (*params, PROJECT_STATE_REPAIR_SCAN_LIMIT + 1),
-        ).fetchall()
-        source_clauses: list[str] = ["1 = 1"]
-        source_params: list[Any] = []
+            tuple(params),
+        )
+        direct_seed_rows = _fetch_rows_in_pages(
+            direct_seed_cursor,
+            page_size=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+        )
+        source_clauses: list[str] = [
+            (
+                f"(source.visibility_scope IN ({visibility_placeholders}) OR "
+                "source.visibility_scope NOT IN "
+                "('global', 'project', 'session', 'private'))"
+            )
+        ]
+        source_params: list[Any] = list(authorized_visibility_scopes)
         if project_id:
             source_clauses.append(
                 """
                 (
                     coalesce(source.project_id, '') = ?
-                    OR (
-                        source.visibility_scope IN ('session', 'private')
-                        AND json_extract(
+                    OR json_extract(
                             CASE
                                 WHEN length(CAST(source.metadata_json AS BLOB)) <= ?
                                  AND json_valid(source.metadata_json)
@@ -11123,7 +11296,6 @@ def repair_invalid_project_state_checkpoints(
                             END,
                             '$.project_id'
                         ) = ?
-                    )
                     OR json_extract(
                         CASE
                             WHEN length(CAST(cards.metadata_json AS BLOB)) <= ?
@@ -11203,8 +11375,14 @@ def repair_invalid_project_state_checkpoints(
             limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
             )
         )
-        orphan_source_clauses: list[str] = ["1 = 1"]
-        orphan_source_params: list[Any] = []
+        orphan_source_clauses: list[str] = [
+            (
+                f"(source.visibility_scope IN ({visibility_placeholders}) OR "
+                "source.visibility_scope NOT IN "
+                "('global', 'project', 'session', 'private'))"
+            )
+        ]
+        orphan_source_params: list[Any] = list(authorized_visibility_scopes)
         if project_id:
             orphan_source_clauses.append(
                 """
@@ -11248,6 +11426,61 @@ def repair_invalid_project_state_checkpoints(
         source_seed_rows: list[ProjectStateRow] = list(
             merged_source_seed_rows.values()
         )
+        durable_direct_source_rows: dict[str, list[ProjectStateRow]] = {}
+        direct_seed_card_ids = sorted(
+            {str(row["id"]) for row in direct_seed_rows}
+        )
+        for offset in range(
+            0,
+            len(direct_seed_card_ids),
+            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+        ):
+            card_id_page = direct_seed_card_ids[
+                offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+            ]
+            placeholders = ", ".join("?" for _ in card_id_page)
+            page_source_rows, _ = _source_bound_project_state_rows(
+                conn,
+                source_visibility_clause=f"cards.id IN ({placeholders})",
+                source_visibility_params=tuple(card_id_page),
+                limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+            )
+            for page_source_row in page_source_rows:
+                durable_direct_source_rows.setdefault(
+                    str(page_source_row["id"]),
+                    [],
+                ).append(page_source_row)
+
+        def durable_source_is_authorized(
+            source_row: ProjectStateRow,
+        ) -> bool:
+            try:
+                source_boundary = _project_state_source_authority_boundary(
+                    source_row
+                )
+            except ValueError:
+                # An invalid visibility value has no valid narrower capability;
+                # retain it only when the ordinary scoped source query admitted it.
+                return str(source_row["id"]) in merged_source_seed_rows
+            if source_boundary[0] not in authorized_visibility_scopes:
+                return False
+            if project_id and source_boundary[1] != project_id:
+                return False
+            if session_id and str(source_row["source_session_id"] or "") != session_id:
+                return False
+            return True
+
+        direct_seed_rows = [
+            row
+            for row in direct_seed_rows
+            if all(
+                durable_source_is_authorized(source_row)
+                for source_row in durable_direct_source_rows.get(
+                    str(row["id"]),
+                    [],
+                )
+            )
+        ]
         orphan_source_events, orphan_source_scan_overflow = (
             _orphan_project_state_source_events(
                 conn,
@@ -11260,24 +11493,21 @@ def repair_invalid_project_state_checkpoints(
         )
         direct_seed_ids = {
             str(row["id"])
-            for row in direct_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+            for row in direct_seed_rows
         }
         seed_rows_by_id: dict[str, ProjectStateRow] = {
             str(row["id"]): row
-            for row in direct_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+            for row in direct_seed_rows
         }
         seed_rows_by_id.update(
             {
                 str(row["id"]): row
-                for row in source_seed_rows[:PROJECT_STATE_REPAIR_SCAN_LIMIT]
+                for row in source_seed_rows
             }
         )
         seed_rows = list(seed_rows_by_id.values())
         seed_scan_overflow = (
-            len(direct_seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
-            or len(source_seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
-            or len(seed_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
-            or legacy_source_scan_overflow
+            legacy_source_scan_overflow
             or proven_source_scan_overflow
             or orphan_source_scan_overflow
         )
@@ -11522,18 +11752,9 @@ def repair_invalid_project_state_checkpoints(
                 FROM cards
                 WHERE supersedes_card_id = ?
                 ORDER BY id
-                LIMIT ?
                 """,
-                (invalid_id, PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1),
+                (invalid_id,),
             ).fetchall()
-            if len(direct_successors) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-                unrepairable_topology.append(
-                    {
-                        "type": "invalid_predecessor_successor_scan_overflow",
-                        "card_id": invalid_id,
-                    }
-                )
-                continue
             for successor_row in direct_successors:
                 successor_id = str(successor_row["id"])
                 if successor_id in repair_candidate_ids:
@@ -11610,24 +11831,9 @@ def repair_invalid_project_state_checkpoints(
                 SELECT id, card_type, status FROM cards
                 WHERE superseded_by_card_id = ?
                 ORDER BY id
-                LIMIT ?
                 """,
-                (
-                    head_id,
-                    PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT + 1,
-                ),
+                (head_id,),
             ).fetchall()
-            if len(incoming_rows) > PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT:
-                unrepairable_topology.append(
-                    {
-                        "type": "retired_peer_scan_overflow",
-                        "card_id": head_id,
-                        "retired_peer_scan_limit": (
-                            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
-                        ),
-                    }
-                )
-                continue
             peer_rows = [
                 row
                 for row in incoming_rows
@@ -11676,14 +11882,6 @@ def repair_invalid_project_state_checkpoints(
             planned_retired_peer_rows[head_id] = proven_peer_rows
             planned_detached_peer_rows[head_id] = unproven_peer_rows
             planned_peer_ids.update(str(row["id"]) for row in peer_rows)
-        if len(planned_peer_ids) > PROJECT_STATE_REPAIR_SCAN_LIMIT:
-            unrepairable_topology.append(
-                {
-                    "type": "retired_peer_scan_overflow",
-                    "retired_peer_count_at_least": len(planned_peer_ids),
-                    "retired_peer_scan_limit": PROJECT_STATE_REPAIR_SCAN_LIMIT,
-                }
-            )
         if not dry_run and len(repair_candidate_ids) > limit:
             unrepairable_topology.append(
                 {
@@ -11967,7 +12165,46 @@ def repair_invalid_project_state_checkpoints(
                 "failures": [{"card_id": None, "error": str(exc)}],
             }
         try:
-            post_repair_semantic_integrity = semantic_integrity_report(root)
+            global_post_repair_semantic_integrity = semantic_integrity_report(root)
+            if full_root_visibility:
+                post_repair_semantic_integrity = (
+                    global_post_repair_semantic_integrity
+                )
+            else:
+                # The transaction already compared global semantic state before
+                # and after the scoped mutation. Do not disclose unrelated
+                # private/session findings through the scoped result payload.
+                preexisting_failures = (
+                    semantic_precondition.get("failing", {})
+                    if isinstance(semantic_precondition, dict)
+                    else {}
+                )
+                postflight_failures = (
+                    global_post_repair_semantic_integrity.get("failing", {})
+                    if isinstance(global_post_repair_semantic_integrity, dict)
+                    else {}
+                )
+                postflight_has_only_preexisting_failures = bool(
+                    isinstance(postflight_failures, dict)
+                    and postflight_failures
+                    and isinstance(preexisting_failures, dict)
+                    and all(
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value <= int(preexisting_failures.get(name, 0) or 0)
+                        for name, value in postflight_failures.items()
+                    )
+                )
+                scoped_postflight_ok = bool(
+                    global_post_repair_semantic_integrity.get("ok") is True
+                    or postflight_has_only_preexisting_failures
+                ) and (sidecar_sync is None or sidecar_sync.get("ok") is True)
+                post_repair_semantic_integrity = {
+                    "ok": scoped_postflight_ok,
+                    "initialized": True,
+                    "scope_limited": True,
+                    "global_report_withheld": True,
+                }
         except Exception as exc:
             post_repair_semantic_error = True
             post_repair_semantic_integrity = {
@@ -12025,6 +12262,7 @@ def repair_invalid_project_state_checkpoints(
             if post_repair_semantic_integrity is not None
             else None
         ),
+        "repair_scope": repair_scope,
     }
 
 
@@ -12136,7 +12374,9 @@ def _discover_resume_state(
             if durable_visibility == "session" and metadata_session and (
                 not requested_session or metadata_session == requested_session
             ):
-                if not requested_project or requested_session:
+                if durable_project and (
+                    not requested_project or requested_session
+                ):
                     return ("session", durable_project, metadata_session)
         return None
 
@@ -12153,16 +12393,22 @@ def _discover_resume_state(
     authority_ambiguity = None
     authority_corruption = None
 
-    direct_seed_rows = conn.execute(
-        f"""
+    direct_seed_sql = f"""
         SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
         FROM cards
         WHERE {' AND '.join(card_clauses)}
         ORDER BY created_at DESC, card_rowid DESC
-        LIMIT ?
-        """,
-        (*card_params, PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT + 1),
-    ).fetchall()
+    """
+    if scoped_resume:
+        direct_seed_rows = _fetch_rows_in_pages(
+            conn.execute(direct_seed_sql, tuple(card_params)),
+            page_size=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+        )
+    else:
+        direct_seed_rows = conn.execute(
+            direct_seed_sql + " LIMIT ?",
+            (*card_params, PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT),
+        ).fetchall()
     source_visibility_clause, source_visibility_params = (
         authorized_visibility_clause("source")
     )
@@ -12364,6 +12610,7 @@ def _discover_resume_state(
             source_visibility_clause=legacy_source_visibility_clause,
             source_visibility_params=tuple(legacy_source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+            complete=scoped_resume,
         )
     )
     proven_source_seed_rows, proven_source_scan_overflow = (
@@ -12372,6 +12619,7 @@ def _discover_resume_state(
             source_visibility_clause=source_visibility_clause,
             source_visibility_params=tuple(source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+            complete=scoped_resume,
         )
     )
     source_seed_rows_by_id: dict[str, ProjectStateRow] = {}
@@ -12388,27 +12636,27 @@ def _discover_resume_state(
             source_visibility_clause=source_visibility_clause,
             source_visibility_params=tuple(source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+            complete=scoped_resume,
         )
     )
-    seed_rows_by_id: dict[str, ProjectStateRow] = {
-        str(row["id"]): row
-        for row in direct_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
-    }
-    seed_rows_by_id.update(
-        {
-            str(row["id"]): row
-            for row in source_seed_rows[
-                :PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
-            ]
-        }
+    direct_seed_window = (
+        direct_seed_rows
+        if scoped_resume
+        else direct_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
     )
-    seed_rows = list(seed_rows_by_id.values())
-    seed_overflow = (
-        len(direct_seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
-        or len(source_seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
-        or legacy_source_scan_overflow
+    source_seed_window = (
+        source_seed_rows
+        if scoped_resume
+        else source_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
+    )
+    orphan_source_window = (
+        orphan_source_events
+        if scoped_resume
+        else orphan_source_events[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
+    )
+    seed_overflow = scoped_resume and (
+        legacy_source_scan_overflow
         or proven_source_scan_overflow
-        or len(seed_rows) > PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT
         or orphan_source_scan_overflow
     )
     if seed_overflow:
@@ -12421,12 +12669,12 @@ def _discover_resume_state(
         }
     else:
         boundaries: set[tuple[str, str, str]] = {
-            _project_state_authority_boundary(row) for row in direct_seed_rows
+            _project_state_authority_boundary(row) for row in direct_seed_window
         }
         source_boundary_issues: dict[
             tuple[str, str, str], list[tuple[ProjectStateRow, str]]
         ] = {}
-        for source_seed_row in source_seed_rows:
+        for source_seed_row in source_seed_window:
             try:
                 source_boundary = _project_state_source_authority_boundary(
                     source_seed_row
@@ -12510,7 +12758,7 @@ def _discover_resume_state(
         orphan_boundaries: list[
             tuple[tuple[str, str, str], dict[str, Any]]
         ] = []
-        for orphan in orphan_source_events:
+        for orphan in orphan_source_window:
             orphan_boundary = (
                 str(orphan["expected_visibility_scope"]),
                 str(orphan["expected_project_id"]),
@@ -12542,28 +12790,86 @@ def _discover_resume_state(
                 orphan,
             )
         reports = [reports_by_boundary[boundary] for boundary in sorted(boundaries)]
+        source_order_by_card_id: dict[str, tuple[str, int]] = {}
+        for source_seed_row in source_seed_rows:
+            if not {
+                "source_created_at",
+                "source_rowid",
+            }.issubset(source_seed_row.keys()):
+                continue
+            source_card_id = str(source_seed_row["id"])
+            source_order = (
+                str(source_seed_row["source_created_at"] or ""),
+                int(source_seed_row["source_rowid"] or -1),
+            )
+            source_order_by_card_id[source_card_id] = max(
+                source_order,
+                source_order_by_card_id.get(source_card_id, ("", -1)),
+            )
         report_candidates: list[
-            tuple[tuple[str, int], dict[str, Any], sqlite3.Row]
+            tuple[tuple[str, int, int], dict[str, Any], sqlite3.Row | None]
         ] = []
         for report in reports:
-            candidate_rows = [
-                report["_rows_by_id"][card_id]
-                for card_id in report["current_head_ids"]
-            ]
+            if not report["ok"]:
+                candidate_rows = [
+                    row
+                    for row in report["_rows_by_id"].values()
+                    if scoped_resume
+                    or str(row["status"] or "").casefold()
+                    not in NON_CURRENT_CARD_STATUSES
+                ]
+            else:
+                candidate_rows = [
+                    report["_rows_by_id"][card_id]
+                    for card_id in report["current_head_ids"]
+                ]
             if not candidate_rows:
+                if not report["ok"] and not report["_rows_by_id"]:
+                    report_candidates.append(
+                        (
+                            (
+                                str(
+                                    report.get(
+                                        "_latest_source_event_order",
+                                        ("", -1),
+                                    )[0]
+                                ),
+                                1,
+                                int(
+                                    report.get(
+                                        "_latest_source_event_order",
+                                        ("", -1),
+                                    )[1]
+                                ),
+                            ),
+                            report,
+                            None,
+                        )
+                    )
                 continue
             newest_row = max(
                 candidate_rows,
-                key=lambda row: (
-                    str(row["created_at"] or ""),
-                    int(row["card_rowid"]),
+                key=lambda row: source_order_by_card_id.get(
+                    str(row["id"]),
+                    (
+                        str(row["created_at"] or ""),
+                        int(row["card_rowid"]),
+                    ),
+                ),
+            )
+            newest_order = source_order_by_card_id.get(
+                str(newest_row["id"]),
+                (
+                    str(newest_row["created_at"] or ""),
+                    int(newest_row["card_rowid"]),
                 ),
             )
             report_candidates.append(
                 (
                     (
-                        str(newest_row["created_at"] or ""),
-                        int(newest_row["card_rowid"]),
+                        newest_order[0],
+                        int(not report["ok"]),
+                        newest_order[1],
                     ),
                     report,
                     newest_row,
@@ -12574,6 +12880,10 @@ def _discover_resume_state(
                 report_candidates,
                 key=lambda item: item[0],
             )
+            if selected_candidate is None and not selected_boundary_report["ok"]:
+                authority_corruption = _public_project_state_authority_report(
+                    selected_boundary_report
+                )
         elif reports and scoped_resume:
             newest_report = max(
                 reports,
@@ -14315,13 +14625,10 @@ def semantic_integrity_report(
                 source_bound_rows_by_id.values()
             )
             source_bound_project_state_scan_overflow = (
-                len(source_bound_rows) > PROJECT_STATE_REPAIR_SCAN_LIMIT
-                or legacy_source_scan_overflow
+                legacy_source_scan_overflow
                 or proven_source_scan_overflow
             )
-            for source_bound_row in source_bound_rows[
-                :PROJECT_STATE_REPAIR_SCAN_LIMIT
-            ]:
+            for source_bound_row in source_bound_rows:
                 if str(source_bound_row["card_type"] or "") == "project_state":
                     continue
                 mismatch = {

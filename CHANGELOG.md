@@ -6,16 +6,25 @@
   with strict personal resume modes, canonical partition lookup, immutable
   checkpoint ordering, guarded CLI recovery receipts, and discovery limited to
   project/session state that the recovery packet can actually render.
-- Resume and checkpoint repair now inspect the complete bounded raw
-  project-state authority boundary before classifying any Card as a current
-  head. Invalid payloads, malformed or cross-boundary links, incomplete conflict
-  groups, unsupported edges, and scan overflow fail closed instead of allowing a
-  corrupt Card to disappear from the authority decision.
+- Resume and checkpoint repair now inspect the complete raw project-state
+  authority boundary in bounded database pages before classifying any Card as a
+  current head. Invalid payloads, malformed or cross-boundary links, incomplete
+  conflict groups, and unsupported edges fail closed instead of allowing a
+  corrupt Card to disappear from the authority decision. Page sizes no longer
+  impose 256-, 512-, or 1,000-checkpoint lifetime ceilings; long project chains
+  and shared roots remain resumable, semantically verifiable, and snapshottable.
+- Made invalid-checkpoint repair scope explicit across CLI and MCP. Repair now
+  requires a project, session, or deliberate global scope; session-scoped and
+  private visibility expansions are separate opt-ins, preview and apply share
+  one capability scope, and applied operation receipts bind every scope flag.
+  MCP agents can now perform the same guarded remediation that resume reports.
 - Restore drills now preserve the durable review-relay `jobs` tree, so review
   packets, capsules, findings, and receipts referenced by the artifact ledger
   survive a root restore and verify by hash in the disposable rehearsal. Strict
   root and restore checks now verify the complete immutable artifact ledger
-  instead of silently stopping at the newest 500 rows.
+  instead of silently stopping at the newest 500 rows. Review Relay internal
+  references are root-relative, and legacy absolute references rebase only to
+  matching evidence inside the active restored job.
 - Made same-agent project-state checkpoints one atomic temporal authority chain:
   only the newest checkpoint is current, while predecessors remain historical
   evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint

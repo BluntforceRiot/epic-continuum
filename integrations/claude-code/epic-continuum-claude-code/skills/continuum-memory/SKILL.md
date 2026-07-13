@@ -13,6 +13,8 @@ tools when available:
 - `continuum_compile_context`
 - `continuum_recover_thread`
 - `continuum_resume_latest` when a known session id is unavailable
+- `continuum_repair_project_state_checkpoints` to preview and explicitly apply
+  a scoped repair when resume reports `repair_required`
 - `continuum_cue_recall` for vague memory prompts
 - `continuum_record_project_state` before a handoff or risky change
 - `continuum_memory_health` to inspect queue, capture, storage, and learning state
@@ -37,6 +39,13 @@ When a session id is known, use `continuum_recover_thread`. Otherwise use
 `continuum_resume_latest` with the best-known project id. Respect the configured
 resume mode: explicit mode requires a supplied session or project, while latest
 project mode uses only its configured project scope.
+
+Checkpoint repair requires a project id, session id, or explicit `all=true`.
+Never turn an omitted scope into root-wide repair. Project/root repair sees only
+project-visible checkpoints unless `include_session_scoped` or
+`include_private` is separately enabled; an exact session id authorizes that
+session boundary. Preview first, reuse the same flags with `apply=true`, and
+verify the guarded receipt before retrying resume.
 
 Resume must inspect the complete requested project-state authority boundary and
 fail closed if a malformed payload, link, group, unsupported edge, exact

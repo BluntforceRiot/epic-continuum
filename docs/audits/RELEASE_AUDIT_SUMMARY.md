@@ -17,21 +17,28 @@ The release gate focused on:
 
 ## Current Gate
 
-The core test suite passed on Windows during this package build. Earlier 0.2
-release-candidate work also exercised the durability foundation on disposable
+The current source patch completed its fresh Windows and WSL verification
+loop. Earlier 0.2 release-candidate work also exercised the durability foundation on disposable
 Debian 12 and Debian 13 systems. The public source package intentionally keeps
 this as a summary rather than bundling full local run logs; the repository CI
 matrix remains the cross-platform release gate for the final v0.3 commit.
 
-The final pre-release Windows v0.3 source tree ran in four disjoint pytest
-partitions: 930 tests passed, 26 environment- or optional-feature skips remained
-explicit, and 583 subtests passed. WSL on Python 3.12 independently ran the full
-Review Relay partition: 158 tests and 133 subtests passed with no skips. Ruff,
-mypy across 31 source files, compileall, fixture allowlist validation, and Git
-diff integrity checks passed. The canonical wheel and source distribution were
-reproduced from separate source-ZIP extractions, rebound by the release
-finalizer's two additional clean rebuilds, accepted by Twine, and exercised by
-clean installed-package `init` and `status` runs outside the repository.
+The current pre-promotion Windows patch ran two disjoint pytest partitions. The
+complete Review Relay file passed 210 tests with 6 environment- or
+optional-feature skips and 171 subtests. The other 31 test files passed 778
+tests with 20 explicit skips and 450 subtests. The unique Windows aggregate is
+therefore 988 passed, 26 skipped, and 621 subtests. After the cross-platform
+gate exposed three POSIX proof mismatches, the affected cases passed on both
+Windows and WSL, and WSL/Python 3.12.3 then reran the complete Review Relay file:
+215 passed, 1 explicit skip, and 171 subtests.
+
+Repository-wide Ruff, mypy across 31 source files, compileall, fixture-allowlist
+validation at 165 exact fingerprints, Git diff integrity, and mixed-line-ending
+checks passed. Independent blind review found no remaining code defect; its
+only HOLD was the then-unrun release evidence recorded above and the immutable
+artifact/installed-distribution gates. Artifact reproduction and clean-install
+evidence remain explicitly pending until this source patch is committed and can
+be built from an immutable Git snapshot; no artifact pass is implied here.
 
 Release review hardening included:
 

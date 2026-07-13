@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 import gzip
 import hashlib
+import http.server
 import io
 import os
+import signal
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +31,8 @@ from continuum.core.review_bridge import (
 )
 from continuum.core.permissions import posix_permissions_supported
 from continuum.core import review_bridge as review_bridge_module
+from continuum import cli as cli_module
+from continuum import mcp_server as mcp_server_module
 from continuum.core.operations import _verify_artifact_ledger, restore_drill
 from continuum.core.store import connect, record_artifact, semantic_integrity_report, snapshot
 from continuum.mcp_server import TOOLS, dispatch
@@ -64,6 +72,53 @@ def valid_review_payload(request: dict) -> dict:
         payload["inner_archive_manifest_sha256"] = request.get("inner_archive_manifest_sha256")
         payload["inner_archive_member_count"] = request.get("inner_archive_member_count")
     return payload
+
+
+def bounded_process_result(
+    stdout: str | bytes = b"",
+    stderr: str | bytes = b"",
+    *,
+    returncode: int = 0,
+    timed_out: bool = False,
+    output_exceeded: bool = False,
+    observed_stdout_bytes: int | None = None,
+    observed_stderr_bytes: int | None = None,
+) -> review_bridge_module.BoundedProcessResult:
+    stdout_bytes = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+    stderr_bytes = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
+    stdout_seen = len(stdout_bytes) if observed_stdout_bytes is None else observed_stdout_bytes
+    stderr_seen = len(stderr_bytes) if observed_stderr_bytes is None else observed_stderr_bytes
+    return review_bridge_module.BoundedProcessResult(
+        returncode=returncode,
+        stdout=stdout_bytes,
+        stderr=stderr_bytes,
+        timed_out=timed_out,
+        output_exceeded=output_exceeded,
+        observed_output_bytes=stdout_seen + stderr_seen,
+        observed_stdout_bytes=stdout_seen,
+        observed_stderr_bytes=stderr_seen,
+    )
+
+
+def wait_for_posix_process_termination(pid: int, *, timeout_seconds: float = 2.0) -> bool:
+    """Treat a reparented zombie as terminated while its init process reaps it."""
+    process_stat = Path(f"/proc/{pid}/stat")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            raw = process_stat.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        suffix = raw.rsplit(")", 1)
+        if len(suffix) == 2:
+            fields = suffix[1].strip().split()
+            if fields and fields[0] in {"Z", "X"}:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def exact_secret_allowlist_entry(source: str, text: str, *, index: int = 0) -> dict:
@@ -111,6 +166,56 @@ def artifact_rows(root: Path) -> list[tuple[object, ...]]:
         return [tuple(row) for row in conn.execute("SELECT * FROM artifacts ORDER BY id")]
     finally:
         conn.close()
+
+
+def stage_completed_review_job_for_recovery(
+    root: Path,
+    job: dict,
+) -> tuple[Path, list[dict]]:
+    job_id = str(job["job_id"])
+    job_dir = Path(job["job_dir"])
+    prefix = review_bridge_module._root_uri(root, job_dir) + "/"
+    conn = connect(root)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT * FROM artifacts WHERE uri >= ? AND uri < ? ORDER BY uri, id",
+                (prefix, prefix[:-1] + "0"),
+            ).fetchall()
+        )
+        self_contained = [
+            (
+                row,
+                str(row["uri"])[len(prefix) :],
+            )
+            for row in rows
+        ]
+        conn.execute(
+            "DELETE FROM artifacts WHERE uri >= ? AND uri < ?",
+            (prefix, prefix[:-1] + "0"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    staging_dir = review_bridge_module.review_bridge_root(root) / "tmp" / job_id
+    staging_dir.parent.mkdir(parents=True, exist_ok=True)
+    job_dir.rename(staging_dir)
+    entries = [
+        (
+            staging_dir.joinpath(*Path(relative).parts),
+            str(row["kind"]),
+            bool(row["immutable"]),
+        )
+        for row, relative in self_contained
+    ]
+    return (
+        staging_dir,
+        review_bridge_module._review_prepare_artifact_plan(
+            staging_dir,
+            job_id,
+            entries,
+        ),
+    )
 
 
 def replace_review_request_artifact(
@@ -198,6 +303,34 @@ def make_link_like_directory(testcase: unittest.TestCase, link: Path, target: Pa
         link.symlink_to(target, target_is_directory=True)
     except (NotImplementedError, OSError) as exc:
         testcase.skipTest(f"directory symlinks unavailable: {exc}")
+
+
+class CommitThenRaiseConnection:
+    """SQLite proxy that reports failure after one durable marker retirement."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+        self._raise_after_commit = False
+        self.raised = False
+
+    def execute(self, sql: str, *args: object, **kwargs: object) -> object:
+        result = self._connection.execute(sql, *args, **kwargs)  # type: ignore[attr-defined]
+        if (
+            sql.lstrip().upper().startswith("DELETE FROM ARTIFACTS")
+            and review_bridge_module.REVIEW_PREPARE_PUBLICATION_MARKER_KIND
+            in repr(args)
+        ):
+            self._raise_after_commit = True
+        return result
+
+    def commit(self) -> None:
+        self._connection.commit()  # type: ignore[attr-defined]
+        if self._raise_after_commit and not self.raised:
+            self.raised = True
+            raise RuntimeError("injected ambiguous post-commit failure")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
 
 
 class ReviewBridgeTest(unittest.TestCase):
@@ -692,7 +825,7 @@ class ReviewBridgeTest(unittest.TestCase):
                     secret_allowlist_files=[allowlist_file],
                 )
 
-    def test_snapshot_archive_and_packet_ignore_later_live_subject_mutation(self) -> None:
+    def test_non_git_subject_mutation_after_snapshot_prevents_publication(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
             root = base / "continuum"
@@ -702,27 +835,164 @@ class ReviewBridgeTest(unittest.TestCase):
             target.write_text('VERSION = "old"\n', encoding="utf-8")
             original_copy = review_bridge_module._copy_snapshot_files
 
-            def copy_then_mutate(root_arg: Path, subject_arg: Path, files: list[Path], snapshot_subject: Path) -> list[Path]:
-                copied = original_copy(root_arg, subject_arg, files, snapshot_subject)
+            def copy_then_mutate(
+                root_arg: Path,
+                subject_arg: Path,
+                files: list[Path],
+                snapshot_subject: Path,
+                **kwargs: object,
+            ) -> list[Path]:
+                copied = original_copy(
+                    root_arg,
+                    subject_arg,
+                    files,
+                    snapshot_subject,
+                    **kwargs,
+                )
                 target.write_text('VERSION = "new"\n', encoding="utf-8")
                 return copied
 
-            with patch.object(review_bridge_module, "_copy_snapshot_files", side_effect=copy_then_mutate):
-                job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            with patch.object(
+                review_bridge_module,
+                "_copy_snapshot_files",
+                side_effect=copy_then_mutate,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "changed after its snapshot",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
 
-            packet = Path(job["packet_uri"]).read_text(encoding="utf-8")
-            self.assertIn('VERSION = "old"', packet)
-            self.assertNotIn('VERSION = "new"', packet)
-            with zipfile.ZipFile(job["subject_archive_uri"]) as zf:
-                archived = zf.read("app.py").decode("utf-8")
-            self.assertIn('VERSION = "old"', archived)
-            self.assertNotIn('VERSION = "new"', archived)
-            manifest = json.loads(Path(job["subject_manifest_uri"]).read_text(encoding="utf-8"))
-            manifest_hash = next(item["sha256"] for item in manifest["files"] if item["path"] == "app.py")
-            snapshot_hash = review_bridge_module.file_sha256(Path(job["packet_uri"]).parent / "snapshot" / "subject" / "app.py")
-            live_hash = review_bridge_module.file_sha256(target)
-            self.assertEqual(manifest_hash, snapshot_hash)
-            self.assertNotEqual(manifest_hash, live_hash)
+            self.assertEqual(target.read_text(encoding="utf-8"), 'VERSION = "new"\n')
+            jobs_dir = root / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_non_git_subject_mutation_after_capsule_prevents_publication(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            target = subject / "app.py"
+            target.write_text('VERSION = "old"\n', encoding="utf-8")
+            original_write_capsule = review_bridge_module._write_review_capsule
+
+            def write_capsule_then_mutate(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[Path, str]:
+                result = original_write_capsule(*args, **kwargs)  # type: ignore[arg-type]
+                target.write_text('VERSION = "new"\n', encoding="utf-8")
+                return result
+
+            with patch.object(
+                review_bridge_module,
+                "_write_review_capsule",
+                side_effect=write_capsule_then_mutate,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "changed after its snapshot",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), 'VERSION = "new"\n')
+            bridge_root = root / "exports" / "review_bridge"
+            self.assertFalse(
+                (bridge_root / "jobs").exists()
+                and any((bridge_root / "jobs").iterdir())
+            )
+            self.assertFalse(any(bridge_root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_empty_directories_are_bound_across_review_artifacts_and_currentness(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            (subject / "empty" / "deeper").mkdir(parents=True)
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            manifest = json.loads(
+                Path(job["subject_manifest_uri"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["directories"], ["empty", "empty/deeper"])
+            self.assertEqual(job["packet_coverage"]["manifest_directory_count"], 2)
+            self.assertIn(
+                "- Directory entries: 2",
+                Path(job["packet_uri"]).read_text(encoding="utf-8"),
+            )
+            snapshot_subject = Path(job["job_dir"]) / "snapshot" / "subject"
+            self.assertTrue((snapshot_subject / "empty" / "deeper").is_dir())
+            with zipfile.ZipFile(job["subject_archive_uri"]) as archive:
+                self.assertIn("empty/", archive.namelist())
+                self.assertIn("empty/deeper/", archive.namelist())
+            with zipfile.ZipFile(job["review_capsule_uri"]) as capsule:
+                self.assertIn("subject/", capsule.namelist())
+                self.assertIn("subject/empty/", capsule.namelist())
+                self.assertIn("subject/empty/deeper/", capsule.namelist())
+            integrity = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=job["job_id"],
+            )
+            self.assertTrue(integrity["ok"], integrity)
+
+            (subject / "empty" / "deeper").rmdir()
+            self.assertFalse(review_check_current(root, job_id=job["job_id"])["current"])
+
+            (snapshot_subject / "empty" / "deeper").rmdir()
+            tampered = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=job["job_id"],
+            )
+            self.assertFalse(tampered["ok"])
+            reasons = {
+                finding.get("reason")
+                for findings in tampered.get("samples", {}).values()
+                for finding in findings
+            }
+            self.assertIn("subject_manifest_directory_set_mismatch", reasons)
+
+    def test_pure_empty_directory_prepares_a_bound_empty_archive(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "empty-subject"
+            subject.mkdir()
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review the empty boundary.",
+                transport="manual",
+            )
+
+            manifest = json.loads(
+                Path(job["subject_manifest_uri"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["files"], [])
+            self.assertEqual(manifest["directories"], [])
+            self.assertEqual(job["packet_coverage"]["manifest_directory_count"], 0)
+            with zipfile.ZipFile(job["subject_archive_uri"]) as archive:
+                self.assertEqual(archive.namelist(), [])
+            with zipfile.ZipFile(job["review_capsule_uri"]) as capsule:
+                self.assertIn("subject/", capsule.namelist())
+            self.assertTrue(review_check_current(root, job_id=job["job_id"])["current"])
 
     def test_limited_coverage_pass_is_downgraded(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -3162,6 +3432,127 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertEqual(first["response_uri"], repeated["response_uri"])
             self.assertEqual(second["attempt"], 2)
 
+    def test_automated_review_operation_id_flows_through_cli_and_mcp(self) -> None:
+        class StubOperation:
+            operation_id = "generated-operation"
+
+            def cursor(self, _value: dict) -> None:
+                return None
+
+        def run_guarded_action(_root: Path, **kwargs: object) -> dict:
+            action = kwargs["action"]
+            assert callable(action)
+            return action(StubOperation())
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "continuum-cli"
+            with patch.object(
+                cli_module,
+                "guarded_result",
+                side_effect=run_guarded_action,
+            ), patch.object(
+                cli_module,
+                "run_review_job",
+                return_value={"ok": True, "status": "ingested"},
+            ) as cli_run, patch.object(
+                cli_module,
+                "emit_result",
+                return_value=0,
+            ):
+                self.assertEqual(
+                    cli_module._main(
+                        [
+                            "review-run",
+                            "--root",
+                            str(root),
+                            "--job-id",
+                            "review-cli-operation",
+                            "--operation-id",
+                            "caller-cli-review-operation",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                cli_run.call_args.kwargs["operation_id"],
+                "caller-cli-review-operation",
+            )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "continuum-mcp"
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(
+                mcp_server_module,
+                "guarded_tool",
+                side_effect=run_guarded_action,
+            ), patch.object(
+                mcp_server_module,
+                "run_review_job",
+                return_value={"ok": True, "status": "ingested"},
+            ) as mcp_run:
+                result = mcp_server_module.tool_review_run(
+                    {
+                        "root": str(root),
+                        "job_id": "review-mcp-operation",
+                        "operation_id": "caller-mcp-review-operation",
+                    }
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                mcp_run.call_args.kwargs["operation_id"],
+                "caller-mcp-review-operation",
+            )
+            self.assertEqual(
+                TOOLS["continuum_review_run"][1]["properties"]["operation_id"],
+                {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                },
+            )
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "continuum-empty-operation"
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-run",
+                            "--root",
+                            str(root),
+                            "--job-id",
+                            "review-empty-operation",
+                            "--operation-id",
+                            "",
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(mcp_server_module, "guarded_tool") as mcp_guard, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "non-empty string",
+            ):
+                mcp_server_module.tool_review_run(
+                    {
+                        "root": str(root),
+                        "job_id": "review-empty-operation",
+                        "operation_id": "",
+                    }
+                )
+            mcp_guard.assert_not_called()
+            self.assertFalse(root.exists())
+
     def test_concurrent_browser_attempt_reservations_are_serialized(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
@@ -3509,7 +3900,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 leftovers = list(bridge_root.glob("**/config.py")) + list(bridge_root.glob("**/subject.zip"))
                 self.assertEqual(leftovers, [])
 
-    def test_review_secret_scan_zero_limit_means_uncapped(self) -> None:
+    def test_review_secret_scan_zero_limit_means_result_uncapped(self) -> None:
         text = (
             'OPENAI_API_KEY="sk-' + ("A" * 32) + '"\n'
             'GITHUB_TOKEN="ghp_' + ("B" * 36) + '"\n'
@@ -3518,6 +3909,74 @@ class ReviewBridgeTest(unittest.TestCase):
         findings = review_bridge_module._scan_review_text_for_secrets(text, source="fixture.py", max_findings=0)
 
         self.assertGreaterEqual(len(findings), 2)
+
+    def test_review_text_scan_streams_result_and_candidate_limits(self) -> None:
+        calls: list[int | None] = []
+
+        def one_finding_per_line(
+            _text: str,
+            *,
+            max_findings: int | None = 20,
+        ) -> list[dict[str, object]]:
+            calls.append(max_findings)
+            return [{"type": "synthetic", "line": 1, "snippet": "redacted"}]
+
+        with patch.object(
+            review_bridge_module,
+            "scan_text_for_secrets",
+            side_effect=one_finding_per_line,
+        ):
+            findings = review_bridge_module._scan_review_text_for_secrets(
+                "line\n" * 10_000,
+                source="synthetic.txt",
+                max_findings=20,
+            )
+
+        self.assertEqual(len(findings), 20)
+        self.assertEqual(len(calls), 20)
+        self.assertTrue(all(value is not None and value > 0 for value in calls))
+
+        suppressed: list[dict] = []
+        with patch.object(
+            review_bridge_module,
+            "REVIEW_SECRET_SCAN_MAX_CANDIDATES",
+            3,
+        ), patch.object(
+            review_bridge_module,
+            "scan_text_for_secrets",
+            side_effect=one_finding_per_line,
+        ), patch.object(
+            review_bridge_module,
+            "_allowlisted_review_secret_finding",
+            return_value="synthetic-allowlist",
+        ), self.assertRaisesRegex(
+            review_bridge_module.ReviewBridgeError,
+            "candidate limit exceeded",
+        ):
+            review_bridge_module._scan_review_text_for_secrets(
+                "line\n" * 4,
+                source="synthetic.txt",
+                max_findings=20,
+                suppressed_findings=suppressed,
+            )
+        self.assertEqual(len(suppressed), 3)
+
+        budget = review_bridge_module._new_review_preparation_budget(
+            max_packet_bytes=1_024,
+            max_subject_file_bytes=1_024,
+            max_subject_bytes=1_024,
+            prepare_timeout_seconds=1,
+        )
+        budget.deadline = 0.0
+        with self.assertRaisesRegex(
+            review_bridge_module.ReviewBridgeError,
+            "elapsed-time budget",
+        ):
+            review_bridge_module._scan_review_text_for_secrets(
+                "line\n",
+                source="synthetic.txt",
+                budget=budget,
+            )
 
     def test_review_secret_scan_reads_beyond_large_file_sample(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -3759,7 +4218,227 @@ class ReviewBridgeTest(unittest.TestCase):
                     transport="manual",
                     model="sk-" + ("M" * 32),
                 )
-            self.assertEqual(list((root / "exports" / "review_bridge").glob("jobs/*")), [])
+            self.assertEqual(
+                list((root / "exports" / "review_bridge").glob("jobs/*")),
+                [],
+            )
+
+    def test_zip_member_cap_is_enforced_before_zipfile_construction(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            archive_path = Path(tmp) / "over-limit.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for index in range(
+                    review_bridge_module.REVIEW_ZIP_SCAN_MAX_MEMBERS + 1
+                ):
+                    archive.writestr(f"member-{index:04d}.txt", b"")
+            forged = bytearray(archive_path.read_bytes())
+            eocd_offset = forged.rfind(b"PK\x05\x06")
+            self.assertGreaterEqual(eocd_offset, 0)
+            forged[eocd_offset + 8 : eocd_offset + 10] = (1).to_bytes(
+                2,
+                "little",
+            )
+            forged[eocd_offset + 10 : eocd_offset + 12] = (1).to_bytes(
+                2,
+                "little",
+            )
+            archive_path.write_bytes(forged)
+            outcome = review_bridge_module.ScanOutcome()
+
+            with patch.object(
+                review_bridge_module.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("ZipFile must not be constructed"),
+            ):
+                findings = review_bridge_module._scan_zip_bytes_for_secrets(
+                    bytes(forged),
+                    archive_name=archive_path.name,
+                    outcome=outcome,
+                )
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "too many members",
+                ):
+                    review_bridge_module._zip_subject_member_manifest(
+                        archive_path,
+                    )
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "too many members",
+                ):
+                    review_bridge_module._write_expanded_zip_subject_to_capsule(
+                        object(),  # type: ignore[arg-type]
+                        archive_path,
+                        {"members": []},
+                    )
+
+            self.assertEqual(findings, [])
+            self.assertEqual(
+                [item["reason"] for item in outcome.limits_hit],
+                ["zip_member_count_exceeded"],
+            )
+
+    def test_zip64_empty_archive_preflight_is_bounded_and_position_safe(self) -> None:
+        zip64_end = struct.pack(
+            "<4sQ2H2L4Q",
+            b"PK\x06\x06",
+            44,
+            45,
+            45,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+        end = struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            0,
+        )
+        stream = io.BytesIO(zip64_end + locator + end)
+        stream.seek(7)
+
+        self.assertEqual(
+            review_bridge_module._preflight_zip_central_directory(
+                stream,
+                archive_name="empty-zip64.zip",
+                member_limit=review_bridge_module.REVIEW_ZIP_SCAN_MAX_MEMBERS,
+            ),
+            0,
+        )
+        self.assertEqual(stream.tell(), 7)
+        with zipfile.ZipFile(stream) as archive:
+            self.assertEqual(archive.infolist(), [])
+
+    def test_zip64_locator_offset_must_bind_the_preflight_record(self) -> None:
+        zip64_end = struct.pack(
+            "<4sQ2H2L4Q",
+            b"PK\x06\x06",
+            44,
+            45,
+            45,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 1, 1)
+        end = struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            0,
+        )
+
+        with self.assertRaisesRegex(
+            zipfile.BadZipFile,
+            "locator offset does not bind",
+        ):
+            review_bridge_module._preflight_zip_central_directory(
+                io.BytesIO(zip64_end + locator + end),
+                archive_name="misbound-zip64.zip",
+                member_limit=review_bridge_module.REVIEW_ZIP_SCAN_MAX_MEMBERS,
+            )
+
+    def test_zip64_extensible_record_is_rejected_before_zipfile_allocation(self) -> None:
+        zip64_end = (
+            struct.pack(
+                "<4sQ2H2L4Q",
+                b"PK\x06\x06",
+                45,
+                45,
+                45,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            + b"X"
+        )
+        locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+        end = struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            0,
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            archive_path = Path(tmp) / "extensible-zip64.zip"
+            archive_path.write_bytes(zip64_end + locator + end)
+
+            with patch.object(
+                review_bridge_module.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("ZipFile must not be constructed"),
+            ) as zip_constructor, self.assertRaisesRegex(
+                zipfile.BadZipFile,
+                "unsupported extensible data",
+            ):
+                with review_bridge_module._open_preflighted_zip_archive(
+                    archive_path,
+                    member_limit=review_bridge_module.REVIEW_ZIP_SCAN_MAX_MEMBERS,
+                ):
+                    self.fail("invalid ZIP64 archive unexpectedly opened")
+
+            zip_constructor.assert_not_called()
+
+    def test_zip_lzma_is_rejected_before_decoder_allocation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            archive_path = Path(tmp) / "lzma-subject.zip"
+            with zipfile.ZipFile(
+                archive_path,
+                "w",
+                compression=zipfile.ZIP_LZMA,
+            ) as archive:
+                archive.writestr("README.md", "# Subject\n")
+            outcome = review_bridge_module.ScanOutcome()
+
+            with patch.object(
+                review_bridge_module.zipfile,
+                "LZMADecompressor",
+                side_effect=AssertionError("LZMA decoder must not be allocated"),
+            ):
+                findings = review_bridge_module._scan_zip_bytes_for_secrets(
+                    archive_path.read_bytes(),
+                    archive_name=archive_path.name,
+                    outcome=outcome,
+                )
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "coverage incomplete",
+                ):
+                    review_bridge_module._zip_subject_member_manifest(
+                        archive_path,
+                    )
+
+            self.assertEqual(findings, [])
+            self.assertIn(
+                "zip_compression_method_not_supported",
+                {item["reason"] for item in outcome.errors},
+            )
 
     def test_review_prepare_rejects_subject_inside_continuum_root(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -3924,14 +4603,2531 @@ class ReviewBridgeTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "init"], cwd=subject, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             original_copy = review_bridge_module._copy_snapshot_files
 
-            def copy_then_mutate(root_arg: Path, subject_arg: Path, files: list[Path], snapshot_subject: Path) -> list[Path]:
-                copied = original_copy(root_arg, subject_arg, files, snapshot_subject)
+            def copy_then_mutate(
+                root_arg: Path,
+                subject_arg: Path,
+                files: list[Path],
+                snapshot_subject: Path,
+                **kwargs: object,
+            ) -> list[Path]:
+                copied = original_copy(
+                    root_arg,
+                    subject_arg,
+                    files,
+                    snapshot_subject,
+                    **kwargs,
+                )
                 target.write_text('VERSION = "new"\n', encoding="utf-8")
                 return copied
 
             with patch.object(review_bridge_module, "_copy_snapshot_files", side_effect=copy_then_mutate):
-                with self.assertRaisesRegex(ValueError, "git state changed during review preparation"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "changed after its snapshot|git state changed during review preparation",
+                ):
                     create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+
+    def test_git_capture_disables_repository_configured_executable_helpers(self) -> None:
+        if review_bridge_module.shutil.which("git") is None:
+            self.skipTest("git executable unavailable")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            for helper_kind in ("fsmonitor", "external", "textconv"):
+                with self.subTest(helper_kind=helper_kind):
+                    root = base / f"continuum-{helper_kind}"
+                    subject = base / f"repo-{helper_kind}"
+                    subject.mkdir()
+                    marker = base / f"{helper_kind}-executed.txt"
+                    helper = subject / "configured-helper.py"
+                    helper.write_text(
+                        "import pathlib\n"
+                        f"marker = pathlib.Path({str(marker)!r})\n"
+                        "with marker.open('a', encoding='utf-8') as handle:\n"
+                        "    handle.write('executed\\n')\n"
+                        "print('converted')\n",
+                        encoding="utf-8",
+                    )
+                    target = subject / "app.py"
+                    target.write_text("VALUE = 'old'\n", encoding="utf-8")
+                    if helper_kind == "textconv":
+                        (subject / ".gitattributes").write_text(
+                            "app.py diff=hostile\n",
+                            encoding="utf-8",
+                        )
+                    subprocess.run(
+                        ["git", "init"],
+                        cwd=subject,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    subprocess.run(
+                        ["git", "config", "user.email", "test@example.invalid"],
+                        cwd=subject,
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "config", "user.name", "Test"],
+                        cwd=subject,
+                        check=True,
+                    )
+                    subprocess.run(["git", "add", "."], cwd=subject, check=True)
+                    subprocess.run(
+                        ["git", "commit", "-m", "init"],
+                        cwd=subject,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    target.write_text("VALUE = 'new'\n", encoding="utf-8")
+                    command = f'"{sys.executable}" "{helper}"'
+                    if helper_kind == "fsmonitor":
+                        config_key = "core.fsmonitor"
+                        probe_command = ["git", "status", "--short"]
+                    elif helper_kind == "external":
+                        config_key = "diff.external"
+                        probe_command = ["git", "diff", "--"]
+                    else:
+                        config_key = "diff.hostile.textconv"
+                        probe_command = ["git", "diff", "--"]
+                    subprocess.run(
+                        ["git", "config", config_key, command],
+                        cwd=subject,
+                        check=True,
+                    )
+                    subprocess.run(
+                        probe_command,
+                        cwd=subject,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    self.assertTrue(marker.exists(), f"hostile {helper_kind} fixture did not execute")
+                    marker.unlink()
+
+                    job = create_review_job(
+                        root,
+                        subject_path=subject,
+                        prompt="Review hard.",
+                        transport="manual",
+                    )
+                    self.assertFalse(marker.exists())
+                    current = review_check_current(root, job_id=job["job_id"])
+                    self.assertTrue(current["current"], current)
+                    self.assertFalse(marker.exists())
+
+    def test_git_diff_capture_stops_at_live_output_budget(self) -> None:
+        if review_bridge_module.shutil.which("git") is None:
+            self.skipTest("git executable unavailable")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            subject = Path(tmp) / "repo"
+            subject.mkdir()
+            target = subject / "large.txt"
+            target.write_text("A" * 524_288 + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "init"],
+                cwd=subject,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=subject,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=subject,
+                check=True,
+            )
+            subprocess.run(["git", "add", "large.txt"], cwd=subject, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "init"],
+                cwd=subject,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            target.write_text("B" * 524_288 + "\n", encoding="utf-8")
+
+            capture_limit = 1_024
+            captured = review_bridge_module._git_capture(
+                subject,
+                include_diff=True,
+                max_diff_bytes=capture_limit,
+            )
+
+            self.assertTrue(captured["diff_truncated"], captured)
+            self.assertIn("[diff truncated]", captured["diff"])
+            self.assertLessEqual(
+                len(captured["diff"].encode("utf-8")),
+                capture_limit + len("\n[diff truncated]"),
+            )
+
+    def test_git_capture_rejects_nonzero_commands_even_with_bounded_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            subject = Path(tmp) / "repo"
+            (subject / ".git").mkdir(parents=True)
+
+            with patch.object(
+                review_bridge_module,
+                "_run_bounded_process",
+                return_value=bounded_process_result(
+                    stderr="synthetic bounded git failure",
+                    returncode=23,
+                ),
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                r"Git branch failed \(exit 23\): synthetic bounded git failure",
+            ):
+                review_bridge_module._git_capture(
+                    subject,
+                    include_diff=False,
+                    max_diff_bytes=1_024,
+                )
+
+    def test_snapshot_link_swap_fails_before_archive_or_capsule_publication(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            nested = subject / "nested"
+            nested.mkdir(parents=True)
+            (nested / "readme.txt").write_text("SAFE_ORIGINAL\n", encoding="utf-8")
+            outside = base / "outside"
+            outside.mkdir()
+            outside_marker = "OUTSIDE_HOST_MARKER_4FQ"
+            (outside / "readme.txt").write_text(
+                outside_marker + "\n",
+                encoding="utf-8",
+            )
+            original_collect = review_bridge_module._collect_subject_files
+
+            def collect_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_collect(*args, **kwargs)
+                shutil.rmtree(nested)
+                make_link_like_directory(self, nested, outside)
+                return result
+
+            with patch.object(
+                review_bridge_module,
+                "_collect_subject_files",
+                side_effect=collect_then_swap,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "link-like|changed|opened safely|pinned",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            jobs_dir = root / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+            self.assertFalse(any(root.rglob("subject.zip")))
+
+    def test_snapshot_plain_file_swap_and_restore_is_rejected_by_identity(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            target = subject / "app.py"
+            target.write_text("ORIGINAL\n", encoding="utf-8")
+            replacement = base / "replacement.py"
+            replacement.write_text("REPLACEMENT\n", encoding="utf-8")
+            saved = base / "app-original.py"
+            original_collect = review_bridge_module._collect_subject_files
+            original_copy = review_bridge_module._copy_snapshot_files
+
+            def collect_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_collect(*args, **kwargs)
+                target.rename(saved)
+                replacement.rename(target)
+                return result
+
+            def copy_then_restore(*args: object, **kwargs: object) -> object:
+                try:
+                    return original_copy(*args, **kwargs)
+                finally:
+                    if target.exists():
+                        target.rename(replacement)
+                    if saved.exists():
+                        saved.rename(target)
+
+            with patch.object(
+                review_bridge_module,
+                "_collect_subject_files",
+                side_effect=collect_then_swap,
+            ), patch.object(
+                review_bridge_module,
+                "_copy_snapshot_files",
+                side_effect=copy_then_restore,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "identity|metadata|changed",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL\n")
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_snapshot_plain_directory_swap_and_restore_is_rejected_by_identity(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            nested = subject / "nested"
+            nested.mkdir(parents=True)
+            target = nested / "app.py"
+            target.write_text("ORIGINAL\n", encoding="utf-8")
+            replacement = base / "replacement-nested"
+            replacement.mkdir()
+            try:
+                os.link(target, replacement / "app.py")
+            except OSError as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+            saved = base / "nested-original"
+            original_collect = review_bridge_module._collect_subject_files
+            original_copy = review_bridge_module._copy_snapshot_files
+
+            def collect_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_collect(*args, **kwargs)
+                nested.rename(saved)
+                replacement.rename(nested)
+                return result
+
+            def copy_then_restore(*args: object, **kwargs: object) -> object:
+                try:
+                    return original_copy(*args, **kwargs)
+                finally:
+                    if nested.exists():
+                        nested.rename(replacement)
+                    if saved.exists():
+                        saved.rename(nested)
+
+            with patch.object(
+                review_bridge_module,
+                "_collect_subject_files",
+                side_effect=collect_then_swap,
+            ), patch.object(
+                review_bridge_module,
+                "_copy_snapshot_files",
+                side_effect=copy_then_restore,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "identity|metadata|changed",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertEqual((nested / "app.py").read_text(encoding="utf-8"), "ORIGINAL\n")
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_currentness_plain_file_swap_and_restore_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            target = subject / "app.py"
+            target.write_text("SAME-CONTENT\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            replacement = base / "replacement.py"
+            replacement.write_text("SAME-CONTENT\n", encoding="utf-8")
+            saved = base / "app-original.py"
+            original_collect = review_bridge_module._collect_subject_files
+            original_manifest = review_bridge_module._file_manifest_entry
+
+            def collect_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_collect(*args, **kwargs)
+                target.rename(saved)
+                replacement.rename(target)
+                return result
+
+            def manifest_then_restore(*args: object, **kwargs: object) -> object:
+                try:
+                    return original_manifest(*args, **kwargs)
+                finally:
+                    if target.exists():
+                        target.rename(replacement)
+                    if saved.exists():
+                        saved.rename(target)
+
+            with patch.object(
+                review_bridge_module,
+                "_collect_subject_files",
+                side_effect=collect_then_swap,
+            ), patch.object(
+                review_bridge_module,
+                "_file_manifest_entry",
+                side_effect=manifest_then_restore,
+            ):
+                current = review_check_current(root, job_id=job["job_id"])
+
+            self.assertFalse(current["current"])
+            self.assertEqual(current["reason"], "subject_currentness_check_failed_safely")
+            self.assertEqual(target.read_text(encoding="utf-8"), "SAME-CONTENT\n")
+
+    def test_subject_ancestor_link_swap_fails_before_source_open(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            parent = base / "plain-parent"
+            subject = parent / "subject"
+            subject.mkdir(parents=True)
+            (subject / "readme.txt").write_text(
+                "SAFE_ORIGINAL\n",
+                encoding="utf-8",
+            )
+            outside_parent = base / "outside-parent"
+            outside_subject = outside_parent / "subject"
+            outside_subject.mkdir(parents=True)
+            outside_marker = "OUTSIDE_ANCESTOR_MARKER_Q7P"
+            (outside_subject / "readme.txt").write_text(
+                outside_marker + "\n",
+                encoding="utf-8",
+            )
+            original_parent = base / "plain-parent-original"
+            original_collect = review_bridge_module._collect_subject_files
+
+            def collect_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_collect(*args, **kwargs)
+                parent.rename(original_parent)
+                make_link_like_directory(self, parent, outside_parent)
+                return result
+
+            try:
+                with patch.object(
+                    review_bridge_module,
+                    "_collect_subject_files",
+                    side_effect=collect_then_swap,
+                ), self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "link-like|changed|opened safely|pinned",
+                ):
+                    create_review_job(
+                        root,
+                        subject_path=subject,
+                        prompt="Review hard.",
+                        transport="manual",
+                    )
+            finally:
+                if parent.is_symlink():
+                    parent.unlink()
+                elif parent.exists():
+                    os.rmdir(parent)
+                if original_parent.exists():
+                    original_parent.rename(parent)
+
+            bridge_root = root / "exports" / "review_bridge"
+            for directory_name in ("jobs", "tmp"):
+                directory = bridge_root / directory_name
+                self.assertFalse(directory.exists() and any(directory.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+            self.assertFalse(any(root.rglob("subject.zip")))
+
+    def test_subject_directory_to_file_swap_during_prepare_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Original\n", encoding="utf-8")
+            original_snapshot = review_bridge_module._snapshot_subject
+
+            def snapshot_then_replace(*args: object, **kwargs: object) -> object:
+                result = original_snapshot(*args, **kwargs)
+                shutil.rmtree(subject)
+                subject.write_text("replacement file\n", encoding="utf-8")
+                return result
+
+            with patch.object(
+                review_bridge_module,
+                "_snapshot_subject",
+                side_effect=snapshot_then_replace,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "type|identity|changed",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            bridge_root = root / "exports" / "review_bridge"
+            for directory_name in ("jobs", "tmp"):
+                directory = bridge_root / directory_name
+                self.assertFalse(directory.exists() and any(directory.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_text_sampling_reads_only_limit_plus_one(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "large.txt"
+            path.write_text("A" * 524_293, encoding="utf-8")
+            real_reader = review_bridge_module._read_regular_file_prefix
+            requested_sizes: list[int] = []
+
+            def recording_reader(candidate: Path, max_bytes: int) -> bytes:
+                requested_sizes.append(max_bytes)
+                return real_reader(candidate, max_bytes)
+
+            with patch.object(
+                review_bridge_module,
+                "_read_regular_file_prefix",
+                side_effect=recording_reader,
+            ):
+                text, truncated = review_bridge_module._read_text_sample(path, 1)
+
+            self.assertEqual(text, "A")
+            self.assertTrue(truncated)
+            self.assertEqual(requested_sizes, [2])
+
+    def test_total_subject_budget_rejects_before_publishing_job_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "a.txt").write_bytes(b"A" * 6)
+            (subject / "b.txt").write_bytes(b"B" * 6)
+
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "subject total byte limit exceeded",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    max_subject_file_bytes=8,
+                    max_subject_bytes=10,
+                )
+
+            jobs_dir = root / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+
+    def test_packet_hard_limit_includes_prompt_manifest_and_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            subject = Path(tmp) / "subject"
+            subject.mkdir()
+            target = subject / "large.txt"
+            target.write_text("file-content-" * 100, encoding="utf-8")
+            manifest = [
+                {
+                    "path": "large.txt",
+                    "size_bytes": target.stat().st_size,
+                    "sha256": "a" * 64,
+                    "text_candidate": True,
+                }
+            ]
+            packet_limit = 128
+
+            packet, warnings, coverage = review_bridge_module._build_packet(
+                subject=subject,
+                manifest=manifest,
+                git_info={
+                    "is_git_repo": True,
+                    "branch": "branch-" * 100,
+                    "status": "status-" * 100,
+                    "diff": "diff-" * 100,
+                },
+                prompt="objective-" * 100,
+                max_packet_bytes=packet_limit,
+                max_file_bytes=64,
+            )
+
+            self.assertLessEqual(len(packet.encode("utf-8")), packet_limit)
+            self.assertEqual(coverage["packet_bytes"], len(packet.encode("utf-8")))
+            self.assertEqual(coverage["packet_limit_bytes"], packet_limit)
+            self.assertTrue(warnings)
+
+    def test_late_preparation_failure_removes_published_and_staged_job(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            with patch.object(
+                review_bridge_module,
+                "_write_review_capsule",
+                side_effect=review_bridge_module.ReviewBridgeError(
+                    "synthetic late preparation failure"
+                ),
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "synthetic late preparation failure",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            bridge_root = root / "exports" / "review_bridge"
+            for directory_name in ("jobs", "tmp"):
+                directory = bridge_root / directory_name
+                self.assertFalse(directory.exists() and any(directory.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_traversal_entry_budget_bounds_prepare_and_currentness(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum-current"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+                max_files=1,
+            )
+
+            for index in range(1_000):
+                (subject / f"empty-{index:04d}").mkdir()
+
+            current = review_check_current(root, job_id=job["job_id"])
+            self.assertFalse(current["current"])
+            self.assertEqual(current["reason"], "subject_cannot_be_enumerated_safely")
+            self.assertIn("traversal entry limit exceeded", current["detail"])
+
+            prepare_root = base / "continuum-prepare"
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "traversal entry limit exceeded",
+            ):
+                create_review_job(
+                    prepare_root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    max_files=1,
+                )
+            jobs_dir = prepare_root / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+
+    def test_currentness_reports_invalid_stored_review_limits(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            invalid_job = review_bridge_module._load_job(root, job["job_id"])
+            invalid_job["max_files"] = 0
+
+            with patch.object(
+                review_bridge_module,
+                "_load_job",
+                return_value=invalid_job,
+            ):
+                current = review_check_current(root, job_id=job["job_id"])
+
+            self.assertFalse(current["current"])
+            self.assertEqual(current["reason"], "stored_review_limits_invalid")
+
+    def test_combined_entry_ceiling_fails_before_snapshot_copy(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            for index in range(4):
+                (subject / f"empty-{index}").mkdir()
+
+            with patch.object(
+                review_bridge_module,
+                "REVIEW_ZIP_SCAN_MAX_MEMBERS",
+                3,
+            ), patch.object(
+                review_bridge_module,
+                "_copy_snapshot_files",
+                side_effect=AssertionError("snapshot copy must not begin"),
+            ) as copy_snapshot, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "file and directory entry limit exceeded",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            copy_snapshot.assert_not_called()
+            jobs_dir = root / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+
+    def test_prompt_and_cross_limit_preflight_precede_cli_and_mcp_guards(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            prompt_file = base / "oversized-prompt.txt"
+            prompt_file.write_bytes(
+                b"A" * (review_bridge_module.REVIEW_MAX_PROMPT_BYTES + 1)
+            )
+
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-prepare",
+                            "--root",
+                            str(root),
+                            "--subject",
+                            str(subject),
+                            "--prompt-file",
+                            str(prompt_file),
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-prepare",
+                            "--root",
+                            str(root),
+                            "--subject",
+                            str(subject),
+                            "--prompt",
+                            "Review hard.",
+                            "--max-subject-file-bytes",
+                            "2",
+                            "--max-subject-bytes",
+                            "1",
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(mcp_server_module, "guarded_tool") as mcp_guard, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "review prompt exceeds",
+            ):
+                mcp_server_module.tool_review_prepare(
+                    {
+                        "root": str(root),
+                        "subject": str(subject),
+                        "prompt": "A"
+                        * (review_bridge_module.REVIEW_MAX_PROMPT_BYTES + 1),
+                    }
+                )
+            mcp_guard.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_prepare_controls_are_bounded_before_operation_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            cases = (
+                ("slash-operation", {"operation_id": "bad/id"}, "portable"),
+                ("reserved-operation", {"operation_id": "CON"}, "portable"),
+                ("long-operation", {"operation_id": "a" * 129}, "portable"),
+                (
+                    "reviewer",
+                    {
+                        "reviewer_id": "r"
+                        * (review_bridge_module.REVIEW_MAX_REVIEWER_ID_BYTES + 1)
+                    },
+                    "reviewer_id exceeds",
+                ),
+                (
+                    "model",
+                    {
+                        "model": "m"
+                        * (review_bridge_module.REVIEW_MAX_MODEL_BYTES + 1)
+                    },
+                    "review model exceeds",
+                ),
+                (
+                    "base-url",
+                    {
+                        "base_url": "b"
+                        * (review_bridge_module.REVIEW_MAX_BASE_URL_BYTES + 1)
+                    },
+                    "base_url exceeds",
+                ),
+                ("transport-type", {"transport": 0}, "must be text"),
+                (
+                    "allowlist-files",
+                    {
+                        "secret_allowlist_files": [base / "unused"]
+                        * (review_bridge_module.REVIEW_SECRET_ALLOWLIST_MAX_FILES + 1)
+                    },
+                    "too many files",
+                ),
+                (
+                    "allowlist-entry-type",
+                    {"secret_allowlist_patterns": [0]},
+                    "entries must be text or fingerprint objects",
+                ),
+                (
+                    "allowlist-entry-bytes",
+                    {
+                        "secret_allowlist_patterns": [
+                            "x"
+                            * (
+                                review_bridge_module.REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES
+                                + 1
+                            )
+                        ]
+                    },
+                    "entry exceeds its byte limit",
+                ),
+                (
+                    "nonlinear-pattern",
+                    {
+                        "secret_allowlist_patterns": [
+                            r"^fixture\.py:1:(a+)+$"
+                        ]
+                    },
+                    "linear literal",
+                ),
+            )
+            for label, overrides, message in cases:
+                with self.subTest(label=label):
+                    root = base / f"continuum-{label}"
+                    with patch.object(
+                        review_bridge_module,
+                        "operation_lock",
+                        side_effect=AssertionError(
+                            "operation lock must not be entered"
+                        ),
+                    ), self.assertRaisesRegex(
+                        review_bridge_module.ReviewBridgeError,
+                        message,
+                    ):
+                        controls = {"transport": "manual", **overrides}
+                        create_review_job(
+                            root,
+                            subject_path=subject,
+                            prompt="Review hard.",
+                            **controls,
+                        )
+                    self.assertFalse(root.exists())
+
+            allowlist_a = base / "allowlist-a.txt"
+            allowlist_b = base / "allowlist-b.txt"
+            allowlist_a.write_text("# a\n", encoding="utf-8")
+            allowlist_b.write_text("# b\n", encoding="utf-8")
+            aggregate_root = base / "continuum-aggregate"
+            with patch.object(
+                review_bridge_module,
+                "REVIEW_SECRET_ALLOWLIST_MAX_TOTAL_FILE_BYTES",
+                6,
+            ), patch.object(
+                review_bridge_module,
+                "operation_lock",
+                side_effect=AssertionError("operation lock must not be entered"),
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "aggregate byte limit",
+            ):
+                create_review_job(
+                    aggregate_root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                    secret_allowlist_files=[allowlist_a, allowlist_b],
+                )
+            self.assertFalse(aggregate_root.exists())
+
+    def test_cli_and_mcp_prepare_controls_fail_before_guards(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            oversized_reviewer = "r" * (
+                review_bridge_module.REVIEW_MAX_REVIEWER_ID_BYTES + 1
+            )
+
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-prepare",
+                            "--root",
+                            str(root),
+                            "--subject",
+                            str(subject),
+                            "--prompt",
+                            "Review hard.",
+                            "--reviewer-id",
+                            oversized_reviewer,
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(
+                mcp_server_module,
+                "guarded_tool",
+            ) as mcp_guard, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "reviewer_id exceeds",
+            ):
+                mcp_server_module.tool_review_prepare(
+                    {
+                        "root": str(root),
+                        "subject": str(subject),
+                        "prompt": "Review hard.",
+                        "reviewer_id": oversized_reviewer,
+                    }
+                )
+            mcp_guard.assert_not_called()
+            self.assertFalse(root.exists())
+
+            malformed_prompt_file = base / "malformed-prompt.txt"
+            malformed_prompt_file.write_bytes(b"review\xffprompt")
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-prepare",
+                            "--root",
+                            str(root),
+                            "--subject",
+                            str(subject),
+                            "--prompt-file",
+                            str(malformed_prompt_file),
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(mcp_server_module, "guarded_tool") as mcp_guard, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "valid UTF-8 text",
+            ):
+                mcp_server_module.tool_review_prepare(
+                    {
+                        "root": str(root),
+                        "subject": str(subject),
+                        "prompt": "review\ud800prompt",
+                    }
+                )
+            mcp_guard.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_capsule_rejects_snapshot_drift_before_atomic_publication(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("ORIGINAL\n", encoding="utf-8")
+            original_write_capsule = review_bridge_module._write_review_capsule
+
+            def mutate_snapshot_before_capsule(
+                job_dir: Path,
+                job: dict,
+                snapshot_subject: Path,
+                snapshot_files: list[Path],
+                snapshot_directories: list[Path],
+                snapshot_manifest: list[dict],
+                manifest_path: Path,
+                **kwargs: object,
+            ) -> tuple[Path, str]:
+                jobs_dir = root / "exports" / "review_bridge" / "jobs"
+                self.assertFalse(jobs_dir.exists() and any(jobs_dir.iterdir()))
+                snapshot_files[0].write_text("MUTATED\n", encoding="utf-8")
+                return original_write_capsule(
+                    job_dir,
+                    job,
+                    snapshot_subject,
+                    snapshot_files,
+                    snapshot_directories,
+                    snapshot_manifest,
+                    manifest_path,
+                    **kwargs,
+                )
+
+            with patch.object(
+                review_bridge_module,
+                "_write_review_capsule",
+                side_effect=mutate_snapshot_before_capsule,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "no longer matches its manifest",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            bridge_root = root / "exports" / "review_bridge"
+            for directory_name in ("jobs", "tmp"):
+                directory = bridge_root / directory_name
+                self.assertFalse(directory.exists() and any(directory.iterdir()))
+            self.assertFalse(any(root.rglob(review_bridge_module.REVIEW_CAPSULE_NAME)))
+
+    def test_prepare_recovery_rolls_back_unmarked_incomplete_staging(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            review_bridge_module.init_db(root)
+            stale = (
+                review_bridge_module.review_bridge_root(root)
+                / "tmp"
+                / "review-interrupted-before-ready"
+            )
+            stale.mkdir(parents=True)
+            (stale / "partial.txt").write_text("partial\n", encoding="utf-8")
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            self.assertFalse(stale.exists())
+            self.assertIn(
+                "rolled_back_incomplete_staging",
+                {
+                    item["outcome"]
+                    for item in job["reconciled_preparations"]
+                },
+            )
+
+    def test_prepare_recovery_finalizes_catalog_bound_staging(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(
+                root,
+                seed,
+            )
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="crashed-prepare-operation",
+                    plan=plan,
+                )
+            )
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            recovered = [
+                item
+                for item in replacement["reconciled_preparations"]
+                if item.get("job_id") == seed["job_id"]
+            ]
+            self.assertEqual(
+                recovered[0]["outcome"],
+                "recovered_staged_publication",
+            )
+            self.assertFalse(marker_path.exists())
+            integrity = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=seed["job_id"],
+            )
+            self.assertTrue(integrity["ok"], integrity)
+            conn = connect(root)
+            try:
+                recovered_rows = review_bridge_module._review_job_artifact_rows(
+                    root,
+                    seed["job_id"],
+                    conn=conn,
+                )
+            finally:
+                conn.close()
+            self.assertTrue(recovered_rows)
+            self.assertEqual(
+                {row["operation_id"] for row in recovered_rows},
+                {"crashed-prepare-operation"},
+            )
+
+    def test_prepare_recovery_finalizes_published_tree_before_catalog_commit(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(
+                root,
+                seed,
+            )
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="crashed-after-rename-operation",
+                    plan=plan,
+                )
+            )
+            published_dir = review_bridge_module.review_job_dir(
+                root,
+                seed["job_id"],
+            )
+            staging_dir.rename(published_dir)
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            recovered = [
+                item
+                for item in replacement["reconciled_preparations"]
+                if item.get("job_id") == seed["job_id"]
+            ]
+            self.assertEqual(
+                recovered[0]["outcome"],
+                "recovered_published_catalog",
+            )
+            self.assertFalse(marker_path.exists())
+            integrity = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=seed["job_id"],
+            )
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_prepare_recovery_cleans_only_post_commit_marker(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            job_dir = Path(seed["job_dir"])
+            conn = connect(root)
+            try:
+                rows = review_bridge_module._review_job_artifact_rows(
+                    root,
+                    seed["job_id"],
+                    conn=conn,
+                )
+            finally:
+                conn.close()
+            prefix = review_bridge_module._root_uri(root, job_dir) + "/"
+            plan = review_bridge_module._review_prepare_artifact_plan(
+                job_dir,
+                seed["job_id"],
+                [
+                    (
+                        job_dir.joinpath(
+                            *Path(str(row["uri"])[len(prefix) :]).parts
+                        ),
+                        str(row["kind"]),
+                        bool(row["immutable"]),
+                    )
+                    for row in rows
+                ],
+            )
+            marker_path = review_bridge_module._review_prepare_marker_path(
+                root,
+                seed["job_id"],
+            )
+            review_bridge_module.secure_write_text(
+                marker_path,
+                review_bridge_module.json_dumps(
+                    {
+                        "schema": review_bridge_module.REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+                        "job_id": seed["job_id"],
+                        "producer_operation_id": "committed-prepare-operation",
+                        "artifacts": plan,
+                    }
+                ),
+            )
+            job_bytes_before = {
+                path.relative_to(job_dir).as_posix(): path.read_bytes()
+                for path in job_dir.rglob("*")
+                if path.is_file()
+            }
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            recovered = [
+                item
+                for item in replacement["reconciled_preparations"]
+                if item.get("job_id") == seed["job_id"]
+            ]
+            self.assertEqual(
+                recovered[0]["outcome"],
+                "cleaned_post_commit_marker",
+            )
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(
+                {
+                    path.relative_to(job_dir).as_posix(): path.read_bytes()
+                    for path in job_dir.rglob("*")
+                    if path.is_file()
+                },
+                job_bytes_before,
+            )
+
+    def test_prepare_recovery_preserves_tampered_bound_state(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(
+                root,
+                seed,
+            )
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="tampered-prepare-operation",
+                    plan=plan,
+                )
+            )
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker["artifacts"][0]["sha256"] = "0" * 64
+            marker_path.write_text(
+                review_bridge_module.json_dumps(marker),
+                encoding="utf-8",
+            )
+            marker_bytes = marker_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "authority drifted",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertTrue(staging_dir.is_dir())
+            self.assertEqual(marker_path.read_bytes(), marker_bytes)
+
+    def test_prepare_catalog_state_requires_exact_marker_binding(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(root, seed)
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="marker-binding-operation",
+                    plan=plan,
+                )
+            )
+
+            self.assertEqual(
+                review_bridge_module._review_prepare_catalog_state(
+                    root,
+                    job_id=seed["job_id"],
+                    marker_path=marker_path,
+                ),
+                "uncommitted",
+            )
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker["artifacts"][0]["sha256"] = "0" * 64
+            marker_path.write_text(
+                review_bridge_module.json_dumps(marker),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                review_bridge_module._review_prepare_catalog_state(
+                    root,
+                    job_id=seed["job_id"],
+                    marker_path=marker_path,
+                ),
+                "unknown",
+            )
+
+    def test_concurrent_review_prepares_are_serialized_and_integral(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                jobs = list(
+                    executor.map(
+                        lambda index: create_review_job(
+                            root,
+                            subject_path=subject,
+                            prompt=f"Review hard {index}.",
+                            transport="manual",
+                        ),
+                        range(2),
+                    )
+                )
+
+            self.assertEqual(len({job["job_id"] for job in jobs}), 2)
+            for job in jobs:
+                integrity = review_bridge_module.review_bridge_integrity_report(
+                    root,
+                    job_id=job["job_id"],
+                )
+                self.assertTrue(integrity["ok"], integrity)
+
+    def test_prepare_post_commit_failure_preserves_committed_job(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            original_connect = review_bridge_module.connect
+            proxies: list[CommitThenRaiseConnection] = []
+
+            def ambiguous_connect(active_root: Path) -> CommitThenRaiseConnection:
+                proxy = CommitThenRaiseConnection(original_connect(active_root))
+                proxies.append(proxy)
+                return proxy
+
+            with patch.object(
+                review_bridge_module,
+                "connect",
+                side_effect=ambiguous_connect,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "ambiguous post-commit",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertTrue(any(proxy.raised for proxy in proxies))
+            jobs = list(
+                (review_bridge_module.review_bridge_root(root) / "jobs").iterdir()
+            )
+            self.assertEqual(len(jobs), 1)
+            job_id = jobs[0].name
+            marker_path = review_bridge_module._review_prepare_marker_path(
+                root,
+                job_id,
+            )
+            self.assertTrue(marker_path.is_file())
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "publication is not committed yet",
+            ):
+                review_job_status(root, job_id=job_id)
+            conn = connect(root)
+            try:
+                self.assertFalse(
+                    review_bridge_module._review_prepare_marker_rows(
+                        conn,
+                        root,
+                        marker_path,
+                    )
+                )
+                self.assertTrue(
+                    review_bridge_module._review_job_artifact_rows(
+                        root,
+                        job_id,
+                        conn=conn,
+                    )
+                )
+            finally:
+                conn.close()
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard again.",
+                transport="manual",
+            )
+            self.assertIn(
+                "cleaned_post_commit_marker",
+                {
+                    item["outcome"]
+                    for item in replacement["reconciled_preparations"]
+                    if item.get("job_id") == job_id
+                },
+            )
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(review_job_status(root, job_id=job_id)["status"], "prepared")
+
+    def test_prepare_unknown_post_commit_state_preserves_publication_authority(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            original_connect = review_bridge_module.connect
+            proxies: list[CommitThenRaiseConnection] = []
+
+            def ambiguous_connect(active_root: Path) -> CommitThenRaiseConnection:
+                proxy = CommitThenRaiseConnection(original_connect(active_root))
+                proxies.append(proxy)
+                return proxy
+
+            with patch.object(
+                review_bridge_module,
+                "connect",
+                side_effect=ambiguous_connect,
+            ), patch.object(
+                review_bridge_module,
+                "_review_prepare_catalog_state",
+                return_value="unknown",
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "ambiguous post-commit",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertTrue(any(proxy.raised for proxy in proxies))
+            jobs = list(
+                (review_bridge_module.review_bridge_root(root) / "jobs").iterdir()
+            )
+            self.assertEqual(len(jobs), 1)
+            marker_path = review_bridge_module._review_prepare_marker_path(
+                root,
+                jobs[0].name,
+            )
+            self.assertTrue(jobs[0].is_dir())
+            self.assertTrue(marker_path.is_file())
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Recover the ambiguous publication.",
+                transport="manual",
+            )
+            self.assertTrue(replacement["ok"])
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(
+                review_job_status(root, job_id=jobs[0].name)["status"],
+                "prepared",
+            )
+
+    def test_prepare_post_rename_cleanup_failure_preserves_marker_and_tree(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            original_remove = review_bridge_module._remove_plain_review_prepare_tree
+
+            def fail_finalization(*args: object, **kwargs: object) -> object:
+                raise RuntimeError("injected post-rename finalization failure")
+
+            def fail_published_cleanup(
+                active_root: Path,
+                path: Path,
+            ) -> None:
+                if Path(path).parent.name == "jobs":
+                    raise review_bridge_module.ReviewBridgeError(
+                        "injected published cleanup failure"
+                    )
+                original_remove(active_root, path)
+
+            with patch.object(
+                review_bridge_module,
+                "_finalize_review_prepare_publication",
+                side_effect=fail_finalization,
+            ), patch.object(
+                review_bridge_module,
+                "_remove_plain_review_prepare_tree",
+                side_effect=fail_published_cleanup,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "post-rename finalization failure",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            jobs = list(
+                (review_bridge_module.review_bridge_root(root) / "jobs").iterdir()
+            )
+            self.assertEqual(len(jobs), 1)
+            marker_path = review_bridge_module._review_prepare_marker_path(
+                root,
+                jobs[0].name,
+            )
+            self.assertTrue(jobs[0].is_dir())
+            self.assertTrue(marker_path.is_file())
+            conn = connect(root)
+            try:
+                self.assertTrue(
+                    review_bridge_module._review_prepare_marker_rows(
+                        conn,
+                        root,
+                        marker_path,
+                    )
+                )
+                self.assertFalse(
+                    review_bridge_module._review_job_artifact_rows(
+                        root,
+                        jobs[0].name,
+                        conn=conn,
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_recovered_post_commit_failure_never_reverses_durable_publication(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(root, seed)
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="recovery-post-commit-operation",
+                    plan=plan,
+                )
+            )
+            published_dir = review_bridge_module.review_job_dir(
+                root,
+                seed["job_id"],
+            )
+            review_bridge_module._rename_review_prepare_tree(
+                root,
+                staging_dir,
+                published_dir,
+            )
+            original_connect = review_bridge_module.connect
+            proxies: list[CommitThenRaiseConnection] = []
+
+            def ambiguous_connect(active_root: Path) -> CommitThenRaiseConnection:
+                proxy = CommitThenRaiseConnection(original_connect(active_root))
+                proxies.append(proxy)
+                return proxy
+
+            with patch.object(
+                review_bridge_module,
+                "connect",
+                side_effect=ambiguous_connect,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "ambiguous post-commit",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Trigger recovery.",
+                    transport="manual",
+                )
+
+            self.assertTrue(any(proxy.raised for proxy in proxies))
+            self.assertTrue(published_dir.is_dir())
+            self.assertFalse(staging_dir.exists())
+            self.assertTrue(marker_path.is_file())
+            conn = connect(root)
+            try:
+                self.assertFalse(
+                    review_bridge_module._review_prepare_marker_rows(
+                        conn,
+                        root,
+                        marker_path,
+                    )
+                )
+                self.assertTrue(
+                    review_bridge_module._review_job_artifact_rows(
+                        root,
+                        seed["job_id"],
+                        conn=conn,
+                    )
+                )
+            finally:
+                conn.close()
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Finish recovery.",
+                transport="manual",
+            )
+            self.assertIn(
+                "cleaned_post_commit_marker",
+                {
+                    item["outcome"]
+                    for item in replacement["reconciled_preparations"]
+                    if item.get("job_id") == seed["job_id"]
+                },
+            )
+            integrity = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=seed["job_id"],
+            )
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_public_job_operations_reject_renamed_uncommitted_job(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(root, seed)
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="pending-publication-operation",
+                    plan=plan,
+                )
+            )
+            published_dir = review_bridge_module.review_job_dir(
+                root,
+                seed["job_id"],
+            )
+            review_bridge_module._rename_review_prepare_tree(
+                root,
+                staging_dir,
+                published_dir,
+            )
+            status_before = (published_dir / "status.json").read_bytes()
+
+            for operation in (
+                lambda: review_job_status(root, job_id=seed["job_id"]),
+                lambda: review_browser_attempt_start(
+                    root,
+                    job_id=seed["job_id"],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "publication is not committed yet",
+                ):
+                    operation()
+            self.assertEqual(
+                (published_dir / "status.json").read_bytes(),
+                status_before,
+            )
+            self.assertTrue(marker_path.is_file())
+
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Recover publication.",
+                transport="manual",
+            )
+            self.assertIn(
+                "recovered_published_catalog",
+                {
+                    item["outcome"]
+                    for item in replacement["reconciled_preparations"]
+                    if item.get("job_id") == seed["job_id"]
+                },
+            )
+
+    def test_prepare_reconciles_catalog_marker_when_tmp_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            review_bridge_module.init_db(root)
+            missing_job_id = "review-missing-marker-file"
+            missing_uri = (
+                f"exports/review_bridge/tmp/{missing_job_id}.ready.json"
+            )
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind=review_bridge_module.REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                    uri=missing_uri,
+                    sha256="0" * 64,
+                    size_bytes=1,
+                    operation_id="missing-marker-operation",
+                    immutable=False,
+                    source_type="review_prepare_transaction",
+                    trust_level="local_generated",
+                    metadata={
+                        "job_id": missing_job_id,
+                        "schema": review_bridge_module.REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+                    },
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertFalse(
+                (review_bridge_module.review_bridge_root(root) / "tmp").exists()
+            )
+
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+
+            self.assertIn(
+                "retired_missing_marker_authority",
+                {
+                    item["outcome"]
+                    for item in job["reconciled_preparations"]
+                    if item.get("job_id") == missing_job_id
+                },
+            )
+
+    def test_prepare_publication_budget_covers_plan_and_finalization(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            staging = base / "standalone-stage"
+            staging.mkdir()
+            artifact = staging / "artifact.txt"
+            artifact.write_text("artifact\n", encoding="utf-8")
+            expired = review_bridge_module.ReviewPreparationBudget(
+                max_subject_file_bytes=1_000_000,
+                max_subject_bytes=1_000_000,
+                max_archive_bytes=1_000_000,
+                max_temporary_bytes=1_000_000,
+                max_work_bytes=1_000_000,
+                deadline=time.monotonic() - 1,
+            )
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "elapsed-time budget",
+            ):
+                review_bridge_module._review_prepare_artifact_plan(
+                    staging,
+                    "review-expired-plan",
+                    [(artifact, "review_packet", True)],
+                    budget=expired,
+                )
+
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(root, seed)
+            marker_path, _marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="expired-finalize-operation",
+                    plan=plan,
+                )
+            )
+            published_dir = review_bridge_module.review_job_dir(
+                root,
+                seed["job_id"],
+            )
+            review_bridge_module._rename_review_prepare_tree(
+                root,
+                staging_dir,
+                published_dir,
+            )
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "elapsed-time budget",
+            ):
+                review_bridge_module._finalize_review_prepare_publication(
+                    root,
+                    job_id=seed["job_id"],
+                    marker_path=marker_path,
+                    budget=expired,
+                )
+            conn = connect(root)
+            try:
+                self.assertTrue(
+                    review_bridge_module._review_prepare_marker_rows(
+                        conn,
+                        root,
+                        marker_path,
+                    )
+                )
+                self.assertFalse(
+                    review_bridge_module._review_job_artifact_rows(
+                        root,
+                        seed["job_id"],
+                        conn=conn,
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_prepare_durability_flushes_files_and_directories_bottom_up(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            staging = base / "tmp" / "review-stage"
+            nested = staging / "nested" / "deeper"
+            nested.mkdir(parents=True)
+            artifact = nested / "artifact.txt"
+            artifact.write_text("artifact\n", encoding="utf-8")
+            flushed_files: list[Path] = []
+            flushed_directories: list[Path] = []
+            budget = review_bridge_module.ReviewPreparationBudget(
+                max_subject_file_bytes=1_000_000,
+                max_subject_bytes=1_000_000,
+                max_archive_bytes=1_000_000,
+                max_temporary_bytes=1_000_000,
+                max_work_bytes=1_000_000,
+                deadline=time.monotonic() + 30,
+            )
+
+            with patch.object(
+                review_bridge_module,
+                "_flush_review_prepare_file",
+                side_effect=flushed_files.append,
+            ), patch.object(
+                review_bridge_module,
+                "_flush_review_prepare_directory",
+                side_effect=flushed_directories.append,
+            ):
+                review_bridge_module._durably_flush_review_prepare_tree(
+                    staging,
+                    budget=budget,
+                )
+
+            self.assertEqual(flushed_files, [artifact])
+            self.assertEqual(
+                flushed_directories,
+                [nested, nested.parent, staging, staging.parent],
+            )
+
+    def test_prepare_durability_failure_precedes_publication_authority(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+
+            with patch.object(
+                review_bridge_module,
+                "_durably_flush_review_prepare_tree",
+                side_effect=review_bridge_module.ReviewBridgeError(
+                    "synthetic durability failure"
+                ),
+            ), patch.object(
+                review_bridge_module,
+                "_catalog_review_prepare_marker",
+            ) as catalog_marker, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "synthetic durability failure",
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            catalog_marker.assert_not_called()
+            bridge_root = root / "exports" / "review_bridge"
+            self.assertFalse(
+                (bridge_root / "jobs").exists()
+                and any((bridge_root / "jobs").iterdir())
+            )
+            self.assertFalse(
+                (bridge_root / "tmp").exists()
+                and any((bridge_root / "tmp").iterdir())
+            )
+
+    def test_review_publication_authority_uses_full_sqlite_durability(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            original_configure = (
+                review_bridge_module._configure_review_prepare_catalog_durability
+            )
+            observed_levels: list[int] = []
+
+            def configure_and_record(connection: object) -> None:
+                self.assertFalse(connection.in_transaction)  # type: ignore[attr-defined]
+                original_configure(connection)
+                row = connection.execute(  # type: ignore[attr-defined]
+                    "PRAGMA synchronous"
+                ).fetchone()
+                observed_levels.append(int(row[0]))
+
+            with patch.object(
+                review_bridge_module,
+                "_configure_review_prepare_catalog_durability",
+                side_effect=configure_and_record,
+            ):
+                create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+
+            self.assertEqual(observed_levels, [2, 2])
+
+    def test_known_uncommitted_marker_authority_can_be_durably_discarded(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            seed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            staging_dir, plan = stage_completed_review_job_for_recovery(root, seed)
+            marker_path, marker_sha256 = (
+                review_bridge_module._catalog_review_prepare_marker(
+                    root,
+                    staging_dir,
+                    job_id=seed["job_id"],
+                    operation_id="discard-uncommitted-marker",
+                    plan=plan,
+                )
+            )
+            review_bridge_module._remove_plain_review_prepare_tree(
+                root,
+                staging_dir,
+            )
+
+            self.assertTrue(
+                review_bridge_module._discard_review_prepare_marker_authority(
+                    root,
+                    marker_path,
+                    marker_sha256,
+                )
+            )
+            self.assertFalse(marker_path.exists())
+            conn = connect(root)
+            try:
+                self.assertEqual(
+                    review_bridge_module._review_prepare_marker_rows(
+                        conn,
+                        root,
+                        marker_path,
+                    ),
+                    [],
+                )
+            finally:
+                conn.close()
+
+    def test_prepare_cleanup_rejects_swapped_tmp_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            review_bridge_module.init_db(root)
+            tmp_root = review_bridge_module.review_bridge_root(root) / "tmp"
+            stale_job_id = "review-interrupted-ancestor-swap"
+            stale = tmp_root / stale_job_id
+            stale.mkdir(parents=True)
+            (stale / "partial.txt").write_text("partial\n", encoding="utf-8")
+            saved_tmp = tmp_root.with_name("tmp-original")
+            external_tmp = base / "external-tmp"
+            external_stale = external_tmp / stale_job_id
+            external_stale.mkdir(parents=True)
+            sentinel = external_stale / "sentinel.txt"
+            sentinel.write_text("preserve me\n", encoding="utf-8")
+            original_rows = review_bridge_module._review_job_artifact_rows
+            swapped = False
+
+            def swap_before_cleanup(*args: object, **kwargs: object) -> object:
+                nonlocal swapped
+                if not swapped:
+                    tmp_root.rename(saved_tmp)
+                    make_link_like_directory(self, tmp_root, external_tmp)
+                    swapped = True
+                return original_rows(*args, **kwargs)
+
+            try:
+                with patch.object(
+                    review_bridge_module,
+                    "_review_job_artifact_rows",
+                    side_effect=swap_before_cleanup,
+                ), self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "link-like|ancestry changed",
+                ):
+                    create_review_job(
+                        root,
+                        subject_path=subject,
+                        prompt="Review hard.",
+                        transport="manual",
+                    )
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
+                self.assertTrue((saved_tmp / stale_job_id / "partial.txt").is_file())
+            finally:
+                if swapped and os.path.lexists(tmp_root):
+                    if os.name == "nt":
+                        os.rmdir(tmp_root)
+                    else:
+                        tmp_root.unlink()
+                if saved_tmp.exists() and not tmp_root.exists():
+                    saved_tmp.rename(tmp_root)
+
+    def test_prepare_cleanup_rejects_plain_tmp_swap_and_restore(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            review_bridge_module.init_db(root)
+            tmp_root = review_bridge_module.review_bridge_root(root) / "tmp"
+            stale_job_id = "review-interrupted-plain-swap"
+            stale = tmp_root / stale_job_id
+            stale.mkdir(parents=True)
+            partial = stale / "partial.txt"
+            partial.write_text("partial\n", encoding="utf-8")
+            saved_tmp = tmp_root.with_name("tmp-original")
+            replacement_tmp = base / "replacement-tmp"
+            replacement_stale = replacement_tmp / stale_job_id
+            replacement_stale.mkdir(parents=True)
+            sentinel = replacement_stale / "sentinel.txt"
+            sentinel.write_text("preserve me\n", encoding="utf-8")
+            original_open = review_bridge_module._open_plain_directory_fd
+            swapped = False
+
+            @contextmanager
+            def swap_before_open(
+                path: Path,
+                **kwargs: object,
+            ) -> object:
+                nonlocal swapped
+                active_path = Path(path)
+                if active_path == tmp_root and not swapped:
+                    tmp_root.rename(saved_tmp)
+                    replacement_tmp.rename(tmp_root)
+                    swapped = True
+                try:
+                    with original_open(active_path, **kwargs) as descriptor:
+                        yield descriptor
+                finally:
+                    if swapped and tmp_root.exists():
+                        tmp_root.rename(replacement_tmp)
+                    if swapped and saved_tmp.exists() and not tmp_root.exists():
+                        saved_tmp.rename(tmp_root)
+
+            with patch.object(
+                review_bridge_module,
+                "_open_plain_directory_fd",
+                side_effect=swap_before_open,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "identity changed|frozen plain directory",
+            ):
+                review_bridge_module._remove_plain_review_prepare_tree(root, stale)
+
+            self.assertTrue(partial.is_file())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
+
+    def test_snapshot_uses_review_publication_authority(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "continuum"
+            review_bridge_module.init_db(root)
+            captured: list[tuple[Path, str, float]] = []
+
+            @contextmanager
+            def capture_lock(
+                lock_root: Path,
+                operation_id: str,
+                *,
+                timeout_seconds: float,
+            ) -> object:
+                captured.append((Path(lock_root), operation_id, timeout_seconds))
+                yield
+
+            with patch(
+                "continuum.core.operations.operation_lock",
+                side_effect=capture_lock,
+            ):
+                result = snapshot(root, reason="publication-lock-proof")
+
+            self.assertTrue(Path(result["snapshot_uri"]).is_file())
+            self.assertIn(
+                (root, review_bridge_module.REVIEW_PREPARE_PUBLICATION_LOCK_ID, 600.0),
+                captured,
+            )
+
+    def test_public_subject_path_rejects_links_and_currentness_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            target_parent = base / "target-parent"
+            target = target_parent / "subject"
+            target.mkdir(parents=True)
+            (target / "README.md").write_text("# Linked target\n", encoding="utf-8")
+            linked_parent = base / "linked-parent"
+            make_link_like_directory(self, linked_parent, target_parent)
+            linked_subject = linked_parent / "subject"
+            rejected_root = base / "continuum-rejected"
+
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "link-like",
+            ):
+                create_review_job(
+                    rejected_root,
+                    subject_path=linked_subject,
+                    prompt="Review hard.",
+                    transport="manual",
+                )
+            self.assertFalse(rejected_root.exists())
+
+            with patch.object(cli_module, "guarded_result") as cli_guard, patch.object(
+                cli_module,
+                "emit",
+            ):
+                self.assertEqual(
+                    cli_module.main(
+                        [
+                            "review-prepare",
+                            "--root",
+                            str(rejected_root),
+                            "--subject",
+                            str(linked_subject),
+                            "--prompt",
+                            "Review hard.",
+                        ]
+                    ),
+                    1,
+                )
+                cli_guard.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+            ), patch.object(mcp_server_module, "guarded_tool") as mcp_guard, self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "link-like",
+            ):
+                mcp_server_module.tool_review_prepare(
+                    {
+                        "root": str(rejected_root),
+                        "subject": str(linked_subject),
+                        "prompt": "Review hard.",
+                    }
+                )
+            mcp_guard.assert_not_called()
+            self.assertFalse(rejected_root.exists())
+
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Original\n", encoding="utf-8")
+            root = base / "continuum-current"
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review hard.",
+                transport="manual",
+            )
+            shutil.rmtree(subject)
+            make_link_like_directory(self, subject, target)
+
+            current = review_check_current(root, job_id=job["job_id"])
+            self.assertFalse(current["current"])
+            self.assertEqual(current["reason"], "subject_path_unsafe")
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object containment proof")
+    def test_windows_process_never_runs_when_job_containment_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            marker = base / "child-ran.txt"
+            child = base / "child.py"
+            child.write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                review_bridge_module,
+                "_attach_windows_kill_job",
+                return_value=None,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "containment could not be established",
+            ):
+                review_bridge_module._run_bounded_process(
+                    [sys.executable, str(child)],
+                    cwd=base,
+                    env=os.environ.copy(),
+                    timeout_seconds=5,
+                    stdout_limit=1_024,
+                    stderr_limit=1_024,
+                    total_limit=2_048,
+                )
+
+            self.assertFalse(marker.exists())
+
+    def test_cli_and_mcp_share_hard_review_limit_maxima(self) -> None:
+        prepare_limits = {
+            "max_packet_bytes": review_bridge_module.REVIEW_MAX_PACKET_BYTES,
+            "max_file_bytes": review_bridge_module.REVIEW_MAX_FILE_SAMPLE_BYTES,
+            "max_files": review_bridge_module.REVIEW_MAX_FILES,
+            "max_subject_file_bytes": review_bridge_module.REVIEW_MAX_SUBJECT_FILE_BYTES,
+            "max_subject_bytes": review_bridge_module.REVIEW_MAX_SUBJECT_BYTES,
+            "prepare_timeout_seconds": review_bridge_module.REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+        }
+        transport_limits = {
+            "timeout_seconds": review_bridge_module.REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+            "max_tokens": review_bridge_module.REVIEW_MAX_TOKENS,
+        }
+        prepare_schema = TOOLS["continuum_review_prepare"][1]
+        run_schema = TOOLS["continuum_review_run"][1]
+        browser_schema = TOOLS["continuum_review_browser_attempt_start"][1]
+        for name, maximum in prepare_limits.items():
+            with self.subTest(surface="mcp-prepare", name=name):
+                self.assertEqual(
+                    prepare_schema["properties"][name],
+                    {"type": "integer", "minimum": 1, "maximum": maximum},
+                )
+        for name, maximum in transport_limits.items():
+            with self.subTest(surface="mcp-run", name=name):
+                self.assertEqual(
+                    run_schema["properties"][name],
+                    {"type": "integer", "minimum": 1, "maximum": maximum},
+                )
+        self.assertEqual(
+            prepare_schema["properties"]["prompt"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_PROMPT_BYTES,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["reviewer_id"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_REVIEWER_ID_BYTES,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["model"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_MODEL_BYTES,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["base_url"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_BASE_URL_BYTES,
+        )
+        self.assertEqual(
+            run_schema["properties"]["model"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_MODEL_BYTES,
+        )
+        self.assertEqual(
+            run_schema["properties"]["base_url"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_BASE_URL_BYTES,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["secret_allowlist_patterns"]["maxItems"],
+            review_bridge_module.REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["secret_allowlist_files"]["maxItems"],
+            review_bridge_module.REVIEW_SECRET_ALLOWLIST_MAX_FILES,
+        )
+        expected_operation_schema = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+        }
+        self.assertEqual(
+            run_schema["properties"]["operation_id"],
+            expected_operation_schema,
+        )
+        self.assertEqual(
+            browser_schema["properties"]["operation_id"],
+            expected_operation_schema,
+        )
+
+        parser = cli_module.build_parser()
+        for name, maximum in prepare_limits.items():
+            flag = "--" + name.replace("_", "-")
+            with self.subTest(surface="cli-prepare", name=name), patch(
+                "sys.stderr",
+                new=io.StringIO(),
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "review-prepare",
+                        "--root",
+                        "root",
+                        "--subject",
+                        "subject",
+                        "--prompt",
+                        "review",
+                        flag,
+                        str(maximum + 1),
+                    ]
+                )
+        for name, maximum in transport_limits.items():
+            flag = "--" + name.replace("_", "-")
+            with self.subTest(surface="cli-run", name=name), patch(
+                "sys.stderr",
+                new=io.StringIO(),
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "review-run",
+                        "--root",
+                        "root",
+                        "--job-id",
+                        "review-test",
+                        flag,
+                        str(maximum + 1),
+                    ]
+                )
+        for flag, maximum in (
+            ("--model", review_bridge_module.REVIEW_MAX_MODEL_BYTES),
+            ("--base-url", review_bridge_module.REVIEW_MAX_BASE_URL_BYTES),
+        ):
+            with self.subTest(surface="cli-run", flag=flag), patch(
+                "sys.stderr",
+                new=io.StringIO(),
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "review-run",
+                        "--root",
+                        "root",
+                        "--job-id",
+                        "review-test",
+                        flag,
+                        "x" * (maximum + 1),
+                    ]
+                )
+
+    def test_review_run_overrides_fail_before_reservation_or_guards(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review through endpoint.",
+                transport="direct-openai",
+            )
+            oversized_controls = (
+                ("model", "m" * (review_bridge_module.REVIEW_MAX_MODEL_BYTES + 1)),
+                (
+                    "base_url",
+                    "u" * (review_bridge_module.REVIEW_MAX_BASE_URL_BYTES + 1),
+                ),
+            )
+
+            for name, value in oversized_controls:
+                with self.subTest(surface="direct", name=name), patch.object(
+                    review_bridge_module,
+                    "_openai_chat_completion",
+                ) as endpoint, self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    f"review {name} exceeds",
+                ):
+                    review_bridge_module.run_review_job(
+                        root,
+                        job_id=job["job_id"],
+                        transport="direct-openai",
+                        **{name: value},
+                    )
+                endpoint.assert_not_called()
+
+            status = review_job_status(root, job_id=job["job_id"])
+            self.assertEqual(status["status"], "prepared")
+            self.assertEqual(status["attempt_count"], 0)
+
+            for name, value in oversized_controls:
+                flag = "--" + name.replace("_", "-")
+                with self.subTest(surface="cli", name=name), patch.object(
+                    cli_module,
+                    "guarded_result",
+                ) as cli_guard, patch(
+                    "sys.stderr",
+                    new=io.StringIO(),
+                ), self.assertRaises(SystemExit):
+                    cli_module.main(
+                        [
+                            "review-run",
+                            "--root",
+                            str(root),
+                            "--job-id",
+                            job["job_id"],
+                            flag,
+                            value,
+                        ]
+                    )
+                cli_guard.assert_not_called()
+
+            for name, value in oversized_controls:
+                with self.subTest(surface="mcp", name=name), patch.dict(
+                    os.environ,
+                    {"CONTINUUM_MCP_ALLOW_ANY_PATH": "1"},
+                ), patch.object(
+                    mcp_server_module,
+                    "guarded_tool",
+                ) as mcp_guard, self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    f"review {name} exceeds",
+                ):
+                    mcp_server_module.tool_review_run(
+                        {
+                            "root": str(root),
+                            "job_id": job["job_id"],
+                            name: value,
+                        }
+                    )
+                mcp_guard.assert_not_called()
+
+            final_status = review_job_status(root, job_id=job["job_id"])
+            self.assertEqual(final_status["status"], "prepared")
+            self.assertEqual(final_status["attempt_count"], 0)
 
     def test_subject_packaging_refuses_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -4001,18 +7197,21 @@ class ReviewBridgeTest(unittest.TestCase):
             status = review_job_status(root, job_id=job["job_id"])
             payload = valid_review_payload({**request, **status})
 
-            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            def fake_run(
+                command: list[str],
+                **kwargs: object,
+            ) -> review_bridge_module.BoundedProcessResult:
                 self.assertIn("hermes", command[0])
                 self.assertIn("--query", command)
                 query = command[command.index("--query") + 1]
                 self.assertIn(request["packet_sha256"], query)
                 self.assertIn(str((root / Path(request["packet_uri"])).resolve()), query)
                 self.assertNotIn("# Hermes subject", query)
-                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+                return bounded_process_result(json.dumps(payload))
 
             with patch.object(review_bridge_module.shutil, "which", return_value="hermes"), patch.object(
-                review_bridge_module.subprocess,
-                "run",
+                review_bridge_module,
+                "_run_bounded_process",
                 side_effect=fake_run,
             ):
                 result = review_bridge_module.run_review_job(root, job_id=job["job_id"], transport="hermes")
@@ -4035,12 +7234,15 @@ class ReviewBridgeTest(unittest.TestCase):
             (subject / "README.md").write_text("# Failed review subject\n", encoding="utf-8")
             job = create_review_job(root, subject_path=subject, prompt="Review through Hermes.", transport="hermes")
 
-            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-                return subprocess.CompletedProcess(command, 0, stdout="What JSON should I return?", stderr="")
+            def fake_run(
+                command: list[str],
+                **kwargs: object,
+            ) -> review_bridge_module.BoundedProcessResult:
+                return bounded_process_result("What JSON should I return?")
 
             with patch.object(review_bridge_module.shutil, "which", return_value="hermes"), patch.object(
-                review_bridge_module.subprocess,
-                "run",
+                review_bridge_module,
+                "_run_bounded_process",
                 side_effect=fake_run,
             ):
                 with self.assertRaisesRegex(ValueError, "review response did not contain a JSON object"):
@@ -4062,12 +7264,15 @@ class ReviewBridgeTest(unittest.TestCase):
             job = create_review_job(root, subject_path=subject, prompt="Review through Hermes.", transport="hermes")
             outputs = iter(["first invalid", "second invalid"])
 
-            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-                return subprocess.CompletedProcess(command, 0, stdout=next(outputs), stderr="")
+            def fake_run(
+                command: list[str],
+                **kwargs: object,
+            ) -> review_bridge_module.BoundedProcessResult:
+                return bounded_process_result(next(outputs))
 
             with patch.object(review_bridge_module.shutil, "which", return_value="hermes"), patch.object(
-                review_bridge_module.subprocess,
-                "run",
+                review_bridge_module,
+                "_run_bounded_process",
                 side_effect=fake_run,
             ):
                 for expected in ("first invalid", "second invalid"):
@@ -6362,30 +9567,15 @@ class ReviewBridgeTest(unittest.TestCase):
 
     def test_endpoint_response_read_stops_at_limit_plus_one(self) -> None:
         limit = review_bridge_module.REVIEW_INTEGRITY_MAX_RECORD_BYTES
-
-        class BoundedResponse:
-            def __init__(self) -> None:
-                self.remaining = b"A" * (limit + 1)
-                self.read_sizes: list[int] = []
-
-            def __enter__(self) -> BoundedResponse:
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self, size: int) -> bytes:
-                self.read_sizes.append(size)
-                chunk = self.remaining[:size]
-                self.remaining = self.remaining[size:]
-                return chunk
-
-        response = BoundedResponse()
         with patch.object(
-            review_bridge_module.urllib.request,
-            "urlopen",
-            return_value=response,
-        ), self.assertRaisesRegex(
+            review_bridge_module,
+            "_run_bounded_process",
+            return_value=bounded_process_result(
+                stdout=b"A" * (limit + 1),
+                output_exceeded=True,
+                observed_stdout_bytes=limit + 1,
+            ),
+        ) as run_process, self.assertRaisesRegex(
             review_bridge_module.ReviewResponseSizeError,
             "UTF-8 response limit",
         ):
@@ -6397,52 +9587,240 @@ class ReviewBridgeTest(unittest.TestCase):
                 timeout_seconds=1,
                 max_tokens=1,
             )
-        self.assertEqual(response.read_sizes, [limit + 1])
+        self.assertEqual(
+            run_process.call_args.kwargs["stdout_limit"],
+            limit,
+        )
 
-    def test_hermes_response_capture_is_file_backed_and_bounded(self) -> None:
-        limit = review_bridge_module.REVIEW_INTEGRITY_MAX_RECORD_BYTES
-        saw_file_backed_stdout = False
-
-        def fake_run(
-            command: list[str],
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[bytes]:
-            nonlocal saw_file_backed_stdout
-            stdout = kwargs["stdout"]
-            saw_file_backed_stdout = stdout is not subprocess.PIPE
-            assert hasattr(stdout, "write")
-            stdout.write(b"A" * (limit + 1))
-            return subprocess.CompletedProcess(command, 0)
-
-        job = {
-            "job_id": "review-test",
-            "packet_sha256": "a" * 64,
-            "review_capsule_sha256": "b" * 64,
-            "subject_archive_sha256": "c" * 64,
-            "sentinel": "sentinel",
-            "request_uri": "request.json",
-            "prompt_uri": "review-prompt.md",
-            "schema_uri": "expected-response.schema.json",
-            "packet_uri": "review-packet.md",
-        }
+    def test_endpoint_response_enforces_one_total_elapsed_deadline(self) -> None:
         with patch.object(
-            review_bridge_module.shutil,
-            "which",
-            return_value="hermes",
-        ), patch.object(
-            review_bridge_module.subprocess,
-            "run",
-            side_effect=fake_run,
-        ), self.assertRaisesRegex(
-            review_bridge_module.ReviewResponseSizeError,
-            "UTF-8 response limit",
+            review_bridge_module,
+            "_run_bounded_process",
+            return_value=bounded_process_result(timed_out=True),
+        ) as run_process, self.assertRaisesRegex(
+            review_bridge_module.ReviewBridgeError,
+            "total elapsed-time limit",
         ):
-            review_bridge_module._run_hermes_oneshot(
-                job=job,
+            review_bridge_module._openai_chat_completion(
+                base_url="http://127.0.0.1:8020/v1",
                 model="test-model",
+                system_prompt="Review.",
+                user_prompt="Review.",
                 timeout_seconds=1,
+                max_tokens=1,
             )
-        self.assertTrue(saw_file_backed_stdout)
+        self.assertEqual(run_process.call_args.kwargs["timeout_seconds"], 1)
+
+    def test_endpoint_total_deadline_terminates_real_dribbling_child(self) -> None:
+        class DribblingHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *args: object) -> None:
+                return None
+
+            def do_POST(self) -> None:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(content_length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                try:
+                    for _index in range(100):
+                        self.wfile.write(b"{")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            DribblingHandler,
+        )
+        server.daemon_threads = True
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            name="continuum-test-dribbling-endpoint",
+            daemon=True,
+        )
+        server_thread.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "total elapsed-time limit",
+            ):
+                review_bridge_module._openai_chat_completion(
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    model="test-model",
+                    system_prompt="Review.",
+                    user_prompt="Review.",
+                    timeout_seconds=1,
+                    max_tokens=1,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_hermes_response_capture_terminates_live_producer_near_limit(self) -> None:
+        limit = review_bridge_module.REVIEW_INTEGRITY_MAX_RECORD_BYTES
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            counter = base / "producer-bytes.txt"
+            producer_pid_path = base / "producer-pid.txt"
+            launcher_script = base / "chat"
+            producer_script = base / "producer.py"
+            producer_script.write_text(
+                "import os, pathlib, sys\n"
+                f"counter = pathlib.Path({str(counter)!r})\n"
+                f"pathlib.Path({str(producer_pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "chunk = b'A' * 65536\n"
+                "total = 0\n"
+                "with counter.open('w', encoding='utf-8') as handle:\n"
+                "    while True:\n"
+                "        try:\n"
+                "            written = os.write(sys.stdout.fileno(), chunk)\n"
+                "        except BrokenPipeError:\n"
+                "            break\n"
+                "        total += written\n"
+                "        handle.seek(0)\n"
+                "        handle.write(str(total))\n"
+                "        handle.truncate()\n"
+                "        handle.flush()\n",
+                encoding="utf-8",
+            )
+            launcher_script.write_text(
+                "import subprocess, sys\n"
+                "raise SystemExit(subprocess.call(\n"
+                f"    [sys.executable, {str(producer_script)!r}]\n"
+                "))\n",
+                encoding="utf-8",
+            )
+            job = {
+                "job_id": "review-test",
+                "packet_sha256": "a" * 64,
+                "review_capsule_sha256": "b" * 64,
+                "subject_archive_sha256": "c" * 64,
+                "sentinel": "sentinel",
+                "request_uri": "request.json",
+                "prompt_uri": "review-prompt.md",
+                "schema_uri": "expected-response.schema.json",
+                "packet_uri": "review-packet.md",
+            }
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(base)
+                with patch.dict(
+                    os.environ,
+                    {"CONTINUUM_HERMES_EXE": sys.executable},
+                ), self.assertRaisesRegex(
+                    review_bridge_module.ReviewResponseSizeError,
+                    "UTF-8 response limit",
+                ):
+                    review_bridge_module._run_hermes_oneshot(
+                        job=job,
+                        model="test-model",
+                        timeout_seconds=10,
+                    )
+            finally:
+                os.chdir(previous_cwd)
+            produced = int(counter.read_text(encoding="utf-8") or "0")
+            producer_pid = int(producer_pid_path.read_text(encoding="utf-8"))
+            overshoot_allowance = review_bridge_module.REVIEW_PROCESS_READ_CHUNK_BYTES * 8
+            self.assertGreater(produced, limit - review_bridge_module.REVIEW_PROCESS_READ_CHUNK_BYTES)
+            self.assertLessEqual(produced, limit + overshoot_allowance)
+            if os.name == "nt":
+                tasklist = subprocess.run(
+                    [
+                        "tasklist",
+                        "/FI",
+                        f"PID eq {producer_pid}",
+                        "/FO",
+                        "CSV",
+                        "/NH",
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertNotIn(f'"{producer_pid}"', tasklist.stdout)
+            else:
+                self.assertTrue(wait_for_posix_process_termination(producer_pid))
+
+    def test_bounded_process_terminates_descendant_after_launcher_exits(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            producer_pid_path = base / "producer-pid.txt"
+            completion_path = base / "producer-completed.txt"
+            producer_script = base / "producer.py"
+            launcher_script = base / "launcher.py"
+            producer_script.write_text(
+                "import os, pathlib, time\n"
+                f"pathlib.Path({str(producer_pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "time.sleep(30)\n"
+                f"pathlib.Path({str(completion_path)!r}).write_text('completed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            launcher_script.write_text(
+                "import pathlib, subprocess, sys, time\n"
+                f"pid_path = pathlib.Path({str(producer_pid_path)!r})\n"
+                f"subprocess.Popen([sys.executable, {str(producer_script)!r}], "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "for _ in range(200):\n"
+                "    if pid_path.exists():\n"
+                "        break\n"
+                "    time.sleep(0.01)\n",
+                encoding="utf-8",
+            )
+
+            producer_pid: int | None = None
+            try:
+                result = review_bridge_module._run_bounded_process(
+                    [sys.executable, str(launcher_script)],
+                    cwd=base,
+                    env=os.environ.copy(),
+                    timeout_seconds=5,
+                    stdout_limit=1_024,
+                    stderr_limit=1_024,
+                    total_limit=2_048,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertTrue(producer_pid_path.exists())
+                producer_pid = int(producer_pid_path.read_text(encoding="utf-8"))
+                self.assertFalse(completion_path.exists())
+                if os.name == "nt":
+                    tasklist = subprocess.run(
+                        [
+                            "tasklist",
+                            "/FI",
+                            f"PID eq {producer_pid}",
+                            "/FO",
+                            "CSV",
+                            "/NH",
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    self.assertNotIn(f'"{producer_pid}"', tasklist.stdout)
+                else:
+                    self.assertTrue(wait_for_posix_process_termination(producer_pid))
+            finally:
+                if producer_pid is not None:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(producer_pid), "/T", "/F"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    else:
+                        try:
+                            os.kill(producer_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                        except ProcessLookupError:
+                            pass
 
     def test_automated_valid_response_enforces_integrated_derived_size_boundary(self) -> None:
         limit = review_bridge_module.REVIEW_INTEGRITY_MAX_RECORD_BYTES

@@ -9,22 +9,34 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unicodedata
-import urllib.error
-import urllib.request
 import zipfile
 from collections import Counter
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Callable, Iterator, Literal, ParamSpec, Sequence, TypeVar, cast
 
-from .operations import operation_lock
-from .permissions import PRIVATE_FILE_MODE, secure_copy_file, secure_file, secure_mkdir, secure_write_text
+from .operations import operation_lock, validate_operation_id as validate_core_operation_id
+from .permissions import (
+    PRIVATE_DIR_MODE,
+    PRIVATE_FILE_MODE,
+    fsync_parent,
+    secure_file,
+    secure_mkdir,
+    secure_write_text,
+)
 from .safety import DEFAULT_IGNORE_PATTERNS, ignored_by_pattern, load_ignore_patterns, redact_text_secrets, scan_text_for_secrets
 from .store import (
     connect,
@@ -105,9 +117,101 @@ REVIEW_ZIP_SCAN_MAX_MEMBERS = 2_000
 REVIEW_ZIP_SCAN_MAX_MEMBER_BYTES = 32_000_000
 REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES = 256_000_000
 REVIEW_ZIP_SCAN_MAX_COMPRESSION_RATIO = 500.0
+REVIEW_ZIP_SCAN_MAX_CENTRAL_DIRECTORY_BYTES = 16_000_000
+REVIEW_ZIP_SCAN_MAX_MEMBER_NAME_BYTES = 4_096
+REVIEW_ZIP_SUPPORTED_COMPRESSION_TYPES = frozenset(
+    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+)
 ZIP_ENCRYPTION_FLAG_MASK = 0x0001 | 0x0040 | 0x2000
 REVIEW_SECRET_ALLOWLIST_MAX_BYTES = 1_000_000
 REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS = 5_000
+REVIEW_SECRET_ALLOWLIST_MAX_FILES = 32
+REVIEW_SECRET_ALLOWLIST_MAX_TOTAL_FILE_BYTES = 4_000_000
+REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES = 4_096
+REVIEW_SECRET_ALLOWLIST_MAX_PATTERN_BYTES_TOTAL = 1_000_000
+REVIEW_MAX_REVIEWER_ID_BYTES = 256
+REVIEW_MAX_MODEL_BYTES = 512
+REVIEW_MAX_BASE_URL_BYTES = 2_048
+REVIEW_MAX_CONTROL_PATH_BYTES = 4_096
+REVIEW_SECRET_SCAN_MAX_CANDIDATES = (
+    REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS + REVIEW_SECRET_SCAN_MAX_FINDINGS
+)
+REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA = (
+    "epic-continuum.review-prepare-publication/1"
+)
+REVIEW_PREPARE_PUBLICATION_MARKER_KIND = "review_prepare_publication_marker"
+REVIEW_PREPARE_PUBLICATION_LOCK_ID = "review-prepare-publication"
+_ACTIVE_REVIEW_PUBLICATION_JOB_ID: ContextVar[str | None] = ContextVar(
+    "active_review_publication_job_id",
+    default=None,
+)
+_OPENAI_ENDPOINT_CHILD_SCRIPT = r"""
+import json
+import sys
+import urllib.error
+import urllib.request
+
+
+def read_bounded(stream, limit):
+    chunks = []
+    observed = 0
+    reader = getattr(stream, "read1", None)
+    if reader is None:
+        reader = stream.read
+    while observed <= limit:
+        chunk = reader(min(65536, limit + 1 - observed))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        observed += len(chunk)
+    return b"".join(chunks)
+
+
+request_path = sys.argv[1]
+with open(request_path, "r", encoding="utf-8") as handle:
+    request_data = json.load(handle)
+request = urllib.request.Request(
+    request_data["url"],
+    data=request_data["body"].encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(
+        request,
+        timeout=int(request_data["socket_timeout_seconds"]),
+    ) as response:
+        sys.stdout.buffer.write(
+            read_bounded(response, int(request_data["response_limit_bytes"]))
+        )
+except urllib.error.HTTPError as exc:
+    body = read_bounded(exc, int(request_data["diagnostic_limit_bytes"]))
+    sys.stderr.write(
+        json.dumps(
+            {
+                "kind": "http",
+                "code": int(exc.code),
+                "body": body.decode("utf-8", errors="replace"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    raise SystemExit(22)
+except Exception as exc:
+    sys.stderr.write(
+        json.dumps(
+            {
+                "kind": "unavailable",
+                "error_type": type(exc).__name__,
+                "detail": str(exc)[:1200],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    raise SystemExit(23)
+"""
 REVIEW_BROWSER_HANDOFFS_DIR = "browser-handoffs"
 REVIEW_INTEGRITY_MAX_RECORD_BYTES = 4_000_000
 REVIEW_INTEGRITY_MAX_JOBS = 10_000
@@ -119,6 +223,28 @@ REVIEW_INTEGRITY_MAX_MUTABLE_ENTRIES_PER_JOB = (
     REVIEW_INTEGRITY_MAX_ATTEMPTS_PER_JOB * 5 + 10
 )
 REVIEW_INTEGRITY_MAX_JOB_TREE_BYTES = REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES * 4
+REVIEW_DEFAULT_PACKET_BYTES = 512_000
+REVIEW_MAX_PACKET_BYTES = REVIEW_INTEGRITY_MAX_RECORD_BYTES
+REVIEW_MAX_PROMPT_BYTES = REVIEW_MAX_PACKET_BYTES
+REVIEW_DEFAULT_FILE_SAMPLE_BYTES = 64_000
+REVIEW_MAX_FILE_SAMPLE_BYTES = REVIEW_INTEGRITY_MAX_RECORD_BYTES
+REVIEW_DEFAULT_MAX_FILES = 300
+REVIEW_MAX_FILES = REVIEW_ZIP_SCAN_MAX_MEMBERS
+REVIEW_TRAVERSAL_ENTRY_MULTIPLIER = 8
+REVIEW_MAX_TRAVERSAL_ENTRIES = REVIEW_MAX_FILES * REVIEW_TRAVERSAL_ENTRY_MULTIPLIER
+REVIEW_DEFAULT_SUBJECT_FILE_BYTES = REVIEW_ZIP_SCAN_MAX_MEMBER_BYTES
+REVIEW_MAX_SUBJECT_FILE_BYTES = REVIEW_ZIP_SCAN_MAX_MEMBER_BYTES
+REVIEW_DEFAULT_SUBJECT_BYTES = 64_000_000
+REVIEW_MAX_SUBJECT_BYTES = REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES
+REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS = 120
+REVIEW_MAX_PREPARE_TIMEOUT_SECONDS = 600
+REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS = 900
+REVIEW_MAX_RUN_TIMEOUT_SECONDS = 3_600
+REVIEW_DEFAULT_MAX_TOKENS = 4_096
+REVIEW_MAX_TOKENS = 65_536
+REVIEW_PROCESS_READ_CHUNK_BYTES = 64 * 1024
+REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES = 64_000
+REVIEW_ARCHIVE_OVERHEAD_BYTES = 4_000_000
 REVIEW_INGEST_BINDING_SCHEMA = "epic-continuum.review-ingest-binding/1"
 REVIEW_INGEST_CLAIM_SCHEMA = "epic-continuum.review-ingest-claim/1"
 REVIEW_INGEST_RECEIPT_SCHEMA = "epic-continuum.review-ingest-receipt/1"
@@ -452,6 +578,15 @@ class ReviewResponseSizeError(ReviewBridgeError):
     """Raised when reviewer-controlled response text exceeds its durable limit."""
 
 
+class _ReviewZipMemberLimitExceeded(ReviewBridgeError):
+    def __init__(self, *, observed: int, limit: int) -> None:
+        self.observed = observed
+        self.limit = limit
+        super().__init__(
+            f"review ZIP subject has too many members: {observed} > {limit}"
+        )
+
+
 def _validated_review_response_text(
     value: str | bytes,
     *,
@@ -482,12 +617,61 @@ def _validated_review_response_text(
     return decoded
 
 
-def _read_bounded_stream_bytes(stream: Any, *, max_bytes: int) -> bytes:
-    """Read no more than max_bytes + 1 bytes from a binary stream."""
+def _set_stream_read_timeout(stream: Any, timeout_seconds: float) -> bool:
+    """Best-effort propagation of a shrinking deadline to an HTTP socket."""
+    pending = [stream]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop(0)
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        setter = getattr(candidate, "settimeout", None)
+        if callable(setter):
+            try:
+                setter(max(0.001, float(timeout_seconds)))
+                return True
+            except (OSError, TypeError, ValueError):
+                pass
+        for attribute in ("fp", "raw", "_sock", "socket"):
+            nested = getattr(candidate, attribute, None)
+            if nested is not None:
+                pending.append(nested)
+    return False
+
+
+def _read_bounded_stream_bytes(
+    stream: Any,
+    *,
+    max_bytes: int,
+    deadline: float | None = None,
+    deadline_label: str = "stream read",
+) -> bytes:
+    """Read max_bytes + 1 with bounded chunks and an optional total deadline."""
     chunks: list[bytes] = []
     observed = 0
+    reader = getattr(stream, "read1", None)
+    if reader is None:
+        reader = stream.read
     while observed <= max_bytes:
-        chunk = stream.read(max_bytes + 1 - observed)
+        if deadline is not None:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise ReviewBridgeError(
+                    f"{deadline_label} exceeded its total elapsed-time limit"
+                )
+            _set_stream_read_timeout(stream, remaining_seconds)
+        chunk = reader(
+            min(
+                REVIEW_PROCESS_READ_CHUNK_BYTES,
+                max_bytes + 1 - observed,
+            )
+        )
+        if deadline is not None and time.monotonic() > deadline:
+            raise ReviewBridgeError(
+                f"{deadline_label} exceeded its total elapsed-time limit"
+            )
         if not chunk:
             break
         if isinstance(chunk, str):
@@ -500,6 +684,609 @@ def _read_bounded_stream_bytes(stream: Any, *, max_bytes: int) -> bytes:
 def _bounded_diagnostic_text(value: str | bytes, *, max_bytes: int = 1_200) -> str:
     encoded = value.encode("utf-8", errors="replace") if isinstance(value, str) else value
     return encoded[:max_bytes].decode("utf-8", errors="replace").strip()
+
+
+def _bounded_review_integer(name: str, value: int, *, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ReviewBridgeError(f"{name} must be an integer")
+    if value < 1 or value > maximum:
+        raise ReviewBridgeError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+def validate_review_prepare_limits(
+    *,
+    max_packet_bytes: int,
+    max_file_bytes: int,
+    max_files: int,
+    max_subject_file_bytes: int,
+    max_subject_bytes: int,
+    prepare_timeout_seconds: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Validate every public review-preparation resource control identically."""
+    packet_limit = _bounded_review_integer(
+        "max_packet_bytes",
+        max_packet_bytes,
+        maximum=REVIEW_MAX_PACKET_BYTES,
+    )
+    sample_limit = _bounded_review_integer(
+        "max_file_bytes",
+        max_file_bytes,
+        maximum=REVIEW_MAX_FILE_SAMPLE_BYTES,
+    )
+    file_count_limit = _bounded_review_integer(
+        "max_files",
+        max_files,
+        maximum=REVIEW_MAX_FILES,
+    )
+    subject_file_limit = _bounded_review_integer(
+        "max_subject_file_bytes",
+        max_subject_file_bytes,
+        maximum=REVIEW_MAX_SUBJECT_FILE_BYTES,
+    )
+    subject_total_limit = _bounded_review_integer(
+        "max_subject_bytes",
+        max_subject_bytes,
+        maximum=REVIEW_MAX_SUBJECT_BYTES,
+    )
+    timeout_limit = _bounded_review_integer(
+        "prepare_timeout_seconds",
+        prepare_timeout_seconds,
+        maximum=REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+    )
+    if subject_file_limit > subject_total_limit:
+        raise ReviewBridgeError(
+            "max_subject_file_bytes must not exceed max_subject_bytes"
+        )
+    return (
+        packet_limit,
+        sample_limit,
+        file_count_limit,
+        subject_file_limit,
+        subject_total_limit,
+        timeout_limit,
+    )
+
+
+def validate_review_transport_limits(
+    *,
+    timeout_seconds: int,
+    max_tokens: int,
+) -> tuple[int, int]:
+    """Validate public reviewer-transport controls before durable mutation."""
+    return (
+        _bounded_review_integer(
+            "timeout_seconds",
+            timeout_seconds,
+            maximum=REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+        ),
+        _bounded_review_integer(
+            "max_tokens",
+            max_tokens,
+            maximum=REVIEW_MAX_TOKENS,
+        ),
+    )
+
+
+def validate_review_operation_id(operation_id: str | None) -> str | None:
+    """Validate an optional caller retry identity before operation mutation."""
+    if operation_id is None:
+        return None
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ReviewBridgeError("operation id must be null or a non-empty string")
+    try:
+        return validate_core_operation_id(operation_id)
+    except ValueError as exc:
+        raise ReviewBridgeError(str(exc)) from exc
+
+
+def _bounded_review_text(
+    name: str,
+    value: Any,
+    *,
+    max_bytes: int,
+    nonempty: bool = True,
+    single_line: bool = True,
+) -> str:
+    if not isinstance(value, str):
+        raise ReviewBridgeError(f"{name} must be text")
+    if len(value) > max_bytes:
+        # Every Unicode scalar occupies at least one UTF-8 byte. Reject very
+        # large controls before allocating a second full encoded copy.
+        raise ReviewBridgeError(
+            f"{name} exceeds its {max_bytes}-byte UTF-8 limit"
+        )
+    if nonempty and not value.strip():
+        raise ReviewBridgeError(f"{name} must not be empty")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReviewBridgeError(f"{name} must be valid UTF-8 text") from exc
+    if len(encoded) > max_bytes:
+        raise ReviewBridgeError(
+            f"{name} exceeds its {max_bytes}-byte UTF-8 limit"
+        )
+    if single_line and any(
+        character in "\x00\r\n" or unicodedata.category(character) == "Cc"
+        for character in value
+    ):
+        raise ReviewBridgeError(f"{name} must be single-line text without controls")
+    return value
+
+
+def validate_review_prompt(prompt: str) -> str:
+    """Validate operator review instructions before any durable mutation."""
+    if not isinstance(prompt, str):
+        raise ReviewBridgeError("review prompt must be text")
+    if len(prompt) > REVIEW_MAX_PROMPT_BYTES:
+        raise ReviewBridgeError(
+            "review prompt exceeds its "
+            f"{REVIEW_MAX_PROMPT_BYTES}-byte UTF-8 limit"
+        )
+    if not prompt.strip():
+        raise ReviewBridgeError("review prompt must not be empty")
+    try:
+        encoded_prompt = prompt.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReviewBridgeError("review prompt must be valid UTF-8 text") from exc
+    prompt_size = len(encoded_prompt)
+    if prompt_size > REVIEW_MAX_PROMPT_BYTES:
+        raise ReviewBridgeError(
+            "review prompt exceeds its "
+            f"{REVIEW_MAX_PROMPT_BYTES}-byte UTF-8 limit"
+        )
+    return prompt
+
+
+@dataclass
+class ReviewPreparationBudget:
+    max_subject_file_bytes: int
+    max_subject_bytes: int
+    max_archive_bytes: int
+    max_temporary_bytes: int
+    max_work_bytes: int
+    deadline: float
+    subject_bytes: int = 0
+    temporary_bytes: int = 0
+    work_bytes: int = 0
+
+    def check_deadline(self, label: str) -> None:
+        if time.monotonic() > self.deadline:
+            raise ReviewBridgeError(
+                f"review preparation exceeded its elapsed-time budget while {label}"
+            )
+
+    def check_subject_file(self, size_bytes: int, *, source: str) -> None:
+        self.check_deadline(f"checking {source}")
+        if size_bytes < 0 or size_bytes > self.max_subject_file_bytes:
+            raise ReviewBridgeError(
+                "review subject file byte limit exceeded: "
+                f"{source} ({size_bytes} > {self.max_subject_file_bytes})"
+            )
+        if self.subject_bytes + size_bytes > self.max_subject_bytes:
+            raise ReviewBridgeError(
+                "review subject total byte limit exceeded: "
+                f"{self.subject_bytes + size_bytes} > {self.max_subject_bytes}"
+            )
+
+    def commit_subject_file(self, size_bytes: int, *, source: str) -> None:
+        self.commit_subject_read(size_bytes, source=source)
+        self.consume_temporary(size_bytes, label=f"snapshot {source}")
+
+    def commit_subject_read(self, size_bytes: int, *, source: str) -> None:
+        self.check_subject_file(size_bytes, source=source)
+        self.subject_bytes += size_bytes
+
+    def consume_temporary(self, size_bytes: int, *, label: str) -> None:
+        self.check_deadline(label)
+        next_total = self.temporary_bytes + max(0, int(size_bytes))
+        if next_total > self.max_temporary_bytes:
+            raise ReviewBridgeError(
+                "review preparation temporary byte limit exceeded: "
+                f"{next_total} > {self.max_temporary_bytes} while {label}"
+            )
+        self.temporary_bytes = next_total
+
+    def consume_work(self, size_bytes: int, *, label: str) -> None:
+        self.check_deadline(label)
+        next_total = self.work_bytes + max(0, int(size_bytes))
+        if next_total > self.max_work_bytes:
+            raise ReviewBridgeError(
+                "review preparation work byte limit exceeded: "
+                f"{next_total} > {self.max_work_bytes} while {label}"
+            )
+        self.work_bytes = next_total
+
+
+def _new_review_preparation_budget(
+    *,
+    max_packet_bytes: int,
+    max_subject_file_bytes: int,
+    max_subject_bytes: int,
+    prepare_timeout_seconds: int,
+    started_at: float | None = None,
+) -> ReviewPreparationBudget:
+    archive_limit = min(
+        REVIEW_MAX_SUBJECT_BYTES * 2 + REVIEW_ARCHIVE_OVERHEAD_BYTES,
+        max_subject_bytes * 2 + REVIEW_ARCHIVE_OVERHEAD_BYTES,
+    )
+    temporary_limit = (
+        max_subject_bytes * 3
+        + max_packet_bytes * 2
+        + REVIEW_ARCHIVE_OVERHEAD_BYTES
+    )
+    work_limit = (
+        max_subject_bytes * 16
+        + max_packet_bytes * 4
+        + REVIEW_ARCHIVE_OVERHEAD_BYTES
+    )
+    return ReviewPreparationBudget(
+        max_subject_file_bytes=max_subject_file_bytes,
+        max_subject_bytes=max_subject_bytes,
+        max_archive_bytes=archive_limit,
+        max_temporary_bytes=temporary_limit,
+        max_work_bytes=work_limit,
+        deadline=(time.monotonic() if started_at is None else started_at)
+        + prepare_timeout_seconds,
+    )
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+    output_exceeded: bool
+    observed_output_bytes: int
+    observed_stdout_bytes: int
+    observed_stderr_bytes: int
+
+
+ReviewSubjectType = Literal["file", "directory"]
+
+
+@dataclass(frozen=True)
+class ReviewSubjectPreflight:
+    path: Path
+    subject_type: ReviewSubjectType
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class ReviewSubjectEntry:
+    path: Path
+    relative: str
+    subject_type: ReviewSubjectType
+    identity: tuple[int, int]
+    size_bytes: int
+    mode: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class ReviewSubjectInventory:
+    root: ReviewSubjectEntry
+    files: tuple[ReviewSubjectEntry, ...]
+    directories: tuple[ReviewSubjectEntry, ...]
+
+
+@dataclass(frozen=True)
+class ReviewPrepareStoragePreflight:
+    directories: tuple[tuple[str, tuple[int, int]], ...]
+
+
+@dataclass
+class _ProcessOutputCollector:
+    stdout_limit: int
+    stderr_limit: int
+    total_limit: int
+    stdout: bytearray = field(default_factory=bytearray)
+    stderr: bytearray = field(default_factory=bytearray)
+    stdout_seen: int = 0
+    stderr_seen: int = 0
+    total_seen: int = 0
+    exceeded: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def feed(self, stream_name: str, chunk: bytes) -> None:
+        if not chunk:
+            return
+        with self.lock:
+            target = self.stdout if stream_name == "stdout" else self.stderr
+            stream_limit = self.stdout_limit if stream_name == "stdout" else self.stderr_limit
+            if stream_name == "stdout":
+                self.stdout_seen += len(chunk)
+                stream_seen = self.stdout_seen
+            else:
+                self.stderr_seen += len(chunk)
+                stream_seen = self.stderr_seen
+            self.total_seen += len(chunk)
+            stored_total = len(self.stdout) + len(self.stderr)
+            remaining_total = max(0, self.total_limit + 1 - stored_total)
+            remaining_stream = max(0, stream_limit + 1 - len(target))
+            take = min(len(chunk), remaining_total, remaining_stream)
+            if take:
+                target.extend(chunk[:take])
+            if stream_seen > stream_limit or self.total_seen > self.total_limit:
+                self.exceeded.set()
+
+
+@dataclass
+class _WindowsKillJob:
+    handle: Any
+    close_handle: Any
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if not self.close_handle(self.handle):
+            raise ReviewBridgeError("Windows review process Job Object could not be closed")
+        self.closed = True
+
+
+def _attach_windows_kill_job(
+    process: subprocess.Popen[bytes],
+) -> _WindowsKillJob | None:
+    """Attach fail-closed kill-on-close containment to a suspended Windows child."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class JobObjectBasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JobObjectExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JobObjectBasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        job_handle = kernel32.CreateJobObjectW(None, None)
+        if not job_handle:
+            return None
+        information = JobObjectExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not kernel32.SetInformationJobObject(
+            job_handle,
+            9,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            kernel32.CloseHandle(job_handle)
+            return None
+        process_handle = wintypes.HANDLE(int(getattr(process, "_handle")))
+        if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
+            kernel32.CloseHandle(job_handle)
+            return None
+        return _WindowsKillJob(job_handle, kernel32.CloseHandle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _resume_windows_process(process: subprocess.Popen[bytes]) -> None:
+    """Resume a child created suspended only after Job Object containment."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        resume = ntdll.NtResumeProcess
+        resume.argtypes = [wintypes.HANDLE]
+        resume.restype = ctypes.c_long
+        status = int(resume(wintypes.HANDLE(int(getattr(process, "_handle")))))
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise ReviewBridgeError(
+            "Windows review process could not be resumed inside its Job Object"
+        ) from exc
+    if status != 0:
+        raise ReviewBridgeError(
+            "Windows review process could not be resumed inside its Job Object "
+            f"(NTSTATUS 0x{status & 0xFFFFFFFF:08x})"
+        )
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    windows_job: _WindowsKillJob | None = None,
+) -> None:
+    if os.name == "nt":
+        if windows_job is not None:
+            windows_job.close()
+        elif process.poll() is None:
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                process.kill()
+                raise ReviewBridgeError(
+                    "Windows review process tree termination could not be verified"
+                ) from None
+            if completed.returncode != 0:
+                process.kill()
+                raise ReviewBridgeError(
+                    "Windows review process tree termination could not be verified "
+                    f"(taskkill exit {completed.returncode})"
+                )
+    else:
+        try:
+            killpg = getattr(os, "killpg")
+            killpg(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (OSError, ProcessLookupError):
+            if process.poll() is None:
+                process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    cwd: Path | None,
+    env: dict[str, str] | None,
+    timeout_seconds: int,
+    stdout_limit: int,
+    stderr_limit: int,
+    total_limit: int,
+) -> BoundedProcessResult:
+    """Run one child with pipe backpressure and terminate on timeout or overflow."""
+    collector = _ProcessOutputCollector(
+        stdout_limit=max(1, int(stdout_limit)),
+        stderr_limit=max(1, int(stderr_limit)),
+        total_limit=max(1, int(total_limit)),
+    )
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | 0x00000004
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+        start_new_session=os.name != "nt",
+    )
+    windows_job = _attach_windows_kill_job(process)
+    if os.name == "nt":
+        if windows_job is None:
+            process.kill()
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            raise ReviewBridgeError(
+                "Windows review process Job Object containment could not be established"
+            )
+        try:
+            _resume_windows_process(process)
+        except BaseException:
+            windows_job.close()
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            raise
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    def drain(stream: BinaryIO, stream_name: str) -> None:
+        reader = getattr(stream, "read1", stream.read)
+        try:
+            while not collector.exceeded.is_set():
+                chunk = reader(REVIEW_PROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                collector.feed(stream_name, bytes(chunk))
+        except (OSError, ValueError):
+            return
+
+    stdout_thread = threading.Thread(
+        target=drain,
+        args=(process.stdout, "stdout"),
+        name="continuum-review-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain,
+        args=(process.stderr, "stderr"),
+        name="continuum-review-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    deadline = time.monotonic() + max(1, int(timeout_seconds))
+    timed_out = False
+    try:
+        while True:
+            if collector.exceeded.is_set():
+                _terminate_process_tree(process, windows_job=windows_job)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process_tree(process, windows_job=windows_job)
+                break
+            if process.poll() is not None:
+                _terminate_process_tree(process, windows_job=windows_job)
+                break
+            time.sleep(0.01)
+        if process.poll() is None:
+            _terminate_process_tree(process, windows_job=windows_job)
+    finally:
+        if windows_job is not None:
+            windows_job.close()
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
+    return BoundedProcessResult(
+        returncode=int(process.returncode if process.returncode is not None else -1),
+        stdout=bytes(collector.stdout),
+        stderr=bytes(collector.stderr),
+        timed_out=timed_out,
+        output_exceeded=collector.exceeded.is_set(),
+        observed_output_bytes=int(collector.total_seen),
+        observed_stdout_bytes=int(collector.stdout_seen),
+        observed_stderr_bytes=int(collector.stderr_seen),
+    )
 
 
 @dataclass
@@ -600,9 +1387,49 @@ def _require_plain_regular_file(path: Path, *, label: str) -> None:
         raise ReviewBridgeError(f"review job {label} is not a regular file")
 
 
+def _review_job_publication_pending(root: Path, job_id: str) -> bool:
+    safe_job_id = _safe_job_id(job_id)
+    if _ACTIVE_REVIEW_PUBLICATION_JOB_ID.get() == safe_job_id:
+        return False
+    marker_path = (
+        review_bridge_root(root) / "tmp" / f"{safe_job_id}.ready.json"
+    )
+    marker_exists = _path_exists_no_follow(marker_path)
+    if marker_exists:
+        storage = _review_prepare_storage_preflight(root, require_tmp=True)
+        _require_plain_regular_file(
+            marker_path,
+            label="preparation publication marker",
+        )
+        _assert_review_prepare_storage_unchanged(root, storage)
+    metadata = json_dumps(
+        {
+            "job_id": safe_job_id,
+            "schema": REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+        }
+    )
+    try:
+        with closing(connect_existing(root)) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM artifacts WHERE kind = ? AND metadata_json = ? LIMIT 1",
+                (REVIEW_PREPARE_PUBLICATION_MARKER_KIND, metadata),
+            ).fetchone()
+    except Exception as exc:
+        if marker_exists:
+            raise ReviewBridgeError(
+                "review job publication authority cannot be inspected"
+            ) from exc
+        return False
+    return marker_exists or row is not None
+
+
 def _validate_review_job_storage(root: Path, job_id: str) -> Path:
     """Reject link-like Review Relay storage before a job operation writes."""
     safe_job_id = _safe_job_id(job_id)
+    if _review_job_publication_pending(root, safe_job_id):
+        raise ReviewBridgeError(
+            f"review job publication is not committed yet: {safe_job_id}"
+        )
     root_path = Path(root).resolve(strict=True)
     current = root_path
     for component in ("exports", "review_bridge", "jobs", safe_job_id):
@@ -723,7 +1550,13 @@ def _confined_read_bytes(
     return data
 
 
-def _confined_file_sha256(root: Path, job_id: str, path: Path | str) -> str:
+def _confined_file_sha256(
+    root: Path,
+    job_id: str,
+    path: Path | str,
+    *,
+    budget: ReviewPreparationBudget | None = None,
+) -> str:
     parts = _job_path_parts(root, job_id, path)
     digest = hashlib.sha256()
     if os.name == "posix":
@@ -738,10 +1571,17 @@ def _confined_file_sha256(root: Path, job_id: str, path: Path | str) -> str:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise ReviewBridgeError("review job evidence is not a regular file")
                 while True:
+                    if budget is not None:
+                        budget.check_deadline("hashing review job evidence")
                     chunk = os.read(fd, 1024 * 1024)
                     if not chunk:
                         break
                     digest.update(chunk)
+                    if budget is not None:
+                        budget.consume_work(
+                            len(chunk),
+                            label="hashing review job evidence",
+                        )
             finally:
                 os.close(fd)
         finally:
@@ -751,8 +1591,18 @@ def _confined_file_sha256(root: Path, job_id: str, path: Path | str) -> str:
     _validate_review_job_storage(root, job_id)
     _require_plain_regular_file(candidate, label="/".join(parts))
     with candidate.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
+        while True:
+            if budget is not None:
+                budget.check_deadline("hashing review job evidence")
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
+            if budget is not None:
+                budget.consume_work(
+                    len(chunk),
+                    label="hashing review job evidence",
+                )
     return digest.hexdigest()
 
 
@@ -2234,6 +3084,7 @@ def _review_job_catalog_and_tree_issues(
     request: dict[str, Any],
     status: dict[str, Any],
     artifact_rows: list[Any],
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     """Reconcile one copied job tree with its manifest and catalog authority."""
 
@@ -2249,6 +3100,8 @@ def _review_job_catalog_and_tree_issues(
     total_bytes = 0
     while pending:
         directory = pending.pop()
+        if budget is not None:
+            budget.check_deadline("validating the published review job")
         try:
             with os.scandir(directory) as entries:
                 children = sorted(entries, key=lambda item: item.name)
@@ -2260,6 +3113,8 @@ def _review_job_catalog_and_tree_issues(
             )
             break
         for entry in children:
+            if budget is not None:
+                budget.check_deadline("validating the published review job")
             total_entries += 1
             if total_entries > REVIEW_INTEGRITY_MAX_MUTABLE_ENTRIES_PER_JOB:
                 issue("job_tree_entry_limit_exceeded")
@@ -2447,6 +3302,8 @@ def _review_job_catalog_and_tree_issues(
 
     manifest_path = job_path / REVIEW_MANIFEST_NAME
     manifest_files: dict[str, tuple[str, int]] = {}
+    manifest_directories: set[str] = set()
+    manifest_has_explicit_directories = False
     try:
         manifest = json.loads(
             _confined_read_bytes(
@@ -2457,6 +3314,10 @@ def _review_job_catalog_and_tree_issues(
             ).decode("utf-8")
         )
         raw_manifest_files = manifest.get("files") if isinstance(manifest, dict) else None
+        raw_manifest_directories = (
+            manifest.get("directories") if isinstance(manifest, dict) else None
+        )
+        fingerprint_version = request.get("source_fingerprint_version")
         if (
             not isinstance(manifest, dict)
             or not isinstance(raw_manifest_files, list)
@@ -2464,6 +3325,43 @@ def _review_job_catalog_and_tree_issues(
             or manifest.get("subject_type") != request.get("subject_type")
         ):
             raise ReviewBridgeError("manifest identity is malformed")
+        raw_directory_count = (
+            len(raw_manifest_directories)
+            if isinstance(raw_manifest_directories, list)
+            else 0
+        )
+        if (
+            len(raw_manifest_files) + raw_directory_count
+            > REVIEW_ZIP_SCAN_MAX_MEMBERS
+        ):
+            raise ReviewBridgeError(
+                "manifest file and directory entry limit is exceeded"
+            )
+        if raw_manifest_directories is None:
+            if fingerprint_version == 2:
+                raise ReviewBridgeError(
+                    "manifest directory inventory is missing"
+                )
+        elif not isinstance(raw_manifest_directories, list):
+            raise ReviewBridgeError("manifest directory inventory is malformed")
+        else:
+            manifest_has_explicit_directories = True
+            for item in raw_manifest_directories:
+                if (
+                    not isinstance(item, str)
+                    or not item
+                    or "\\" in item
+                    or re.fullmatch(
+                        rf"{_PORTABLE_PATH_SEGMENT}(?:/{_PORTABLE_PATH_SEGMENT})*",
+                        item,
+                    )
+                    is None
+                    or item in manifest_directories
+                ):
+                    raise ReviewBridgeError(
+                        "manifest directory member is malformed"
+                    )
+                manifest_directories.add(item)
         for item in raw_manifest_files:
             if (
                 not isinstance(item, dict)
@@ -2497,6 +3395,28 @@ def _review_job_catalog_and_tree_issues(
                 str(item["sha256"]),
                 int(item["size_bytes"]),
             )
+        if manifest_has_explicit_directories:
+            if set(manifest_files) & manifest_directories:
+                raise ReviewBridgeError(
+                    "manifest file and directory members overlap"
+                )
+            required_directories = {
+                "/".join(member.split("/")[:depth])
+                for member in (*manifest_files, *manifest_directories)
+                for depth in range(1, len(member.split("/")))
+            }
+            if not required_directories <= manifest_directories:
+                raise ReviewBridgeError(
+                    "manifest directory parent closure is incomplete"
+                )
+            if (
+                fingerprint_version == 2
+                and request.get("source_directory_count")
+                != len(manifest_directories)
+            ):
+                raise ReviewBridgeError(
+                    "manifest directory count mismatches the request"
+                )
     except (
         OSError,
         UnicodeDecodeError,
@@ -2516,11 +3436,18 @@ def _review_job_catalog_and_tree_issues(
             missing=sorted(set(manifest_files) - set(actual_subject_files))[:20],
             unexpected=sorted(set(actual_subject_files) - set(manifest_files))[:20],
         )
-    expected_subject_directories = {
-        "snapshot/subject/" + "/".join(member.split("/")[:depth])
-        for member in manifest_files
-        for depth in range(1, len(member.split("/")))
-    }
+    expected_subject_directories = (
+        {
+            "snapshot/subject/" + member
+            for member in manifest_directories
+        }
+        if manifest_has_explicit_directories
+        else {
+            "snapshot/subject/" + "/".join(member.split("/")[:depth])
+            for member in manifest_files
+            for depth in range(1, len(member.split("/")))
+        }
+    )
     if subject_directories != expected_subject_directories:
         issue(
             "subject_manifest_directory_set_mismatch",
@@ -2531,7 +3458,12 @@ def _review_job_catalog_and_tree_issues(
         path, actual_size = actual_subject_files[member]
         expected_sha256, expected_size = manifest_files[member]
         try:
-            actual_sha256 = _confined_file_sha256(root, job_id, path)
+            actual_sha256 = _confined_file_sha256(
+                root,
+                job_id,
+                path,
+                budget=budget,
+            )
         except (OSError, ReviewBridgeError) as exc:
             issue(
                 "subject_manifest_member_unreadable",
@@ -2802,7 +3734,12 @@ def _review_job_catalog_and_tree_issues(
                 continue
             path, actual_size = file_state
             try:
-                actual_sha256 = _confined_file_sha256(root, job_id, path)
+                actual_sha256 = _confined_file_sha256(
+                    root,
+                    job_id,
+                    path,
+                    budget=budget,
+                )
             except (OSError, ReviewBridgeError) as exc:
                 issue(
                     "job_artifact_target_unreadable",
@@ -4931,8 +5868,877 @@ def review_sentinel(job_id: str, packet_sha256: str) -> str:
     return f"CONTINUUM_REVIEW_COMPLETE:{job_id}:{packet_sha256}"
 
 
-def _read_text_sample(path: Path, max_bytes: int) -> tuple[str, bool]:
-    data = path.read_bytes()[: max(0, int(max_bytes)) + 1]
+def _relative_path_parts(relative: Path) -> tuple[str, ...]:
+    if relative.is_absolute():
+        raise ReviewBridgeError(f"review subject path must be relative: {relative}")
+    parts = tuple(str(part) for part in relative.parts)
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ReviewBridgeError(f"review subject path is not canonical: {relative}")
+    return parts
+
+
+def _is_link_like_stat(path: Path, stat_result: os.stat_result) -> bool:
+    if stat.S_ISLNK(stat_result.st_mode):
+        return True
+    attributes = int(getattr(stat_result, "st_file_attributes", 0) or 0)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if attributes & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    try:
+        return bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+
+
+def _stat_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return int(stat_result.st_dev), int(stat_result.st_ino)
+
+
+def _review_subject_entry(
+    path: Path,
+    *,
+    subject: Path,
+    subject_type: ReviewSubjectType,
+    stat_result: os.stat_result,
+) -> ReviewSubjectEntry:
+    identity = _stat_identity(stat_result)
+    if identity[1] == 0:
+        raise ReviewBridgeError(
+            f"review subject entry has no stable filesystem identity: {path}"
+        )
+    absolute = Path(os.path.abspath(path))
+    relative = "" if absolute == Path(os.path.abspath(subject)) else absolute.relative_to(
+        Path(os.path.abspath(subject))
+    ).as_posix()
+    return ReviewSubjectEntry(
+        path=absolute,
+        relative=relative,
+        subject_type=subject_type,
+        identity=identity,
+        size_bytes=int(stat_result.st_size),
+        mode=int(stat_result.st_mode),
+        mtime_ns=int(getattr(stat_result, "st_mtime_ns", 0)),
+        ctime_ns=int(getattr(stat_result, "st_ctime_ns", 0)),
+    )
+
+
+def _assert_review_subject_entry_stat(
+    expected: ReviewSubjectEntry,
+    actual: os.stat_result,
+) -> None:
+    actual_type: ReviewSubjectType | None = None
+    if stat.S_ISREG(actual.st_mode):
+        actual_type = "file"
+    elif stat.S_ISDIR(actual.st_mode):
+        actual_type = "directory"
+    if (
+        actual_type != expected.subject_type
+        or _stat_identity(actual) != expected.identity
+        or int(actual.st_size) != expected.size_bytes
+        or stat.S_IMODE(actual.st_mode) != stat.S_IMODE(expected.mode)
+        or int(getattr(actual, "st_mtime_ns", 0)) != expected.mtime_ns
+        # Windows path-stat and handle-stat can report different sub-millisecond
+        # change times for an untouched file. The stable file ID, size, type,
+        # mode, and modification time remain bound across the open.
+        or (
+            os.name != "nt"
+            and int(getattr(actual, "st_ctime_ns", 0)) != expected.ctime_ns
+        )
+    ):
+        raise ReviewBridgeError(
+            "review subject entry identity or metadata changed during preparation: "
+            f"{expected.relative or '.'}"
+        )
+
+
+def _review_subject_inventory_entry(
+    inventory: ReviewSubjectInventory | None,
+    path: Path,
+) -> ReviewSubjectEntry | None:
+    if inventory is None:
+        return None
+    normalized = os.path.normcase(os.path.abspath(path))
+    for entry in (inventory.root, *inventory.directories, *inventory.files):
+        if os.path.normcase(os.path.abspath(entry.path)) == normalized:
+            return entry
+    return None
+
+
+def _plain_absolute_path_stat(path: Path) -> tuple[Path, os.stat_result]:
+    """Inspect an absolute path component-by-component without following links."""
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    if not parts or not absolute.anchor:
+        raise ReviewBridgeError(f"review subject path is not absolute: {absolute}")
+    current = Path(parts[0])
+    try:
+        current_stat = os.lstat(current)
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review subject path component could not be inspected: {current}"
+        ) from exc
+    if _is_link_like_stat(current, current_stat):
+        raise ReviewBridgeError(
+            f"review subject path component is link-like: {current}"
+        )
+    if len(parts) == 1:
+        return absolute, current_stat
+    for index, part in enumerate(parts[1:], start=1):
+        current = current / part
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise ReviewBridgeError(
+                f"subject path does not exist: {absolute}"
+            ) from exc
+        except OSError as exc:
+            raise ReviewBridgeError(
+                f"review subject path component could not be inspected: {current}"
+            ) from exc
+        if _is_link_like_stat(current, current_stat):
+            raise ReviewBridgeError(
+                f"review subject path component is link-like: {current}"
+            )
+        is_final = index == len(parts) - 1
+        if not is_final and not stat.S_ISDIR(current_stat.st_mode):
+            raise ReviewBridgeError(
+                f"review subject path component is not a directory: {current}"
+            )
+    return absolute, current_stat
+
+
+def _review_subject_preflight(root: Path, path: Path) -> ReviewSubjectPreflight:
+    absolute, subject_stat = _plain_absolute_path_stat(path)
+    if not (
+        stat.S_ISDIR(subject_stat.st_mode) or stat.S_ISREG(subject_stat.st_mode)
+    ):
+        raise ReviewBridgeError(
+            f"review subject is not a regular file or directory: {absolute}"
+        )
+    if _is_relative_to(absolute, Path(root).resolve(strict=False)):
+        raise ReviewBridgeError("review subject must not be inside the Continuum root")
+    subject_type: ReviewSubjectType = (
+        "directory" if stat.S_ISDIR(subject_stat.st_mode) else "file"
+    )
+    identity = _stat_identity(subject_stat)
+    if identity[1] == 0:
+        raise ReviewBridgeError(
+            f"review subject filesystem does not provide a stable identity: {absolute}"
+        )
+    return ReviewSubjectPreflight(
+        path=absolute,
+        subject_type=subject_type,
+        identity=identity,
+    )
+
+
+def validate_review_subject_path(root: Path, path: Path) -> Path:
+    """Return an external absolute subject only when every component is plain."""
+    return _review_subject_preflight(root, path).path
+
+
+def _assert_review_subject_unchanged(
+    root: Path,
+    expected: ReviewSubjectPreflight,
+) -> None:
+    current = _review_subject_preflight(root, expected.path)
+    if current != expected:
+        raise ReviewBridgeError(
+            "review subject path, type, or identity changed during preparation"
+        )
+
+
+def _review_prepare_storage_preflight(
+    root: Path,
+    *,
+    require_tmp: bool = False,
+    require_jobs: bool = False,
+) -> ReviewPrepareStoragePreflight:
+    """Freeze the plain internal ancestors used by review publication."""
+    absolute_root = Path(os.path.abspath(root))
+    bridge_root = absolute_root / "exports" / "review_bridge"
+    tmp_root = bridge_root / "tmp"
+    jobs_root = bridge_root / "jobs"
+    candidates = [absolute_root, absolute_root / "exports"]
+    if require_tmp or require_jobs or _path_exists_no_follow(bridge_root):
+        candidates.append(bridge_root)
+    if require_tmp or _path_exists_no_follow(tmp_root):
+        candidates.append(tmp_root)
+    if require_jobs or _path_exists_no_follow(jobs_root):
+        candidates.append(jobs_root)
+
+    directories: list[tuple[str, tuple[int, int]]] = []
+    for candidate in candidates:
+        absolute, candidate_stat = _plain_absolute_path_stat(candidate)
+        if not stat.S_ISDIR(candidate_stat.st_mode):
+            raise ReviewBridgeError(
+                f"review preparation storage ancestor is not a directory: {absolute}"
+            )
+        identity = _stat_identity(candidate_stat)
+        if identity[1] == 0:
+            raise ReviewBridgeError(
+                "review preparation storage does not provide a stable identity: "
+                f"{absolute}"
+            )
+        directories.append((str(absolute), identity))
+    return ReviewPrepareStoragePreflight(directories=tuple(directories))
+
+
+def _assert_review_prepare_storage_unchanged(
+    root: Path,
+    expected: ReviewPrepareStoragePreflight,
+) -> None:
+    absolute_root = Path(os.path.abspath(root))
+    if not expected.directories or Path(expected.directories[0][0]) != absolute_root:
+        raise ReviewBridgeError("review preparation storage preflight root mismatches")
+    current: list[tuple[str, tuple[int, int]]] = []
+    for path_text, _identity in expected.directories:
+        absolute, candidate_stat = _plain_absolute_path_stat(Path(path_text))
+        if not stat.S_ISDIR(candidate_stat.st_mode):
+            raise ReviewBridgeError(
+                f"review preparation storage ancestor is not a directory: {absolute}"
+            )
+        current.append((str(absolute), _stat_identity(candidate_stat)))
+    if tuple(current) != expected.directories:
+        raise ReviewBridgeError(
+            "review preparation storage ancestry changed during publication"
+        )
+
+
+def _review_prepare_expected_identity(
+    expected: ReviewPrepareStoragePreflight | None,
+    path: Path,
+) -> tuple[int, int] | None:
+    if expected is None:
+        return None
+    normalized = os.path.normcase(os.path.abspath(path))
+    for path_text, identity in expected.directories:
+        if os.path.normcase(os.path.abspath(path_text)) == normalized:
+            return identity
+    return None
+
+
+def _assert_opened_review_prepare_directory(
+    path: Path,
+    opened_stat: os.stat_result,
+    expected: ReviewPrepareStoragePreflight | None,
+) -> None:
+    if not stat.S_ISDIR(opened_stat.st_mode) or _is_link_like_stat(path, opened_stat):
+        raise ReviewBridgeError(
+            f"review preparation path is link-like or not a directory: {path}"
+        )
+    expected_identity = _review_prepare_expected_identity(expected, path)
+    if expected is not None and expected_identity is None:
+        raise ReviewBridgeError(
+            f"review preparation path is outside its frozen ancestry: {path}"
+        )
+    if expected_identity is not None and _stat_identity(opened_stat) != expected_identity:
+        raise ReviewBridgeError(
+            f"review preparation directory identity changed while opening: {path}"
+        )
+
+
+@contextmanager
+def _open_plain_directory_fd(
+    path: Path,
+    *,
+    expected: ReviewPrepareStoragePreflight | None = None,
+) -> Iterator[int | None]:
+    """Pin an absolute plain directory and bind it to frozen identities."""
+    nofollow_flag = int(getattr(os, "O_NOFOLLOW", 0))
+    directory_flag = int(getattr(os, "O_DIRECTORY", 0))
+    absolute = Path(os.path.abspath(path))
+    if not absolute.anchor:
+        raise ReviewBridgeError(
+            f"review preparation directory is not absolute: {absolute}"
+        )
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("file_attributes", wintypes.DWORD),
+                ("creation_time", wintypes.FILETIME),
+                ("last_access_time", wintypes.FILETIME),
+                ("last_write_time", wintypes.FILETIME),
+                ("volume_serial_number", wintypes.DWORD),
+                ("file_size_high", wintypes.DWORD),
+                ("file_size_low", wintypes.DWORD),
+                ("number_of_links", wintypes.DWORD),
+                ("file_index_high", wintypes.DWORD),
+                ("file_index_low", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        file_read_attributes = 0x0080
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        open_existing = 3
+        file_flag_backup_semantics = 0x02000000
+        file_flag_open_reparse_point = 0x00200000
+        invalid_handle_value = wintypes.HANDLE(-1).value
+        handles: list[Any] = []
+        try:
+            candidates = [
+                Path(path_text)
+                for path_text, _identity in (expected.directories if expected else ())
+                if _is_relative_to(absolute, Path(path_text))
+            ]
+            if not candidates:
+                candidates = [absolute]
+            for candidate in candidates:
+                handle = kernel32.CreateFileW(
+                    str(candidate),
+                    file_read_attributes,
+                    file_share_read | file_share_write,
+                    None,
+                    open_existing,
+                    file_flag_backup_semantics | file_flag_open_reparse_point,
+                    None,
+                )
+                if handle == invalid_handle_value:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                handles.append(handle)
+                _opened_path, opened_stat = _plain_absolute_path_stat(candidate)
+                _assert_opened_review_prepare_directory(
+                    candidate,
+                    opened_stat,
+                    expected,
+                )
+                handle_information = _ByHandleFileInformation()
+                if not kernel32.GetFileInformationByHandle(
+                    handle,
+                    ctypes.byref(handle_information),
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                handle_file_index = (
+                    int(handle_information.file_index_high) << 32
+                ) | int(handle_information.file_index_low)
+                if (
+                    not int(handle_information.file_attributes) & 0x10
+                    or int(handle_information.file_attributes) & 0x400
+                    or handle_file_index != int(opened_stat.st_ino)
+                ):
+                    raise ReviewBridgeError(
+                        "review preparation opened handle does not match its "
+                        f"frozen plain directory: {candidate}"
+                    )
+            yield None
+            for candidate in candidates:
+                _opened_path, opened_stat = _plain_absolute_path_stat(candidate)
+                _assert_opened_review_prepare_directory(
+                    candidate,
+                    opened_stat,
+                    expected,
+                )
+        except OSError as exc:
+            raise ReviewBridgeError(
+                f"review preparation directory could not be pinned: {absolute}"
+            ) from exc
+        finally:
+            for handle in reversed(handles):
+                kernel32.CloseHandle(handle)
+        return
+
+    if not nofollow_flag or not directory_flag:
+        if expected is not None:
+            raise ReviewBridgeError(
+                "review preparation directory pinning is unavailable on this platform"
+            )
+        _opened_path, opened_stat = _plain_absolute_path_stat(absolute)
+        _assert_opened_review_prepare_directory(absolute, opened_stat, expected)
+        yield None
+        return
+
+    flags = os.O_RDONLY | directory_flag | nofollow_flag
+    directory_fd = -1
+    try:
+        current = Path(absolute.anchor)
+        directory_fd = os.open(str(current), flags)
+        expected_identity = _review_prepare_expected_identity(expected, current)
+        if expected_identity is not None:
+            _assert_opened_review_prepare_directory(
+                current,
+                os.fstat(directory_fd),
+                expected,
+            )
+        for part in absolute.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+            current = current / part
+            expected_identity = _review_prepare_expected_identity(expected, current)
+            if expected_identity is not None:
+                _assert_opened_review_prepare_directory(
+                    current,
+                    os.fstat(directory_fd),
+                    expected,
+                )
+        _assert_opened_review_prepare_directory(
+            absolute,
+            os.fstat(directory_fd),
+            expected,
+        )
+        yield directory_fd
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review preparation directory could not be pinned: {absolute}"
+        ) from exc
+    finally:
+        if directory_fd >= 0:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def _fsync_directory_fd(directory_fd: int) -> None:
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+
+
+def _flush_windows_review_path(
+    path: Path,
+    *,
+    expected_stat: os.stat_result,
+    require_directory: bool,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    generic_write = 0x40000000
+    share_read_write_delete = 0x00000007
+    open_existing = 3
+    backup_semantics = 0x02000000 if require_directory else 0
+    open_reparse_point = 0x00200000
+    invalid_handle_value = wintypes.HANDLE(-1).value
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_write,
+        share_read_write_delete,
+        None,
+        open_existing,
+        backup_semantics | open_reparse_point,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            handle,
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = int(information.file_attributes)
+        handle_is_directory = bool(attributes & 0x10)
+        handle_file_index = (
+            int(information.file_index_high) << 32
+        ) | int(information.file_index_low)
+        if (
+            handle_is_directory != require_directory
+            or attributes & 0x400
+            or handle_file_index != int(expected_stat.st_ino)
+        ):
+            raise ReviewBridgeError(
+                f"review preparation flush target identity changed: {path}"
+            )
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _flush_review_prepare_file(path: Path) -> None:
+    absolute, expected_stat = _plain_absolute_path_stat(path)
+    if not stat.S_ISREG(expected_stat.st_mode):
+        raise ReviewBridgeError(
+            f"review preparation flush target is not a regular file: {absolute}"
+        )
+    try:
+        if os.name == "nt":
+            _flush_windows_review_path(
+                absolute,
+                expected_stat=expected_stat,
+                require_directory=False,
+            )
+        else:
+            descriptor = os.open(
+                absolute,
+                os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0)),
+            )
+            try:
+                opened_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or _stat_identity(opened_stat) != _stat_identity(expected_stat)
+                ):
+                    raise ReviewBridgeError(
+                        f"review preparation flush target identity changed: {absolute}"
+                    )
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review preparation file durability flush failed: {absolute}"
+        ) from exc
+    _absolute, final_stat = _plain_absolute_path_stat(absolute)
+    if (
+        _stat_identity(final_stat) != _stat_identity(expected_stat)
+        or int(final_stat.st_size) != int(expected_stat.st_size)
+    ):
+        raise ReviewBridgeError(
+            f"review preparation flush target changed: {absolute}"
+        )
+
+
+def _flush_review_prepare_directory(path: Path) -> None:
+    absolute, expected_stat = _plain_absolute_path_stat(path)
+    if not stat.S_ISDIR(expected_stat.st_mode):
+        raise ReviewBridgeError(
+            f"review preparation flush target is not a directory: {absolute}"
+        )
+    try:
+        if os.name == "nt":
+            _flush_windows_review_path(
+                absolute,
+                expected_stat=expected_stat,
+                require_directory=True,
+            )
+        else:
+            descriptor = os.open(
+                absolute,
+                os.O_RDONLY
+                | int(getattr(os, "O_DIRECTORY", 0))
+                | int(getattr(os, "O_NOFOLLOW", 0)),
+            )
+            try:
+                opened_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(opened_stat.st_mode)
+                    or _stat_identity(opened_stat) != _stat_identity(expected_stat)
+                ):
+                    raise ReviewBridgeError(
+                        f"review preparation flush target identity changed: {absolute}"
+                    )
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review preparation directory durability flush failed: {absolute}"
+        ) from exc
+    _absolute, final_stat = _plain_absolute_path_stat(absolute)
+    if _stat_identity(final_stat) != _stat_identity(expected_stat):
+        raise ReviewBridgeError(
+            f"review preparation flush target changed: {absolute}"
+        )
+
+
+def _durably_flush_review_prepare_tree(
+    staging_dir: Path,
+    *,
+    budget: ReviewPreparationBudget,
+) -> None:
+    """Flush every staged file and directory before publication authority."""
+    files: list[Path] = []
+    directories: list[Path] = []
+    pending = [staging_dir]
+    observed_entries = 0
+    while pending:
+        directory = pending.pop()
+        budget.check_deadline("flushing the staged review tree")
+        _require_plain_directory(
+            directory,
+            label="staged review durability directory",
+        )
+        directories.append(directory)
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            raise ReviewBridgeError(
+                "staged review tree could not be inspected for durability"
+            ) from exc
+        for entry in entries:
+            observed_entries += 1
+            if observed_entries > REVIEW_INTEGRITY_MAX_MUTABLE_ENTRIES_PER_JOB:
+                raise ReviewBridgeError(
+                    "staged review tree exceeds its durability entry limit"
+                )
+            entry_path = directory / entry.name
+            entry_stat = os.lstat(entry_path)
+            if _is_link_like_stat(entry_path, entry_stat):
+                raise ReviewBridgeError(
+                    "staged review tree contains a link-like durability target"
+                )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                pending.append(entry_path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                files.append(entry_path)
+            else:
+                raise ReviewBridgeError(
+                    "staged review tree contains a non-regular durability target"
+                )
+    for file_path in sorted(files, key=lambda item: item.as_posix()):
+        budget.check_deadline("flushing staged review files")
+        _flush_review_prepare_file(file_path)
+    for directory in sorted(
+        directories,
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        budget.check_deadline("flushing staged review directories")
+        _flush_review_prepare_directory(directory)
+    _flush_review_prepare_directory(staging_dir.parent)
+
+
+def _remove_tree_at_fd(parent_fd: int, name: str) -> None:
+    """Remove one plain tree without ever resolving through a replaced parent."""
+    nofollow_flag = int(getattr(os, "O_NOFOLLOW", 0))
+    directory_flag = int(getattr(os, "O_DIRECTORY", 0))
+    target_fd = os.open(
+        name,
+        os.O_RDONLY | directory_flag | nofollow_flag,
+        dir_fd=parent_fd,
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(target_fd).st_mode):
+            raise ReviewBridgeError(
+                "review preparation cleanup target is not a directory"
+            )
+        with os.scandir(target_fd) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+        for entry in entries:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ReviewBridgeError(
+                    "review preparation cleanup tree contains a link-like entry"
+                )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                _remove_tree_at_fd(target_fd, entry.name)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                os.unlink(entry.name, dir_fd=target_fd)
+            else:
+                raise ReviewBridgeError(
+                    "review preparation cleanup tree contains a non-regular entry"
+                )
+        _fsync_directory_fd(target_fd)
+    finally:
+        os.close(target_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    _fsync_directory_fd(parent_fd)
+
+
+def _windows_validate_regular_components(base: Path, parts: tuple[str, ...]) -> os.stat_result:
+    final_path = Path(os.path.abspath(base.joinpath(*parts)))
+    _absolute, final_stat = _plain_absolute_path_stat(final_path)
+    if not stat.S_ISREG(final_stat.st_mode):
+        raise ReviewBridgeError(
+            f"review subject file is link-like or not regular: {final_path}"
+        )
+    if _stat_identity(final_stat)[1] == 0:
+        raise ReviewBridgeError(
+            f"review subject file has no stable filesystem identity: {final_path}"
+        )
+    return final_stat
+
+
+def _assert_review_subject_inventory_components(
+    inventory: ReviewSubjectInventory | None,
+    target: Path,
+) -> None:
+    if inventory is None:
+        return
+    for entry in (inventory.root, *inventory.directories):
+        if entry.subject_type != "directory" or not _is_relative_to(target, entry.path):
+            continue
+        _absolute, current_stat = _plain_absolute_path_stat(entry.path)
+        _assert_review_subject_entry_stat(entry, current_stat)
+
+
+@contextmanager
+def _open_confined_regular_file(
+    base: Path,
+    relative: Path,
+    *,
+    expected: ReviewSubjectEntry | None = None,
+    inventory: ReviewSubjectInventory | None = None,
+) -> Iterator[tuple[BinaryIO, os.stat_result]]:
+    """Open one subject file without following a substituted path component."""
+    parts = _relative_path_parts(relative)
+    nofollow_flag = int(getattr(os, "O_NOFOLLOW", False))
+    directory_flag = int(getattr(os, "O_DIRECTORY", False))
+    if os.name != "nt" and nofollow_flag and directory_flag:
+        directory_fds: list[int] = []
+        file_fd: int | None = None
+        try:
+            directory_flags = os.O_RDONLY | directory_flag | nofollow_flag
+            absolute_base = Path(os.path.abspath(base))
+            if not absolute_base.anchor:
+                raise ReviewBridgeError(
+                    f"review subject root is not absolute: {absolute_base}"
+                )
+            directory_fds.append(
+                os.open(str(Path(absolute_base.anchor)), directory_flags)
+            )
+            current = Path(absolute_base.anchor)
+            for part in absolute_base.parts[1:]:
+                directory_fds.append(
+                    os.open(part, directory_flags, dir_fd=directory_fds[-1])
+                )
+                current = current / part
+                current_entry = _review_subject_inventory_entry(inventory, current)
+                if current_entry is not None:
+                    _assert_review_subject_entry_stat(
+                        current_entry,
+                        os.fstat(directory_fds[-1]),
+                    )
+            for part in parts[:-1]:
+                directory_fds.append(
+                    os.open(part, directory_flags, dir_fd=directory_fds[-1])
+                )
+                current = current / part
+                current_entry = _review_subject_inventory_entry(inventory, current)
+                if current_entry is not None:
+                    _assert_review_subject_entry_stat(
+                        current_entry,
+                        os.fstat(directory_fds[-1]),
+                    )
+            file_fd = os.open(
+                parts[-1],
+                os.O_RDONLY | nofollow_flag | getattr(os, "O_BINARY", 0),
+                dir_fd=directory_fds[-1],
+            )
+            opened_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ReviewBridgeError(
+                    f"review subject file is not regular: {relative.as_posix()}"
+                )
+            expected_entry = expected or _review_subject_inventory_entry(
+                inventory,
+                absolute_base.joinpath(*parts),
+            )
+            if expected_entry is not None:
+                _assert_review_subject_entry_stat(expected_entry, opened_stat)
+            with os.fdopen(file_fd, "rb", closefd=True) as handle:
+                file_fd = None
+                yield handle, opened_stat
+        except OSError as exc:
+            raise ReviewBridgeError(
+                f"review subject path changed or could not be opened safely: {relative.as_posix()}"
+            ) from exc
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
+        return
+
+    path = base.joinpath(*parts)
+    _assert_review_subject_inventory_components(inventory, path)
+    expected_stat = _windows_validate_regular_components(base, parts)
+    file_fd = None
+    try:
+        file_fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        opened_stat = os.fstat(file_fd)
+        current_stat = _windows_validate_regular_components(base, parts)
+        expected_entry = expected or _review_subject_inventory_entry(inventory, path)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(opened_stat) != _stat_identity(expected_stat)
+            or _stat_identity(opened_stat) != _stat_identity(current_stat)
+        ):
+            raise ReviewBridgeError(
+                f"review subject file identity changed while opening: {relative.as_posix()}"
+            )
+        if expected_entry is not None:
+            _assert_review_subject_entry_stat(expected_entry, opened_stat)
+        _assert_review_subject_inventory_components(inventory, path)
+        with os.fdopen(file_fd, "rb", closefd=True) as handle:
+            file_fd = None
+            yield handle, opened_stat
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review subject path changed or could not be opened safely: {relative.as_posix()}"
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+
+def _read_regular_file_prefix(path: Path, max_bytes: int) -> bytes:
+    limit = max(0, int(max_bytes))
+    with _open_confined_regular_file(path.parent, Path(path.name)) as (handle, _stat_result):
+        return handle.read(limit)
+
+
+def _read_text_sample(
+    path: Path,
+    max_bytes: int,
+    *,
+    budget: ReviewPreparationBudget | None = None,
+) -> tuple[str, bool]:
+    data = _read_regular_file_prefix(path, max(0, int(max_bytes)) + 1)
+    if budget is not None:
+        budget.consume_work(len(data), label=f"sampling {path.name}")
     truncated = len(data) > max_bytes
     if truncated:
         data = data[:max_bytes]
@@ -5050,200 +6856,473 @@ def _is_zip_subject(path: Path) -> bool:
     return path.is_file() and _archive_kind(path) == "zip"
 
 
-def _collect_subject_files(root: Path, subject: Path, *, max_files: int) -> tuple[list[Path], bool, list[dict[str, str]]]:
-    files: list[Path] = []
+def _collect_subject_files(
+    root: Path,
+    subject: Path,
+    *,
+    subject_type: ReviewSubjectType | None = None,
+    subject_preflight: ReviewSubjectPreflight | None = None,
+    max_files: int,
+    budget: ReviewPreparationBudget | None = None,
+) -> tuple[ReviewSubjectInventory, bool, list[dict[str, str]], bool]:
+    """Enumerate a subject through a bounded, deadline-aware scandir walk."""
+    files: list[ReviewSubjectEntry] = []
+    directories: list[ReviewSubjectEntry] = []
     exclusions: list[dict[str, str]] = []
     limit = max(1, int(max_files))
-    base = subject if subject.is_dir() else subject.parent
-    resolved_base = base.resolve(strict=False)
+    entry_limit = min(
+        REVIEW_MAX_TRAVERSAL_ENTRIES,
+        max(1_000, limit * REVIEW_TRAVERSAL_ENTRY_MULTIPLIER),
+    )
+    resolved_base = Path(os.path.abspath(subject))
     resolved_root = Path(root).resolve(strict=False)
     ignore_patterns = load_ignore_patterns(root)
-    custom_patterns = {pattern for pattern in ignore_patterns if pattern not in DEFAULT_IGNORE_PATTERNS}
-    if subject.is_file():
-        if subject.is_symlink():
-            raise ReviewBridgeError(f"refusing to review symlinked subject file: {subject}")
-        return [subject], False, exclusions
-    for dirpath, dirnames, filenames in os.walk(subject, topdown=True, followlinks=False):
-        current_dir = Path(dirpath)
-        pruned_dirs: list[str] = []
-        for dirname in dirnames:
-            child_dir = current_dir / dirname
-            relative_child = child_dir.relative_to(subject).as_posix()
-            if dirname in DEFAULT_EXCLUDE_NAMES:
-                exclusions.append(
-                    {
-                        "path": relative_child,
-                        "reason": "default_exclude_name",
-                        "pattern": dirname,
-                    }
+    custom_patterns = {
+        pattern for pattern in ignore_patterns if pattern not in DEFAULT_IGNORE_PATTERNS
+    }
+    regular_file_seen = False
+    included_directory_seen = False
+    excluded_directory_seen = False
+    visited_entries = 0
+
+    try:
+        subject_stat = os.lstat(subject)
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review subject could not be inspected: {subject}"
+        ) from exc
+    if _is_link_like_stat(subject, subject_stat):
+        raise ReviewBridgeError(f"refusing to review link-like subject: {subject}")
+    observed_subject_type: ReviewSubjectType | None = None
+    if stat.S_ISREG(subject_stat.st_mode):
+        observed_subject_type = "file"
+    elif stat.S_ISDIR(subject_stat.st_mode):
+        observed_subject_type = "directory"
+    if subject_type is not None and observed_subject_type != subject_type:
+        raise ReviewBridgeError(
+            "review subject type changed during preparation"
+        )
+    if observed_subject_type is None:
+        raise ReviewBridgeError(
+            f"review subject is not a regular file or directory: {subject}"
+        )
+    subject_entry = _review_subject_entry(
+        subject,
+        subject=subject,
+        subject_type=observed_subject_type,
+        stat_result=subject_stat,
+    )
+    if subject_preflight is not None and (
+        subject_entry.path != subject_preflight.path
+        or subject_entry.subject_type != subject_preflight.subject_type
+        or subject_entry.identity != subject_preflight.identity
+    ):
+        raise ReviewBridgeError(
+            "review subject path, type, or identity changed before enumeration"
+        )
+    if stat.S_ISREG(subject_stat.st_mode):
+        return (
+            ReviewSubjectInventory(
+                root=subject_entry,
+                files=(subject_entry,),
+                directories=(),
+            ),
+            False,
+            exclusions,
+            True,
+        )
+    if not stat.S_ISDIR(subject_stat.st_mode):
+        raise ReviewBridgeError(
+            f"review subject is not a regular file or directory: {subject}"
+        )
+
+    def record_exclusion(path: str, reason: str, pattern: str) -> None:
+        exclusions.append({"path": path, "reason": reason, "pattern": pattern})
+
+    pending_directories: list[
+        tuple[ReviewSubjectEntry, tuple[ReviewSubjectEntry, ...]]
+    ] = [(subject_entry, (subject_entry,))]
+    while pending_directories:
+        current_entry, current_ancestors = pending_directories.pop()
+        current_dir = current_entry.path
+        if budget is not None:
+            budget.check_deadline(f"enumerating {current_dir}")
+        entries: list[tuple[str, os.stat_result]] = []
+        try:
+            directory_preflight = ReviewPrepareStoragePreflight(
+                directories=tuple(
+                    (str(entry.path), entry.identity)
+                    for entry in current_ancestors
                 )
-                continue
-            try:
-                if child_dir.is_symlink():
-                    exclusions.append(
-                        {
-                            "path": relative_child,
-                            "reason": "symlink_directory",
-                            "pattern": "followlinks=false",
-                        }
+            )
+            with _open_plain_directory_fd(
+                current_dir,
+                expected=directory_preflight,
+            ) as current_fd:
+                if current_fd is not None:
+                    _assert_review_subject_entry_stat(
+                        current_entry,
+                        os.fstat(current_fd),
                     )
-                    continue
-            except OSError as exc:
-                exclusions.append(
-                    {
-                        "path": relative_child,
-                        "reason": "path_stat_failed",
-                        "pattern": type(exc).__name__,
-                    }
-                )
-                continue
-            if _is_relative_to(child_dir, resolved_root):
-                exclusions.append(
-                    {
-                        "path": relative_child,
-                        "reason": "continuum_root_exclusion",
-                        "pattern": str(resolved_root),
-                    }
-                )
-                continue
-            pruned_dirs.append(dirname)
-        dirnames[:] = sorted(pruned_dirs)
-        for filename in sorted(filenames):
-            path = current_dir / filename
+                else:
+                    _absolute, current_stat = _plain_absolute_path_stat(current_dir)
+                    _assert_review_subject_entry_stat(current_entry, current_stat)
+                with os.scandir(
+                    current_fd if current_fd is not None else current_dir
+                ) as iterator:
+                    for entry in iterator:
+                        visited_entries += 1
+                        if visited_entries > entry_limit:
+                            raise ReviewBridgeError(
+                                "review subject traversal entry limit exceeded: "
+                                f"more than {entry_limit} entries for max_files={limit}"
+                            )
+                        if budget is not None:
+                            budget.check_deadline(
+                                f"enumerating {current_dir / entry.name}"
+                            )
+                        entry_path = current_dir / entry.name
+                        try:
+                            # On Windows DirEntry.stat() can omit the stable file
+                            # index. The pinned ancestor handles prevent rename or
+                            # replacement while the path-based lstat is taken.
+                            entry_stat = (
+                                os.lstat(entry_path)
+                                if os.name == "nt"
+                                else entry.stat(follow_symlinks=False)
+                            )
+                        except OSError as exc:
+                            record_exclusion(
+                                entry_path.relative_to(subject).as_posix(),
+                                "path_stat_failed",
+                                type(exc).__name__,
+                            )
+                            continue
+                        entries.append((entry.name, entry_stat))
+        except ReviewBridgeError:
+            raise
+        except OSError as exc:
+            raise ReviewBridgeError(
+                f"review subject directory could not be enumerated: {current_dir}"
+            ) from exc
+
+        child_directories: list[
+            tuple[ReviewSubjectEntry, tuple[ReviewSubjectEntry, ...]]
+        ] = []
+        for entry_name, entry_stat in sorted(entries, key=lambda item: item[0]):
+            if budget is not None:
+                budget.check_deadline(f"processing {current_dir / entry_name}")
+            path = current_dir / entry_name
             relative_path = path.relative_to(subject).as_posix()
-            try:
-                if path.is_symlink():
-                    exclusions.append(
-                        {
-                            "path": relative_path,
-                            "reason": "symlink_file",
-                            "pattern": "symlink",
-                        }
+            if _is_link_like_stat(path, entry_stat):
+                reason = (
+                    "symlink_directory"
+                    if stat.S_ISDIR(entry_stat.st_mode)
+                    else "symlink_file"
+                )
+                record_exclusion(relative_path, reason, "no-follow")
+                continue
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if entry_name in DEFAULT_EXCLUDE_NAMES:
+                    excluded_directory_seen = True
+                    record_exclusion(
+                        relative_path,
+                        "default_exclude_name",
+                        entry_name,
                     )
                     continue
-                if not path.is_file():
-                    exclusions.append(
-                        {
-                            "path": relative_path,
-                            "reason": "non_regular_file",
-                            "pattern": "not-a-regular-file",
-                        }
+                if _is_relative_to(path, resolved_root):
+                    excluded_directory_seen = True
+                    record_exclusion(
+                        relative_path,
+                        "continuum_root_exclusion",
+                        str(resolved_root),
                     )
                     continue
-            except OSError as exc:
-                exclusions.append(
-                    {
-                        "path": relative_path,
-                        "reason": "path_stat_failed",
-                        "pattern": type(exc).__name__,
-                    }
+                directory_entry = _review_subject_entry(
+                    path,
+                    subject=subject,
+                    subject_type="directory",
+                    stat_result=entry_stat,
+                )
+                if (
+                    len(files) + len(directories)
+                    >= REVIEW_ZIP_SCAN_MAX_MEMBERS
+                ):
+                    raise ReviewBridgeError(
+                        "review subject file and directory entry limit exceeded: "
+                        f"more than {REVIEW_ZIP_SCAN_MAX_MEMBERS} entries"
+                    )
+                directories.append(directory_entry)
+                included_directory_seen = True
+                child_directories.append(
+                    (directory_entry, (*current_ancestors, directory_entry))
                 )
                 continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                record_exclusion(
+                    relative_path,
+                    "non_regular_file",
+                    "not-a-regular-file",
+                )
+                continue
+
+            regular_file_seen = True
             try:
-                path.resolve(strict=False).relative_to(resolved_base)
-            except OSError as exc:
-                exclusions.append(
-                    {
-                        "path": relative_path,
-                        "reason": "path_resolve_failed",
-                        "pattern": type(exc).__name__,
-                    }
-                )
-                continue
+                Path(os.path.abspath(path)).relative_to(resolved_base)
             except ValueError:
-                exclusions.append(
-                    {
-                        "path": relative_path,
-                        "reason": "path_outside_subject",
-                        "pattern": str(resolved_base),
-                    }
+                record_exclusion(
+                    relative_path,
+                    "path_outside_subject",
+                    str(resolved_base),
                 )
                 continue
             if _is_relative_to(path, resolved_root):
-                exclusions.append(
-                    {
-                        "path": relative_path,
-                        "reason": "continuum_root_exclusion",
-                        "pattern": str(resolved_root),
-                    }
+                record_exclusion(
+                    relative_path,
+                    "continuum_root_exclusion",
+                    str(resolved_root),
                 )
                 continue
             rel_parts = set(path.relative_to(subject).parts)
             default_part_matches = rel_parts & DEFAULT_EXCLUDE_NAMES
             if default_part_matches:
-                exclusions.append(
-                    {
-                        "path": path.relative_to(subject).as_posix(),
-                        "reason": "default_exclude_name",
-                        "pattern": sorted(default_part_matches)[0],
-                    }
+                record_exclusion(
+                    relative_path,
+                    "default_exclude_name",
+                    sorted(default_part_matches)[0],
                 )
                 continue
-            if any(fnmatch.fnmatch(path.name, pattern) for pattern in DEFAULT_EXCLUDE_BASENAME_PATTERNS):
-                matched_pattern = next(
-                    pattern for pattern in DEFAULT_EXCLUDE_BASENAME_PATTERNS if fnmatch.fnmatch(path.name, pattern)
-                )
-                exclusions.append(
-                    {
-                        "path": path.relative_to(subject).as_posix(),
-                        "reason": "default_exclude_basename",
-                        "pattern": matched_pattern,
-                    }
+            matching_basename_patterns = [
+                pattern
+                for pattern in DEFAULT_EXCLUDE_BASENAME_PATTERNS
+                if fnmatch.fnmatch(path.name, pattern)
+            ]
+            if matching_basename_patterns:
+                record_exclusion(
+                    relative_path,
+                    "default_exclude_basename",
+                    sorted(matching_basename_patterns)[0],
                 )
                 continue
             pattern = ignored_by_pattern(path, ignore_patterns)
             if pattern:
-                if pattern in custom_patterns:
-                    exclusions.append(
-                        {
-                            "path": path.relative_to(subject).as_posix(),
-                            "reason": "custom_continuumignore",
-                            "pattern": pattern,
-                        }
-                    )
-                else:
-                    exclusions.append(
-                        {
-                            "path": path.relative_to(subject).as_posix(),
-                            "reason": "default_continuumignore",
-                            "pattern": pattern,
-                        }
-                    )
+                record_exclusion(
+                    relative_path,
+                    (
+                        "custom_continuumignore"
+                        if pattern in custom_patterns
+                        else "default_continuumignore"
+                    ),
+                    pattern,
+                )
                 continue
-            files.append(path)
+            if len(files) + len(directories) >= REVIEW_ZIP_SCAN_MAX_MEMBERS:
+                raise ReviewBridgeError(
+                    "review subject file and directory entry limit exceeded: "
+                    f"more than {REVIEW_ZIP_SCAN_MAX_MEMBERS} entries"
+                )
+            files.append(
+                _review_subject_entry(
+                    path,
+                    subject=subject,
+                    subject_type="file",
+                    stat_result=entry_stat,
+                )
+            )
             if len(files) > limit:
-                return files[:limit], True, exclusions
-    return files, False, exclusions
+                return (
+                    ReviewSubjectInventory(
+                        root=subject_entry,
+                        files=tuple(
+                            sorted(files[:limit], key=lambda item: item.relative)
+                        ),
+                        directories=tuple(
+                            sorted(directories, key=lambda item: item.relative)
+                        ),
+                    ),
+                    True,
+                    exclusions,
+                    regular_file_seen
+                    or included_directory_seen
+                    or excluded_directory_seen,
+                )
+        pending_directories.extend(reversed(child_directories))
+    return (
+        ReviewSubjectInventory(
+            root=subject_entry,
+            files=tuple(sorted(files, key=lambda item: item.relative)),
+            directories=tuple(sorted(directories, key=lambda item: item.relative)),
+        ),
+        False,
+        exclusions,
+        regular_file_seen or included_directory_seen or excluded_directory_seen,
+    )
 
 
 def _iter_subject_files(root: Path, subject: Path, *, max_files: int) -> list[Path]:
-    files, _file_limit_reached, _exclusions = _collect_subject_files(root, subject, max_files=max_files)
-    return files
+    inventory, _file_limit_reached, _exclusions, _content_seen = (
+        _collect_subject_files(root, subject, max_files=max_files)
+    )
+    return [entry.path for entry in inventory.files]
 
 
-def _copy_snapshot_files(root: Path, subject: Path, files: list[Path], snapshot_subject: Path) -> list[Path]:
-    secure_mkdir(snapshot_subject, secure_existing=True)
-    if subject.is_file():
+def _copy_confined_snapshot_file(
+    *,
+    base: Path,
+    relative: Path,
+    destination: Path,
+    budget: ReviewPreparationBudget,
+    expected: ReviewSubjectEntry | None = None,
+    inventory: ReviewSubjectInventory | None = None,
+) -> Path:
+    secure_mkdir(destination.parent, secure_existing=True)
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    destination_fd: int | None = None
+    try:
+        with _open_confined_regular_file(
+            base,
+            relative,
+            expected=expected,
+            inventory=inventory,
+        ) as (source_handle, initial_stat):
+            source_label = relative.as_posix()
+            initial_size = int(initial_stat.st_size)
+            budget.check_subject_file(initial_size, source=source_label)
+            destination_fd = os.open(str(destination), destination_flags, PRIVATE_FILE_MODE)
+            copied_bytes = 0
+            with os.fdopen(destination_fd, "wb", closefd=True) as destination_handle:
+                destination_fd = None
+                while True:
+                    budget.check_deadline(f"copying {source_label}")
+                    chunk = source_handle.read(REVIEW_PROCESS_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > budget.max_subject_file_bytes:
+                        raise ReviewBridgeError(
+                            "review subject file byte limit exceeded while copying: "
+                            f"{source_label} ({copied_bytes} > {budget.max_subject_file_bytes})"
+                        )
+                    if budget.subject_bytes + copied_bytes > budget.max_subject_bytes:
+                        raise ReviewBridgeError(
+                            "review subject total byte limit exceeded while copying: "
+                            f"{budget.subject_bytes + copied_bytes} > {budget.max_subject_bytes}"
+                        )
+                    written = destination_handle.write(chunk)
+                    if written != len(chunk):
+                        raise OSError("short write while snapshotting review subject")
+                    budget.consume_work(len(chunk), label=f"copying {source_label}")
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+            final_stat = os.fstat(source_handle.fileno())
+            if (
+                _stat_identity(final_stat) != _stat_identity(initial_stat)
+                or int(final_stat.st_size) != initial_size
+                or int(getattr(final_stat, "st_mtime_ns", 0))
+                != int(getattr(initial_stat, "st_mtime_ns", 0))
+                or copied_bytes != initial_size
+            ):
+                raise ReviewBridgeError(
+                    f"review subject file changed while snapshotting: {source_label}"
+                )
+            budget.commit_subject_file(copied_bytes, source=source_label)
+            secure_file(destination)
+            _restore_private_snapshot_mode(
+                base / relative,
+                destination,
+                source_mode=stat.S_IMODE(initial_stat.st_mode),
+            )
+            return destination
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+def _copy_snapshot_files(
+    root: Path,
+    subject: Path,
+    inventory: ReviewSubjectInventory,
+    snapshot_subject: Path,
+    *,
+    subject_type: ReviewSubjectType,
+    budget: ReviewPreparationBudget | None = None,
+) -> list[Path]:
+    del root
+    active_budget = budget or _new_review_preparation_budget(
+        max_packet_bytes=REVIEW_DEFAULT_PACKET_BYTES,
+        max_subject_file_bytes=REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+        max_subject_bytes=REVIEW_DEFAULT_SUBJECT_BYTES,
+        prepare_timeout_seconds=REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    )
+    if subject_type == "file":
+        secure_mkdir(snapshot_subject, secure_existing=True)
         destination = snapshot_subject / subject.name
-        secure_copy_file(subject, destination)
-        _restore_private_snapshot_mode(subject, destination)
-        return [destination]
+        return [
+            _copy_confined_snapshot_file(
+                base=subject.parent,
+                relative=Path(subject.name),
+                destination=destination,
+                budget=active_budget,
+                expected=inventory.root,
+                inventory=inventory,
+            )
+        ]
+    directory_preflight = ReviewPrepareStoragePreflight(
+        directories=tuple(
+            (str(entry.path), entry.identity)
+            for entry in (inventory.root, *inventory.directories)
+        )
+    )
     copied: list[Path] = []
-    for path in files:
-        rel = path.relative_to(subject)
-        destination = snapshot_subject / rel
-        secure_copy_file(path, destination)
-        _restore_private_snapshot_mode(path, destination)
-        copied.append(destination)
+    with _open_plain_directory_fd(subject, expected=directory_preflight):
+        secure_mkdir(snapshot_subject, secure_existing=True)
+        for directory in inventory.directories:
+            with _open_plain_directory_fd(
+                directory.path,
+                expected=directory_preflight,
+            ):
+                secure_mkdir(
+                    snapshot_subject.joinpath(*Path(directory.relative).parts),
+                    secure_existing=True,
+                )
+        for entry in inventory.files:
+            rel = Path(entry.relative)
+            destination = snapshot_subject / rel
+            copied.append(
+                _copy_confined_snapshot_file(
+                    base=subject,
+                    relative=rel,
+                    destination=destination,
+                    budget=active_budget,
+                    expected=entry,
+                    inventory=inventory,
+                )
+            )
     return copied
 
 
-def _restore_private_snapshot_mode(source: Path, destination: Path) -> None:
+def _restore_private_snapshot_mode(
+    source: Path,
+    destination: Path,
+    *,
+    source_mode: int | None = None,
+) -> None:
     """Keep copied snapshots private while preserving executable intent."""
-    try:
-        source_mode = stat.S_IMODE(source.stat().st_mode)
-    except OSError:
-        return
+    if source_mode is None:
+        try:
+            source_mode = stat.S_IMODE(source.stat().st_mode)
+        except OSError:
+            return
     if source_mode & 0o111:
         try:
             os.chmod(destination, 0o700)
@@ -5251,54 +7330,341 @@ def _restore_private_snapshot_mode(source: Path, destination: Path) -> None:
             return
 
 
-def _snapshot_subject(root: Path, subject: Path, job_dir: Path, *, max_files: int) -> tuple[Path, list[Path], bool, list[dict[str, str]]]:
-    files, file_limit_reached, exclusions = _collect_subject_files(root, subject, max_files=max_files)
+def _snapshot_subject(
+    root: Path,
+    subject: Path,
+    job_dir: Path,
+    *,
+    subject_type: ReviewSubjectType,
+    max_files: int,
+    budget: ReviewPreparationBudget | None = None,
+    subject_preflight: ReviewSubjectPreflight | None = None,
+) -> tuple[
+    Path,
+    list[Path],
+    list[Path],
+    ReviewSubjectInventory,
+    bool,
+    list[dict[str, str]],
+    bool,
+]:
+    inventory, file_limit_reached, exclusions, content_seen = _collect_subject_files(
+        root,
+        subject,
+        subject_type=subject_type,
+        subject_preflight=subject_preflight,
+        max_files=max_files,
+        budget=budget,
+    )
     snapshot_subject = job_dir / "snapshot" / "subject"
-    copied = _copy_snapshot_files(root, subject, files, snapshot_subject)
-    return snapshot_subject, copied, file_limit_reached, exclusions
+    copied = _copy_snapshot_files(
+        root,
+        subject,
+        inventory,
+        snapshot_subject,
+        subject_type=subject_type,
+        budget=budget,
+    )
+    copied_directories = [
+        snapshot_subject.joinpath(*Path(entry.relative).parts)
+        for entry in inventory.directories
+    ]
+    return (
+        snapshot_subject,
+        copied,
+        copied_directories,
+        inventory,
+        file_limit_reached,
+        exclusions,
+        content_seen,
+    )
 
 
-def _subject_has_regular_file(subject: Path) -> bool:
-    if subject.is_file() and not subject.is_symlink():
-        return True
-    if not subject.is_dir():
-        return False
-    for _dirpath, _dirnames, filenames in os.walk(subject, topdown=True, followlinks=False):
-        for filename in filenames:
-            path = Path(_dirpath) / filename
-            try:
-                if path.is_file() and not path.is_symlink():
-                    return True
-            except OSError:
-                continue
-    return False
+def _assert_review_subject_matches_snapshot(
+    root: Path,
+    subject: Path,
+    *,
+    subject_type: ReviewSubjectType,
+    subject_preflight: ReviewSubjectPreflight,
+    initial_inventory: ReviewSubjectInventory,
+    initial_exclusions: list[dict[str, str]],
+    initial_content_seen: bool,
+    snapshot_manifest: list[dict[str, Any]],
+    max_files: int,
+    budget: ReviewPreparationBudget,
+) -> None:
+    """Prove the live subject still equals the frozen snapshot before commit."""
+    (
+        final_inventory,
+        final_file_limit_reached,
+        final_exclusions,
+        final_content_seen,
+    ) = _collect_subject_files(
+        root,
+        subject,
+        subject_type=subject_type,
+        subject_preflight=subject_preflight,
+        max_files=max_files,
+        budget=budget,
+    )
+    if (
+        final_file_limit_reached
+        or final_inventory != initial_inventory
+        or final_exclusions != initial_exclusions
+        or final_content_seen != initial_content_seen
+    ):
+        raise ReviewBridgeError(
+            "review subject inventory changed after its snapshot was captured"
+        )
+    final_entries: Sequence[ReviewSubjectEntry]
+    if subject_type == "file":
+        final_entries = (final_inventory.root,)
+        manifest_base = subject.parent
+    else:
+        final_entries = final_inventory.files
+        manifest_base = subject
+    final_manifest = [
+        _file_manifest_entry(
+            entry.path,
+            manifest_base,
+            budget=budget,
+            expected=entry,
+            inventory=final_inventory,
+        )
+        for entry in final_entries
+    ]
+    if final_manifest != snapshot_manifest:
+        raise ReviewBridgeError(
+            "review subject content or mode changed after its snapshot was captured"
+        )
+    _assert_review_subject_unchanged(root, subject_preflight)
 
 
-def _file_manifest_entry(path: Path, base: Path) -> dict[str, Any]:
-    stat_result = path.stat()
-    mode = stat.S_IMODE(stat_result.st_mode)
+def _file_manifest_entry(
+    path: Path,
+    base: Path,
+    *,
+    budget: ReviewPreparationBudget | None = None,
+    count_subject_bytes: bool = False,
+    expected: ReviewSubjectEntry | None = None,
+    inventory: ReviewSubjectInventory | None = None,
+) -> dict[str, Any]:
     try:
         rel = path.relative_to(base).as_posix()
     except ValueError:
         rel = path.name
+    with _open_confined_regular_file(
+        base,
+        Path(rel),
+        expected=expected,
+        inventory=inventory,
+    ) as (handle, stat_result):
+        if budget is not None:
+            if count_subject_bytes:
+                budget.check_subject_file(int(stat_result.st_size), source=rel)
+            elif int(stat_result.st_size) > budget.max_subject_file_bytes:
+                raise ReviewBridgeError(
+                    "review subject file byte limit exceeded while hashing: "
+                    f"{rel} ({int(stat_result.st_size)} > {budget.max_subject_file_bytes})"
+                )
+        digest = hashlib.sha256()
+        observed = 0
+        while True:
+            if budget is not None:
+                budget.check_deadline(f"hashing {rel}")
+            chunk = handle.read(REVIEW_PROCESS_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            observed += len(chunk)
+            if budget is not None:
+                budget.consume_work(len(chunk), label=f"hashing {rel}")
+        final_stat = os.fstat(handle.fileno())
+        if (
+            _stat_identity(final_stat) != _stat_identity(stat_result)
+            or int(final_stat.st_size) != int(stat_result.st_size)
+            or observed != int(stat_result.st_size)
+        ):
+            raise ReviewBridgeError(f"review manifest input changed while reading: {rel}")
+        if budget is not None and count_subject_bytes:
+            budget.commit_subject_read(int(stat_result.st_size), source=rel)
+    mode = stat.S_IMODE(stat_result.st_mode)
     return {
         "path": rel,
         "size_bytes": int(stat_result.st_size),
-        "sha256": file_sha256(path),
+        "sha256": digest.hexdigest(),
         "zip_mode": "100755" if mode & 0o111 else "100644",
         "text_candidate": _is_probably_text(path),
     }
 
 
-def _zip_subject(subject: Path, files: list[Path], out_path: Path) -> str:
-    secure_mkdir(out_path.parent)
+def _hash_bounded_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    budget: ReviewPreparationBudget | None = None,
+) -> str:
+    """Hash one regular file through a confined descriptor under an explicit cap."""
+    with _open_confined_regular_file(path.parent, Path(path.name)) as (
+        handle,
+        initial_stat,
+    ):
+        expected_size = int(initial_stat.st_size)
+        if expected_size < 0 or expected_size > max(1, int(max_bytes)):
+            raise ReviewBridgeError(
+                f"{label} exceeds its {max(1, int(max_bytes))}-byte limit"
+            )
+        digest = hashlib.sha256()
+        observed = 0
+        while True:
+            if budget is not None:
+                budget.check_deadline(f"hashing {label}")
+            chunk = handle.read(REVIEW_PROCESS_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > max_bytes:
+                raise ReviewBridgeError(f"{label} grew beyond its byte limit while hashing")
+            digest.update(chunk)
+            if budget is not None:
+                budget.consume_work(len(chunk), label=f"hashing {label}")
+        final_stat = os.fstat(handle.fileno())
+        if (
+            _stat_identity(final_stat) != _stat_identity(initial_stat)
+            or int(final_stat.st_size) != expected_size
+            or observed != expected_size
+        ):
+            raise ReviewBridgeError(f"{label} changed while hashing")
+        return digest.hexdigest()
+
+
+class _BoundedSeekableWriter:
+    def __init__(self, handle: BinaryIO, *, max_bytes: int) -> None:
+        self._handle = handle
+        self._max_bytes = max(1, int(max_bytes))
+        self._high_water = 0
+
+    def write(self, data: bytes) -> int:
+        prospective = max(self._high_water, self._handle.tell() + len(data))
+        if prospective > self._max_bytes:
+            raise ReviewBridgeError(
+                f"review archive exceeds its {self._max_bytes}-byte output limit"
+            )
+        written = self._handle.write(data)
+        self._high_water = max(self._high_water, self._handle.tell())
+        return written
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._handle.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def seekable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+
+@contextmanager
+def _bounded_zip_writer(
+    out_path: Path,
+    *,
+    max_bytes: int,
+) -> Iterator[zipfile.ZipFile]:
+    secure_mkdir(out_path.parent, secure_existing=True)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(str(out_path), flags, PRIVATE_FILE_MODE)
+        with os.fdopen(descriptor, "w+b", closefd=True) as raw_handle:
+            descriptor = None
+            bounded_handle = _BoundedSeekableWriter(raw_handle, max_bytes=max_bytes)
+            with zipfile.ZipFile(
+                bounded_handle,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                yield archive
+            bounded_handle.flush()
+            os.fsync(raw_handle.fileno())
+        secure_file(out_path)
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _zip_subject(
+    subject: Path,
+    files: list[Path],
+    out_path: Path,
+    *,
+    directories: list[Path] | None = None,
+    expected_hashes: dict[str, str] | None = None,
+    budget: ReviewPreparationBudget | None = None,
+) -> str:
+    active_budget = budget or _new_review_preparation_budget(
+        max_packet_bytes=REVIEW_DEFAULT_PACKET_BYTES,
+        max_subject_file_bytes=REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+        max_subject_bytes=REVIEW_DEFAULT_SUBJECT_BYTES,
+        prepare_timeout_seconds=REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    )
     base = subject if subject.is_dir() else subject.parent
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for path in files:
+    with _bounded_zip_writer(
+        out_path,
+        max_bytes=active_budget.max_archive_bytes,
+    ) as zf:
+        for directory in sorted(
+            directories or [],
+            key=lambda item: item.relative_to(base).as_posix(),
+        ):
+            active_budget.check_deadline("writing subject archive directories")
+            _write_zip_directory(
+                zf,
+                directory.relative_to(base).as_posix(),
+            )
+        for path in sorted(
+            files,
+            key=lambda item: item.relative_to(base).as_posix(),
+        ):
+            active_budget.check_deadline("writing the subject archive")
             arcname = path.relative_to(base).as_posix()
-            _write_zip_file(zf, path, arcname)
-    secure_file(out_path)
-    return file_sha256(out_path)
+            _write_zip_file(
+                zf,
+                path,
+                arcname,
+                expected_sha256=(expected_hashes or {}).get(arcname),
+                budget=active_budget,
+            )
+    archive_size = int(out_path.stat().st_size)
+    active_budget.consume_temporary(archive_size, label="subject archive")
+    return _hash_bounded_regular_file(
+        out_path,
+        max_bytes=active_budget.max_archive_bytes,
+        label="review subject archive",
+        budget=active_budget,
+    )
 
 
 def _zip_info(arcname: str, *, mode: int = 0o644) -> zipfile.ZipInfo:
@@ -5309,22 +7675,274 @@ def _zip_info(arcname: str, *, mode: int = 0o644) -> zipfile.ZipInfo:
     return info
 
 
-def _write_zip_file(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
-    file_mode = stat.S_IMODE(path.stat().st_mode)
-    mode = 0o755 if file_mode & 0o111 else 0o644
-    zf.writestr(_zip_info(arcname, mode=mode), path.read_bytes())
+def _zip_directory_info(arcname: str, *, mode: int = 0o755) -> zipfile.ZipInfo:
+    normalized = arcname.rstrip("/") + "/"
+    info = zipfile.ZipInfo(normalized, date_time=(1980, 1, 1, 0, 0, 0))
+    info.create_system = 3
+    info.compress_type = zipfile.ZIP_STORED
+    info.external_attr = ((stat.S_IFDIR | stat.S_IMODE(mode)) << 16) | 0x10
+    return info
+
+
+def _write_zip_directory(zf: zipfile.ZipFile, arcname: str) -> None:
+    zf.writestr(_zip_directory_info(arcname), b"")
+
+
+def _write_zip_file(
+    zf: zipfile.ZipFile,
+    path: Path,
+    arcname: str,
+    *,
+    expected_sha256: str | None = None,
+    budget: ReviewPreparationBudget | None = None,
+) -> None:
+    with _open_confined_regular_file(path.parent, Path(path.name)) as (
+        source_handle,
+        initial_stat,
+    ):
+        file_mode = stat.S_IMODE(initial_stat.st_mode)
+        mode = 0o755 if file_mode & 0o111 else 0o644
+        copied = 0
+        digest = hashlib.sha256()
+        with zf.open(_zip_info(arcname, mode=mode), "w", force_zip64=True) as target:
+            while True:
+                if budget is not None:
+                    budget.check_deadline(f"archiving {arcname}")
+                chunk = source_handle.read(REVIEW_PROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                target.write(chunk)
+                digest.update(chunk)
+                copied += len(chunk)
+                if budget is not None:
+                    budget.consume_work(len(chunk), label=f"archiving {arcname}")
+        final_stat = os.fstat(source_handle.fileno())
+        if (
+            _stat_identity(final_stat) != _stat_identity(initial_stat)
+            or int(final_stat.st_size) != int(initial_stat.st_size)
+            or copied != int(initial_stat.st_size)
+        ):
+            raise ReviewBridgeError(f"review archive input changed while reading: {arcname}")
+        actual_sha256 = digest.hexdigest()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise ReviewBridgeError(
+                f"review archive input no longer matches its manifest: {arcname}"
+            )
 
 
 def _write_zip_text(zf: zipfile.ZipFile, arcname: str, text: str) -> None:
     zf.writestr(_zip_info(arcname), text.encode("utf-8"))
 
 
-def _zip_subject_member_manifest(archive_path: Path) -> dict[str, Any]:
+def _read_zip_region(handle: BinaryIO, offset: int, size: int) -> bytes:
+    if offset < 0 or size < 0:
+        raise zipfile.BadZipFile("negative ZIP record boundary")
+    handle.seek(offset)
+    data = handle.read(size)
+    if len(data) != size:
+        raise zipfile.BadZipFile("truncated ZIP record")
+    return data
+
+
+def _preflight_zip_central_directory(
+    handle: BinaryIO,
+    *,
+    archive_name: str,
+    member_limit: int,
+    budget: ReviewPreparationBudget | None = None,
+) -> int:
+    """Count bounded central-directory headers before ZipFile allocates ZipInfo."""
+    original_position = handle.tell()
+    try:
+        handle.seek(0, os.SEEK_END)
+        archive_size = handle.tell()
+        if archive_size < 22:
+            raise zipfile.BadZipFile(f"invalid ZIP archive: {archive_name}")
+        tail_size = min(archive_size, 22 + 65_535)
+        tail_offset = archive_size - tail_size
+        tail = _read_zip_region(handle, tail_offset, tail_size)
+        eocd_relative = tail.rfind(b"PK\x05\x06")
+        eocd_offset = -1
+        eocd: tuple[Any, ...] | None = None
+        while eocd_relative >= 0:
+            if eocd_relative + 22 <= len(tail):
+                candidate = struct.unpack_from("<4s4H2LH", tail, eocd_relative)
+                comment_size = int(candidate[-1])
+                candidate_offset = tail_offset + eocd_relative
+                if candidate_offset + 22 + comment_size == archive_size:
+                    eocd_offset = candidate_offset
+                    eocd = candidate
+                    break
+            eocd_relative = tail.rfind(b"PK\x05\x06", 0, eocd_relative)
+        if eocd is None:
+            raise zipfile.BadZipFile(f"ZIP end record is missing: {archive_name}")
+
+        (
+            _signature,
+            disk_number,
+            central_disk_number,
+            disk_entries,
+            total_entries,
+            central_size,
+            central_offset,
+            _comment_size,
+        ) = eocd
+        if disk_number != 0 or central_disk_number != 0:
+            raise zipfile.BadZipFile("multi-disk ZIP archives are not supported")
+
+        declared_entries = int(total_entries)
+        central_end = eocd_offset
+        zip64_required = (
+            int(disk_entries) == 0xFFFF
+            or int(total_entries) == 0xFFFF
+            or int(central_size) == 0xFFFFFFFF
+            or int(central_offset) == 0xFFFFFFFF
+        )
+        if zip64_required:
+            locator_offset = eocd_offset - 20
+            locator = struct.unpack(
+                "<4sLQL",
+                _read_zip_region(handle, locator_offset, 20),
+            )
+            if locator[0] != b"PK\x06\x07":
+                raise zipfile.BadZipFile("ZIP64 locator is missing")
+            if int(locator[1]) != 0 or int(locator[3]) != 1:
+                raise zipfile.BadZipFile(
+                    "multi-disk ZIP64 archives are not supported"
+                )
+            # CPython's ZipFile supports only the fixed 56-byte ZIP64 end
+            # record immediately before the locator. Accept exactly that
+            # geometry so preflight and the subsequent parser cannot select
+            # different records before ZipInfo allocation.
+            zip64_offset = locator_offset - 56
+            zip64_record = struct.unpack(
+                "<4sQ2H2L4Q",
+                _read_zip_region(handle, zip64_offset, 56),
+            )
+            if zip64_record[0] != b"PK\x06\x06" or int(zip64_record[1]) != 44:
+                raise zipfile.BadZipFile(
+                    "ZIP64 end record is missing or has unsupported extensible data"
+                )
+            if int(zip64_record[4]) != 0 or int(zip64_record[5]) != 0:
+                raise zipfile.BadZipFile(
+                    "multi-disk ZIP64 archives are not supported"
+                )
+            if int(zip64_record[6]) != int(zip64_record[7]):
+                raise zipfile.BadZipFile("ZIP64 member counts disagree")
+            declared_entries = int(zip64_record[7])
+            central_size = int(zip64_record[8])
+            central_offset = int(zip64_record[9])
+            central_end = zip64_offset
+        elif int(disk_entries) != int(total_entries):
+            raise zipfile.BadZipFile("ZIP member counts disagree")
+
+        central_size = int(central_size)
+        central_offset = int(central_offset)
+        if central_size > REVIEW_ZIP_SCAN_MAX_CENTRAL_DIRECTORY_BYTES:
+            raise ReviewBridgeError(
+                "review ZIP central directory exceeds its byte limit: "
+                f"{central_size} > {REVIEW_ZIP_SCAN_MAX_CENTRAL_DIRECTORY_BYTES}"
+            )
+        central_start = central_end - central_size
+        concatenated_prefix = central_start - central_offset
+        if central_start < 0 or concatenated_prefix < 0:
+            raise zipfile.BadZipFile("ZIP central-directory boundary is invalid")
+        if zip64_required and int(locator[2]) + concatenated_prefix != zip64_offset:
+            raise zipfile.BadZipFile(
+                "ZIP64 locator offset does not bind the parsed end record"
+            )
+
+        observed = 0
+        position = central_start
+        while position < central_end:
+            if budget is not None:
+                budget.check_deadline("preflighting the ZIP central directory")
+            header = _read_zip_region(handle, position, 46)
+            if header[:4] != b"PK\x01\x02":
+                raise zipfile.BadZipFile(
+                    "ZIP central-directory member header is malformed"
+                )
+            filename_size = int(struct.unpack_from("<H", header, 28)[0])
+            extra_size = int(struct.unpack_from("<H", header, 30)[0])
+            comment_size = int(struct.unpack_from("<H", header, 32)[0])
+            member_disk = int(struct.unpack_from("<H", header, 34)[0])
+            if member_disk != 0:
+                raise zipfile.BadZipFile(
+                    "multi-disk ZIP member records are not supported"
+                )
+            if filename_size > REVIEW_ZIP_SCAN_MAX_MEMBER_NAME_BYTES:
+                raise ReviewBridgeError(
+                    "review ZIP member name exceeds its byte limit: "
+                    f"{filename_size} > {REVIEW_ZIP_SCAN_MAX_MEMBER_NAME_BYTES}"
+                )
+            observed += 1
+            if observed > member_limit:
+                raise _ReviewZipMemberLimitExceeded(
+                    observed=observed,
+                    limit=member_limit,
+                )
+            position += 46 + filename_size + extra_size + comment_size
+            if position > central_end:
+                raise zipfile.BadZipFile(
+                    "ZIP central-directory member exceeds its boundary"
+                )
+        if position != central_end or observed != declared_entries:
+            raise zipfile.BadZipFile(
+                "ZIP central-directory count or boundary is inconsistent"
+            )
+        return observed
+    finally:
+        handle.seek(original_position)
+
+
+@contextmanager
+def _open_preflighted_zip_archive(
+    archive_path: Path,
+    *,
+    member_limit: int,
+    budget: ReviewPreparationBudget | None = None,
+) -> Iterator[zipfile.ZipFile]:
+    with _open_confined_regular_file(
+        archive_path.parent,
+        Path(archive_path.name),
+    ) as (handle, initial_stat):
+        _preflight_zip_central_directory(
+            handle,
+            archive_name=archive_path.name,
+            member_limit=member_limit,
+            budget=budget,
+        )
+        with zipfile.ZipFile(handle) as archive:
+            yield archive
+        final_stat = os.fstat(handle.fileno())
+        if (
+            _stat_identity(final_stat) != _stat_identity(initial_stat)
+            or int(final_stat.st_size) != int(initial_stat.st_size)
+            or int(getattr(final_stat, "st_mtime_ns", 0))
+            != int(getattr(initial_stat, "st_mtime_ns", 0))
+        ):
+            raise ReviewBridgeError(
+                f"review ZIP subject changed while reading: {archive_path.name}"
+            )
+
+
+def _zip_subject_member_manifest(
+    archive_path: Path,
+    *,
+    max_member_bytes: int = REVIEW_MAX_SUBJECT_FILE_BYTES,
+    max_total_bytes: int = REVIEW_MAX_SUBJECT_BYTES,
+    archive_sha256: str | None = None,
+    budget: ReviewPreparationBudget | None = None,
+) -> dict[str, Any]:
     outcome = ScanOutcome()
     members: list[dict[str, Any]] = []
     total_bytes = 0
     try:
-        with zipfile.ZipFile(archive_path) as zf:
+        with _open_preflighted_zip_archive(
+            archive_path,
+            member_limit=REVIEW_ZIP_SCAN_MAX_MEMBERS,
+            budget=budget,
+        ) as zf:
             if zf.comment:
                 outcome.add_error(f"{archive_path.name}!<archive-comment>", "zip_archive_comment_not_allowed")
             infos = zf.infolist()
@@ -5344,13 +7962,21 @@ def _zip_subject_member_manifest(archive_path: Path) -> dict[str, Any]:
                     continue
                 if info.is_dir():
                     continue
+                if int(info.file_size or 0) > max_member_bytes:
+                    outcome.add_limit(
+                        f"{archive_path.name}!/{normalized}",
+                        "zip_member_uncompressed_bytes_exceeded",
+                        total_bytes=int(info.file_size or 0),
+                        limit_bytes=max_member_bytes,
+                    )
+                    break
                 total_bytes += int(info.file_size or 0)
-                if total_bytes > REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES:
+                if total_bytes > max_total_bytes:
                     outcome.add_limit(
                         archive_path.name,
                         "zip_total_uncompressed_bytes_exceeded",
                         total_bytes=total_bytes,
-                        limit_bytes=REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES,
+                        limit_bytes=max_total_bytes,
                     )
                     break
                 try:
@@ -5358,6 +7984,11 @@ def _zip_subject_member_manifest(archive_path: Path) -> dict[str, Any]:
                 except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
                     outcome.add_error(f"{archive_path.name}!/{normalized}", "zip_member_read_failed", error=str(exc))
                     continue
+                if budget is not None:
+                    budget.consume_work(
+                        len(data),
+                        label=f"inspecting archive member {normalized}",
+                    )
                 members.append(
                     {
                         "path": normalized,
@@ -5375,7 +8006,7 @@ def _zip_subject_member_manifest(archive_path: Path) -> dict[str, Any]:
     manifest = {
         "schema": "epic-continuum.inner-archive-manifest/1",
         "archive_name": archive_path.name,
-        "archive_sha256": file_sha256(archive_path),
+        "archive_sha256": archive_sha256 or file_sha256(archive_path),
         "member_count": len(members),
         "total_uncompressed_bytes": total_bytes,
         "members": sorted(members, key=lambda item: str(item["path"])),
@@ -5384,10 +8015,28 @@ def _zip_subject_member_manifest(archive_path: Path) -> dict[str, Any]:
     return manifest
 
 
-def _write_expanded_zip_subject_to_capsule(zf: zipfile.ZipFile, archive_path: Path, manifest: dict[str, Any]) -> None:
+def _write_expanded_zip_subject_to_capsule(
+    zf: zipfile.ZipFile,
+    archive_path: Path,
+    manifest: dict[str, Any],
+    *,
+    budget: ReviewPreparationBudget | None = None,
+) -> None:
     expected = {str(item.get("path") or ""): str(item.get("sha256") or "") for item in manifest.get("members", [])}
-    with zipfile.ZipFile(archive_path) as inner:
+    with _open_preflighted_zip_archive(
+        archive_path,
+        member_limit=REVIEW_ZIP_SCAN_MAX_MEMBERS,
+        budget=budget,
+    ) as inner:
         for info in sorted(inner.infolist(), key=lambda item: item.filename):
+            if (
+                int(info.compress_type)
+                not in REVIEW_ZIP_SUPPORTED_COMPRESSION_TYPES
+            ):
+                raise ReviewBridgeError(
+                    "review ZIP subject compression method is unsupported: "
+                    f"{info.filename} ({int(info.compress_type)})"
+                )
             normalized = info.filename.replace("\\", "/")
             parts = [part for part in normalized.split("/") if part]
             if not parts or any(part == ".." for part in parts) or info.is_dir():
@@ -5396,28 +8045,66 @@ def _write_expanded_zip_subject_to_capsule(zf: zipfile.ZipFile, archive_path: Pa
             if normalized not in expected:
                 continue
             try:
-                data = inner.read(info)
+                source = inner.open(info, "r")
             except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
                 raise ReviewBridgeError(f"review ZIP subject member could not be read: {normalized}") from exc
-            actual = hashlib.sha256(data).hexdigest()
+            digest = hashlib.sha256()
+            observed = 0
+            mode = 0o755 if ((int(info.external_attr) >> 16) & 0o111) else 0o644
+            with source, zf.open(
+                _zip_info(f"subject/{normalized}", mode=mode),
+                "w",
+                force_zip64=True,
+            ) as target:
+                while True:
+                    if budget is not None:
+                        budget.check_deadline(
+                            f"writing archive member {normalized} to the capsule"
+                        )
+                    chunk = source.read(REVIEW_PROCESS_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    observed += len(chunk)
+                    if observed > int(info.file_size or 0):
+                        raise ReviewBridgeError(
+                            f"review ZIP subject member grew while reading: {normalized}"
+                        )
+                    digest.update(chunk)
+                    target.write(chunk)
+                    if budget is not None:
+                        budget.consume_work(
+                            len(chunk),
+                            label=f"writing archive member {normalized} to the capsule",
+                        )
+            actual = digest.hexdigest()
+            if observed != int(info.file_size or 0):
+                raise ReviewBridgeError(
+                    f"review ZIP subject member size changed while writing capsule: {normalized}"
+                )
             if actual != expected[normalized]:
                 raise ReviewBridgeError(f"review ZIP subject member hash changed while writing capsule: {normalized}")
-            mode = 0o755 if ((int(info.external_attr) >> 16) & 0o111) else 0o644
-            zf.writestr(_zip_info(f"subject/{normalized}", mode=mode), data)
 
 
 def _read_decodable_text(path: Path, *, max_bytes: int = 2_000_000) -> str | None:
     try:
-        data = path.read_bytes()[:max_bytes]
-    except OSError:
+        data = _read_regular_file_prefix(path, max(0, int(max_bytes)) + 1)
+    except (OSError, ReviewBridgeError):
         return None
+    if len(data) > max_bytes:
+        data = data[:max_bytes]
     return _decode_review_bytes(data)
 
 
-def _read_full_decodable_text(path: Path) -> str | None:
+def _read_full_decodable_text(
+    path: Path,
+    *,
+    max_bytes: int = REVIEW_SECRET_ALLOWLIST_MAX_BYTES,
+) -> str | None:
     try:
-        data = path.read_bytes()
-    except OSError:
+        data = _read_regular_file_prefix(path, max(0, int(max_bytes)) + 1)
+    except (OSError, ReviewBridgeError):
+        return None
+    if len(data) > max_bytes:
         return None
     return _decode_review_bytes(data)
 
@@ -5426,51 +8113,117 @@ def _sha256_utf8(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _review_secret_allowlist_file_entries(path: Path) -> list[str | dict[str, Any]]:
-    try:
-        stat = path.stat()
-    except OSError as exc:
-        raise ReviewBridgeError(f"review secret allowlist file is not readable: {path}") from exc
-    if stat.st_size > REVIEW_SECRET_ALLOWLIST_MAX_BYTES:
+def _review_secret_allowlist_file_entries(
+    path: Path,
+    *,
+    max_entries: int,
+    expected: ReviewSubjectEntry,
+) -> list[str | dict[str, Any]]:
+    absolute, file_stat = _plain_absolute_path_stat(path)
+    if not stat.S_ISREG(file_stat.st_mode):
         raise ReviewBridgeError(
-            f"review secret allowlist file is too large: {path} "
-            f"({stat.st_size} bytes > {REVIEW_SECRET_ALLOWLIST_MAX_BYTES})"
+            f"review secret allowlist file is not regular: {absolute}"
         )
-    text = _read_full_decodable_text(path)
+    if file_stat.st_size > REVIEW_SECRET_ALLOWLIST_MAX_BYTES:
+        raise ReviewBridgeError(
+            f"review secret allowlist file is too large: {absolute} "
+            f"({file_stat.st_size} bytes > {REVIEW_SECRET_ALLOWLIST_MAX_BYTES})"
+        )
+    with _open_confined_regular_file(
+        absolute.parent,
+        Path(absolute.name),
+        expected=expected,
+    ) as (handle, opened_stat):
+        data = handle.read(REVIEW_SECRET_ALLOWLIST_MAX_BYTES + 1)
+        final_stat = os.fstat(handle.fileno())
+        _assert_review_subject_entry_stat(expected, opened_stat)
+        _assert_review_subject_entry_stat(expected, final_stat)
+    text = (
+        _decode_review_bytes(data)
+        if len(data) <= REVIEW_SECRET_ALLOWLIST_MAX_BYTES
+        else None
+    )
     if text is None:
-        raise ReviewBridgeError(f"review secret allowlist file is not UTF text: {path}")
+        raise ReviewBridgeError(
+            f"review secret allowlist file is not bounded UTF text: {absolute}"
+        )
     entries: list[str | dict[str, Any]] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        if (
+            len(line) > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES
+            or len(line.encode("utf-8"))
+            > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES
+        ):
+            raise ReviewBridgeError(
+                "review secret allowlist entry exceeds its byte limit at "
+                f"{absolute}:{line_number}"
+            )
         if line.startswith("{"):
             try:
                 parsed = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ReviewBridgeError(f"invalid review secret allowlist JSONL entry at {path}:{line_number}: {exc}") from exc
+                raise ReviewBridgeError(f"invalid review secret allowlist JSONL entry at {absolute}:{line_number}: {exc}") from exc
             if not isinstance(parsed, dict):
-                raise ReviewBridgeError(f"review secret allowlist entry must be an object at {path}:{line_number}")
+                raise ReviewBridgeError(f"review secret allowlist entry must be an object at {absolute}:{line_number}")
             entries.append(parsed)
         else:
             entries.append(line)
-        if len(entries) > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
+        if len(entries) > max_entries:
             raise ReviewBridgeError(
                 f"review secret allowlist has too many entries; "
-                f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS} (while reading {path}:{line_number})"
+                f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS} (while reading {absolute}:{line_number})"
             )
     return entries
 
 
 def _compile_review_secret_allowlist_fingerprint(entry: dict[str, Any]) -> dict[str, Any]:
-    source = str(entry.get("source") or "").replace("\\", "/")
-    finding_type = str(entry.get("finding_type") or entry.get("type") or "")
-    secret_hash = str(entry.get("secret_sha256") or entry.get("secret_hash") or "").casefold()
-    line_hash = str(entry.get("line_sha256") or "").casefold()
-    try:
-        line = int(entry.get("line") or 0)
-    except (TypeError, ValueError):
+    allowed_fields = {
+        "source",
+        "line",
+        "finding_type",
+        "type",
+        "secret_sha256",
+        "secret_hash",
+        "line_sha256",
+        "reason",
+    }
+    if set(entry) - allowed_fields:
+        raise ReviewBridgeError(
+            "review secret allowlist fingerprint contains unknown fields"
+        )
+    source = _bounded_review_text(
+        "review secret allowlist fingerprint source",
+        entry.get("source"),
+        max_bytes=REVIEW_MAX_CONTROL_PATH_BYTES,
+    ).replace("\\", "/")
+    finding_type = _bounded_review_text(
+        "review secret allowlist fingerprint finding_type",
+        entry.get("finding_type") or entry.get("type"),
+        max_bytes=256,
+    )
+    secret_hash = _bounded_review_text(
+        "review secret allowlist fingerprint secret_sha256",
+        entry.get("secret_sha256") or entry.get("secret_hash"),
+        max_bytes=64,
+    ).casefold()
+    line_hash = _bounded_review_text(
+        "review secret allowlist fingerprint line_sha256",
+        entry.get("line_sha256"),
+        max_bytes=64,
+    ).casefold()
+    raw_line = entry.get("line")
+    if isinstance(raw_line, bool) or not isinstance(raw_line, (int, str)):
         line = 0
+    elif isinstance(raw_line, int):
+        line = raw_line if raw_line <= 2_147_483_647 else 0
+    else:
+        try:
+            line = int(raw_line) if len(raw_line) <= 10 else 0
+        except ValueError:
+            line = 0
     if not source or source.startswith("/") or "\\" in source or ".." in Path(source).parts:
         raise ReviewBridgeError("review secret allowlist fingerprint source must be an explicit relative file path")
     if line < 1:
@@ -5488,29 +8241,182 @@ def _compile_review_secret_allowlist_fingerprint(entry: dict[str, Any]) -> dict[
         "finding_type": finding_type,
         "secret_sha256": secret_hash,
         "line_sha256": line_hash,
-        "reason": str(entry.get("reason") or "synthetic fixture fingerprint"),
+        "reason": _bounded_review_text(
+            "review secret allowlist fingerprint reason",
+            entry.get("reason") or "synthetic fixture fingerprint",
+            max_bytes=1_024,
+        ),
     }
 
 
+def _linear_allowlist_literal(
+    value: str,
+    *,
+    allow_edge_wildcards: bool,
+    label: str,
+) -> str:
+    remaining = value
+    if allow_edge_wildcards and remaining.startswith(".*"):
+        remaining = remaining[2:]
+    if allow_edge_wildcards and remaining.endswith(".*"):
+        remaining = remaining[:-2]
+    literal: list[str] = []
+    index = 0
+    metacharacters = set(".^$*+?{}[]()|")
+    while index < len(remaining):
+        character = remaining[index]
+        if character == "\\":
+            index += 1
+            if index >= len(remaining):
+                raise ReviewBridgeError(f"{label} has a trailing escape")
+            literal.append(remaining[index])
+        elif character in metacharacters:
+            raise ReviewBridgeError(
+                f"{label} must be a linear literal with optional edge .*"
+            )
+        else:
+            literal.append(character)
+        index += 1
+    result = "".join(literal)
+    if not result:
+        raise ReviewBridgeError(f"{label} must not match empty text")
+    return result
+
+
+def _allowlist_entry_bytes(entry: str | dict[str, Any]) -> int:
+    if isinstance(entry, str):
+        if len(entry) > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES:
+            raise ReviewBridgeError(
+                "review secret allowlist entry exceeds its byte limit"
+            )
+        return len(entry.encode("utf-8"))
+    if not isinstance(entry, dict):
+        raise ReviewBridgeError(
+            "review secret allowlist entries must be text or fingerprint objects"
+        )
+    if len(entry) > 8:
+        raise ReviewBridgeError(
+            "review secret allowlist fingerprint contains too many fields"
+        )
+    total = 0
+    for key, value in entry.items():
+        if not isinstance(key, str) or not isinstance(value, (str, int)) or isinstance(
+            value, bool
+        ):
+            raise ReviewBridgeError(
+                "review secret allowlist fingerprint fields must be text or integers"
+            )
+        if len(key) > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES:
+            raise ReviewBridgeError(
+                "review secret allowlist entry exceeds its byte limit"
+            )
+        total += len(key.encode("utf-8"))
+        if isinstance(value, int):
+            if value < 0 or value > 2_147_483_647:
+                raise ReviewBridgeError(
+                    "review secret allowlist fingerprint integer is out of range"
+                )
+            value_text = str(value)
+        else:
+            if len(value) > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES:
+                raise ReviewBridgeError(
+                    "review secret allowlist entry exceeds its byte limit"
+                )
+            value_text = value
+        total += len(value_text.encode("utf-8"))
+        if total > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES:
+            raise ReviewBridgeError(
+                "review secret allowlist entry exceeds its byte limit"
+            )
+    return total
+
+
 def _compile_review_secret_allowlist(
-    patterns: list[str] | None,
-    files: list[Path] | None = None,
+    patterns: Sequence[str | dict[str, Any]] | None,
+    files: Sequence[Path] | None = None,
 ) -> list[dict[str, Any]]:
-    raw_entries: list[str | dict[str, Any]] = list(patterns or [])
-    for allowlist_file in files or []:
-        raw_entries.extend(_review_secret_allowlist_file_entries(Path(allowlist_file)))
-    if len(raw_entries) > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
+    if patterns is not None and not isinstance(patterns, (list, tuple)):
+        raise ReviewBridgeError("review secret allowlist patterns must be a list")
+    if files is not None and not isinstance(files, (list, tuple)):
+        raise ReviewBridgeError("review secret allowlist files must be a list")
+    raw_patterns = patterns or []
+    raw_files = files or []
+    if len(raw_patterns) > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
         raise ReviewBridgeError(
             f"review secret allowlist has too many entries; limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS}"
         )
+    if len(raw_files) > REVIEW_SECRET_ALLOWLIST_MAX_FILES:
+        raise ReviewBridgeError(
+            "review secret allowlist has too many files; "
+            f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_FILES}"
+        )
+
+    allowlist_files: list[tuple[Path, ReviewSubjectEntry]] = []
+    aggregate_file_bytes = 0
+    for raw_file in raw_files:
+        if not isinstance(raw_file, (str, Path)):
+            raise ReviewBridgeError(
+                "review secret allowlist file paths must be text paths"
+            )
+        path_text = _bounded_review_text(
+            "review secret allowlist file path",
+            str(raw_file),
+            max_bytes=REVIEW_MAX_CONTROL_PATH_BYTES,
+        )
+        absolute, file_stat = _plain_absolute_path_stat(Path(path_text))
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ReviewBridgeError(
+                f"review secret allowlist file is not regular: {absolute}"
+            )
+        size_bytes = int(file_stat.st_size)
+        if size_bytes > REVIEW_SECRET_ALLOWLIST_MAX_BYTES:
+            raise ReviewBridgeError(
+                f"review secret allowlist file is too large: {absolute}"
+            )
+        aggregate_file_bytes += size_bytes
+        if aggregate_file_bytes > REVIEW_SECRET_ALLOWLIST_MAX_TOTAL_FILE_BYTES:
+            raise ReviewBridgeError(
+                "review secret allowlist files exceed their aggregate byte limit: "
+                f"{aggregate_file_bytes} > {REVIEW_SECRET_ALLOWLIST_MAX_TOTAL_FILE_BYTES}"
+            )
+        allowlist_files.append(
+            (
+                absolute,
+                _review_subject_entry(
+                    absolute,
+                    subject=absolute,
+                    subject_type="file",
+                    stat_result=file_stat,
+                ),
+            )
+        )
+
     compiled: list[dict[str, Any]] = []
-    for pattern in raw_entries:
+    aggregate_pattern_bytes = 0
+    observed_entries = len(raw_patterns)
+
+    def compile_entry(pattern: str | dict[str, Any]) -> None:
+        nonlocal aggregate_pattern_bytes
+        entry_bytes = _allowlist_entry_bytes(pattern)
+        if entry_bytes > REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES:
+            raise ReviewBridgeError(
+                "review secret allowlist entry exceeds its byte limit"
+            )
+        aggregate_pattern_bytes += entry_bytes
+        if aggregate_pattern_bytes > REVIEW_SECRET_ALLOWLIST_MAX_PATTERN_BYTES_TOTAL:
+            raise ReviewBridgeError(
+                "review secret allowlist entries exceed their aggregate byte limit"
+            )
         if isinstance(pattern, dict):
             compiled.append(_compile_review_secret_allowlist_fingerprint(pattern))
-            continue
-        text = str(pattern or "").strip()
+            return
+        if not isinstance(pattern, str):
+            raise ReviewBridgeError(
+                "review secret allowlist entries must be text or fingerprint objects"
+            )
+        text = pattern.strip()
         if not text:
-            continue
+            return
         if not text.startswith("^") or text.count(":") < 2:
             raise ReviewBridgeError(
                 "review secret allowlist patterns must be anchored to 'source:line:text' "
@@ -5520,23 +8426,150 @@ def _compile_review_secret_allowlist(
         raw_source_part = prefix[0]
         line_part = prefix[1]
         text_pattern = prefix[2]
-        source_part = raw_source_part.replace(r"\/", "/").replace(r"\.", ".")
-        if "\\" in source_part or not source_part or re.search(r"[*+\[\](){}|?^$]", source_part):
+        source_part = _linear_allowlist_literal(
+            raw_source_part,
+            allow_edge_wildcards=False,
+            label="review secret allowlist source",
+        ).replace(r"\/", "/")
+        if (
+            "\\" in source_part
+            or not source_part
+            or source_part.startswith("/")
+            or ".." in Path(source_part).parts
+        ):
             raise ReviewBridgeError("review secret allowlist source must be an explicit file path, not a wildcard pattern")
-        if not re.fullmatch(r"\d+", line_part):
+        if not re.fullmatch(r"\d+", line_part) or len(line_part) > 10:
             raise ReviewBridgeError("review secret allowlist line must be an explicit positive integer")
-        if int(line_part) < 1:
+        parsed_line = int(line_part)
+        if parsed_line < 1 or parsed_line > 2_147_483_647:
             raise ReviewBridgeError("review secret allowlist line must be an explicit positive integer")
         if not text_pattern:
             raise ReviewBridgeError("review secret allowlist text pattern must not be empty")
-        try:
-            pattern_re = re.compile(text_pattern)
-        except re.error as exc:
-            raise ReviewBridgeError(f"invalid review secret allowlist pattern {text!r}: {exc}") from exc
-        if pattern_re.search(""):
-            raise ReviewBridgeError("review secret allowlist pattern must not match empty text")
-        compiled.append({"kind": "pattern", "source": source_part, "line": int(line_part), "pattern": pattern_re})
+        literal = _linear_allowlist_literal(
+            text_pattern,
+            allow_edge_wildcards=True,
+            label="review secret allowlist text pattern",
+        )
+        compiled.append(
+            {
+                "kind": "pattern",
+                "source": source_part,
+                "line": parsed_line,
+                "literal": literal,
+            }
+        )
+
+    for pattern in raw_patterns:
+        compile_entry(pattern)
+    for allowlist_file, expected_file in allowlist_files:
+        remaining = REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS - observed_entries
+        if remaining < 0:
+            raise ReviewBridgeError(
+                "review secret allowlist has too many entries; "
+                f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS}"
+            )
+        for entry in _review_secret_allowlist_file_entries(
+            allowlist_file,
+            max_entries=remaining,
+            expected=expected_file,
+        ):
+            observed_entries += 1
+            compile_entry(entry)
+            if observed_entries > REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS:
+                raise ReviewBridgeError(
+                    "review secret allowlist has too many entries; "
+                    f"limit is {REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS}"
+                )
     return compiled
+
+
+def validate_review_prepare_controls(
+    *,
+    reviewer_id: Any,
+    transport: Any,
+    model: Any,
+    base_url: Any,
+    operation_id: Any,
+    secret_allowlist_patterns: Sequence[str | dict[str, Any]] | None,
+    secret_allowlist_files: Sequence[Path] | None,
+) -> tuple[str, str, str, str, str | None, list[dict[str, Any]]]:
+    """Validate all public preparation controls before operation mutation."""
+    reviewer_value = _bounded_review_text(
+        "reviewer_id",
+        reviewer_id,
+        max_bytes=REVIEW_MAX_REVIEWER_ID_BYTES,
+    )
+    transport_value = _bounded_review_text(
+        "review transport",
+        DEFAULT_REVIEW_TRANSPORT if transport in (None, "") else transport,
+        max_bytes=64,
+    )
+    if transport_value not in SUPPORTED_TRANSPORTS:
+        raise ReviewBridgeError(f"unsupported review transport: {transport_value}")
+    model_value = _bounded_review_text(
+        "review model",
+        model,
+        max_bytes=REVIEW_MAX_MODEL_BYTES,
+    )
+    base_url_value = _bounded_review_text(
+        "review base_url",
+        base_url,
+        max_bytes=REVIEW_MAX_BASE_URL_BYTES,
+    )
+    operation_value = validate_review_operation_id(operation_id)
+    compiled_allowlist = _compile_review_secret_allowlist(
+        secret_allowlist_patterns,
+        secret_allowlist_files,
+    )
+    return (
+        reviewer_value,
+        transport_value,
+        model_value,
+        base_url_value,
+        operation_value,
+        compiled_allowlist,
+    )
+
+
+def validate_review_run_controls(
+    *,
+    transport: Any,
+    model: Any,
+    base_url: Any,
+    operation_id: Any,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Validate optional run overrides before any guard or reservation."""
+    transport_value = (
+        None
+        if transport in (None, "")
+        else _bounded_review_text(
+            "review transport",
+            transport,
+            max_bytes=64,
+        )
+    )
+    if transport_value is not None and transport_value not in SUPPORTED_TRANSPORTS:
+        raise ReviewBridgeError(f"unsupported review transport: {transport_value}")
+    model_value = (
+        None
+        if model in (None, "")
+        else _bounded_review_text(
+            "review model",
+            model,
+            max_bytes=REVIEW_MAX_MODEL_BYTES,
+        )
+    )
+    base_url_value = (
+        None
+        if base_url in (None, "")
+        else _bounded_review_text(
+            "review base_url",
+            base_url,
+            max_bytes=REVIEW_MAX_BASE_URL_BYTES,
+        )
+    )
+    operation_value = validate_review_operation_id(operation_id)
+    return transport_value, model_value, base_url_value, operation_value
 
 
 def _allowlist_source_matches(source: str, expected: str) -> bool:
@@ -5571,19 +8604,6 @@ def _allowlist_source_matches(source: str, expected: str) -> bool:
     return member_source == normalized_expected
 
 
-def _line_for_finding(text: str, finding: dict[str, Any]) -> str:
-    try:
-        line_number = int(finding.get("line") or 0)
-    except (TypeError, ValueError):
-        return ""
-    if line_number < 1:
-        return ""
-    lines = text.splitlines()
-    if line_number > len(lines):
-        return ""
-    return lines[line_number - 1]
-
-
 def _allowlisted_review_secret_finding(
     finding: dict[str, Any],
     *,
@@ -5615,8 +8635,8 @@ def _allowlisted_review_secret_finding(
                 continue
             if secret_hash:
                 continue
-            pattern = item.get("pattern")
-            if pattern is not None and pattern.search(line):
+            literal = item.get("literal")
+            if isinstance(literal, str) and literal in line:
                 return "explicit_secret_allowlist_pattern"
     return None
 
@@ -5631,6 +8651,25 @@ def _suppressed_secret_record(finding: dict[str, Any], *, source: str, reason: s
         "secret_hash": finding.get("secret_hash"),
         "secret_hash_risk": finding.get("secret_hash_risk"),
     }
+
+
+def _append_suppressed_secret_record(
+    records: list[dict[str, Any]] | None,
+    finding: dict[str, Any],
+    *,
+    source: str,
+    reason: str,
+) -> None:
+    if records is None:
+        return
+    if len(records) >= REVIEW_SECRET_SCAN_MAX_CANDIDATES:
+        raise ReviewBridgeError(
+            "review suppressed-finding limit exceeded: more than "
+            f"{REVIEW_SECRET_SCAN_MAX_CANDIDATES}"
+        )
+    records.append(
+        _suppressed_secret_record(finding, source=source, reason=reason)
+    )
 
 
 def _suppressed_secret_hashes(records: list[dict[str, Any]]) -> set[str]:
@@ -5674,30 +8713,57 @@ def _scan_review_text_for_secrets(
     suppressed_findings: list[dict[str, Any]] | None = None,
     allowed_secret_hashes: set[str] | None = None,
     outcome: ScanOutcome | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if outcome is not None:
         outcome.add_scanned(source)
     raw_limit = int(max_findings)
     limit = raw_limit if raw_limit > 0 else None
-    for finding in scan_text_for_secrets(text, max_findings=0):
-        line = _line_for_finding(text, finding)
-        allow_reason = _allowlisted_review_secret_finding(
-            finding,
-            line=line,
-            source=source,
-            extra_allowlist=extra_allowlist,
-            allowed_secret_hashes=allowed_secret_hashes,
-        )
-        if allow_reason:
-            if suppressed_findings is not None:
-                suppressed_findings.append(_suppressed_secret_record(finding, source=source, reason=allow_reason))
-            continue
-        scoped = dict(finding)
-        scoped["source"] = source
-        findings.append(scoped)
-        if limit is not None and len(findings) >= limit:
-            break
+    candidate_count = 0
+    with io.StringIO(text, newline=None) as stream:
+        for line_number, raw_line in enumerate(stream, start=1):
+            if budget is not None and (line_number == 1 or line_number % 256 == 0):
+                budget.check_deadline(f"scanning {source}")
+            line = raw_line.rstrip("\r\n")
+            remaining_candidates = REVIEW_SECRET_SCAN_MAX_CANDIDATES - candidate_count
+            line_findings = scan_text_for_secrets(
+                line,
+                max_findings=remaining_candidates + 1,
+            )
+            if len(line_findings) > remaining_candidates:
+                raise ReviewBridgeError(
+                    "review scan candidate limit exceeded while scanning "
+                    f"{source}: more than {REVIEW_SECRET_SCAN_MAX_CANDIDATES}"
+                )
+            candidate_count += len(line_findings)
+            for raw_finding in line_findings:
+                if budget is not None:
+                    budget.check_deadline(f"scanning {source}")
+                finding = dict(raw_finding)
+                finding["line"] = line_number
+                allow_reason = _allowlisted_review_secret_finding(
+                    finding,
+                    line=line,
+                    source=source,
+                    extra_allowlist=extra_allowlist,
+                    allowed_secret_hashes=allowed_secret_hashes,
+                )
+                if allow_reason:
+                    _append_suppressed_secret_record(
+                        suppressed_findings,
+                        finding,
+                        source=source,
+                        reason=allow_reason,
+                    )
+                    continue
+                scoped = dict(finding)
+                scoped["source"] = source
+                findings.append(scoped)
+                if limit is not None and len(findings) >= limit:
+                    break
+            if limit is not None and len(findings) >= limit:
+                break
     if outcome is not None:
         outcome.extend_findings(findings)
     return findings
@@ -5712,17 +8778,35 @@ def _scan_review_bytes_for_raw_secrets(
     suppressed_findings: list[dict[str, Any]] | None = None,
     allowed_secret_hashes: set[str] | None = None,
     outcome: ScanOutcome | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if outcome is not None:
         outcome.add_scanned(f"{source}<raw-bytes>")
     raw_limit = int(max_findings)
     limit = raw_limit if raw_limit > 0 else None
-    lines = data.splitlines() or [data]
+    candidate_count = 0
     for name, pattern in RAW_SECRET_BYTE_PATTERNS:
+        line_number = 1
+        line_cursor = 0
         for match in pattern.finditer(data):
-            line_number = data[: match.start()].count(b"\n") + 1
-            line_bytes = lines[line_number - 1] if 0 < line_number <= len(lines) else match.group(0)
+            if budget is not None:
+                budget.check_deadline(f"scanning raw bytes from {source}")
+            candidate_count += 1
+            if candidate_count > REVIEW_SECRET_SCAN_MAX_CANDIDATES:
+                raise ReviewBridgeError(
+                    "review scan candidate limit exceeded while scanning raw bytes from "
+                    f"{source}: more than {REVIEW_SECRET_SCAN_MAX_CANDIDATES}"
+                )
+            line_number += data.count(b"\n", line_cursor, match.start())
+            line_cursor = match.start()
+            line_start = data.rfind(b"\n", 0, match.start()) + 1
+            line_end = data.find(b"\n", match.end())
+            if line_end < 0:
+                line_end = len(data)
+            line_bytes = data[line_start:line_end]
+            if line_bytes.endswith(b"\r"):
+                line_bytes = line_bytes[:-1]
             try:
                 line = line_bytes.decode("utf-8", errors="replace")
             except UnicodeError:
@@ -5743,8 +8827,12 @@ def _scan_review_bytes_for_raw_secrets(
                 allowed_secret_hashes=allowed_secret_hashes,
             )
             if allow_reason:
-                if suppressed_findings is not None:
-                    suppressed_findings.append(_suppressed_secret_record(finding, source=source, reason=allow_reason))
+                _append_suppressed_secret_record(
+                    suppressed_findings,
+                    finding,
+                    source=source,
+                    reason=allow_reason,
+                )
                 continue
             scoped = dict(finding)
             scoped["source"] = source
@@ -5763,17 +8851,30 @@ def _scan_review_file_for_secrets(
     *,
     source: str,
     max_findings: int = REVIEW_SECRET_SCAN_MAX_FINDINGS,
+    max_bytes: int = REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+    budget: ReviewPreparationBudget | None = None,
     extra_allowlist: list[dict[str, Any]] | None = None,
     suppressed_findings: list[dict[str, Any]] | None = None,
     allowed_secret_hashes: set[str] | None = None,
     outcome: ScanOutcome | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        data = path.read_bytes()
-    except OSError as exc:
+        data = _read_regular_file_prefix(path, max(1, int(max_bytes)) + 1)
+    except (OSError, ReviewBridgeError) as exc:
         if outcome is not None:
             outcome.add_error(source, "read_failed", error=str(exc))
         return []
+    if len(data) > max_bytes:
+        if outcome is not None:
+            outcome.add_limit(
+                source,
+                "regular_file_scan_bytes_exceeded",
+                total_bytes=len(data),
+                limit_bytes=max_bytes,
+            )
+        return []
+    if budget is not None:
+        budget.consume_work(len(data), label=f"scanning {source}")
     findings = _scan_review_bytes_for_raw_secrets(
         data,
         source=source,
@@ -5782,6 +8883,7 @@ def _scan_review_file_for_secrets(
         suppressed_findings=suppressed_findings,
         allowed_secret_hashes=allowed_secret_hashes,
         outcome=outcome,
+        budget=budget,
     )
     remaining = max_findings - len(findings) if max_findings > 0 else 0
     if max_findings > 0 and remaining <= 0:
@@ -5798,6 +8900,7 @@ def _scan_review_file_for_secrets(
             suppressed_findings=suppressed_findings,
             allowed_secret_hashes=allowed_secret_hashes,
             outcome=outcome,
+            budget=budget,
         )
     )
     return findings
@@ -5825,6 +8928,14 @@ def _validate_zip_member_for_review(
     if not normalized or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
         if outcome is not None:
             outcome.add_error(f"{archive_name}!/{raw_name}", "unsafe_zip_member_path")
+        return None
+    if int(info.compress_type) not in REVIEW_ZIP_SUPPORTED_COMPRESSION_TYPES:
+        if outcome is not None:
+            outcome.add_error(
+                f"{archive_name}!/{raw_name}",
+                "zip_compression_method_not_supported",
+                compression_type=int(info.compress_type),
+            )
         return None
     if info.comment:
         if outcome is not None:
@@ -5915,24 +9026,60 @@ def _scan_zip_members_for_secrets(
     outcome: ScanOutcome | None = None,
     prevalidated_nested_archives: dict[str, str] | None = None,
     budget_exempt_members: set[str] | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        data = path.read_bytes()
-    except OSError as exc:
+        with _open_confined_regular_file(path.parent, Path(path.name)) as (
+            handle,
+            initial_stat,
+        ):
+            archive_size = int(initial_stat.st_size)
+            archive_byte_limit = (
+                budget.max_archive_bytes
+                if budget is not None
+                else REVIEW_ZIP_SCAN_MAX_TOTAL_BYTES
+            )
+            if archive_size > archive_byte_limit:
+                if outcome is not None:
+                    outcome.add_limit(
+                        path.name,
+                        "zip_archive_bytes_exceeded",
+                        total_bytes=archive_size,
+                        limit_bytes=archive_byte_limit,
+                    )
+                return []
+            if budget is not None:
+                budget.consume_work(
+                    archive_size,
+                    label=f"reading archive {path.name}",
+                )
+            findings = _scan_zip_bytes_for_secrets(
+                handle,
+                archive_name=path.name,
+                max_findings=max_findings,
+                extra_allowlist=extra_allowlist,
+                suppressed_findings=suppressed_findings,
+                allowed_secret_hashes=allowed_secret_hashes,
+                outcome=outcome,
+                prevalidated_nested_archives=prevalidated_nested_archives,
+                budget_exempt_members=budget_exempt_members,
+                budget=budget,
+            )
+            final_stat = os.fstat(handle.fileno())
+            if (
+                _stat_identity(final_stat) != _stat_identity(initial_stat)
+                or int(final_stat.st_size) != archive_size
+            ):
+                raise ReviewBridgeError(
+                    f"review archive changed while scanning: {path.name}"
+                )
+            return findings
+    except (OSError, ReviewBridgeError) as exc:
+        if isinstance(exc, ReviewBridgeError) and budget is not None:
+            raise
         if outcome is not None:
             outcome.add_error(path.name, "read_failed", error=str(exc))
         return []
-    return _scan_zip_bytes_for_secrets(
-        data,
-        archive_name=path.name,
-        max_findings=max_findings,
-        extra_allowlist=extra_allowlist,
-        suppressed_findings=suppressed_findings,
-        allowed_secret_hashes=allowed_secret_hashes,
-        outcome=outcome,
-        prevalidated_nested_archives=prevalidated_nested_archives,
-        budget_exempt_members=budget_exempt_members,
-    )
 
 
 def _append_review_scan(
@@ -5945,6 +9092,7 @@ def _append_review_scan(
     suppressed_findings: list[dict[str, Any]] | None = None,
     allowed_secret_hashes: set[str] | None = None,
     outcome: ScanOutcome | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> bool:
     if text is None:
         return False
@@ -5960,6 +9108,7 @@ def _append_review_scan(
             suppressed_findings=suppressed_findings,
             allowed_secret_hashes=allowed_secret_hashes,
             outcome=outcome,
+            budget=budget,
         )
     )
     return max_findings > 0 and len(findings) >= max_findings
@@ -5973,6 +9122,7 @@ def _scan_generated_review_texts(
     suppressed_findings: list[dict[str, Any]] | None = None,
     allowed_secret_hashes: set[str] | None = None,
     outcome: ScanOutcome | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for source, text in items:
@@ -5985,13 +9135,14 @@ def _scan_generated_review_texts(
             suppressed_findings=suppressed_findings,
             allowed_secret_hashes=allowed_secret_hashes,
             outcome=outcome,
+            budget=budget,
         ):
             break
     return findings
 
 
 def _scan_zip_bytes_for_secrets(
-    data: bytes,
+    data: bytes | BinaryIO,
     *,
     archive_name: str,
     max_findings: int = REVIEW_SECRET_SCAN_MAX_FINDINGS,
@@ -6001,14 +9152,36 @@ def _scan_zip_bytes_for_secrets(
     outcome: ScanOutcome | None = None,
     prevalidated_nested_archives: dict[str, str] | None = None,
     budget_exempt_members: set[str] | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     total_state = {"members": 0, "bytes": 0}
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        archive_source: BinaryIO = io.BytesIO(data) if isinstance(data, bytes) else data
+        top_level_exempt = set(budget_exempt_members or ()) | set(
+            (prevalidated_nested_archives or {}).keys()
+        )
+        archive_member_limit = REVIEW_ZIP_SCAN_MAX_MEMBERS + len(
+            top_level_exempt
+        )
+        try:
+            _preflight_zip_central_directory(
+                archive_source,
+                archive_name=archive_name,
+                member_limit=archive_member_limit,
+                budget=budget,
+            )
+        except _ReviewZipMemberLimitExceeded as exc:
+            if outcome is not None:
+                outcome.add_limit(
+                    archive_name,
+                    "zip_member_count_exceeded",
+                    member_count=exc.observed,
+                    limit=exc.limit,
+                )
+            return findings
+        with zipfile.ZipFile(archive_source) as zf:
             infos = zf.infolist()
-            top_level_exempt = set(budget_exempt_members or ()) | set((prevalidated_nested_archives or {}).keys())
-            archive_member_limit = REVIEW_ZIP_SCAN_MAX_MEMBERS + len(top_level_exempt)
             if len(infos) > archive_member_limit:
                 if outcome is not None:
                     outcome.add_limit(
@@ -6027,6 +9200,7 @@ def _scan_zip_bytes_for_secrets(
                 suppressed_findings=suppressed_findings,
                 allowed_secret_hashes=allowed_secret_hashes,
                 outcome=outcome,
+                budget=budget,
             )
             if zf.comment:
                 if outcome is not None:
@@ -6045,6 +9219,7 @@ def _scan_zip_bytes_for_secrets(
                     suppressed_findings=suppressed_findings,
                     allowed_secret_hashes=allowed_secret_hashes,
                     outcome=outcome,
+                    budget=budget,
                 ):
                     return findings
                 if _append_review_scan(
@@ -6056,6 +9231,7 @@ def _scan_zip_bytes_for_secrets(
                     suppressed_findings=suppressed_findings,
                     allowed_secret_hashes=allowed_secret_hashes,
                     outcome=outcome,
+                    budget=budget,
                 ):
                     return findings
                 if _append_review_scan(
@@ -6067,6 +9243,7 @@ def _scan_zip_bytes_for_secrets(
                     suppressed_findings=suppressed_findings,
                     allowed_secret_hashes=allowed_secret_hashes,
                     outcome=outcome,
+                    budget=budget,
                 ):
                     return findings
                 candidate_name = str(info.filename or "").replace("\\", "/")
@@ -6094,6 +9271,11 @@ def _scan_zip_bytes_for_secrets(
                             error=str(exc),
                         )
                     continue
+                if budget is not None:
+                    budget.consume_work(
+                        len(member_data),
+                        label=f"scanning archive member {normalized_name}",
+                    )
                 source = f"{archive_name}!/{normalized_name}"
                 nested_archive_kind = _archive_magic_kind(member_data)
                 is_nested_zip = (
@@ -6159,6 +9341,7 @@ def _scan_zip_bytes_for_secrets(
                         suppressed_findings=suppressed_findings,
                         allowed_secret_hashes=allowed_secret_hashes,
                         outcome=outcome,
+                        budget=budget,
                     )
                 )
                 if max_findings > 0 and len(findings) >= max_findings:
@@ -6173,6 +9356,7 @@ def _scan_zip_bytes_for_secrets(
                     suppressed_findings=suppressed_findings,
                     allowed_secret_hashes=allowed_secret_hashes,
                     outcome=outcome,
+                    budget=budget,
                 ):
                     return findings
     except zipfile.BadZipFile:
@@ -6182,44 +9366,180 @@ def _scan_zip_bytes_for_secrets(
     return findings
 
 
-def _git_capture(subject: Path, *, include_diff: bool, max_diff_bytes: int) -> dict[str, Any]:
-    if not subject.is_dir() or not (subject / ".git").exists():
+def _sterile_git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    explicit = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_DIR",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+    for key in list(environment):
+        if key in explicit or key.startswith("GIT_CONFIG_"):
+            environment.pop(key, None)
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_EXTERNAL_DIFF": "",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PAGER": "",
+        }
+    )
+    return environment
+
+
+def _git_capture(
+    subject: Path,
+    *,
+    subject_type: ReviewSubjectType | None = None,
+    include_diff: bool,
+    max_diff_bytes: int,
+    deadline: float | None = None,
+    budget: ReviewPreparationBudget | None = None,
+) -> dict[str, Any]:
+    if subject_type is None:
+        try:
+            subject_stat = os.lstat(subject)
+        except OSError:
+            return {"is_git_repo": False}
+        subject_type = (
+            "directory" if stat.S_ISDIR(subject_stat.st_mode) else "file"
+        )
+    if subject_type != "directory" or not (subject / ".git").exists():
         return {"is_git_repo": False}
 
-    def run_git(args: list[str], timeout: int = 30) -> str:
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=str(subject),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+    capture_limit = _bounded_review_integer(
+        "max_diff_bytes",
+        max_diff_bytes,
+        maximum=REVIEW_MAX_PACKET_BYTES,
+    )
+    git_command = shutil.which("git")
+    if not git_command:
+        raise ReviewBridgeError("Git capture requested but `git` was not found on PATH")
+    git_executable = Path(git_command).resolve(strict=True)
+    if _is_relative_to(git_executable, subject):
+        raise ReviewBridgeError(
+            "refusing to execute a Git program from inside the review subject"
         )
-        text = completed.stdout.strip()
-        if completed.returncode != 0 and completed.stderr.strip():
-            text = f"{text}\n[stderr]\n{completed.stderr.strip()}".strip()
-        return text
+    sterile_prefix = [
+        str(git_executable),
+        "--no-pager",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.trustExitCode=false",
+    ]
+    environment = _sterile_git_environment()
 
+    def run_git(
+        args: list[str],
+        *,
+        label: str,
+        timeout: int = 30,
+        allow_stdout_truncation: bool = False,
+    ) -> tuple[str, bool]:
+        effective_timeout = max(1, int(timeout))
+        active_deadline = deadline if deadline is not None else (
+            budget.deadline if budget is not None else None
+        )
+        if active_deadline is not None:
+            remaining = int(active_deadline - time.monotonic())
+            if remaining < 1:
+                raise ReviewBridgeError(
+                    f"review preparation elapsed-time budget expired before Git {label}"
+                )
+            effective_timeout = min(effective_timeout, remaining)
+        try:
+            completed = _run_bounded_process(
+                [*sterile_prefix, *args],
+                cwd=subject,
+                env=environment,
+                timeout_seconds=effective_timeout,
+                stdout_limit=capture_limit,
+                stderr_limit=min(capture_limit, REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES),
+                total_limit=capture_limit,
+            )
+        except OSError as exc:
+            raise ReviewBridgeError(f"Git {label} could not be started") from exc
+        if budget is not None:
+            budget.consume_work(
+                completed.observed_output_bytes,
+                label=f"capturing Git {label}",
+            )
+        if completed.timed_out:
+            raise ReviewBridgeError(
+                f"Git {label} exceeded its {effective_timeout}-second capture budget"
+            )
+        truncated = False
+        if completed.output_exceeded:
+            if allow_stdout_truncation and completed.observed_stdout_bytes > capture_limit:
+                truncated = True
+            else:
+                raise ReviewBridgeError(
+                    f"Git {label} output exceeded its {capture_limit}-byte capture budget"
+                )
+        text = completed.stdout[:capture_limit].decode("utf-8", errors="replace").strip()
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        if truncated:
+            text = f"{text}\n[diff truncated]".strip()
+        elif completed.returncode != 0:
+            diagnostic = stderr or "no diagnostic output"
+            raise ReviewBridgeError(
+                f"Git {label} failed (exit {completed.returncode}): {diagnostic}"
+            )
+        return text, truncated
+
+    branch, _ = run_git(["branch", "--show-current"], label="branch")
+    head, _ = run_git(["rev-parse", "--short=16", "HEAD"], label="HEAD")
+    status, _ = run_git(
+        ["status", "--short", "--branch", "--untracked-files=normal"],
+        label="status",
+    )
     result: dict[str, Any] = {
         "is_git_repo": True,
-        "branch": run_git(["branch", "--show-current"]),
-        "head": run_git(["rev-parse", "--short=16", "HEAD"]),
-        "status": run_git(["status", "--short", "--branch"]),
+        "branch": branch,
+        "head": head,
+        "status": status,
     }
     if include_diff:
-        diff = run_git(["diff", "--stat"], timeout=30)
-        full_diff = run_git(["diff", "--"], timeout=60)
-        encoded = full_diff.encode("utf-8", errors="replace")
-        if len(encoded) > max_diff_bytes:
-            full_diff = encoded[:max_diff_bytes].decode("utf-8", errors="replace") + "\n[diff truncated]"
-            result["diff_truncated"] = True
-        else:
-            result["diff_truncated"] = False
+        diff, stat_truncated = run_git(
+            ["diff", "--no-ext-diff", "--no-textconv", "--stat", "--"],
+            label="diff stat",
+            timeout=30,
+            allow_stdout_truncation=True,
+        )
+        full_diff, diff_truncated = run_git(
+            ["diff", "--no-ext-diff", "--no-textconv", "--"],
+            label="diff",
+            timeout=60,
+            allow_stdout_truncation=True,
+        )
         result["diff_stat"] = diff
+        result["diff_stat_truncated"] = stat_truncated
         result["diff"] = full_diff
+        result["diff_truncated"] = diff_truncated
     return result
 
 
@@ -6233,34 +9553,101 @@ def _build_packet(
     max_file_bytes: int,
     subject_label: str = "subject/",
     subject_type: str | None = None,
+    directories: Sequence[str] | None = None,
     file_limit_reached: bool = False,
+    budget: ReviewPreparationBudget | None = None,
 ) -> tuple[str, list[str], dict[str, Any]]:
     warnings: list[str] = []
     excerpted_paths: list[str] = []
     omitted_text_paths: list[str] = []
-    lines: list[str] = [
-        "# Epic Continuum Review Packet",
-        "",
-        "## Review Objective",
-        prompt.strip(),
-        "",
-        "## Subject",
-        f"- Path: {subject_label}",
-        f"- Type: {subject_type or ('directory' if subject.is_dir() else 'file')}",
-        "",
-        "## Git Snapshot",
-        "```text",
-        json_dumps(git_info),
-        "```",
-        "",
-        "## File Manifest",
-        "```json",
-        json_dumps(manifest),
-        "```",
-        "",
-    ]
+    packet_limit = max(1, int(max_packet_bytes))
+    packet_parts: list[str] = []
+    used = 0
 
-    used = len("\n".join(lines).encode("utf-8", errors="replace"))
+    def bounded_prefix(value: str, byte_limit: int) -> tuple[str, bool]:
+        if byte_limit <= 0:
+            return "", bool(value)
+        candidate = value[:byte_limit]
+        encoded = candidate.encode("utf-8", errors="replace")
+        truncated = len(candidate) < len(value) or len(encoded) > byte_limit
+        if len(encoded) > byte_limit:
+            encoded = encoded[:byte_limit]
+        return encoded.decode("utf-8", errors="ignore"), truncated
+
+    def append_bounded(
+        value: str,
+        *,
+        section_limit: int | None = None,
+        warning: str | None = None,
+    ) -> bool:
+        nonlocal used
+        remaining = max(0, packet_limit - used)
+        allowed = remaining if section_limit is None else min(remaining, section_limit)
+        rendered, truncated = bounded_prefix(value, allowed)
+        if rendered:
+            packet_parts.append(rendered)
+            used += len(rendered.encode("utf-8"))
+        if truncated and warning and warning not in warnings:
+            warnings.append(warning)
+        return not truncated
+
+    directory_count = len(directories or ())
+    append_bounded(
+        "# Epic Continuum Review Packet\n\n"
+        "## Subject\n"
+        f"- Path: {subject_label}\n"
+        f"- Type: {subject_type or ('directory' if subject.is_dir() else 'file')}\n"
+        f"- Directory entries: {directory_count}",
+        warning="packet_header_budget_exhausted",
+    )
+    if used < packet_limit:
+        append_bounded(
+            "\n\n## Review Objective\n" + prompt.strip(),
+            section_limit=max(1, packet_limit // 4),
+            warning="packet_objective_budget_exhausted",
+        )
+
+    packet_git_info = {
+        key: value
+        for key, value in git_info.items()
+        if key != "diff"
+    }
+    if used < packet_limit:
+        append_bounded(
+            "\n\n## Git Snapshot\n```text\n"
+            + json_dumps(packet_git_info)
+            + "\n```",
+            section_limit=max(1, packet_limit // 3),
+            warning="packet_git_snapshot_budget_exhausted",
+        )
+
+    manifest_section_limit = min(
+        max(0, packet_limit - used),
+        max(1, packet_limit // 3),
+    )
+    manifest_prefix = "\n\n## File Manifest\n```json\n["
+    manifest_suffix = "\n]\n```"
+    manifest_lines: list[str] = []
+    manifest_used = len((manifest_prefix + manifest_suffix).encode("utf-8"))
+    packet_manifest_entry_count = 0
+    for entry in manifest:
+        row = (",\n" if manifest_lines else "\n") + json_dumps(entry)
+        row_bytes = len(row.encode("utf-8", errors="replace"))
+        if manifest_used + row_bytes > manifest_section_limit:
+            break
+        manifest_lines.append(row)
+        manifest_used += row_bytes
+        packet_manifest_entry_count += 1
+    manifest_truncated = packet_manifest_entry_count < len(manifest)
+    if manifest_truncated:
+        warnings.append("packet_manifest_budget_exhausted")
+    if used < packet_limit:
+        append_bounded(
+            manifest_prefix + "".join(manifest_lines) + manifest_suffix,
+            section_limit=manifest_section_limit,
+            warning="packet_manifest_budget_exhausted",
+        )
+
     base = subject if subject.is_dir() else subject.parent
     for entry in manifest:
         if not entry.get("text_candidate"):
@@ -6268,26 +9655,39 @@ def _build_packet(
         path = base / str(entry["path"])
         if not path.exists() or not path.is_file():
             continue
+        excerpt_wrapper = (
+            f"\n## File: {entry['path']}\n```text\n\n```"
+        )
+        excerpt_overhead = len(excerpt_wrapper.encode("utf-8", errors="replace"))
+        remaining_packet_bytes = max(0, packet_limit - used)
+        if remaining_packet_bytes <= excerpt_overhead:
+            warnings.append("packet_file_excerpt_budget_exhausted")
+            omitted_text_paths.append(str(entry["path"]))
+            break
+        sample_limit = min(
+            max_file_bytes,
+            remaining_packet_bytes - excerpt_overhead,
+        )
         try:
-            text, truncated = _read_text_sample(path, max_file_bytes)
+            text, truncated = _read_text_sample(
+                path,
+                sample_limit,
+                budget=budget,
+            )
         except UnicodeDecodeError:
             continue
-        section = [
-            "",
-            f"## File: {entry['path']}",
-            "```text",
-            text,
-            "```",
-        ]
+        section = ["", f"## File: {entry['path']}", "```text", text, "```"]
         if truncated:
             section.insert(1, "[file truncated]")
+            if "packet_file_excerpt_truncated" not in warnings:
+                warnings.append("packet_file_excerpt_truncated")
         section_text = "\n".join(section)
         next_used = used + len(section_text.encode("utf-8", errors="replace"))
         if next_used > max_packet_bytes:
             warnings.append("packet_file_excerpt_budget_exhausted")
             omitted_text_paths.append(str(entry["path"]))
             break
-        lines.append(section_text)
+        packet_parts.append(section_text)
         excerpted_paths.append(str(entry["path"]))
         used = next_used
     excerpted_set = set(excerpted_paths)
@@ -6299,7 +9699,8 @@ def _build_packet(
     if git_info.get("diff"):
         diff_section = "\n".join(["", "## Git Diff", "```diff", str(git_info["diff"]), "```"])
         if used + len(diff_section.encode("utf-8", errors="replace")) <= max_packet_bytes:
-            lines.append(diff_section)
+            packet_parts.append(diff_section)
+            used += len(diff_section.encode("utf-8", errors="replace"))
         else:
             warnings.append("packet_diff_budget_exhausted")
 
@@ -6318,6 +9719,9 @@ def _build_packet(
     coverage = {
         "review_surface": "packet_excerpt_only",
         "manifest_file_count": len(manifest),
+        "manifest_directory_count": directory_count,
+        "packet_manifest_entry_count": packet_manifest_entry_count,
+        "packet_manifest_truncated": manifest_truncated,
         "file_limit_reached": bool(file_limit_reached),
         "text_candidate_count": text_candidate_count,
         "excerpted_file_count": len(excerpted_paths),
@@ -6327,7 +9731,19 @@ def _build_packet(
         "critical_omitted": critical_omitted,
         "coverage_limited": bool(warnings or omitted_text_paths or file_limit_reached),
     }
-    return "\n".join(lines).strip() + "\n", warnings, coverage
+    packet = "".join(packet_parts).strip()
+    packet, hard_truncated = bounded_prefix(packet, packet_limit)
+    if hard_truncated and "packet_hard_limit_applied" not in warnings:
+        warnings.append("packet_hard_limit_applied")
+        coverage["coverage_limited"] = True
+    if len(packet.encode("utf-8")) < packet_limit:
+        packet += "\n"
+    packet_size = len(packet.encode("utf-8"))
+    if packet_size > packet_limit:
+        raise ReviewBridgeError("review packet exceeded its configured hard byte limit")
+    coverage["packet_bytes"] = packet_size
+    coverage["packet_limit_bytes"] = packet_limit
+    return packet, warnings, coverage
 
 
 def _review_prompt_text(job: dict[str, Any]) -> str:
@@ -6584,10 +10000,15 @@ def _public_review_request(job: dict[str, Any]) -> dict[str, Any]:
         "packet_warnings": job.get("packet_warnings"),
         "packet_coverage": job.get("packet_coverage"),
         "source_fingerprint": job.get("source_fingerprint"),
+        "source_fingerprint_version": job.get("source_fingerprint_version"),
+        "source_directory_count": job.get("source_directory_count"),
         "include_diff": job.get("include_diff"),
         "max_packet_bytes": job.get("max_packet_bytes"),
         "max_file_bytes": job.get("max_file_bytes"),
         "max_files": job.get("max_files"),
+        "max_subject_file_bytes": job.get("max_subject_file_bytes"),
+        "max_subject_bytes": job.get("max_subject_bytes"),
+        "prepare_timeout_seconds": job.get("prepare_timeout_seconds"),
         "secret_allowlist_pattern_count": job.get("secret_allowlist_pattern_count"),
         "secret_allowlist_fingerprint_count": job.get("secret_allowlist_fingerprint_count"),
         "secret_allowlist_entry_count": job.get("secret_allowlist_entry_count"),
@@ -6610,20 +10031,34 @@ def _public_review_request(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _public_source_manifest(subject_type: str, manifest: list[dict[str, Any]], packet_coverage: dict[str, Any]) -> dict[str, Any]:
+def _public_source_manifest(
+    subject_type: str,
+    manifest: list[dict[str, Any]],
+    directories: list[str],
+    packet_coverage: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "subject": "subject/",
         "subject_type": subject_type,
         "files": manifest,
+        "directories": directories,
         "packet_coverage": packet_coverage,
         "local_paths_redacted": True,
     }
 
 
-def _source_fingerprint(subject: Path, manifest: list[dict[str, Any]], git_info: dict[str, Any], subject_sha256: str | None) -> str:
+def _source_fingerprint(
+    subject: Path,
+    manifest: list[dict[str, Any]],
+    git_info: dict[str, Any],
+    subject_sha256: str | None,
+    *,
+    subject_type: ReviewSubjectType,
+    directories: list[str] | None = None,
+) -> str:
     payload = {
-        "subject_path": str(subject.resolve(strict=False)),
-        "subject_type": "directory" if subject.is_dir() else "file",
+        "subject_path": str(subject),
+        "subject_type": subject_type,
         "subject_sha256": subject_sha256,
         "git_head": git_info.get("head"),
         "git_status": git_info.get("status"),
@@ -6637,6 +10072,8 @@ def _source_fingerprint(subject: Path, manifest: list[dict[str, Any]], git_info:
             for entry in manifest
         ],
     }
+    if directories is not None:
+        payload["directories"] = list(directories)
     return _sha256_text(json_dumps(payload))
 
 
@@ -8114,14 +11551,28 @@ def _write_review_capsule(
     job_dir: Path,
     job: dict[str, Any],
     snapshot_subject: Path,
+    snapshot_files: list[Path],
+    snapshot_directories: list[Path],
+    snapshot_manifest: list[dict[str, Any]],
     manifest_path: Path,
     *,
+    subject_archive_path: Path | None = None,
     inner_manifest_path: Path | None = None,
     inner_manifest: dict[str, Any] | None = None,
+    budget: ReviewPreparationBudget | None = None,
 ) -> tuple[Path, str]:
     capsule_path = job_dir / REVIEW_CAPSULE_NAME
     instructions = _review_capsule_instructions(job)
-    with zipfile.ZipFile(capsule_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    active_budget = budget or _new_review_preparation_budget(
+        max_packet_bytes=REVIEW_DEFAULT_PACKET_BYTES,
+        max_subject_file_bytes=REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+        max_subject_bytes=REVIEW_DEFAULT_SUBJECT_BYTES,
+        prepare_timeout_seconds=REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    )
+    with _bounded_zip_writer(
+        capsule_path,
+        max_bytes=active_budget.max_archive_bytes,
+    ) as zf:
         _write_zip_text(zf, "REVIEW_INSTRUCTIONS.md", instructions)
         _write_zip_text(zf, "request.json", json_dumps(_public_review_request(job)))
         _write_zip_text(
@@ -8135,22 +11586,1670 @@ def _write_review_capsule(
                 }
             ),
         )
-        _write_zip_file(zf, job_dir / "expected-response.schema.json", "expected-response.schema.json")
-        _write_zip_file(zf, manifest_path, "source-manifest.json")
+        _write_zip_file(
+            zf,
+            job_dir / "expected-response.schema.json",
+            "expected-response.schema.json",
+            budget=active_budget,
+        )
+        _write_zip_file(
+            zf,
+            manifest_path,
+            "source-manifest.json",
+            budget=active_budget,
+        )
         if inner_manifest_path is not None:
-            _write_zip_file(zf, inner_manifest_path, "inner-archive-manifest.json")
-        _write_zip_file(zf, job_dir / "review-packet.md", "review-packet.md")
+            _write_zip_file(
+                zf,
+                inner_manifest_path,
+                "inner-archive-manifest.json",
+                budget=active_budget,
+            )
+        _write_zip_file(
+            zf,
+            job_dir / "review-packet.md",
+            "review-packet.md",
+            budget=active_budget,
+        )
+        _write_zip_directory(zf, "subject")
         if inner_manifest is not None and job.get("subject_archive_uri"):
-            archive_path = Path(str(job["subject_archive_uri"]))
-            _write_zip_file(zf, archive_path, f"original/{archive_path.name}")
-            _write_expanded_zip_subject_to_capsule(zf, archive_path, inner_manifest)
+            archive_path = subject_archive_path or Path(str(job["subject_archive_uri"]))
+            _write_zip_file(
+                zf,
+                archive_path,
+                f"original/{archive_path.name}",
+                expected_sha256=str(job.get("subject_archive_sha256") or ""),
+                budget=active_budget,
+            )
+            _write_expanded_zip_subject_to_capsule(
+                zf,
+                archive_path,
+                inner_manifest,
+                budget=active_budget,
+            )
         else:
-            for path in sorted(item for item in snapshot_subject.rglob("*") if item.is_file() and not item.is_symlink()):
-                _write_zip_file(zf, path, f"subject/{path.relative_to(snapshot_subject).as_posix()}")
-    secure_file(capsule_path)
-    return capsule_path, file_sha256(capsule_path)
+            for directory in sorted(
+                snapshot_directories,
+                key=lambda item: item.relative_to(snapshot_subject).as_posix(),
+            ):
+                _write_zip_directory(
+                    zf,
+                    "subject/"
+                    + directory.relative_to(snapshot_subject).as_posix(),
+                )
+            expected_hashes = {
+                str(entry.get("path") or ""): str(entry.get("sha256") or "")
+                for entry in snapshot_manifest
+            }
+            for path in sorted(
+                snapshot_files,
+                key=lambda item: item.relative_to(snapshot_subject).as_posix(),
+            ):
+                relative = path.relative_to(snapshot_subject).as_posix()
+                _write_zip_file(
+                    zf,
+                    path,
+                    f"subject/{relative}",
+                    expected_sha256=expected_hashes.get(relative),
+                    budget=active_budget,
+                )
+    active_budget.consume_temporary(
+        int(capsule_path.stat().st_size),
+        label="review capsule",
+    )
+    return capsule_path, _hash_bounded_regular_file(
+        capsule_path,
+        max_bytes=active_budget.max_archive_bytes,
+        label="review capsule",
+        budget=active_budget,
+    )
 
 
+@dataclass
+class _ReviewPreparationCleanupState:
+    paths: list[Path] = field(default_factory=list)
+    root: Path | None = None
+    job_id: str | None = None
+    marker_path: Path | None = None
+    marker_sha256: str | None = None
+    catalog_committed: bool = False
+    rollback_authorized: bool = True
+
+
+_ACTIVE_REVIEW_PREPARATION_CLEANUP: ContextVar[
+    _ReviewPreparationCleanupState | None
+] = ContextVar(
+    "active_review_preparation_cleanup",
+    default=None,
+)
+_ACTIVE_REVIEW_PREPARATION_STARTED_AT: ContextVar[float | None] = ContextVar(
+    "active_review_preparation_started_at",
+    default=None,
+)
+_CleanupParams = ParamSpec("_CleanupParams")
+_CleanupResult = TypeVar("_CleanupResult")
+
+
+def _review_prepare_marker_path(root: Path, job_id: str) -> Path:
+    return review_bridge_root(root) / "tmp" / f"{_safe_job_id(job_id)}.ready.json"
+
+
+def _review_prepare_tree_parent(
+    root: Path,
+    path: Path,
+) -> tuple[Path, str, Literal["tmp", "jobs"]]:
+    absolute = Path(os.path.abspath(path))
+    bridge_root = Path(os.path.abspath(review_bridge_root(root)))
+    name = _safe_job_id(absolute.name)
+    for parent_name in ("tmp", "jobs"):
+        parent = bridge_root / parent_name
+        if absolute == parent / name:
+            return parent, name, parent_name
+    raise ReviewBridgeError(
+        "review preparation tree is outside its staging/publication roots"
+    )
+
+
+def _review_prepare_tmp_child(root: Path, path: Path) -> tuple[Path, str]:
+    absolute = Path(os.path.abspath(path))
+    tmp_root = Path(os.path.abspath(review_bridge_root(root) / "tmp"))
+    if absolute.parent != tmp_root or absolute.name in {"", ".", ".."}:
+        raise ReviewBridgeError(
+            "review preparation temporary file is outside its authority root"
+        )
+    return tmp_root, absolute.name
+
+
+def _remove_plain_tree_by_path(path: Path) -> None:
+    _require_plain_directory(path, label="preparation cleanup directory")
+    try:
+        with os.scandir(path) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        raise ReviewBridgeError(
+            "review preparation cleanup directory could not be inspected"
+        ) from exc
+    for entry in entries:
+        entry_path = path / entry.name
+        try:
+            entry_stat = os.lstat(entry_path)
+        except OSError as exc:
+            raise ReviewBridgeError(
+                "review preparation cleanup entry could not be inspected"
+            ) from exc
+        if _is_link_like_stat(entry_path, entry_stat):
+            raise ReviewBridgeError(
+                "review preparation cleanup tree contains a link-like entry"
+            )
+        if stat.S_ISDIR(entry_stat.st_mode):
+            _remove_plain_tree_by_path(entry_path)
+        elif stat.S_ISREG(entry_stat.st_mode):
+            entry_path.unlink()
+        else:
+            raise ReviewBridgeError(
+                "review preparation cleanup tree contains a non-regular entry"
+            )
+    path.rmdir()
+
+
+def _remove_plain_review_prepare_tree(root: Path, path: Path) -> None:
+    parent, name, parent_name = _review_prepare_tree_parent(root, path)
+    expected = _review_prepare_storage_preflight(
+        root,
+        require_tmp=parent_name == "tmp",
+        require_jobs=parent_name == "jobs",
+    )
+    _assert_review_prepare_storage_unchanged(root, expected)
+    with _open_plain_directory_fd(parent, expected=expected) as parent_fd:
+        if parent_fd is not None:
+            try:
+                target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _assert_review_prepare_storage_unchanged(root, expected)
+                return
+            if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISDIR(
+                target_stat.st_mode
+            ):
+                raise ReviewBridgeError(
+                    "review preparation cleanup target is link-like or not a directory"
+                )
+            _remove_tree_at_fd(parent_fd, name)
+        else:
+            if not _path_exists_no_follow(path):
+                _assert_review_prepare_storage_unchanged(root, expected)
+                return
+            _remove_plain_tree_by_path(path)
+    _assert_review_prepare_storage_unchanged(root, expected)
+
+
+def _read_plain_review_prepare_tmp_file(
+    root: Path,
+    path: Path,
+    *,
+    limit: int,
+) -> tuple[bytes, os.stat_result]:
+    tmp_root, name = _review_prepare_tmp_child(root, path)
+    expected = _review_prepare_storage_preflight(root, require_tmp=True)
+    _assert_review_prepare_storage_unchanged(root, expected)
+    with _open_plain_directory_fd(tmp_root, expected=expected) as tmp_fd:
+        if tmp_fd is not None:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY
+                | int(getattr(os, "O_NOFOLLOW", 0))
+                | int(getattr(os, "O_BINARY", 0)),
+                dir_fd=tmp_fd,
+            )
+            try:
+                opened_stat = os.fstat(file_fd)
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    raise ReviewBridgeError(
+                        "review preparation temporary file is not regular"
+                    )
+                chunks: list[bytes] = []
+                observed = 0
+                while observed <= limit:
+                    chunk = os.read(file_fd, min(65_536, limit + 1 - observed))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    observed += len(chunk)
+                data = b"".join(chunks)
+            finally:
+                os.close(file_fd)
+        else:
+            _require_plain_regular_file(
+                path,
+                label="preparation temporary file",
+            )
+            opened_stat = os.lstat(path)
+            data = _read_regular_file_prefix(path, limit + 1)
+    _assert_review_prepare_storage_unchanged(root, expected)
+    return data, opened_stat
+
+
+def _write_review_prepare_marker_file(
+    root: Path,
+    marker_path: Path,
+    text: str,
+    *,
+    expected: ReviewPrepareStoragePreflight,
+) -> None:
+    tmp_root, marker_name = _review_prepare_tmp_child(root, marker_path)
+    _assert_review_prepare_storage_unchanged(root, expected)
+    data = text.encode("utf-8")
+    with _open_plain_directory_fd(tmp_root, expected=expected) as tmp_fd:
+        if tmp_fd is not None:
+            try:
+                os.stat(marker_name, dir_fd=tmp_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ReviewBridgeError(
+                    "review preparation publication marker already exists"
+                )
+            temporary_name = (
+                f".{marker_name}.{secrets.token_hex(12)}.tmp"
+            )
+            temporary_fd = -1
+            marker_created = False
+            try:
+                temporary_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | int(getattr(os, "O_NOFOLLOW", 0))
+                    | int(getattr(os, "O_BINARY", 0)),
+                    PRIVATE_FILE_MODE,
+                    dir_fd=tmp_fd,
+                )
+                view = memoryview(data)
+                while view:
+                    written = os.write(temporary_fd, view)
+                    if written <= 0:
+                        raise OSError(
+                            "short write while creating review publication marker"
+                        )
+                    view = view[written:]
+                os.fsync(temporary_fd)
+                os.close(temporary_fd)
+                temporary_fd = -1
+                os.link(
+                    temporary_name,
+                    marker_name,
+                    src_dir_fd=tmp_fd,
+                    dst_dir_fd=tmp_fd,
+                    follow_symlinks=False,
+                )
+                marker_created = True
+                os.unlink(temporary_name, dir_fd=tmp_fd)
+                _fsync_directory_fd(tmp_fd)
+            except BaseException:
+                if temporary_fd >= 0:
+                    os.close(temporary_fd)
+                try:
+                    os.unlink(temporary_name, dir_fd=tmp_fd)
+                except OSError:
+                    pass
+                if marker_created:
+                    try:
+                        os.unlink(marker_name, dir_fd=tmp_fd)
+                    except OSError:
+                        pass
+                raise
+        else:
+            if _path_exists_no_follow(marker_path):
+                raise ReviewBridgeError(
+                    "review preparation publication marker already exists"
+                )
+            secure_write_text(marker_path, text)
+    _assert_review_prepare_storage_unchanged(root, expected)
+    _flush_review_prepare_directory(tmp_root)
+
+
+def _unlink_plain_review_prepare_tmp_file(
+    root: Path,
+    path: Path,
+    *,
+    expected: ReviewPrepareStoragePreflight | None = None,
+    missing_ok: bool = False,
+) -> bool:
+    tmp_root, name = _review_prepare_tmp_child(root, path)
+    active_expected = expected or _review_prepare_storage_preflight(
+        root,
+        require_tmp=True,
+    )
+    _assert_review_prepare_storage_unchanged(root, active_expected)
+    removed = False
+    with _open_plain_directory_fd(tmp_root, expected=active_expected) as tmp_fd:
+        if tmp_fd is not None:
+            try:
+                file_stat = os.stat(name, dir_fd=tmp_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise ReviewBridgeError(
+                        "review preparation temporary file is missing"
+                    ) from None
+            else:
+                if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(
+                    file_stat.st_mode
+                ):
+                    raise ReviewBridgeError(
+                        "review preparation temporary file is link-like or not regular"
+                    )
+                os.unlink(name, dir_fd=tmp_fd)
+                _fsync_directory_fd(tmp_fd)
+                removed = True
+        elif not _path_exists_no_follow(path):
+            if not missing_ok:
+                raise ReviewBridgeError(
+                    "review preparation temporary file is missing"
+                )
+        else:
+            _require_plain_regular_file(
+                path,
+                label="preparation temporary file",
+            )
+            path.unlink()
+            fsync_parent(path)
+            removed = True
+    _assert_review_prepare_storage_unchanged(root, active_expected)
+    return removed
+
+
+def _rename_review_prepare_tree(
+    root: Path,
+    source: Path,
+    destination: Path,
+) -> None:
+    source_parent, source_name, _source_kind = _review_prepare_tree_parent(
+        root,
+        source,
+    )
+    destination_parent, destination_name, _destination_kind = (
+        _review_prepare_tree_parent(root, destination)
+    )
+    if source_name != destination_name or source_parent == destination_parent:
+        raise ReviewBridgeError("review preparation rename identity mismatches")
+    expected = _review_prepare_storage_preflight(
+        root,
+        require_tmp=True,
+        require_jobs=True,
+    )
+    _assert_review_prepare_storage_unchanged(root, expected)
+    with ExitStack() as stack:
+        source_fd = stack.enter_context(
+            _open_plain_directory_fd(source_parent, expected=expected)
+        )
+        destination_fd = stack.enter_context(
+            _open_plain_directory_fd(destination_parent, expected=expected)
+        )
+        if source_fd is not None and destination_fd is not None:
+            source_stat = os.stat(
+                source_name,
+                dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISDIR(
+                source_stat.st_mode
+            ):
+                raise ReviewBridgeError(
+                    "review preparation rename source is link-like or not a directory"
+                )
+            try:
+                os.stat(
+                    destination_name,
+                    dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise ReviewBridgeError(
+                    "review preparation rename destination already exists"
+                )
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+            )
+            _fsync_directory_fd(source_fd)
+            _fsync_directory_fd(destination_fd)
+        else:
+            _require_plain_directory(
+                source,
+                label="preparation rename source",
+            )
+            if _path_exists_no_follow(destination):
+                raise ReviewBridgeError(
+                    "review preparation rename destination already exists"
+                )
+            source.rename(destination)
+            fsync_parent(source)
+            fsync_parent(destination)
+    _flush_review_prepare_directory(source_parent)
+    _flush_review_prepare_directory(destination_parent)
+    _assert_review_prepare_storage_unchanged(root, expected)
+
+
+def _create_review_prepare_staging_dir(root: Path, path: Path) -> None:
+    parent, name, parent_name = _review_prepare_tree_parent(root, path)
+    if parent_name != "tmp":
+        raise ReviewBridgeError(
+            "review preparation staging directory must be created under tmp"
+        )
+    expected = _review_prepare_storage_preflight(root, require_tmp=True)
+    _assert_review_prepare_storage_unchanged(root, expected)
+    with _open_plain_directory_fd(parent, expected=expected) as parent_fd:
+        if parent_fd is not None:
+            try:
+                os.mkdir(name, PRIVATE_DIR_MODE, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise ReviewBridgeError(
+                    "review preparation staging directory already exists"
+                ) from exc
+            _fsync_directory_fd(parent_fd)
+        else:
+            if _path_exists_no_follow(path):
+                raise ReviewBridgeError(
+                    "review preparation staging directory already exists"
+                )
+            secure_mkdir(path)
+    _assert_review_prepare_storage_unchanged(root, expected)
+
+
+def _review_prepare_tmp_inventory(
+    root: Path,
+) -> tuple[
+    list[tuple[str, os.stat_result]],
+    ReviewPrepareStoragePreflight,
+    bool,
+]:
+    tmp_root = review_bridge_root(root) / "tmp"
+    tmp_existed = _path_exists_no_follow(tmp_root)
+    expected = _review_prepare_storage_preflight(
+        root,
+        require_tmp=tmp_existed,
+    )
+    if not tmp_existed:
+        return [], expected, False
+    _assert_review_prepare_storage_unchanged(root, expected)
+    inventory: list[tuple[str, os.stat_result]] = []
+    with _open_plain_directory_fd(tmp_root, expected=expected) as tmp_fd:
+        try:
+            with os.scandir(tmp_fd if tmp_fd is not None else tmp_root) as iterator:
+                for entry in iterator:
+                    inventory.append(
+                        (entry.name, entry.stat(follow_symlinks=False))
+                    )
+        except OSError as exc:
+            raise ReviewBridgeError(
+                "review preparation staging root could not be inspected"
+            ) from exc
+    _assert_review_prepare_storage_unchanged(root, expected)
+    return sorted(inventory, key=lambda item: item[0]), expected, True
+
+
+def _configure_review_prepare_catalog_durability(conn: Any) -> None:
+    """Require power-loss-durable SQLite commits for publication authority."""
+    if bool(getattr(conn, "in_transaction", False)):
+        raise ReviewBridgeError(
+            "review publication catalog durability must be configured before its transaction"
+        )
+    try:
+        conn.execute("PRAGMA synchronous = FULL")
+        row = conn.execute("PRAGMA synchronous").fetchone()
+    except Exception as exc:
+        raise ReviewBridgeError(
+            "review publication catalog could not enable full durability"
+        ) from exc
+    if row is None or int(row[0]) != 2:
+        raise ReviewBridgeError(
+            "review publication catalog did not enable full durability"
+        )
+
+
+def _discard_review_prepare_marker_authority(
+    root: Path,
+    marker_path: Path,
+    marker_sha256: str | None,
+) -> bool:
+    """Retire known-uncommitted marker authority after its trees are absent."""
+    uri = _root_uri(root, marker_path)
+    try:
+        with closing(connect(root)) as conn:
+            _configure_review_prepare_catalog_durability(conn)
+            rows = _review_prepare_marker_rows(conn, root, marker_path)
+            if marker_sha256:
+                if rows and not any(
+                    str(row["sha256"]) == marker_sha256 for row in rows
+                ):
+                    return False
+                conn.execute(
+                    "DELETE FROM artifacts WHERE kind = ? AND uri = ? AND sha256 = ?",
+                    (
+                        REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                        uri,
+                        marker_sha256,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM artifacts WHERE kind = ? AND uri = ?",
+                    (REVIEW_PREPARE_PUBLICATION_MARKER_KIND, uri),
+                )
+            conn.commit()
+    except Exception:
+        return False
+    try:
+        _unlink_plain_review_prepare_tmp_file(
+            root,
+            marker_path,
+            missing_ok=True,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _retire_review_prepare_marker_authority(
+    root: Path,
+    marker_path: Path,
+    marker_sha256: str,
+) -> None:
+    _marker, actual_sha256, _marker_size = _load_review_prepare_marker(
+        root,
+        marker_path,
+    )
+    if actual_sha256 != marker_sha256:
+        raise ReviewBridgeError(
+            "review preparation publication marker drifted before retirement"
+        )
+    with closing(connect(root)) as conn:
+        _configure_review_prepare_catalog_durability(conn)
+        deleted = conn.execute(
+            "DELETE FROM artifacts WHERE kind = ? AND uri = ? AND sha256 = ?",
+            (
+                REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                _root_uri(root, marker_path),
+                marker_sha256,
+            ),
+        )
+        if deleted.rowcount != 1:
+            conn.rollback()
+            raise ReviewBridgeError(
+                "review preparation publication marker authority could not be retired"
+            )
+        conn.commit()
+    _unlink_plain_review_prepare_tmp_file(root, marker_path)
+
+
+def _review_prepare_artifact_plan(
+    staging_dir: Path,
+    job_id: str,
+    entries: list[tuple[Path, str, bool]],
+    *,
+    budget: ReviewPreparationBudget | None = None,
+) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for path, kind, immutable in entries:
+        if budget is not None:
+            budget.check_deadline("building the review publication plan")
+        try:
+            relative = path.relative_to(staging_dir).as_posix()
+        except ValueError as exc:
+            raise ReviewBridgeError(
+                "review preparation artifact escapes its staging directory"
+            ) from exc
+        _relative_path_parts(Path(relative))
+        if relative in seen_paths:
+            raise ReviewBridgeError(
+                f"review preparation artifact plan duplicates a path: {relative}"
+            )
+        seen_paths.add(relative)
+        _require_plain_regular_file(path, label=f"staged artifact {relative}")
+        size_bytes = int(os.lstat(path).st_size)
+        plan.append(
+            {
+                "relative_path": relative,
+                "kind": kind,
+                "immutable": bool(immutable),
+                "source_type": "review_bridge",
+                "trust_level": "local_generated",
+                "metadata": {"job_id": job_id},
+                "sha256": _hash_bounded_regular_file(
+                    path,
+                    max_bytes=REVIEW_INTEGRITY_MAX_JOB_TREE_BYTES,
+                    label=f"review publication artifact {relative}",
+                    budget=budget,
+                ),
+                "size_bytes": size_bytes,
+            }
+        )
+    return sorted(
+        plan,
+        key=lambda item: (str(item["relative_path"]), str(item["kind"])),
+    )
+
+
+def _load_review_prepare_marker(
+    root: Path,
+    marker_path: Path,
+    *,
+    expected_job_id: str | None = None,
+) -> tuple[dict[str, Any], str, int]:
+    data, marker_stat = _read_plain_review_prepare_tmp_file(
+        root,
+        marker_path,
+        limit=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
+    )
+    if len(data) > REVIEW_INTEGRITY_MAX_RECORD_BYTES:
+        raise ReviewBridgeError(
+            "review preparation publication marker exceeds its byte limit"
+        )
+    if int(marker_stat.st_size) != len(data):
+        raise ReviewBridgeError(
+            "review preparation publication marker changed while being read"
+        )
+    try:
+        text = data.decode("utf-8")
+        marker = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewBridgeError(
+            "review preparation publication marker is malformed"
+        ) from exc
+    if not isinstance(marker, dict) or json_dumps(marker) != text:
+        raise ReviewBridgeError(
+            "review preparation publication marker is not canonical"
+        )
+    if set(marker) != {
+        "schema",
+        "job_id",
+        "producer_operation_id",
+        "artifacts",
+    }:
+        raise ReviewBridgeError(
+            "review preparation publication marker has unexpected fields"
+        )
+    if marker.get("schema") != REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA:
+        raise ReviewBridgeError(
+            "review preparation publication marker schema is unsupported"
+        )
+    job_id = _safe_job_id(str(marker.get("job_id") or ""))
+    if expected_job_id is not None and job_id != expected_job_id:
+        raise ReviewBridgeError(
+            "review preparation publication marker job identity mismatches"
+        )
+    producer_operation_id = marker.get("producer_operation_id")
+    validate_review_operation_id(producer_operation_id)
+    raw_plan = marker.get("artifacts")
+    if not isinstance(raw_plan, list) or not raw_plan:
+        raise ReviewBridgeError(
+            "review preparation publication marker has no artifact plan"
+        )
+    if len(raw_plan) > 32:
+        raise ReviewBridgeError(
+            "review preparation publication marker artifact plan is oversized"
+        )
+    allowed_kinds = {
+        "review_packet",
+        "review_prompt",
+        "review_schema",
+        "review_subject_manifest",
+        "review_request",
+        "review_capsule",
+        "review_manual_handoff",
+        "review_secret_allowlist_report",
+        "review_inner_archive_manifest",
+        "review_browser_handoff_latest",
+        "review_status",
+        "review_subject_archive",
+    }
+    seen_paths: set[str] = set()
+    canonical_plan: list[dict[str, Any]] = []
+    for item in raw_plan:
+        if not isinstance(item, dict) or set(item) != {
+            "relative_path",
+            "kind",
+            "immutable",
+            "source_type",
+            "trust_level",
+            "metadata",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ReviewBridgeError(
+                "review preparation publication marker artifact is malformed"
+            )
+        relative = item.get("relative_path")
+        kind = item.get("kind")
+        immutable = item.get("immutable")
+        sha256 = item.get("sha256")
+        size_bytes = item.get("size_bytes")
+        if (
+            not isinstance(relative, str)
+            or "\\" in relative
+            or relative in seen_paths
+            or not isinstance(kind, str)
+            or kind not in allowed_kinds
+            or not isinstance(immutable, bool)
+            or item.get("source_type") != "review_bridge"
+            or item.get("trust_level") != "local_generated"
+            or item.get("metadata") != {"job_id": job_id}
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise ReviewBridgeError(
+                "review preparation publication marker artifact is invalid"
+            )
+        _relative_path_parts(Path(relative))
+        seen_paths.add(relative)
+        canonical_plan.append(item)
+    if canonical_plan != sorted(
+        canonical_plan,
+        key=lambda item: (str(item["relative_path"]), str(item["kind"])),
+    ):
+        raise ReviewBridgeError(
+            "review preparation publication marker artifact plan is not sorted"
+        )
+    return marker, hashlib.sha256(data).hexdigest(), len(data)
+
+
+def _review_prepare_marker_rows(
+    conn: Any,
+    root: Path,
+    marker_path: Path,
+) -> list[Any]:
+    return list(
+        conn.execute(
+            "SELECT * FROM artifacts WHERE kind = ? AND uri = ? ORDER BY id LIMIT 3",
+            (
+                REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                _root_uri(root, marker_path),
+            ),
+        ).fetchall()
+    )
+
+
+def _review_prepare_marker_row_matches(
+    row: Any,
+    *,
+    root: Path,
+    marker_path: Path,
+    marker: dict[str, Any],
+    marker_sha256: str,
+    marker_size: int,
+) -> bool:
+    uri = _root_uri(root, marker_path)
+    metadata = {
+        "job_id": marker["job_id"],
+        "schema": REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+    }
+    return bool(
+        str(row["id"])
+        == stable_id(
+            "artifact",
+            REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+            uri,
+            marker_sha256,
+        )
+        and str(row["kind"]) == REVIEW_PREPARE_PUBLICATION_MARKER_KIND
+        and str(row["uri"]) == uri
+        and str(row["sha256"]) == marker_sha256
+        and int(row["size_bytes"]) == marker_size
+        and row["operation_id"] == marker.get("producer_operation_id")
+        and int(row["immutable"]) == 0
+        and str(row["source_type"] or "") == "review_prepare_transaction"
+        and str(row["trust_level"] or "") == "local_generated"
+        and str(row["metadata_json"]) == json_dumps(metadata)
+    )
+
+
+def _catalog_review_prepare_marker(
+    root: Path,
+    staging_dir: Path,
+    *,
+    job_id: str,
+    operation_id: str | None,
+    plan: list[dict[str, Any]],
+) -> tuple[Path, str]:
+    marker_path = _review_prepare_marker_path(root, job_id)
+    expected_staging_dir = review_bridge_root(root) / "tmp" / job_id
+    if Path(os.path.abspath(staging_dir)) != Path(
+        os.path.abspath(expected_staging_dir)
+    ):
+        raise ReviewBridgeError(
+            "review preparation publication marker staging identity mismatches"
+        )
+    storage = _review_prepare_storage_preflight(
+        root,
+        require_tmp=True,
+        require_jobs=True,
+    )
+    if _path_exists_no_follow(marker_path):
+        raise ReviewBridgeError(
+            f"review preparation publication marker already exists: {job_id}"
+        )
+    marker = {
+        "schema": REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+        "job_id": job_id,
+        "producer_operation_id": operation_id,
+        "artifacts": plan,
+    }
+    text = json_dumps(marker)
+    if len(text.encode("utf-8")) > REVIEW_INTEGRITY_MAX_RECORD_BYTES:
+        raise ReviewBridgeError(
+            "review preparation publication marker exceeds its byte limit"
+        )
+    marker_data = text.encode("utf-8")
+    _write_review_prepare_marker_file(
+        root,
+        marker_path,
+        text,
+        expected=storage,
+    )
+    marker_sha256 = hashlib.sha256(marker_data).hexdigest()
+    marker_size = len(marker_data)
+    state = _ACTIVE_REVIEW_PREPARATION_CLEANUP.get()
+    if state is not None:
+        state.root = root
+        state.job_id = job_id
+        state.marker_path = marker_path
+        state.marker_sha256 = marker_sha256
+    with closing(connect(root)) as conn:
+        _configure_review_prepare_catalog_durability(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        record_artifact(
+            conn,
+            kind=REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+            uri=_root_uri(root, marker_path),
+            sha256=marker_sha256,
+            size_bytes=marker_size,
+            operation_id=operation_id,
+            immutable=False,
+            source_type="review_prepare_transaction",
+            trust_level="local_generated",
+            metadata={
+                "job_id": job_id,
+                "schema": REVIEW_PREPARE_PUBLICATION_MARKER_SCHEMA,
+            },
+        )
+        rows = _review_prepare_marker_rows(conn, root, marker_path)
+        if len(rows) != 1 or not _review_prepare_marker_row_matches(
+            rows[0],
+            root=root,
+            marker_path=marker_path,
+            marker=marker,
+            marker_sha256=marker_sha256,
+            marker_size=marker_size,
+        ):
+            conn.rollback()
+            raise ReviewBridgeError(
+                "review preparation publication marker catalog binding failed"
+            )
+        conn.commit()
+    _assert_review_prepare_storage_unchanged(root, storage)
+    return marker_path, marker_sha256
+
+
+ReviewPrepareCatalogState = Literal["committed", "uncommitted", "unknown"]
+
+
+def _review_prepare_catalog_state(
+    root: Path,
+    *,
+    job_id: str,
+    marker_path: Path,
+) -> ReviewPrepareCatalogState:
+    """Classify publication state without treating inspection failure as rollback proof."""
+    try:
+        with closing(connect_existing(root)) as conn:
+            marker_rows = _review_prepare_marker_rows(conn, root, marker_path)
+            job_rows = _review_job_artifact_rows(root, job_id, conn=conn)
+            if marker_rows:
+                if job_rows or len(marker_rows) != 1:
+                    return "unknown"
+                marker, marker_sha256, marker_size = _load_review_prepare_marker(
+                    root,
+                    marker_path,
+                    expected_job_id=job_id,
+                )
+                if not _review_prepare_marker_row_matches(
+                    marker_rows[0],
+                    root=root,
+                    marker_path=marker_path,
+                    marker=marker,
+                    marker_sha256=marker_sha256,
+                    marker_size=marker_size,
+                ):
+                    return "unknown"
+                return "uncommitted"
+            if not job_rows:
+                return "uncommitted"
+            report = review_bridge_integrity_report(
+                root,
+                job_id=job_id,
+                artifact_conn=conn,
+            )
+            return "committed" if bool(report.get("ok")) else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _finalize_review_prepare_publication(
+    root: Path,
+    *,
+    job_id: str,
+    marker_path: Path,
+    budget: ReviewPreparationBudget,
+    on_catalog_commit: Callable[[], None] | None = None,
+    on_catalog_unknown: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    token = _ACTIVE_REVIEW_PUBLICATION_JOB_ID.set(job_id)
+    try:
+        return _finalize_review_prepare_publication_active(
+            root,
+            job_id=job_id,
+            marker_path=marker_path,
+            budget=budget,
+            on_catalog_commit=on_catalog_commit,
+            on_catalog_unknown=on_catalog_unknown,
+        )
+    finally:
+        _ACTIVE_REVIEW_PUBLICATION_JOB_ID.reset(token)
+
+
+def _finalize_review_prepare_publication_active(
+    root: Path,
+    *,
+    job_id: str,
+    marker_path: Path,
+    budget: ReviewPreparationBudget,
+    on_catalog_commit: Callable[[], None] | None = None,
+    on_catalog_unknown: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    budget.check_deadline("finalizing the review publication")
+    marker, marker_sha256, marker_size = _load_review_prepare_marker(
+        root,
+        marker_path,
+        expected_job_id=job_id,
+    )
+    job_dir = review_job_dir(root, job_id)
+    _validate_review_job_storage(root, job_id)
+    with closing(connect(root)) as conn:
+        _configure_review_prepare_catalog_durability(conn)
+        commit_attempted = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker_rows = _review_prepare_marker_rows(conn, root, marker_path)
+            if len(marker_rows) != 1 or not _review_prepare_marker_row_matches(
+                marker_rows[0],
+                root=root,
+                marker_path=marker_path,
+                marker=marker,
+                marker_sha256=marker_sha256,
+                marker_size=marker_size,
+            ):
+                raise ReviewBridgeError(
+                    "review preparation publication authority is missing or drifted"
+                )
+            if _review_job_artifact_rows(root, job_id, conn=conn):
+                raise ReviewBridgeError(
+                    "review preparation publication conflicts with existing job artifacts"
+                )
+            for item in marker["artifacts"]:
+                budget.check_deadline("finalizing the review publication")
+                relative = str(item["relative_path"])
+                path = job_dir.joinpath(*Path(relative).parts)
+                _require_plain_regular_file(
+                    path,
+                    label=f"published artifact {relative}",
+                )
+                actual_size = int(os.lstat(path).st_size)
+                actual_sha256 = _confined_file_sha256(
+                    root,
+                    job_id,
+                    path,
+                    budget=budget,
+                )
+                if (
+                    actual_size != int(item["size_bytes"])
+                    or actual_sha256 != str(item["sha256"])
+                ):
+                    raise ReviewBridgeError(
+                        f"review preparation published artifact drifted: {relative}"
+                    )
+                record_artifact(
+                    conn,
+                    kind=str(item["kind"]),
+                    uri=_root_uri(root, path),
+                    sha256=actual_sha256,
+                    size_bytes=actual_size,
+                    operation_id=marker.get("producer_operation_id"),
+                    immutable=bool(item["immutable"]),
+                    source_type=str(item["source_type"]),
+                    trust_level=str(item["trust_level"]),
+                    metadata=dict(item["metadata"]),
+                )
+            request = _load_request(root, job_id)
+            status = _load_status(root, job_id)
+            artifact_rows = _review_job_artifact_rows(
+                root,
+                job_id,
+                conn=conn,
+            )
+            issues = _review_job_catalog_and_tree_issues(
+                root,
+                job_id,
+                job_dir,
+                request,
+                status,
+                artifact_rows,
+                budget=budget,
+            )
+            if issues:
+                raise ReviewBridgeError(
+                    "review preparation publication integrity failed: "
+                    + json_dumps(issues[:3])
+                )
+            deleted = conn.execute(
+                "DELETE FROM artifacts WHERE id = ? AND kind = ? AND uri = ? AND sha256 = ?",
+                (
+                    str(marker_rows[0]["id"]),
+                    REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                    _root_uri(root, marker_path),
+                    marker_sha256,
+                ),
+            )
+            if deleted.rowcount != 1:
+                raise ReviewBridgeError(
+                    "review preparation publication marker could not be retired"
+                )
+            budget.check_deadline("committing the review publication")
+            commit_attempted = True
+            conn.commit()
+            if on_catalog_commit is not None:
+                on_catalog_commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if commit_attempted:
+                conn.close()
+                catalog_state = _review_prepare_catalog_state(
+                    root,
+                    job_id=job_id,
+                    marker_path=marker_path,
+                )
+                if catalog_state == "committed" and on_catalog_commit is not None:
+                    on_catalog_commit()
+                elif catalog_state == "unknown" and on_catalog_unknown is not None:
+                    on_catalog_unknown()
+            raise
+    marker_removed = False
+    try:
+        marker_removed = _unlink_plain_review_prepare_tmp_file(
+            root,
+            marker_path,
+            missing_ok=True,
+        )
+    except (OSError, ReviewBridgeError):
+        pass
+    return {
+        "job_id": job_id,
+        "producer_operation_id": marker.get("producer_operation_id"),
+        "outcome": "catalog_committed",
+        "marker_removed": marker_removed,
+    }
+
+
+def _remaining_review_preparation_seconds(
+    budget: ReviewPreparationBudget,
+    *,
+    label: str,
+) -> float:
+    remaining = budget.deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewBridgeError(
+            f"review preparation exceeded its elapsed-time budget while {label}"
+        )
+    return remaining
+
+
+def _review_prepare_reversal_authorized(
+    root: Path,
+    *,
+    job_id: str,
+    marker_path: Path,
+) -> bool:
+    try:
+        marker, marker_sha256, marker_size = _load_review_prepare_marker(
+            root,
+            marker_path,
+            expected_job_id=job_id,
+        )
+        with closing(connect_existing(root)) as conn:
+            marker_rows = _review_prepare_marker_rows(conn, root, marker_path)
+            return bool(
+                len(marker_rows) == 1
+                and _review_prepare_marker_row_matches(
+                    marker_rows[0],
+                    root=root,
+                    marker_path=marker_path,
+                    marker=marker,
+                    marker_sha256=marker_sha256,
+                    marker_size=marker_size,
+                )
+                and not _review_job_artifact_rows(root, job_id, conn=conn)
+            )
+    except Exception:
+        return False
+
+
+def _publish_staged_review_job(
+    root: Path,
+    *,
+    job_id: str,
+    staging_dir: Path,
+    job_dir: Path,
+    marker_path: Path,
+    budget: ReviewPreparationBudget,
+    on_catalog_commit: Callable[[], None] | None = None,
+    on_catalog_unknown: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    with operation_lock(
+        root,
+        job_id,
+        timeout_seconds=_remaining_review_preparation_seconds(
+            budget,
+            label="waiting for review job publication authority",
+        ),
+    ):
+        budget.check_deadline("publishing the completed review job")
+        if _path_exists_no_follow(job_dir):
+            raise ReviewBridgeError(
+                f"review job publication destination already exists: {job_id}"
+            )
+        _rename_review_prepare_tree(root, staging_dir, job_dir)
+        return _finalize_review_prepare_publication(
+            root,
+            job_id=job_id,
+            marker_path=marker_path,
+            budget=budget,
+            on_catalog_commit=on_catalog_commit,
+            on_catalog_unknown=on_catalog_unknown,
+        )
+
+
+def _reconcile_review_prepare_publications(
+    root: Path,
+    *,
+    budget: ReviewPreparationBudget,
+) -> list[dict[str, Any]]:
+    tmp_root = review_bridge_root(root) / "tmp"
+    budget.check_deadline("scanning interrupted review preparations")
+    marker_paths: dict[str, Path] = {}
+    staging_paths: dict[str, Path] = {}
+    transient_files: list[Path] = []
+    entries, storage_preflight, tmp_existed = _review_prepare_tmp_inventory(root)
+    if len(entries) > REVIEW_INTEGRITY_MAX_JOBS * 2 + 32:
+        raise ReviewBridgeError(
+            "review preparation staging inventory exceeds its limit"
+        )
+    for entry_name, entry_stat in entries:
+        budget.check_deadline("scanning interrupted review preparations")
+        path = tmp_root / entry_name
+        if _is_link_like_stat(path, entry_stat):
+            raise ReviewBridgeError(
+                f"review preparation staging entry is link-like: {entry_name}"
+            )
+        if stat.S_ISDIR(entry_stat.st_mode):
+            job_id = _safe_job_id(entry_name)
+            staging_paths[job_id] = path
+        elif stat.S_ISREG(entry_stat.st_mode) and entry_name.endswith(
+            ".ready.json"
+        ):
+            job_id = _safe_job_id(entry_name[: -len(".ready.json")])
+            marker_paths[job_id] = path
+        elif (
+            stat.S_ISREG(entry_stat.st_mode)
+            and entry_name.startswith(".")
+            and entry_name.endswith(".tmp")
+        ):
+            transient_files.append(path)
+        else:
+            raise ReviewBridgeError(
+                f"review preparation staging entry is unexpected: {entry_name}"
+            )
+    outcomes: list[dict[str, Any]] = []
+    for transient_path in transient_files:
+        _unlink_plain_review_prepare_tmp_file(
+            root,
+            transient_path,
+            expected=storage_preflight,
+        )
+        outcomes.append(
+            {
+                "job_id": None,
+                "producer_operation_id": None,
+                "outcome": "rolled_back_incomplete_marker_write",
+            }
+        )
+    with closing(connect(root)) as conn:
+        all_marker_rows = list(
+            conn.execute(
+                "SELECT * FROM artifacts WHERE kind = ? ORDER BY uri, id LIMIT ?",
+                (
+                    REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                    REVIEW_INTEGRITY_MAX_JOBS + 1,
+                ),
+            ).fetchall()
+        )
+    if len(all_marker_rows) > REVIEW_INTEGRITY_MAX_JOBS:
+        raise ReviewBridgeError(
+            "review preparation marker catalog inventory exceeds its limit"
+        )
+    rows_by_uri: dict[str, list[Any]] = {}
+    for row in all_marker_rows:
+        rows_by_uri.setdefault(str(row["uri"]), []).append(row)
+
+    for job_id, marker_path in sorted(marker_paths.items()):
+        budget.check_deadline(f"reconciling interrupted review {job_id}")
+        marker, marker_sha256, marker_size = _load_review_prepare_marker(
+            root,
+            marker_path,
+            expected_job_id=job_id,
+        )
+        marker_rows = rows_by_uri.pop(_root_uri(root, marker_path), [])
+        if len(marker_rows) > 1:
+            raise ReviewBridgeError(
+                f"review preparation marker has conflicting catalog authority: {job_id}"
+            )
+        if marker_rows and not _review_prepare_marker_row_matches(
+            marker_rows[0],
+            root=root,
+            marker_path=marker_path,
+            marker=marker,
+            marker_sha256=marker_sha256,
+            marker_size=marker_size,
+        ):
+            raise ReviewBridgeError(
+                f"review preparation marker catalog authority drifted: {job_id}"
+            )
+        stage_path = staging_paths.pop(job_id, None)
+        job_path = review_job_dir(root, job_id)
+        published_exists = _path_exists_no_follow(job_path)
+        if stage_path is not None and published_exists:
+            raise ReviewBridgeError(
+                f"review preparation has both staged and published trees: {job_id}"
+            )
+        job_rows = _review_job_artifact_rows(root, job_id)
+        if not marker_rows and job_rows and not published_exists:
+            raise ReviewBridgeError(
+                f"review preparation has unbound partial job catalog rows: {job_id}"
+            )
+        if marker_rows:
+            if job_rows:
+                raise ReviewBridgeError(
+                    f"review preparation has partial or conflicting job catalog rows: {job_id}"
+                )
+            if stage_path is not None:
+                _require_plain_directory(
+                    stage_path,
+                    label="preparation staging directory",
+                )
+                secure_mkdir(job_path.parent, secure_existing=True)
+                try:
+                    finalized = _publish_staged_review_job(
+                        root,
+                        job_id=job_id,
+                        staging_dir=stage_path,
+                        job_dir=job_path,
+                        marker_path=marker_path,
+                        budget=budget,
+                    )
+                except BaseException:
+                    if (
+                        _review_prepare_reversal_authorized(
+                            root,
+                            job_id=job_id,
+                            marker_path=marker_path,
+                        )
+                        and
+                        _path_exists_no_follow(job_path)
+                        and not _path_exists_no_follow(stage_path)
+                    ):
+                        with operation_lock(
+                            root,
+                            job_id,
+                            timeout_seconds=_remaining_review_preparation_seconds(
+                                budget,
+                                label="restoring interrupted review staging",
+                            ),
+                        ):
+                            if _review_prepare_reversal_authorized(
+                                root,
+                                job_id=job_id,
+                                marker_path=marker_path,
+                            ):
+                                _rename_review_prepare_tree(
+                                    root,
+                                    job_path,
+                                    stage_path,
+                                )
+                    raise
+                finalized["outcome"] = "recovered_staged_publication"
+                outcomes.append(finalized)
+            elif published_exists:
+                _require_plain_directory(
+                    job_path,
+                    label="published preparation directory",
+                )
+                with operation_lock(
+                    root,
+                    job_id,
+                    timeout_seconds=_remaining_review_preparation_seconds(
+                        budget,
+                        label="waiting for review job recovery authority",
+                    ),
+                ):
+                    finalized = _finalize_review_prepare_publication(
+                        root,
+                        job_id=job_id,
+                        marker_path=marker_path,
+                        budget=budget,
+                    )
+                finalized["outcome"] = "recovered_published_catalog"
+                outcomes.append(finalized)
+            else:
+                _retire_review_prepare_marker_authority(
+                    root,
+                    marker_path,
+                    marker_sha256,
+                )
+                outcomes.append(
+                    {
+                        "job_id": job_id,
+                        "producer_operation_id": marker.get(
+                            "producer_operation_id"
+                        ),
+                        "outcome": "rolled_back_missing_publication_evidence",
+                    }
+                )
+        elif stage_path is not None:
+            _remove_plain_review_prepare_tree(root, stage_path)
+            _unlink_plain_review_prepare_tmp_file(
+                root,
+                marker_path,
+                expected=storage_preflight,
+            )
+            outcomes.append(
+                {
+                    "job_id": job_id,
+                    "producer_operation_id": marker.get(
+                        "producer_operation_id"
+                    ),
+                    "outcome": "rolled_back_unbound_staging",
+                }
+            )
+        elif published_exists:
+            publication_token = _ACTIVE_REVIEW_PUBLICATION_JOB_ID.set(job_id)
+            try:
+                report = review_bridge_integrity_report(root, job_id=job_id)
+            finally:
+                _ACTIVE_REVIEW_PUBLICATION_JOB_ID.reset(publication_token)
+            if not report.get("ok"):
+                raise ReviewBridgeError(
+                    f"review preparation post-commit marker cannot be reconciled: {job_id}"
+                )
+            _unlink_plain_review_prepare_tmp_file(
+                root,
+                marker_path,
+                expected=storage_preflight,
+            )
+            outcomes.append(
+                {
+                    "job_id": job_id,
+                    "producer_operation_id": marker.get(
+                        "producer_operation_id"
+                    ),
+                    "outcome": "cleaned_post_commit_marker",
+                }
+            )
+        else:
+            _unlink_plain_review_prepare_tmp_file(
+                root,
+                marker_path,
+                expected=storage_preflight,
+            )
+            outcomes.append(
+                {
+                    "job_id": job_id,
+                    "producer_operation_id": marker.get(
+                        "producer_operation_id"
+                    ),
+                    "outcome": "cleaned_unbound_marker",
+                }
+            )
+
+    for job_id, stage_path in sorted(staging_paths.items()):
+        budget.check_deadline(f"rolling back incomplete review {job_id}")
+        if (
+            _review_job_artifact_rows(root, job_id)
+            or _path_exists_no_follow(review_job_dir(root, job_id))
+        ):
+            raise ReviewBridgeError(
+                f"incomplete review staging conflicts with durable job evidence: {job_id}"
+            )
+        _remove_plain_review_prepare_tree(root, stage_path)
+        outcomes.append(
+            {
+                "job_id": job_id,
+                "producer_operation_id": None,
+                "outcome": "rolled_back_incomplete_staging",
+            }
+        )
+
+    for uri, rows in rows_by_uri.items():
+        candidate = Path(uri)
+        marker_path = candidate if candidate.is_absolute() else Path(root) / candidate
+        expected_parent = Path(os.path.abspath(review_bridge_root(root) / "tmp"))
+        if (
+            Path(os.path.abspath(marker_path.parent)) != expected_parent
+            or not marker_path.name.endswith(".ready.json")
+        ):
+            raise ReviewBridgeError(
+                "review preparation marker catalog URI is outside its authority root"
+            )
+        job_id = _safe_job_id(marker_path.name[: -len(".ready.json")])
+        stage_path = review_bridge_root(root) / "tmp" / job_id
+        job_path = review_job_dir(root, job_id)
+        if (
+            len(rows) != 1
+            or _path_exists_no_follow(stage_path)
+            or _path_exists_no_follow(job_path)
+        ):
+            raise ReviewBridgeError(
+                f"review preparation marker authority is missing its evidence: {job_id}"
+            )
+        with closing(connect(root)) as conn:
+            _configure_review_prepare_catalog_durability(conn)
+            deleted = conn.execute(
+                "DELETE FROM artifacts WHERE id = ? AND kind = ? AND uri = ?",
+                (
+                    str(rows[0]["id"]),
+                    REVIEW_PREPARE_PUBLICATION_MARKER_KIND,
+                    uri,
+                ),
+            )
+            if deleted.rowcount != 1:
+                conn.rollback()
+                raise ReviewBridgeError(
+                    f"review preparation missing marker authority could not be retired: {job_id}"
+                )
+            conn.commit()
+        outcomes.append(
+            {
+                "job_id": job_id,
+                "producer_operation_id": rows[0]["operation_id"],
+                "outcome": "retired_missing_marker_authority",
+            }
+        )
+    _assert_review_prepare_storage_unchanged(root, storage_preflight)
+    if not tmp_existed and _path_exists_no_follow(tmp_root):
+        raise ReviewBridgeError(
+            "review preparation staging root appeared during reconciliation"
+        )
+    return outcomes
+
+
+def _serialize_review_preparation(
+    function: Callable[_CleanupParams, _CleanupResult],
+) -> Callable[_CleanupParams, _CleanupResult]:
+    """Serialize staging recovery and publication under one elapsed budget."""
+
+    @wraps(function)
+    def wrapped(
+        *args: _CleanupParams.args,
+        **kwargs: _CleanupParams.kwargs,
+    ) -> _CleanupResult:
+        root_value = args[0] if args else kwargs.get("root")
+        if root_value is None:
+            raise ReviewBridgeError("review preparation root is required")
+        root = Path(str(root_value))
+        subject_path = kwargs.get("subject_path")
+        if subject_path is None:
+            raise ReviewBridgeError("review preparation subject is required")
+        _review_subject_preflight(root, Path(str(subject_path)))
+        prompt_value = kwargs.get("prompt")
+        if not isinstance(prompt_value, str):
+            raise ReviewBridgeError("review prompt must be text")
+        validate_review_prompt(prompt_value)
+        validate_review_prepare_controls(
+            reviewer_id=kwargs.get("reviewer_id", "local-reviewer"),
+            transport=kwargs.get("transport", DEFAULT_REVIEW_TRANSPORT),
+            model=kwargs.get("model", DEFAULT_REVIEW_MODEL),
+            base_url=kwargs.get("base_url", DEFAULT_REVIEW_BASE_URL),
+            operation_id=kwargs.get("operation_id"),
+            secret_allowlist_patterns=cast(
+                Sequence[str | dict[str, Any]] | None,
+                kwargs.get("secret_allowlist_patterns"),
+            ),
+            secret_allowlist_files=cast(
+                Sequence[Path] | None,
+                kwargs.get("secret_allowlist_files"),
+            ),
+        )
+        raw_timeout = kwargs.get(
+            "prepare_timeout_seconds",
+            REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+        )
+        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int):
+            raise ReviewBridgeError("prepare_timeout_seconds must be an integer")
+        timeout_seconds = _bounded_review_integer(
+            "prepare_timeout_seconds",
+            raw_timeout,
+            maximum=REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+        )
+        started_at = time.monotonic()
+        token = _ACTIVE_REVIEW_PREPARATION_STARTED_AT.set(started_at)
+        try:
+            with operation_lock(
+                root,
+                REVIEW_PREPARE_PUBLICATION_LOCK_ID,
+                timeout_seconds=float(timeout_seconds),
+            ):
+                if time.monotonic() > started_at + timeout_seconds:
+                    raise ReviewBridgeError(
+                        "review preparation exceeded its elapsed-time budget "
+                        "while waiting for publication authority"
+                    )
+                return function(*args, **kwargs)
+        finally:
+            _ACTIVE_REVIEW_PREPARATION_STARTED_AT.reset(token)
+
+    return wrapped
+
+
+def _cleanup_failed_review_preparation(
+    function: Callable[_CleanupParams, _CleanupResult],
+) -> Callable[_CleanupParams, _CleanupResult]:
+    """Remove the exact staging and published job paths if preparation aborts."""
+
+    @wraps(function)
+    def wrapped(
+        *args: _CleanupParams.args,
+        **kwargs: _CleanupParams.kwargs,
+    ) -> _CleanupResult:
+        state = _ReviewPreparationCleanupState()
+        token = _ACTIVE_REVIEW_PREPARATION_CLEANUP.set(state)
+        try:
+            return function(*args, **kwargs)
+        except BaseException:
+            preserve_authority = state.catalog_committed or not state.rollback_authorized
+            if (
+                not preserve_authority
+                and state.root is not None
+                and state.job_id is not None
+                and state.marker_path is not None
+            ):
+                catalog_state = _review_prepare_catalog_state(
+                    state.root,
+                    job_id=state.job_id,
+                    marker_path=state.marker_path,
+                )
+                if catalog_state == "committed":
+                    state.catalog_committed = True
+                    preserve_authority = True
+                elif catalog_state == "unknown":
+                    state.rollback_authorized = False
+                    preserve_authority = True
+            if not preserve_authority:
+                cleanup_succeeded = True
+                for cleanup_path in reversed(state.paths):
+                    try:
+                        if state.root is not None:
+                            _remove_plain_review_prepare_tree(
+                                state.root,
+                                cleanup_path,
+                            )
+                            if _path_exists_no_follow(cleanup_path):
+                                cleanup_succeeded = False
+                    except Exception:
+                        cleanup_succeeded = False
+                if (
+                    cleanup_succeeded
+                    and state.root is not None
+                    and state.job_id is not None
+                    and state.marker_path is not None
+                    and _review_prepare_catalog_state(
+                        state.root,
+                        job_id=state.job_id,
+                        marker_path=state.marker_path,
+                    )
+                    == "uncommitted"
+                ):
+                    _discard_review_prepare_marker_authority(
+                        state.root,
+                        state.marker_path,
+                        state.marker_sha256,
+                    )
+            raise
+        finally:
+            _ACTIVE_REVIEW_PREPARATION_CLEANUP.reset(token)
+
+    return wrapped
+
+
+@_serialize_review_preparation
+@_cleanup_failed_review_preparation
 def create_review_job(
     root: Path,
     *,
@@ -8161,43 +13260,126 @@ def create_review_job(
     model: str = DEFAULT_REVIEW_MODEL,
     base_url: str = DEFAULT_REVIEW_BASE_URL,
     include_diff: bool = True,
-    max_packet_bytes: int = 512_000,
-    max_file_bytes: int = 64_000,
-    max_files: int = 300,
-    secret_allowlist_patterns: list[str] | None = None,
-    secret_allowlist_files: list[Path] | None = None,
+    max_packet_bytes: int = REVIEW_DEFAULT_PACKET_BYTES,
+    max_file_bytes: int = REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+    max_files: int = REVIEW_DEFAULT_MAX_FILES,
+    max_subject_file_bytes: int = REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+    max_subject_bytes: int = REVIEW_DEFAULT_SUBJECT_BYTES,
+    prepare_timeout_seconds: int = REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    secret_allowlist_patterns: Sequence[str | dict[str, Any]] | None = None,
+    secret_allowlist_files: Sequence[Path] | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    init_db(root)
-    transport = str(transport or DEFAULT_REVIEW_TRANSPORT)
-    if transport not in SUPPORTED_TRANSPORTS:
-        raise ReviewBridgeError(f"unsupported review transport: {transport}")
-    if not prompt.strip():
-        raise ReviewBridgeError("review prompt must not be empty")
-    subject = Path(subject_path).resolve(strict=False)
-    if not subject.exists():
-        raise ReviewBridgeError(f"subject path does not exist: {subject}")
-    if _is_relative_to(subject, Path(root).resolve(strict=False)):
-        raise ReviewBridgeError("review subject must not be inside the Continuum root")
-    secret_allowlist = _compile_review_secret_allowlist(secret_allowlist_patterns, secret_allowlist_files)
+    (
+        max_packet_bytes,
+        max_file_bytes,
+        max_files,
+        max_subject_file_bytes,
+        max_subject_bytes,
+        prepare_timeout_seconds,
+    ) = validate_review_prepare_limits(
+        max_packet_bytes=max_packet_bytes,
+        max_file_bytes=max_file_bytes,
+        max_files=max_files,
+        max_subject_file_bytes=max_subject_file_bytes,
+        max_subject_bytes=max_subject_bytes,
+        prepare_timeout_seconds=prepare_timeout_seconds,
+    )
+    prompt = validate_review_prompt(prompt)
+    (
+        reviewer_id,
+        transport,
+        model,
+        base_url,
+        operation_id,
+        secret_allowlist,
+    ) = validate_review_prepare_controls(
+        reviewer_id=reviewer_id,
+        transport=transport,
+        model=model,
+        base_url=base_url,
+        operation_id=operation_id,
+        secret_allowlist_patterns=secret_allowlist_patterns,
+        secret_allowlist_files=secret_allowlist_files,
+    )
+    subject_preflight = _review_subject_preflight(root, Path(subject_path))
+    subject = subject_preflight.path
+    subject_type = subject_preflight.subject_type
     allowlist_counts = _review_allowlist_counts(secret_allowlist)
+    preparation_budget = _new_review_preparation_budget(
+        max_packet_bytes=max_packet_bytes,
+        max_subject_file_bytes=max_subject_file_bytes,
+        max_subject_bytes=max_subject_bytes,
+        prepare_timeout_seconds=prepare_timeout_seconds,
+        started_at=_ACTIVE_REVIEW_PREPARATION_STARTED_AT.get(),
+    )
+    init_db(root)
+    reconciled_preparations = _reconcile_review_prepare_publications(
+        root,
+        budget=preparation_budget,
+    )
 
     job_id = unique_id("review")
     job_dir = review_job_dir(root, job_id)
     temp_job_dir = review_bridge_root(root) / "tmp" / job_id
+    storage_before_parents = _review_prepare_storage_preflight(root)
     secure_mkdir(temp_job_dir.parent, secure_existing=True)
+    _assert_review_prepare_storage_unchanged(root, storage_before_parents)
+    storage_with_tmp = _review_prepare_storage_preflight(root, require_tmp=True)
     secure_mkdir(job_dir.parent, secure_existing=True)
-    if temp_job_dir.exists():
-        shutil.rmtree(temp_job_dir, ignore_errors=True)
-    secure_mkdir(temp_job_dir)
+    _assert_review_prepare_storage_unchanged(root, storage_with_tmp)
+    _review_prepare_storage_preflight(
+        root,
+        require_tmp=True,
+        require_jobs=True,
+    )
+    if _path_exists_no_follow(temp_job_dir) or _path_exists_no_follow(job_dir):
+        raise ReviewBridgeError(
+            f"review preparation job identity already exists: {job_id}"
+        )
+    cleanup_state = _ACTIVE_REVIEW_PREPARATION_CLEANUP.get()
+    if cleanup_state is not None:
+        cleanup_state.root = root
+        cleanup_state.paths.extend((temp_job_dir, job_dir))
+    _create_review_prepare_staging_dir(root, temp_job_dir)
 
     try:
-        git_info = _git_capture(subject, include_diff=include_diff, max_diff_bytes=max_packet_bytes // 2)
-        snapshot_subject, snapshot_files, file_limit_reached, snapshot_exclusions = _snapshot_subject(root, subject, temp_job_dir, max_files=max_files)
+        git_info = _git_capture(
+            subject,
+            subject_type=subject_type,
+            include_diff=include_diff,
+            max_diff_bytes=max(1, max_packet_bytes // 2),
+            deadline=preparation_budget.deadline,
+            budget=preparation_budget,
+        )
+        (
+            snapshot_subject,
+            snapshot_files,
+            snapshot_directories,
+            subject_inventory,
+            file_limit_reached,
+            snapshot_exclusions,
+            subject_content_seen,
+        ) = _snapshot_subject(
+            root,
+            subject,
+            temp_job_dir,
+            subject_type=subject_type,
+            max_files=max_files,
+            budget=preparation_budget,
+            subject_preflight=subject_preflight,
+        )
+        _assert_review_subject_unchanged(root, subject_preflight)
         if file_limit_reached:
             raise ReviewBridgeError(
                 f"review subject file limit exceeded: more than {int(max_files)} files; "
                 "review an existing release ZIP or increase --max-files for a full-capsule review"
+            )
+        captured_entry_count = len(snapshot_files) + len(snapshot_directories)
+        if captured_entry_count > REVIEW_ZIP_SCAN_MAX_MEMBERS:
+            raise ReviewBridgeError(
+                "review subject file and directory entry limit exceeded: "
+                f"{captured_entry_count} > {REVIEW_ZIP_SCAN_MAX_MEMBERS}"
             )
         custom_exclusions = [item for item in snapshot_exclusions if item.get("reason") == "custom_continuumignore"]
         if custom_exclusions:
@@ -8217,19 +13399,36 @@ def create_review_job(
                 "review subject contains paths that cannot be captured safely; strict review prep refuses incomplete coverage"
                 f" ({len(strict_exclusions)} path(s); first: {preview})"
             )
-        if not snapshot_files and _subject_has_regular_file(subject):
+        if not snapshot_files and not snapshot_directories and subject_content_seen:
             raise ReviewBridgeError("review subject produced an empty snapshot from a non-empty subject")
         snapshot_base = snapshot_subject if snapshot_subject.is_dir() else snapshot_subject.parent
-        manifest = [_file_manifest_entry(path, snapshot_base) for path in snapshot_files]
+        manifest = [
+            _file_manifest_entry(path, snapshot_base, budget=preparation_budget)
+            for path in snapshot_files
+        ]
+        directory_manifest = sorted(
+            path.relative_to(snapshot_subject).as_posix()
+            for path in snapshot_directories
+        )
         archive_uri: str | None = None
         archive_sha256: str | None = None
-        if subject.is_file() and snapshot_files:
+        if subject_type == "file" and snapshot_files:
             archive_path = snapshot_files[0]
-            archive_sha256 = file_sha256(archive_path)
+            archive_sha256 = str(manifest[0]["sha256"])
             archive_uri = str(archive_path)
-        elif snapshot_files:
+        elif subject_type == "directory":
             archive_path = temp_job_dir / "subject.zip"
-            archive_sha256 = _zip_subject(snapshot_subject, snapshot_files, archive_path)
+            archive_sha256 = _zip_subject(
+                snapshot_subject,
+                snapshot_files,
+                archive_path,
+                directories=snapshot_directories,
+                expected_hashes={
+                    str(entry["path"]): str(entry["sha256"])
+                    for entry in manifest
+                },
+                budget=preparation_budget,
+            )
             archive_uri = str(archive_path)
 
         packet_text, packet_warnings, packet_coverage = _build_packet(
@@ -8240,9 +13439,12 @@ def create_review_job(
             max_packet_bytes=max_packet_bytes,
             max_file_bytes=max_file_bytes,
             subject_label="subject/",
-            subject_type="directory" if subject.is_dir() else "file",
+            subject_type=subject_type,
+            directories=directory_manifest,
             file_limit_reached=file_limit_reached,
+            budget=preparation_budget,
         )
+        packet_coverage["manifest_directory_count"] = len(directory_manifest)
         if snapshot_exclusions:
             packet_coverage["subject_exclusions"] = snapshot_exclusions[:100]
             packet_coverage["subject_exclusion_count"] = len(snapshot_exclusions)
@@ -8263,6 +13465,7 @@ def create_review_job(
                         extra_allowlist=secret_allowlist,
                         suppressed_findings=suppressed_secret_findings,
                         outcome=secret_scan_outcome,
+                        budget=preparation_budget,
                     )
                 )
             elif archive_kind is not None:
@@ -8277,6 +13480,8 @@ def create_review_job(
                         path,
                         source=rel,
                         max_findings=REVIEW_SECRET_SCAN_MAX_FINDINGS - len(secret_findings),
+                        max_bytes=max_subject_file_bytes,
+                        budget=preparation_budget,
                         extra_allowlist=secret_allowlist,
                         suppressed_findings=suppressed_secret_findings,
                         outcome=secret_scan_outcome,
@@ -8294,54 +13499,69 @@ def create_review_job(
                 suppressed_findings=suppressed_secret_findings,
                 allowed_secret_hashes=suppressed_hashes,
                 outcome=secret_scan_outcome,
+                budget=preparation_budget,
             )
             secret_findings.extend(packet_findings)
         if secret_findings:
             _raise_secret_scan_block(secret_findings)
         if secret_scan_outcome.errors or secret_scan_outcome.skipped_sources or secret_scan_outcome.limits_hit:
             _raise_scan_outcome_block(secret_scan_outcome)
-        git_info_after = _git_capture(subject, include_diff=include_diff, max_diff_bytes=max_packet_bytes // 2)
-        if git_info_after != git_info:
-            raise ReviewBridgeError("subject git state changed during review preparation; retry with a stable tree")
-
-        temp_job_dir.rename(job_dir)
-        snapshot_subject = job_dir / snapshot_subject.relative_to(temp_job_dir)
-        snapshot_files = [job_dir / path.relative_to(temp_job_dir) for path in snapshot_files]
-        if archive_uri:
-            archive_uri = str(job_dir / Path(archive_uri).relative_to(temp_job_dir))
-        for subdirectory in REVIEW_JOB_MUTABLE_SUBDIRS:
-            secure_mkdir(job_dir / subdirectory, secure_existing=True)
+        _assert_review_subject_unchanged(root, subject_preflight)
     except Exception:
         shutil.rmtree(temp_job_dir, ignore_errors=True)
-        if not (job_dir / REVIEW_REQUEST_NAME).exists():
-            shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-    packet_path = job_dir / "review-packet.md"
-    prompt_path = job_dir / "review-prompt.md"
-    schema_path = job_dir / "expected-response.schema.json"
-    manifest_path = job_dir / "source-manifest.json"
-    inner_manifest_path = job_dir / "inner-archive-manifest.json"
-    request_path = job_dir / REVIEW_REQUEST_NAME
-    status_path = job_dir / REVIEW_STATUS_NAME
-    handoff_path = job_dir / "manual-handoff.md"
-    browser_handoff_path = job_dir / REVIEW_BROWSER_HANDOFF_NAME
-    allowlist_report_path = job_dir / REVIEW_ALLOWLIST_REPORT_NAME
+    def published_path(staging_path: Path) -> Path:
+        return job_dir / staging_path.relative_to(temp_job_dir)
+
+    packet_path = temp_job_dir / "review-packet.md"
+    prompt_path = temp_job_dir / "review-prompt.md"
+    schema_path = temp_job_dir / "expected-response.schema.json"
+    manifest_path = temp_job_dir / "source-manifest.json"
+    inner_manifest_path = temp_job_dir / "inner-archive-manifest.json"
+    request_path = temp_job_dir / REVIEW_REQUEST_NAME
+    status_path = temp_job_dir / REVIEW_STATUS_NAME
+    handoff_path = temp_job_dir / "manual-handoff.md"
+    browser_handoff_path = temp_job_dir / REVIEW_BROWSER_HANDOFF_NAME
+    allowlist_report_path = temp_job_dir / REVIEW_ALLOWLIST_REPORT_NAME
 
     inner_archive_manifest: dict[str, Any] | None = None
-    is_zip_file_subject = _is_zip_subject(subject)
+    is_zip_file_subject = bool(
+        subject_type == "file"
+        and archive_uri
+        and _is_zip_subject(Path(archive_uri))
+    )
     if archive_uri and is_zip_file_subject:
-        inner_archive_manifest = _zip_subject_member_manifest(Path(archive_uri))
+        inner_archive_manifest = _zip_subject_member_manifest(
+            Path(archive_uri),
+            max_member_bytes=max_subject_file_bytes,
+            max_total_bytes=max_subject_bytes,
+            archive_sha256=archive_sha256,
+            budget=preparation_budget,
+        )
         secure_write_text(inner_manifest_path, json_dumps(inner_archive_manifest))
 
-    public_manifest = _public_source_manifest("directory" if subject.is_dir() else "file", manifest, packet_coverage)
+    public_manifest = _public_source_manifest(
+        subject_type,
+        manifest,
+        directory_manifest,
+        packet_coverage,
+    )
     public_manifest_text = json_dumps(public_manifest)
     secure_write_text(packet_path, packet_text)
     secure_write_text(schema_path, json_dumps(REVIEW_RESULT_SCHEMA))
     secure_write_text(manifest_path, public_manifest_text)
 
     packet_sha256 = file_sha256(packet_path)
-    source_fingerprint = _source_fingerprint(subject, manifest, git_info, archive_sha256)
+    source_fingerprint = _source_fingerprint(
+        subject,
+        manifest,
+        git_info,
+        archive_sha256,
+        subject_type=subject_type,
+        directories=directory_manifest,
+    )
     capsule_challenge = secrets.token_urlsafe(32)
     request = {
         "schema": "epic-continuum.review-request/1",
@@ -8357,35 +13577,44 @@ def create_review_job(
         "review_objective": _trusted_review_objective({"review_objective": prompt}),
         "base_url": str(base_url),
         "subject_path": str(subject),
-        "subject_type": "directory" if subject.is_dir() else "file",
-        "snapshot_subject_path": str(snapshot_subject),
-        "subject_archive_uri": archive_uri,
+        "subject_type": subject_type,
+        "snapshot_subject_path": str(published_path(snapshot_subject)),
+        "subject_archive_uri": (
+            str(published_path(Path(archive_uri))) if archive_uri else None
+        ),
         "subject_archive_sha256": archive_sha256,
         "package_sha256": archive_sha256,
         "subject_sha256": archive_sha256,
-        "inner_archive_manifest_uri": str(inner_manifest_path) if inner_archive_manifest else None,
+        "inner_archive_manifest_uri": (
+            str(published_path(inner_manifest_path)) if inner_archive_manifest else None
+        ),
         "inner_archive_manifest_sha256": file_sha256(inner_manifest_path) if inner_archive_manifest else None,
         "inner_archive_member_count": int(inner_archive_manifest["member_count"]) if inner_archive_manifest else None,
-        "subject_manifest_uri": str(manifest_path),
-        "request_uri": str(request_path),
-        "status_uri": str(status_path),
-        "packet_uri": str(packet_path),
+        "subject_manifest_uri": str(published_path(manifest_path)),
+        "request_uri": str(published_path(request_path)),
+        "status_uri": str(published_path(status_path)),
+        "packet_uri": str(published_path(packet_path)),
         "packet_sha256": packet_sha256,
-        "prompt_uri": str(prompt_path),
-        "schema_uri": str(schema_path),
+        "prompt_uri": str(published_path(prompt_path)),
+        "schema_uri": str(published_path(schema_path)),
         "schema_sha256": file_sha256(schema_path),
         "packet_warnings": packet_warnings,
         "packet_coverage": packet_coverage,
         "source_fingerprint": source_fingerprint,
+        "source_fingerprint_version": 2,
+        "source_directory_count": len(directory_manifest),
         "include_diff": bool(include_diff),
         "max_packet_bytes": int(max_packet_bytes),
         "max_file_bytes": int(max_file_bytes),
         "max_files": int(max_files),
+        "max_subject_file_bytes": int(max_subject_file_bytes),
+        "max_subject_bytes": int(max_subject_bytes),
+        "prepare_timeout_seconds": int(prepare_timeout_seconds),
         "secret_allowlist_pattern_count": allowlist_counts["patterns"],
         "secret_allowlist_fingerprint_count": allowlist_counts["fingerprints"],
         "secret_allowlist_entry_count": allowlist_counts["total"],
         "secret_allowlist_file_count": len(secret_allowlist_files or []),
-        "secret_allowlist_report_uri": str(allowlist_report_path),
+        "secret_allowlist_report_uri": str(published_path(allowlist_report_path)),
         "secret_allowlist_suppressed_count": len(suppressed_secret_findings),
         "operation_id": operation_id,
         "status": "prepared",
@@ -8417,17 +13646,22 @@ def create_review_job(
         suppressed_findings=None,
         allowed_secret_hashes=suppressed_hashes,
         outcome=ScanOutcome(),
+        budget=preparation_budget,
     )
     if generated_findings:
         _raise_secret_scan_block(generated_findings, cleanup_dir=job_dir)
-    secure_write_text(request_path, json_dumps(_stored_job_record(root, job_id, request)))
     capsule_path, capsule_sha256 = _write_review_capsule(
-        job_dir,
+        temp_job_dir,
         request,
         snapshot_subject,
+        snapshot_files,
+        snapshot_directories,
+        manifest,
         manifest_path,
+        subject_archive_path=Path(archive_uri) if archive_uri else None,
         inner_manifest_path=inner_manifest_path if inner_archive_manifest else None,
         inner_manifest=inner_archive_manifest,
+        budget=preparation_budget,
     )
     capsule_scan_outcome = ScanOutcome()
     capsule_budget_exempt_members = {
@@ -8437,6 +13671,7 @@ def create_review_job(
         "expected-response.schema.json",
         "source-manifest.json",
         "review-packet.md",
+        "subject/",
     }
     prevalidated_nested_archives: dict[str, str] = {}
     if inner_archive_manifest is not None and request.get("subject_archive_uri"):
@@ -8451,22 +13686,26 @@ def create_review_job(
         outcome=capsule_scan_outcome,
         prevalidated_nested_archives=prevalidated_nested_archives,
         budget_exempt_members=capsule_budget_exempt_members,
+        budget=preparation_budget,
     )
     if capsule_findings:
         _raise_secret_scan_block(capsule_findings, cleanup_dir=job_dir)
     if capsule_scan_outcome.errors or capsule_scan_outcome.skipped_sources or capsule_scan_outcome.limits_hit:
         _raise_scan_outcome_block(capsule_scan_outcome, cleanup_dir=job_dir)
-    request["review_capsule_uri"] = str(capsule_path)
+    request["review_capsule_uri"] = str(published_path(capsule_path))
     request["review_capsule_sha256"] = capsule_sha256
-    request["browser_handoff_uri"] = str(browser_handoff_path)
+    request["browser_handoff_uri"] = str(published_path(browser_handoff_path))
     secure_write_text(request_path, json_dumps(_stored_job_record(root, job_id, request)))
     status = {
         "status": "prepared",
         "updated_at": utc_now(),
-        "browser_handoff_uri": str(browser_handoff_path),
+        "browser_handoff_uri": str(published_path(browser_handoff_path)),
         "attempt_count": 0,
     }
-    _write_status(root, job_id, status)
+    secure_write_text(
+        status_path,
+        json_dumps(_stored_status_record(root, job_id, status)),
+    )
     job_for_handoff = _merge_job_state(request, status)
     prompt_text = _review_prompt_text(job_for_handoff)
     prompt_findings = _scan_review_text_for_secrets(
@@ -8476,6 +13715,7 @@ def create_review_job(
         suppressed_findings=None,
         allowed_secret_hashes=suppressed_hashes,
         outcome=ScanOutcome(),
+        budget=preparation_budget,
     )
     if prompt_findings:
         _raise_secret_scan_block(prompt_findings, cleanup_dir=job_dir)
@@ -8491,6 +13731,7 @@ def create_review_job(
         suppressed_findings=None,
         allowed_secret_hashes=suppressed_hashes,
         outcome=ScanOutcome(),
+        budget=preparation_budget,
     )
     if browser_findings:
         _raise_secret_scan_block(browser_findings, cleanup_dir=job_dir)
@@ -8500,24 +13741,24 @@ def create_review_job(
         "job_id": job_id,
         "root": str(root),
         "job_dir": str(job_dir),
-        "request_uri": str(request_path),
-        "status_uri": str(status_path),
-        "packet_uri": str(packet_path),
-        "prompt_uri": str(prompt_path),
-        "schema_uri": str(schema_path),
-        "subject_manifest_uri": str(manifest_path),
-        "subject_archive_uri": archive_uri,
+        "request_uri": str(published_path(request_path)),
+        "status_uri": str(published_path(status_path)),
+        "packet_uri": str(published_path(packet_path)),
+        "prompt_uri": str(published_path(prompt_path)),
+        "schema_uri": str(published_path(schema_path)),
+        "subject_manifest_uri": str(published_path(manifest_path)),
+        "subject_archive_uri": request.get("subject_archive_uri"),
         "subject_archive_sha256": archive_sha256,
         "inner_archive_manifest_uri": request.get("inner_archive_manifest_uri"),
         "inner_archive_manifest_sha256": request.get("inner_archive_manifest_sha256"),
         "inner_archive_member_count": request.get("inner_archive_member_count"),
-        "review_capsule_uri": str(capsule_path),
+        "review_capsule_uri": str(published_path(capsule_path)),
         "review_capsule_sha256": capsule_sha256,
-        "browser_handoff_uri": str(browser_handoff_path),
+        "browser_handoff_uri": str(published_path(browser_handoff_path)),
         "packet_sha256": request["packet_sha256"],
         "packet_warnings": packet_warnings,
         "packet_coverage": packet_coverage,
-        "secret_allowlist_report_uri": str(allowlist_report_path),
+        "secret_allowlist_report_uri": str(published_path(allowlist_report_path)),
         "secret_allowlist_suppressed_count": len(suppressed_secret_findings),
         "transport": transport,
         "model": str(model),
@@ -8532,66 +13773,100 @@ def create_review_job(
         suppressed_findings=None,
         allowed_secret_hashes=suppressed_hashes,
         outcome=ScanOutcome(),
+        budget=preparation_budget,
     )
     if manual_findings:
         _raise_secret_scan_block(manual_findings, cleanup_dir=job_dir)
     secure_write_text(handoff_path, manual_handoff_text)
-    job_result["manual_handoff_uri"] = str(handoff_path)
+    job_result["manual_handoff_uri"] = str(published_path(handoff_path))
 
-    with closing(connect(root)) as conn:
-        artifact_rows: list[tuple[Path, str, bool]] = [
-            (packet_path, "review_packet", True),
-            (prompt_path, "review_prompt", True),
-            (schema_path, "review_schema", True),
-            (manifest_path, "review_subject_manifest", True),
-            (request_path, "review_request", True),
-            (capsule_path, "review_capsule", True),
-            (handoff_path, "review_manual_handoff", True),
-            (allowlist_report_path, "review_secret_allowlist_report", True),
-        ]
-        if inner_archive_manifest:
-            artifact_rows.append((inner_manifest_path, "review_inner_archive_manifest", True))
-        artifact_rows.append((browser_handoff_path, "review_browser_handoff_latest", False))
-        for path, kind, immutable in artifact_rows:
-            record_artifact(
-                conn,
-                kind=kind,
-                uri=_root_uri(root, path),
-                sha256=file_sha256(path),
-                size_bytes=path.stat().st_size,
-                operation_id=operation_id,
-                source_type="review_bridge",
-                trust_level="local_generated",
-                metadata={"job_id": job_id},
-                immutable=immutable,
-            )
-        record_artifact(
-            conn,
-            kind="review_status",
-            uri=_root_uri(root, status_path),
-            sha256=file_sha256(status_path),
-            size_bytes=status_path.stat().st_size,
-            operation_id=operation_id,
-            source_type="review_bridge",
-            trust_level="local_generated",
-            metadata={"job_id": job_id},
-            immutable=False,
+    for subdirectory in REVIEW_JOB_MUTABLE_SUBDIRS:
+        secure_mkdir(temp_job_dir / subdirectory, secure_existing=True)
+    artifact_entries: list[tuple[Path, str, bool]] = [
+        (packet_path, "review_packet", True),
+        (prompt_path, "review_prompt", True),
+        (schema_path, "review_schema", True),
+        (manifest_path, "review_subject_manifest", True),
+        (request_path, "review_request", True),
+        (capsule_path, "review_capsule", True),
+        (handoff_path, "review_manual_handoff", True),
+        (allowlist_report_path, "review_secret_allowlist_report", True),
+        (browser_handoff_path, "review_browser_handoff_latest", False),
+        (status_path, "review_status", False),
+    ]
+    if inner_archive_manifest:
+        artifact_entries.append(
+            (inner_manifest_path, "review_inner_archive_manifest", True)
         )
-        if archive_uri:
-            archive_path = Path(archive_uri)
-            record_artifact(
-                conn,
-                kind="review_subject_archive",
-                uri=_root_uri(root, archive_path),
-                sha256=str(archive_sha256),
-                size_bytes=archive_path.stat().st_size,
-                operation_id=operation_id,
-                source_type="review_bridge",
-                trust_level="local_generated",
-                metadata={"job_id": job_id},
-            )
-        conn.commit()
-
+    if archive_uri:
+        artifact_entries.append(
+            (Path(archive_uri), "review_subject_archive", True)
+        )
+    publication_plan = _review_prepare_artifact_plan(
+        temp_job_dir,
+        job_id,
+        artifact_entries,
+        budget=preparation_budget,
+    )
+    preparation_budget.check_deadline("publishing the completed review job")
+    _durably_flush_review_prepare_tree(
+        temp_job_dir,
+        budget=preparation_budget,
+    )
+    git_info_after = _git_capture(
+        subject,
+        subject_type=subject_type,
+        include_diff=include_diff,
+        max_diff_bytes=max(1, max_packet_bytes // 2),
+        deadline=preparation_budget.deadline,
+        budget=preparation_budget,
+    )
+    if git_info_after != git_info:
+        raise ReviewBridgeError(
+            "subject git state changed during review preparation; retry with a stable tree"
+        )
+    _assert_review_subject_matches_snapshot(
+        root,
+        subject,
+        subject_type=subject_type,
+        subject_preflight=subject_preflight,
+        initial_inventory=subject_inventory,
+        initial_exclusions=snapshot_exclusions,
+        initial_content_seen=subject_content_seen,
+        snapshot_manifest=manifest,
+        max_files=max_files,
+        budget=preparation_budget,
+    )
+    marker_path, _marker_sha256 = _catalog_review_prepare_marker(
+        root,
+        temp_job_dir,
+        job_id=job_id,
+        operation_id=operation_id,
+        plan=publication_plan,
+    )
+    preparation_budget.check_deadline("publishing the completed review job")
+    publication = _publish_staged_review_job(
+        root,
+        job_id=job_id,
+        staging_dir=temp_job_dir,
+        job_dir=job_dir,
+        marker_path=marker_path,
+        budget=preparation_budget,
+        on_catalog_commit=(
+            (lambda: setattr(cleanup_state, "catalog_committed", True))
+            if cleanup_state is not None
+            else None
+        ),
+        on_catalog_unknown=(
+            (lambda: setattr(cleanup_state, "rollback_authorized", False))
+            if cleanup_state is not None
+            else None
+        ),
+    )
+    if cleanup_state is not None:
+        cleanup_state.catalog_committed = True
+    job_result["publication"] = publication
+    job_result["reconciled_preparations"] = reconciled_preparations
     return job_result
 
 
@@ -8623,10 +13898,7 @@ def _stored_status_record(root: Path, job_id: str, job: dict[str, Any]) -> dict[
 
 
 def _validate_operation_id(operation_id: str | None) -> None:
-    if operation_id is not None and (
-        not isinstance(operation_id, str) or not operation_id
-    ):
-        raise ReviewBridgeError("operation id must be null or a non-empty string")
+    validate_review_operation_id(operation_id)
 
 
 def _browser_reservation_artifact_rows(
@@ -9514,26 +14786,100 @@ def _openai_chat_completion(
         "temperature": 0,
         "max_tokens": int(max_tokens),
     }
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            response_text = _validated_review_response_text(
-                _read_bounded_stream_bytes(
-                    response,
-                    max_bytes=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
-                ),
-                label="review endpoint response",
-            )
-            return json.loads(response_text)
-    except urllib.error.HTTPError as exc:
-        body = _bounded_diagnostic_text(
-            _read_bounded_stream_bytes(exc, max_bytes=1_200),
-            max_bytes=1_000,
+    child_request = {
+        "url": url,
+        "body": json.dumps(payload, separators=(",", ":")),
+        "socket_timeout_seconds": max(1, int(timeout_seconds)),
+        "response_limit_bytes": REVIEW_INTEGRITY_MAX_RECORD_BYTES,
+        "diagnostic_limit_bytes": 1_200,
+    }
+    request_text = json_dumps(child_request)
+    if len(request_text.encode("utf-8")) > REVIEW_MAX_PACKET_BYTES * 3:
+        raise ReviewBridgeError(
+            "review endpoint request exceeds its bounded transport size"
         )
-        raise ReviewBridgeError(f"review endpoint HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise ReviewBridgeError(f"review endpoint unavailable: {exc}") from exc
+    descriptor, request_name = tempfile.mkstemp(
+        prefix="continuum-review-endpoint-",
+        suffix=".json",
+    )
+    request_path = Path(request_name)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(request_text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        secure_file(request_path)
+        completed = _run_bounded_process(
+            [sys.executable, "-c", _OPENAI_ENDPOINT_CHILD_SCRIPT, str(request_path)],
+            cwd=request_path.parent,
+            env=None,
+            timeout_seconds=max(1, int(timeout_seconds)),
+            stdout_limit=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
+            stderr_limit=REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES,
+            total_limit=(
+                REVIEW_INTEGRITY_MAX_RECORD_BYTES
+                + REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES
+            )
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        request_path.unlink(missing_ok=True)
+    if completed.timed_out:
+        raise ReviewBridgeError(
+            "review endpoint request exceeded its total elapsed-time limit"
+        )
+    if completed.output_exceeded:
+        if completed.observed_stdout_bytes > REVIEW_INTEGRITY_MAX_RECORD_BYTES:
+            _validated_review_response_text(
+                completed.stdout,
+                label="review endpoint response",
+                observed_size=completed.observed_stdout_bytes,
+                observed_size_is_exact=False,
+            )
+        raise ReviewBridgeError(
+            "review endpoint diagnostic output exceeded its bounded capture limit"
+        )
+    if completed.returncode != 0:
+        diagnostic_text = completed.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        try:
+            diagnostic = json.loads(diagnostic_text)
+        except json.JSONDecodeError:
+            diagnostic = {}
+        if completed.returncode == 22 and isinstance(diagnostic, dict):
+            code = diagnostic.get("code", "unknown")
+            body = _bounded_diagnostic_text(
+                str(diagnostic.get("body") or ""),
+                max_bytes=1_000,
+            )
+            raise ReviewBridgeError(f"review endpoint HTTP {code}: {body}")
+        detail = (
+            str(diagnostic.get("detail") or "")
+            if isinstance(diagnostic, dict)
+            else ""
+        )
+        if not detail:
+            detail = _bounded_diagnostic_text(completed.stderr)
+        raise ReviewBridgeError(f"review endpoint unavailable: {detail}")
+    response_text = _validated_review_response_text(
+        completed.stdout,
+        label="review endpoint response",
+        observed_size=completed.observed_stdout_bytes,
+        observed_size_is_exact=True,
+    )
+    try:
+        response = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise ReviewBridgeError(
+            "review endpoint returned malformed JSON"
+        ) from exc
+    if not isinstance(response, dict):
+        raise ReviewBridgeError("review endpoint returned a non-object response")
+    return response
 
 
 def _run_hermes_oneshot(
@@ -9599,45 +14945,49 @@ def _run_hermes_oneshot(
     ]
     if model:
         command.extend(["--model", model])
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        completed = subprocess.run(
+    try:
+        completed = _run_bounded_process(
             command,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            timeout=timeout_seconds,
-            check=False,
+            cwd=None,
+            env=None,
+            timeout_seconds=timeout_seconds,
+            stdout_limit=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
+            stderr_limit=REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES,
+            total_limit=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
         )
-        if completed.returncode != 0:
-            stderr_file.seek(0)
-            stderr_value: str | bytes = (
-                completed.stderr
-                if completed.stderr not in (None, "", b"")
-                else _read_bounded_stream_bytes(stderr_file, max_bytes=1_200)
+    except OSError as exc:
+        raise ReviewBridgeError("Hermes review transport could not be started") from exc
+    if completed.timed_out:
+        raise ReviewBridgeError(
+            f"Hermes review transport exceeded its {timeout_seconds}-second timeout"
+        )
+    if completed.output_exceeded:
+        if completed.observed_stdout_bytes > REVIEW_INTEGRITY_MAX_RECORD_BYTES:
+            _validated_review_response_text(
+                completed.stdout,
+                label="Hermes review response",
+                observed_size=completed.observed_stdout_bytes,
+                observed_size_is_exact=False,
             )
-            diagnostic = _bounded_diagnostic_text(stderr_value)
-            if not diagnostic:
-                stdout_file.seek(0)
-                stdout_value: str | bytes = (
-                    completed.stdout
-                    if completed.stdout not in (None, "", b"")
-                    else _read_bounded_stream_bytes(stdout_file, max_bytes=1_200)
-                )
-                diagnostic = _bounded_diagnostic_text(stdout_value)
+        if completed.observed_stderr_bytes > REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES:
             raise ReviewBridgeError(
-                "Hermes review transport failed "
-                f"(exit {completed.returncode}): {diagnostic}"
+                "Hermes review transport diagnostic output exceeded its "
+                f"{REVIEW_PROCESS_DIAGNOSTIC_MAX_BYTES}-byte limit"
             )
-        stdout_file.seek(0)
-        stdout_value = (
-            completed.stdout
-            if completed.stdout is not None
-            else _read_bounded_stream_bytes(
-                stdout_file,
-                max_bytes=REVIEW_INTEGRITY_MAX_RECORD_BYTES,
-            )
+        raise ReviewBridgeError(
+            "Hermes review transport combined output exceeded its "
+            f"{REVIEW_INTEGRITY_MAX_RECORD_BYTES}-byte limit"
+        )
+    if completed.returncode != 0:
+        diagnostic = _bounded_diagnostic_text(completed.stderr)
+        if not diagnostic:
+            diagnostic = _bounded_diagnostic_text(completed.stdout)
+        raise ReviewBridgeError(
+            "Hermes review transport failed "
+            f"(exit {completed.returncode}): {diagnostic}"
         )
     content = _validated_review_response_text(
-        stdout_value,
+        completed.stdout,
         label="Hermes review response",
     )
     return _validated_review_response_text(
@@ -9882,11 +15232,20 @@ def run_review_job(
     transport: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
-    timeout_seconds: int = 900,
-    max_tokens: int = 4096,
+    timeout_seconds: int = REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS,
+    max_tokens: int = REVIEW_DEFAULT_MAX_TOKENS,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    _validate_operation_id(operation_id)
+    timeout_seconds, max_tokens = validate_review_transport_limits(
+        timeout_seconds=timeout_seconds,
+        max_tokens=max_tokens,
+    )
+    transport, model, base_url, operation_id = validate_review_run_controls(
+        transport=transport,
+        model=model,
+        base_url=base_url,
+        operation_id=operation_id,
+    )
     _validate_review_job_storage(root, job_id)
     init_db(root)
     _assert_review_job_not_quarantined(root, job_id)
@@ -11802,16 +17161,102 @@ def review_job_status(root: Path, *, job_id: str) -> dict[str, Any]:
 
 def review_check_current(root: Path, *, job_id: str) -> dict[str, Any]:
     job = _load_job(root, job_id)
-    subject = Path(str(job.get("subject_path") or ""))
-    if not subject.exists():
+    stored_subject = Path(str(job.get("subject_path") or ""))
+    try:
+        subject_preflight = _review_subject_preflight(root, stored_subject)
+        subject = subject_preflight.path
+    except ReviewBridgeError as exc:
         return {
             "ok": False,
             "job_id": job_id,
             "current": False,
-            "reason": "subject_missing",
+            "reason": (
+                "subject_path_unsafe"
+                if _path_exists_no_follow(stored_subject)
+                else "subject_missing"
+            ),
+            "subject_path": str(stored_subject),
+            "detail": _bounded_diagnostic_text(str(exc)),
+        }
+    stored_subject_type = str(job.get("subject_type") or "")
+    if stored_subject_type != subject_preflight.subject_type:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "subject_type_changed_since_review_preparation",
+            "subject_path": str(subject),
+            "expected_subject_type": stored_subject_type,
+            "current_subject_type": subject_preflight.subject_type,
+        }
+    subject_type = subject_preflight.subject_type
+    def stored_limit(name: str, default: int) -> Any:
+        value = job.get(name)
+        return default if value is None else value
+
+    try:
+        (
+            max_packet_bytes,
+            _max_file_bytes,
+            max_files,
+            max_subject_file_bytes,
+            max_subject_bytes,
+            prepare_timeout_seconds,
+        ) = validate_review_prepare_limits(
+            max_packet_bytes=stored_limit(
+                "max_packet_bytes",
+                REVIEW_DEFAULT_PACKET_BYTES,
+            ),
+            max_file_bytes=stored_limit(
+                "max_file_bytes",
+                REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+            ),
+            max_files=stored_limit("max_files", REVIEW_DEFAULT_MAX_FILES),
+            max_subject_file_bytes=stored_limit(
+                "max_subject_file_bytes",
+                REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+            ),
+            max_subject_bytes=stored_limit(
+                "max_subject_bytes",
+                REVIEW_DEFAULT_SUBJECT_BYTES,
+            ),
+            prepare_timeout_seconds=stored_limit(
+                "prepare_timeout_seconds",
+                REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+            ),
+        )
+    except (TypeError, ValueError, ReviewBridgeError):
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "stored_review_limits_invalid",
             "subject_path": str(subject),
         }
-    files, file_limit_reached, exclusions = _collect_subject_files(root, subject, max_files=int(job.get("max_files") or 300))
+    current_budget = _new_review_preparation_budget(
+        max_packet_bytes=max_packet_bytes,
+        max_subject_file_bytes=max_subject_file_bytes,
+        max_subject_bytes=max_subject_bytes,
+        prepare_timeout_seconds=prepare_timeout_seconds,
+    )
+    try:
+        inventory, file_limit_reached, exclusions, _content_seen = _collect_subject_files(
+            root,
+            subject,
+            subject_type=subject_type,
+            subject_preflight=subject_preflight,
+            max_files=max_files,
+            budget=current_budget,
+        )
+    except ReviewBridgeError as exc:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "subject_cannot_be_enumerated_safely",
+            "subject_path": str(subject),
+            "detail": _bounded_diagnostic_text(str(exc)),
+        }
     if file_limit_reached:
         return {
             "ok": False,
@@ -11819,7 +17264,18 @@ def review_check_current(root: Path, *, job_id: str) -> dict[str, Any]:
             "current": False,
             "reason": "subject_file_limit_reached_during_current_check",
             "subject_path": str(subject),
-            "max_files": int(job.get("max_files") or 300),
+            "max_files": max_files,
+        }
+    captured_entry_count = len(inventory.files) + len(inventory.directories)
+    if captured_entry_count > REVIEW_ZIP_SCAN_MAX_MEMBERS:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "subject_entry_limit_reached_during_current_check",
+            "subject_path": str(subject),
+            "entry_count": captured_entry_count,
+            "max_entries": REVIEW_ZIP_SCAN_MAX_MEMBERS,
         }
     custom_exclusions = [item for item in exclusions if item.get("reason") == "custom_continuumignore"]
     if custom_exclusions:
@@ -11843,15 +17299,78 @@ def review_check_current(root: Path, *, job_id: str) -> dict[str, Any]:
             "exclusions": strict_exclusions[:20],
         }
     subject_sha256: str | None
-    if subject.is_file():
-        manifest = [_file_manifest_entry(subject, subject.parent)]
-        subject_sha256 = file_sha256(subject)
-    else:
-        manifest = [_file_manifest_entry(path, subject) for path in files]
-        raw_subject_sha256 = job.get("subject_archive_sha256")
-        subject_sha256 = str(raw_subject_sha256) if raw_subject_sha256 else None
-    git_info = _git_capture(subject, include_diff=bool(job.get("include_diff", True)), max_diff_bytes=int(job.get("max_packet_bytes") or 512_000) // 2)
-    current_fingerprint = _source_fingerprint(subject, manifest, git_info, subject_sha256)
+    try:
+        if subject_type == "file":
+            manifest = [
+                _file_manifest_entry(
+                    subject,
+                    subject.parent,
+                    budget=current_budget,
+                    count_subject_bytes=True,
+                    expected=inventory.root,
+                    inventory=inventory,
+                )
+            ]
+            subject_sha256 = str(manifest[0]["sha256"])
+        else:
+            manifest = [
+                _file_manifest_entry(
+                    entry.path,
+                    subject,
+                    budget=current_budget,
+                    count_subject_bytes=True,
+                    expected=entry,
+                    inventory=inventory,
+                )
+                for entry in inventory.files
+            ]
+            raw_subject_sha256 = job.get("subject_archive_sha256")
+            subject_sha256 = str(raw_subject_sha256) if raw_subject_sha256 else None
+        git_info = _git_capture(
+            subject,
+            subject_type=subject_type,
+            include_diff=bool(job.get("include_diff", True)),
+            max_diff_bytes=max(1, max_packet_bytes // 2),
+            deadline=current_budget.deadline,
+            budget=current_budget,
+        )
+        final_inventory, final_limit, _final_exclusions, _final_content_seen = (
+            _collect_subject_files(
+                root,
+                subject,
+                subject_type=subject_type,
+                subject_preflight=subject_preflight,
+                max_files=max_files,
+                budget=current_budget,
+            )
+        )
+        if final_limit != file_limit_reached or final_inventory != inventory:
+            raise ReviewBridgeError(
+                "review subject inventory changed during currentness check"
+            )
+        _assert_review_subject_unchanged(root, subject_preflight)
+    except ReviewBridgeError as exc:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "current": False,
+            "reason": "subject_currentness_check_failed_safely",
+            "subject_path": str(subject),
+            "detail": _bounded_diagnostic_text(str(exc)),
+        }
+    directory_manifest = [entry.relative for entry in inventory.directories]
+    current_fingerprint = _source_fingerprint(
+        subject,
+        manifest,
+        git_info,
+        subject_sha256,
+        subject_type=subject_type,
+        directories=(
+            directory_manifest
+            if job.get("source_fingerprint_version") == 2
+            else None
+        ),
+    )
     expected = str(job.get("source_fingerprint") or "")
     return {
         "ok": current_fingerprint == expected,

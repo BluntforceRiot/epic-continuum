@@ -15,9 +15,36 @@ or a tool-loop question, Continuum marks the job `review_failed` and preserves t
 
 ## Job Layout
 
-`review-prepare` first copies the subject into a frozen snapshot under the job directory. The packet,
+`review-prepare` validates the prompt, cross-field limits, transport, and the lexical subject path before it
+initializes the Continuum root. The subject and every existing path component must be a plain directory or
+regular file; a symlink, junction, or reparse-point component is rejected. `review-check-current` repeats the
+same path check and reports an unsafe source as non-current.
+
+Preparation copies the subject into a frozen snapshot under a private staging directory. The packet,
 manifest, subject archive, and capsule are all generated from that snapshot, not from later reads of the
-live worktree.
+live worktree. Snapshot inputs are opened component by component without following links, must remain
+regular files with stable identity and size, and are copied through the already-open descriptor. Capsule
+construction consumes the exact snapshot file list and rechecks every member against its manifest hash; it
+does not rediscover files with a second tree walk. A link, FIFO, file-identity substitution, or snapshot
+mutation aborts preparation. POSIX opens start at the filesystem anchor and pin every absolute ancestor;
+Windows validates the complete ancestor chain both before and after opening the file. The subject's original
+file/directory type and filesystem identity are frozen at preflight and rechecked after snapshotting. After
+the capsule is complete, Continuum re-enumerates the live subject and compares the complete inventory,
+exclusions, identities, sizes, modes, timestamps, and file hashes to the frozen snapshot immediately before
+publication authority is created.
+
+The complete staged job is renamed into `exports/review_bridge/jobs` only after all artifacts, scans,
+handoffs, mutable subdirectories, and the final deadline check succeed. Publication is serialized per root.
+Before creating journal authority, Continuum flushes every staged file, then every staged directory from
+deepest to shallowest, and finally the staging parent. A flush failure aborts preparation without a published
+job or marker. Marker creation and the final rename also flush their affected parent directories.
+Before the rename, Continuum writes and catalogs a sibling `tmp/<job-id>.ready.json` journal containing the
+exact sorted artifact plan. The artifact rows and retirement of that journal authority commit in one SQLite
+transaction with `synchronous=FULL` after the published tree passes the existing exact tree/catalog integrity grammar. On the next
+prepare, an interrupted bound staging tree or renamed tree is finalized deterministically; incomplete
+unbound staging is rolled back, a leftover post-commit journal file is removed without changing the durable
+job, and conflicting or drifted evidence is preserved and refused. The journal never enters the job tree or
+the review capsule.
 
 It creates one job under the Continuum root:
 
@@ -174,9 +201,10 @@ preferred file format is JSONL with exact finding fingerprints:
 ```
 
 The fingerprint must match the canonical scanner source, line number, finding type, matched secret SHA-256,
-and full line SHA-256. Replacing the fixture value with a different token invalidates the exception. The legacy
-`--secret-allowlist-pattern` route remains only for non-hashed false positives; hashed token and private-key
-findings are never suppressed by a source-line regex alone. Raw allowlist file paths are not written into the
+and full line SHA-256. Replacing the fixture value with a different token invalidates the exception. The
+`--secret-allowlist-pattern` route remains only for non-hashed false positives and accepts an anchored
+`source:line:text` literal with optional leading or trailing `.*`; general regular expressions are rejected so
+matching remains linear. Hashed findings are never suppressed by a source-line literal alone. Raw allowlist file paths are not written into the
 public capsule; only counts are recorded. Suppressed findings are written to the local
 `secret-allowlist-report.json` with redacted snippets and stable hashes. If the scan blocks, Continuum removes
 the temporary preparation directory and does not leave an uploadable capsule or subject archive behind.
@@ -187,10 +215,54 @@ fingerprint for any new synthetic fixture, run the script with `--write`. It rel
 only line numbers change, removes and reports obsolete approvals, and refuses to write if any scanned finding
 does not match an approved source/type/secret/line fingerprint.
 
-Directory subjects must fit under `--max-files`. If the file limit is reached, a custom `.continuumignore`
-rule excludes subject files, the subject is inside the Continuum root, or a non-empty subject produces an
-empty snapshot, `review-prepare` fails rather than silently claiming full coverage. For large release reviews,
-pass the already-built release ZIP as the subject.
+Directory subjects must fit under `--max-files`. Enumeration counts every directory entry, including empty
+directories and ignored candidates, against
+`min(16,000, max(1,000, max_files * 8))`; it checks the shared deadline while reading each entry. This keeps
+both `review-prepare` and `review-check-current` bounded even when few or no regular files are selected. The
+combined included file/directory inventory also stops at 2,000 entries during enumeration, before snapshot
+copying. If the file, combined-entry, or traversal limit is reached, a custom `.continuumignore` rule excludes subject files, the subject
+is inside the Continuum root, or a non-empty subject produces an empty snapshot, `review-prepare` fails
+rather than silently claiming full coverage. Every included directory is identity-bound during enumeration,
+preserved explicitly in the snapshot, manifest, subject ZIP, capsule, and source fingerprint, and checked by
+`review-check-current`; adding or removing an empty directory therefore makes the prior review stale. For large release reviews, pass the already-built release ZIP
+as the subject.
+
+Preparation also has one shared resource budget. File copies, hashes, excerpts, archive inspection, ZIP
+creation, capsule creation, generated temporary data, and elapsed time consume that budget; sampling reads
+only the requested bytes plus one, and Git output is drained while Git is running. Git runs with system and
+global configuration disabled, repository executable helpers overridden, optional writes disabled, and
+external/text-conversion diff drivers disabled. The public CLI and MCP surface use the same defaults and hard
+maxima. Waiting for the root-wide preparation/publication lock consumes the same elapsed-time budget:
+
+| Control | Default | Hard maximum |
+| --- | ---: | ---: |
+| `max_packet_bytes` | 512,000 | 4,000,000 |
+| `max_file_bytes` | 64,000 | 4,000,000 |
+| `max_files` | 300 | 2,000 |
+| `max_subject_file_bytes` | 32,000,000 | 32,000,000 |
+| `max_subject_bytes` | 64,000,000 | 256,000,000 |
+| `prepare_timeout_seconds` | 120 | 600 |
+
+The CLI spellings for the last three are `--max-subject-file-bytes`, `--max-subject-bytes`, and
+`--prepare-timeout-seconds`. The review prompt is non-empty UTF-8 text with a 4,000,000-byte ceiling; a
+`--prompt-file` read stops at that ceiling plus one byte. Values outside the published range, a per-file
+subject limit greater than the total subject limit, and invalid prompts are rejected before the CLI/MCP
+operation guard or a review job is created.
+
+Reviewer IDs, models, and base URLs are single-line UTF-8 controls capped at 256, 512, and 2,048 bytes.
+Operation IDs use one portable filename component of at most 128 characters. Preparation accepts at most 32
+allowlist files, 1,000,000 bytes per file, 4,000,000 aggregate file bytes, 5,000 total entries, 4,096 bytes per
+entry, and 1,000,000 aggregate entry bytes. `review-run` applies the same model and base-URL caps to runtime
+overrides. CLI and MCP reject invalid controls before opening their operation guard; the direct core rejects
+them before it validates job storage or reserves an attempt.
+
+ZIP member count is established from bounded EOCD/ZIP64 and fixed central-directory headers before Python's
+ZIP object is constructed. The central directory is capped at 16,000,000 bytes and member names at 4,096
+bytes, so a forged count cannot defer the 2,000-member rejection until after metadata allocation. ZIP64 uses
+the fixed end record supported by Python's parser, and the locator offset must bind that exact record after
+any concatenated prefix is accounted for. Only
+stored and deflated ZIP members are accepted. Other compression methods are rejected before their Python
+decoder can be allocated, both during inspection and when expanding a subject ZIP into the capsule.
 
 ## Validation
 
@@ -212,8 +284,24 @@ exactly 4,000,000 encoded bytes. The same predicate covers the direct endpoint's
 transport wrapper and extracted reviewer content, Hermes output, inline ingest,
 reserved browser files, external result paths, and every durable resume read.
 External and network reads stop after the limit plus one byte; Hermes output is
-captured through a file-backed bounded read. Direct transport validates both the
-wrapper and reviewer content before writing either one.
+drained through bounded pipes while the child runs. Continuum terminates the
+Hermes process tree as soon as stdout, diagnostic stderr, or their combined
+ceiling is crossed, and does the same on timeout. Direct endpoint work runs in
+one contained child with bounded stdout/stderr, so connection, headers, and body
+share one forcibly enforced elapsed-time limit instead of receiving a fresh
+timeout per socket read. Direct transport validates both the wrapper and
+reviewer content before writing either one. `review-run`
+uses the same CLI/MCP hard bounds: `timeout_seconds` defaults to 900 and is at
+most 3,600; `max_tokens` defaults to 4,096 and is at most 65,536.
+
+On Windows, the child is created suspended and attached to a kill-on-close Job
+Object before any child code is resumed. If that containment cannot be
+established, the suspended process is terminated and the review run fails. On
+POSIX, the child starts in a dedicated process group, and Continuum terminates
+that complete group on timeout, output limit, or launcher exit even when a
+descendant closed the captured pipes. POSIX descendants that deliberately
+create a new session or process group are outside this portable containment
+contract; reviewer launchers must not detach them.
 
 For a fresh oversized automated response, Continuum finalizes the existing
 reservation as `transport_failed`, stores only the bounded error evidence, and
@@ -244,7 +332,7 @@ continuum review-prepare \
 ```
 
 If a fixture or documentation line trips the review secret scanner, prefer an exact fingerprint allowlist file.
-Legacy regex patterns can only suppress non-hashed findings:
+Anchored literal patterns with optional edge `.*` can only suppress non-hashed findings:
 
 ```bash
 continuum review-prepare \
@@ -375,7 +463,9 @@ continuum review-check-current \
   --job-id review_20260624T000000Z_example
 ```
 
-If `current` is false, create a new review job instead of patching stale findings.
+If `current` is false, create a new review job instead of patching stale findings. A legacy or damaged job
+whose stored preparation limits are invalid reports `reason: stored_review_limits_invalid` rather than
+raising an unstructured validation error.
 
 Run a local OpenAI-compatible reviewer directly:
 
@@ -390,8 +480,14 @@ continuum review-prepare \
 
 continuum review-run \
   --root ./.continuum-demo \
-  --job-id review_20260624T000000Z_example
+  --job-id review_20260624T000000Z_example \
+  --operation-id direct-review-001
 ```
+
+`review-run --operation-id` and the MCP `continuum_review_run.operation_id`
+name one logical automated reservation. Reuse the same value after an
+interruption to reconcile or replay that exact attempt without another model
+call. Use a different value only when intentionally starting the next attempt.
 
 Run through Hermes Agent:
 
@@ -405,7 +501,8 @@ continuum review-prepare \
 
 continuum review-run \
   --root ./.continuum-demo \
-  --job-id review_20260624T000000Z_example
+  --job-id review_20260624T000000Z_example \
+  --operation-id hermes-review-001
 ```
 
 The Hermes path passes file locations, hashes, and a pre-filled response template to
@@ -442,7 +539,8 @@ MCP-capable agents can use the same workflow without shelling out:
 
 `continuum_review_prepare` and `continuum_review_run` are marked open-world because they can package paths
 outside the memory root and call external or local model endpoints. Configure `CONTINUUM_ALLOWED_ROOTS` so
-the MCP server can access the intended repository or review-result path.
+the MCP server can access the intended repository or review-result path. Supply the same non-empty
+`operation_id` to `continuum_review_run` when recovering one interrupted automated attempt.
 
 ## What This Solves
 

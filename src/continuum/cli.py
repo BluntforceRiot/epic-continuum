@@ -48,6 +48,25 @@ from .core.review_bridge import (
     DEFAULT_REVIEW_BASE_URL,
     DEFAULT_REVIEW_MODEL,
     DEFAULT_REVIEW_TRANSPORT,
+    REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+    REVIEW_DEFAULT_MAX_FILES,
+    REVIEW_DEFAULT_MAX_TOKENS,
+    REVIEW_DEFAULT_PACKET_BYTES,
+    REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS,
+    REVIEW_DEFAULT_SUBJECT_BYTES,
+    REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+    REVIEW_MAX_FILES,
+    REVIEW_MAX_BASE_URL_BYTES,
+    REVIEW_MAX_FILE_SAMPLE_BYTES,
+    REVIEW_MAX_MODEL_BYTES,
+    REVIEW_MAX_TOKENS,
+    REVIEW_MAX_PACKET_BYTES,
+    REVIEW_MAX_PROMPT_BYTES,
+    REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+    REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+    REVIEW_MAX_SUBJECT_BYTES,
+    REVIEW_MAX_SUBJECT_FILE_BYTES,
     SUPPORTED_TRANSPORTS,
     create_review_job,
     ingest_review_result,
@@ -57,6 +76,11 @@ from .core.review_bridge import (
     review_job_status,
     run_review_job,
     upgrade_review_job_integrity,
+    validate_review_prepare_controls,
+    validate_review_prepare_limits,
+    validate_review_prompt,
+    validate_review_run_controls,
+    validate_review_subject_path,
 )
 from .core.store import (
     append_scroll_event,
@@ -107,6 +131,58 @@ from .integrations.hermes_adapter import install_hermes_adapter
 
 ABSOLUTE_PATH_RE = re.compile(r"(?i)(?:[A-Z]:[\\/][^\s\"'<>|]+|/[^\s\"'<>]+)")
 MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
+
+
+def bounded_cli_integer(name: str, maximum: int) -> Callable[[str], int]:
+    """Build an argparse integer parser with the same public hard bound as MCP."""
+
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
+        if parsed < 1 or parsed > maximum:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be between 1 and {maximum}"
+            )
+        return parsed
+
+    return parse
+
+
+def bounded_cli_text(name: str, maximum_bytes: int) -> Callable[[str], str]:
+    """Build an argparse UTF-8 parser with the same public byte ceiling."""
+
+    def parse(value: str) -> str:
+        if len(value) > maximum_bytes:
+            raise argparse.ArgumentTypeError(
+                f"{name} exceeds its {maximum_bytes}-byte UTF-8 limit"
+            )
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be valid UTF-8 text"
+            ) from exc
+        if len(encoded) > maximum_bytes:
+            raise argparse.ArgumentTypeError(
+                f"{name} exceeds its {maximum_bytes}-byte UTF-8 limit"
+            )
+        return value
+
+    return parse
+
+
+def read_bounded_cli_text_file(path: Path, *, max_bytes: int) -> str:
+    """Read one CLI text input through an exact byte ceiling."""
+    with Path(path).open("rb") as handle:
+        payload = handle.read(max(1, int(max_bytes)) + 1)
+    if len(payload) > max_bytes:
+        raise ValueError(f"review prompt file exceeds its {max_bytes}-byte limit")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("review prompt file must contain valid UTF-8 text") from exc
 
 
 def redact_cli_error_message(message: str) -> str:
@@ -623,14 +699,47 @@ def build_parser() -> argparse.ArgumentParser:
     p_review_prepare.add_argument("--model", default=DEFAULT_REVIEW_MODEL)
     p_review_prepare.add_argument("--base-url", default=DEFAULT_REVIEW_BASE_URL)
     p_review_prepare.add_argument("--no-diff", action="store_true")
-    p_review_prepare.add_argument("--max-packet-bytes", type=int, default=512_000)
-    p_review_prepare.add_argument("--max-file-bytes", type=int, default=64_000)
-    p_review_prepare.add_argument("--max-files", type=int, default=300)
+    p_review_prepare.add_argument(
+        "--max-packet-bytes",
+        type=bounded_cli_integer("max_packet_bytes", REVIEW_MAX_PACKET_BYTES),
+        default=REVIEW_DEFAULT_PACKET_BYTES,
+    )
+    p_review_prepare.add_argument(
+        "--max-file-bytes",
+        type=bounded_cli_integer("max_file_bytes", REVIEW_MAX_FILE_SAMPLE_BYTES),
+        default=REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+    )
+    p_review_prepare.add_argument(
+        "--max-files",
+        type=bounded_cli_integer("max_files", REVIEW_MAX_FILES),
+        default=REVIEW_DEFAULT_MAX_FILES,
+    )
+    p_review_prepare.add_argument(
+        "--max-subject-file-bytes",
+        type=bounded_cli_integer(
+            "max_subject_file_bytes",
+            REVIEW_MAX_SUBJECT_FILE_BYTES,
+        ),
+        default=REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+    )
+    p_review_prepare.add_argument(
+        "--max-subject-bytes",
+        type=bounded_cli_integer("max_subject_bytes", REVIEW_MAX_SUBJECT_BYTES),
+        default=REVIEW_DEFAULT_SUBJECT_BYTES,
+    )
+    p_review_prepare.add_argument(
+        "--prepare-timeout-seconds",
+        type=bounded_cli_integer(
+            "prepare_timeout_seconds",
+            REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+        ),
+        default=REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    )
     p_review_prepare.add_argument(
         "--secret-allowlist-pattern",
         action="append",
         default=[],
-        help="Legacy anchored source:line:text regex for non-hashed review-secret false positives; exact fingerprints are required for hashed token findings.",
+        help="Anchored source:line:text literal matcher (optional edge .* only) for non-hashed review-secret false positives; exact fingerprints are required for hashed token findings.",
     )
     p_review_prepare.add_argument(
         "--secret-allowlist-file",
@@ -643,10 +752,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_review_run.add_argument("--root", required=True)
     p_review_run.add_argument("--job-id", required=True)
     p_review_run.add_argument("--transport", choices=sorted(SUPPORTED_TRANSPORTS))
-    p_review_run.add_argument("--model")
-    p_review_run.add_argument("--base-url")
-    p_review_run.add_argument("--timeout-seconds", type=int, default=900)
-    p_review_run.add_argument("--max-tokens", type=int, default=4096)
+    p_review_run.add_argument(
+        "--model",
+        type=bounded_cli_text("review model", REVIEW_MAX_MODEL_BYTES),
+    )
+    p_review_run.add_argument(
+        "--base-url",
+        type=bounded_cli_text("review base_url", REVIEW_MAX_BASE_URL_BYTES),
+    )
+    p_review_run.add_argument(
+        "--operation-id",
+        help="Reuse the caller id bound to an interrupted automated reservation",
+    )
+    p_review_run.add_argument(
+        "--timeout-seconds",
+        type=bounded_cli_integer("timeout_seconds", REVIEW_MAX_RUN_TIMEOUT_SECONDS),
+        default=REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS,
+    )
+    p_review_run.add_argument(
+        "--max-tokens",
+        type=bounded_cli_integer("max_tokens", REVIEW_MAX_TOKENS),
+        default=REVIEW_DEFAULT_MAX_TOKENS,
+    )
 
     p_review_ingest = sub.add_parser("review-ingest", help="Ingest a completed hash-bound review result")
     p_review_ingest.add_argument("--root", required=True)
@@ -1892,27 +2019,68 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "review-prepare":
         assert root is not None
+        (
+            max_packet_bytes,
+            max_file_bytes,
+            max_files,
+            max_subject_file_bytes,
+            max_subject_bytes,
+            prepare_timeout_seconds,
+        ) = validate_review_prepare_limits(
+            max_packet_bytes=args.max_packet_bytes,
+            max_file_bytes=args.max_file_bytes,
+            max_files=args.max_files,
+            max_subject_file_bytes=args.max_subject_file_bytes,
+            max_subject_bytes=args.max_subject_bytes,
+            prepare_timeout_seconds=args.prepare_timeout_seconds,
+        )
         prompt_text = args.prompt
         if args.prompt_file:
-            prompt_text = Path(args.prompt_file).read_text(encoding="utf-8", errors="replace")
-        subject_path = Path(args.subject)
-        subject_ref = source_file_reference(root, subject_path) if subject_path.exists() else {"name": subject_path.name}
+            prompt_text = read_bounded_cli_text_file(
+                Path(args.prompt_file),
+                max_bytes=REVIEW_MAX_PROMPT_BYTES,
+            )
+        prompt_text = validate_review_prompt(str(prompt_text or ""))
+        subject_path = validate_review_subject_path(root, Path(args.subject))
+        secret_allowlist_files = [
+            Path(path) for path in args.secret_allowlist_file or []
+        ]
+        (
+            reviewer_id,
+            transport,
+            model,
+            base_url,
+            _operation_id,
+            _compiled_allowlist,
+        ) = validate_review_prepare_controls(
+            reviewer_id=args.reviewer_id,
+            transport=args.transport,
+            model=args.model,
+            base_url=args.base_url,
+            operation_id=None,
+            secret_allowlist_patterns=args.secret_allowlist_pattern,
+            secret_allowlist_files=secret_allowlist_files,
+        )
+        subject_ref = source_file_reference(root, subject_path)
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = create_review_job(
                 root,
                 subject_path=subject_path,
                 prompt=str(prompt_text or ""),
-                reviewer_id=args.reviewer_id,
-                transport=args.transport,
-                model=args.model,
-                base_url=args.base_url,
+                reviewer_id=reviewer_id,
+                transport=transport,
+                model=model,
+                base_url=base_url,
                 include_diff=not args.no_diff,
-                max_packet_bytes=args.max_packet_bytes,
-                max_file_bytes=args.max_file_bytes,
-                max_files=args.max_files,
+                max_packet_bytes=max_packet_bytes,
+                max_file_bytes=max_file_bytes,
+                max_files=max_files,
+                max_subject_file_bytes=max_subject_file_bytes,
+                max_subject_bytes=max_subject_bytes,
+                prepare_timeout_seconds=prepare_timeout_seconds,
                 secret_allowlist_patterns=args.secret_allowlist_pattern,
-                secret_allowlist_files=[Path(path) for path in args.secret_allowlist_file or []],
+                secret_allowlist_files=secret_allowlist_files,
                 operation_id=operation.operation_id,
             )
             operation.cursor({"phase": "review_job_created", "job_id": result["job_id"], "packet_sha256": result["packet_sha256"]})
@@ -1924,10 +2092,16 @@ def _main(argv: list[str] | None = None) -> int:
                 operation_type="cli_review_prepare",
                 title=f"Prepare review relay job for {subject_ref.get('name')}",
                 intent={
-                    "subject": source_file_reference(root, subject_path) if subject_path.exists() else str(subject_path),
-                    "transport": args.transport,
-                    "reviewer_id": args.reviewer_id,
-                    "model": args.model,
+                    "subject": subject_ref,
+                    "transport": transport,
+                    "reviewer_id": reviewer_id,
+                    "model": model,
+                    "max_packet_bytes": max_packet_bytes,
+                    "max_file_bytes": max_file_bytes,
+                    "max_files": max_files,
+                    "max_subject_file_bytes": max_subject_file_bytes,
+                    "max_subject_bytes": max_subject_bytes,
+                    "prepare_timeout_seconds": prepare_timeout_seconds,
                     "secret_allowlist_pattern_count": len(args.secret_allowlist_pattern or []),
                     "secret_allowlist_file_count": len(args.secret_allowlist_file or []),
                 },
@@ -1956,17 +2130,28 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "review-run":
         assert root is not None
+        (
+            run_transport,
+            run_model,
+            run_base_url,
+            caller_operation_id,
+        ) = validate_review_run_controls(
+            transport=args.transport,
+            model=args.model,
+            base_url=args.base_url,
+            operation_id=args.operation_id,
+        )
 
         def action(operation: OperationGuard) -> dict[str, Any]:
             result = run_review_job(
                 root,
                 job_id=args.job_id,
-                transport=args.transport,
-                model=args.model,
-                base_url=args.base_url,
+                transport=run_transport,
+                model=run_model,
+                base_url=run_base_url,
                 timeout_seconds=args.timeout_seconds,
                 max_tokens=args.max_tokens,
-                operation_id=operation.operation_id,
+                operation_id=caller_operation_id or operation.operation_id,
             )
             operation.cursor({"phase": "review_job_ran", "job_id": args.job_id, "status": result.get("status")})
             return result
@@ -1976,7 +2161,14 @@ def _main(argv: list[str] | None = None) -> int:
                 root,
                 operation_type="cli_review_run",
                 title=f"Run review relay job {args.job_id}",
-                intent={"job_id": args.job_id, "transport": args.transport, "model": args.model},
+                intent={
+                    "job_id": args.job_id,
+                    "transport": args.transport,
+                    "model": args.model,
+                    "operation_id": caller_operation_id,
+                    "timeout_seconds": args.timeout_seconds,
+                    "max_tokens": args.max_tokens,
+                },
                 snapshot_policy="none",
                 snapshot_reason="review run writes export artifacts only",
                 result_touched_paths=lambda result: [

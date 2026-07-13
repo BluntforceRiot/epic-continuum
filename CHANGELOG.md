@@ -85,6 +85,51 @@
   including historical A/B/A retries; browser, inline, and external-path
   preflight rejection is non-mutating, while a distinct operation may start the
   next attempt.
+- Made Review Relay preparation resource-bounded end to end. Repository Git
+  capture now ignores executable helper configuration, drains output under a
+  live byte ceiling, rejects nonzero commands, and stops an overflowing child.
+  Subject traversal now counts every entry under a deadline and a hard ceiling;
+  the public subject and all ancestors must be plain paths. Snapshots open every
+  source through confined regular-file descriptors, reject link/reparse
+  substitutions and unstable identities, pin every POSIX absolute ancestor,
+  validate the complete Windows ancestor chain around each open, freeze the
+  source type/identity through preparation, and stream copy, hash, sampling, ZIP,
+  and capsule work under per-file, total-subject, temporary-space, work, archive,
+  and elapsed-time budgets. Included directories are identity-bound during the
+  walk, empty directories remain explicit through the snapshot, manifests,
+  archives, capsule, packet coverage, and currentness fingerprint, and the
+  combined file/directory inventory has one hard ceiling enforced during the
+  walk, before snapshot copying. After the capsule is complete, preparation
+  compares the final live inventory, exclusions, identities, sizes, modes, and
+  content hashes to the frozen snapshot before publication authority can be
+  created. ZIP reads count
+  bounded EOCD/ZIP64 central-directory headers before constructing Python ZIP
+  metadata, require the fixed ZIP64 end record and its locator to bind the exact
+  geometry consumed by Python's parser, and accept only stored or deflated members. Other compression
+  methods; other decoders are refused before allocation. Capsule construction consumes the exact manifest file set, rechecks
+  each hash while writing, and publishes the whole job with one final rename. A
+  root-serialized, catalog-bound publication journal now
+  finishes interrupted pre-rename or post-rename jobs transactionally, rolls
+  back only positively uncommitted staging, and preserves ambiguous or
+  conflicting evidence for diagnosis. Every staged file and directory is
+  durably flushed bottom-up, including the staging parent, before that journal
+  gains authority; marker creation and the final rename also flush their parent
+  directories, and the marker/final catalog authority transactions run with
+  SQLite `synchronous=FULL`. Invalid legacy stored review limits now produce a
+  structured non-current result instead of escaping the currentness check. Prompt input, reviewer controls,
+  operation IDs, and allowlist files and entries are preflight-bounded before
+  operation mutation, with identical public hard maxima; user allowlist text is
+  matched as a linear literal with only optional edge wildcards. Automated
+  `review-run` callers can supply the stable operation ID needed to reconcile an
+  interrupted reservation, and run-time model/base-URL overrides are rejected
+  at the same limits before an operation guard or attempt reservation. Hermes now streams stdout/stderr through a combined
+  live ceiling; Windows attaches a suspended child to a kill-on-close Job Object
+  before it can run. POSIX launchers run in a dedicated process group that is
+  always terminated on timeout, overflow, or launcher exit, including when a
+  descendant closed its inherited pipes; deliberately detached POSIX sessions
+  remain outside the portable containment contract. Direct OpenAI-compatible
+  requests now run in the same contained child model, giving connection,
+  headers, response body, stdout, and diagnostics one total elapsed deadline.
 - Made same-agent project-state checkpoints one atomic temporal authority chain:
   only the newest checkpoint is current, while predecessors remain historical
   evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint

@@ -300,7 +300,9 @@ The capsule is the only upload artifact, but it cannot contain its own final SHA
 
 For strict unattended loops, the OpenAI-compatible/vLLM path is the preferred automated reviewer, but it is a packet-only review unless the reviewer also has file access. Hermes remains supported, but invalid or partial Hermes output is marked `review_failed` and kept as evidence instead of being ingested. Before applying external findings after a long review, use `review-check-current` to prove the active subject still matches the frozen snapshot.
 
-Review preparation scans decodable files, UTF-8/UTF-16 text, ZIP contents and metadata, generated request text, and the completed capsule boundary for obvious secrets; narrow `--secret-allowlist-pattern` entries or `--secret-allowlist-file` fixture lists can suppress known false-positive lines without recording the raw patterns or local file paths in the capsule.
+Review preparation is streaming, resource-bounded, and crash-recoverably published: it uses a bounded identity-bound directory walk with an early combined entry ceiling, preserves empty directories in the frozen snapshot, source manifest, source archive, capsule, and currentness fingerprint, confines regular-file snapshots to the enumerated identities, preflights bounded ZIP central-directory headers and exact ZIP64 locator geometry before allocating member metadata, accepts only stored or deflated ZIP members, checks exact manifest-to-capsule hashes, applies a total subject budget, caps live Git capture, and shares CLI/MCP hard maxima. After capsule construction it re-enumerates and rehashes the live source, including modes, before publication. Prompt files stop at the same 4,000,000-byte ceiling used by the packet, and invalid public controls or an unsafe link-like subject path are refused before the Continuum root is initialized. A tri-state catalog-bound journal preserves ambiguous publication authority and reconciles an interruption before or after the final staging rename without admitting a partial job; every staged file and directory is durably flushed before the journal gains authority, and its authority-changing SQLite commits use full synchronization. Oversized `review-run` model or base-URL overrides fail before an attempt reservation. Hermes stdout/stderr is capped while the process runs, and direct endpoint work runs in the same contained-process model so one deadline covers connection, headers, and body. Windows uses fail-closed Job Object containment; POSIX uses process-group cleanup on timeout, overflow, or launcher exit. See the detailed limit table in the Review Relay guide.
+
+Review preparation scans decodable files, UTF-8/UTF-16 text, ZIP contents and metadata, generated request text, and the completed capsule boundary for obvious secrets; narrow anchored literal `--secret-allowlist-pattern` entries (optional edge `.*` only) or exact `--secret-allowlist-file` fixture lists can suppress known false-positive lines without recording the raw matchers or local file paths in the capsule.
 
 ```bash
 continuum review-prepare \
@@ -334,7 +336,10 @@ continuum review-prepare \
   --model local-reviewer \
   --base-url http://127.0.0.1:8020/v1
 
-continuum review-run --root ./.continuum-demo --job-id review_...
+continuum review-run \
+  --root ./.continuum-demo \
+  --job-id review_... \
+  --operation-id local-review-001
 ```
 
 See [docs/review-relay.md](docs/review-relay.md) for the file layout, validation rules, and MCP tool names.

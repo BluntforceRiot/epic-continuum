@@ -12,6 +12,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Iterable
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -16720,6 +16721,30 @@ def _cleanup_uncommitted_snapshot_outputs(
             pass
 
 
+def _serialize_review_publication(
+    function: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """Keep catalog backup and Review Relay tree capture on one stable side."""
+
+    @wraps(function)
+    def wrapped(
+        root: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        from .operations import operation_lock
+
+        with operation_lock(
+            Path(root),
+            "review-prepare-publication",
+            timeout_seconds=600.0,
+        ):
+            return function(root, *args, **kwargs)
+
+    return wrapped
+
+
+@_serialize_review_publication
 def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     init_db(root)
     reason = enforce_text_secret_policy(root, str(reason), scope="snapshot reason")

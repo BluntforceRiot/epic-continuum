@@ -39,6 +39,30 @@ from .core.review_bridge import (
     DEFAULT_REVIEW_BASE_URL,
     DEFAULT_REVIEW_MODEL,
     DEFAULT_REVIEW_TRANSPORT,
+    REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+    REVIEW_DEFAULT_MAX_FILES,
+    REVIEW_DEFAULT_MAX_TOKENS,
+    REVIEW_DEFAULT_PACKET_BYTES,
+    REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+    REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS,
+    REVIEW_DEFAULT_SUBJECT_BYTES,
+    REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+    REVIEW_MAX_FILES,
+    REVIEW_MAX_BASE_URL_BYTES,
+    REVIEW_MAX_CONTROL_PATH_BYTES,
+    REVIEW_MAX_FILE_SAMPLE_BYTES,
+    REVIEW_MAX_MODEL_BYTES,
+    REVIEW_MAX_PACKET_BYTES,
+    REVIEW_MAX_PROMPT_BYTES,
+    REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+    REVIEW_MAX_REVIEWER_ID_BYTES,
+    REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+    REVIEW_MAX_SUBJECT_BYTES,
+    REVIEW_MAX_SUBJECT_FILE_BYTES,
+    REVIEW_MAX_TOKENS,
+    REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES,
+    REVIEW_SECRET_ALLOWLIST_MAX_FILES,
+    REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS,
     SUPPORTED_TRANSPORTS,
     create_review_job,
     ingest_review_result,
@@ -46,6 +70,12 @@ from .core.review_bridge import (
     review_check_current,
     review_job_status,
     run_review_job,
+    validate_review_prepare_controls,
+    validate_review_prepare_limits,
+    validate_review_prompt,
+    validate_review_run_controls,
+    validate_review_subject_path,
+    validate_review_transport_limits,
 )
 from .core.store import (
     MAX_RECENT_EVENT_LIMIT,
@@ -1379,30 +1409,88 @@ def tool_restore_drill(args: JSON) -> Any:
 
 def tool_review_prepare(args: JSON) -> Any:
     root = root_arg(args)
-    subject = validate_allowed_path(Path(require_str(args, "subject")), purpose="review subject")
-    prompt = require_str(args, "prompt")
+    subject = validate_review_subject_path(
+        root,
+        validate_allowed_path(
+            Path(require_str(args, "subject")),
+            purpose="review subject",
+        ),
+    )
+    prompt = validate_review_prompt(require_str(args, "prompt"))
     transport = optional_str(args, "transport") or DEFAULT_REVIEW_TRANSPORT
-    if transport not in SUPPORTED_TRANSPORTS:
-        raise ValueError(f"transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORTS))}")
     secret_allowlist_patterns = optional_str_list(args, "secret_allowlist_patterns")
     secret_allowlist_files = [
         validate_allowed_path(Path(path), purpose="review secret allowlist file")
         for path in optional_str_list(args, "secret_allowlist_files")
     ]
+    (
+        reviewer_id,
+        transport,
+        model,
+        base_url,
+        _operation_id,
+        _compiled_allowlist,
+    ) = validate_review_prepare_controls(
+        reviewer_id=optional_str(args, "reviewer_id") or "local-reviewer",
+        transport=transport,
+        model=optional_str(args, "model") or DEFAULT_REVIEW_MODEL,
+        base_url=optional_str(args, "base_url") or DEFAULT_REVIEW_BASE_URL,
+        operation_id=None,
+        secret_allowlist_patterns=secret_allowlist_patterns,
+        secret_allowlist_files=secret_allowlist_files,
+    )
+    (
+        max_packet_bytes,
+        max_file_bytes,
+        max_files,
+        max_subject_file_bytes,
+        max_subject_bytes,
+        prepare_timeout_seconds,
+    ) = validate_review_prepare_limits(
+        max_packet_bytes=optional_int(
+            args,
+            "max_packet_bytes",
+            REVIEW_DEFAULT_PACKET_BYTES,
+        ),
+        max_file_bytes=optional_int(
+            args,
+            "max_file_bytes",
+            REVIEW_DEFAULT_FILE_SAMPLE_BYTES,
+        ),
+        max_files=optional_int(args, "max_files", REVIEW_DEFAULT_MAX_FILES),
+        max_subject_file_bytes=optional_int(
+            args,
+            "max_subject_file_bytes",
+            REVIEW_DEFAULT_SUBJECT_FILE_BYTES,
+        ),
+        max_subject_bytes=optional_int(
+            args,
+            "max_subject_bytes",
+            REVIEW_DEFAULT_SUBJECT_BYTES,
+        ),
+        prepare_timeout_seconds=optional_int(
+            args,
+            "prepare_timeout_seconds",
+            REVIEW_DEFAULT_PREPARE_TIMEOUT_SECONDS,
+        ),
+    )
 
     def action(operation: OperationGuard) -> JSON:
         result = create_review_job(
             root,
             subject_path=subject,
             prompt=prompt,
-            reviewer_id=optional_str(args, "reviewer_id") or "local-reviewer",
+            reviewer_id=reviewer_id,
             transport=transport,
-            model=optional_str(args, "model") or DEFAULT_REVIEW_MODEL,
-            base_url=optional_str(args, "base_url") or DEFAULT_REVIEW_BASE_URL,
+            model=model,
+            base_url=base_url,
             include_diff=optional_bool(args, "include_diff", True),
-            max_packet_bytes=optional_int(args, "max_packet_bytes", 512_000),
-            max_file_bytes=optional_int(args, "max_file_bytes", 64_000),
-            max_files=optional_int(args, "max_files", 300),
+            max_packet_bytes=max_packet_bytes,
+            max_file_bytes=max_file_bytes,
+            max_files=max_files,
+            max_subject_file_bytes=max_subject_file_bytes,
+            max_subject_bytes=max_subject_bytes,
+            prepare_timeout_seconds=prepare_timeout_seconds,
             secret_allowlist_patterns=secret_allowlist_patterns,
             secret_allowlist_files=secret_allowlist_files,
             operation_id=operation.operation_id,
@@ -1417,6 +1505,12 @@ def tool_review_prepare(args: JSON) -> Any:
         intent={
             "subject": str(subject),
             "transport": transport,
+            "max_packet_bytes": max_packet_bytes,
+            "max_file_bytes": max_file_bytes,
+            "max_files": max_files,
+            "max_subject_file_bytes": max_subject_file_bytes,
+            "max_subject_bytes": max_subject_bytes,
+            "prepare_timeout_seconds": prepare_timeout_seconds,
             "secret_allowlist_pattern_count": len(secret_allowlist_patterns),
             "secret_allowlist_file_count": len(secret_allowlist_files),
         },
@@ -1445,20 +1539,40 @@ def tool_review_prepare(args: JSON) -> Any:
 
 def tool_review_run(args: JSON) -> Any:
     root = root_arg(args)
-    transport = optional_str(args, "transport")
-    if transport is not None and transport not in SUPPORTED_TRANSPORTS:
-        raise ValueError(f"transport must be one of: {', '.join(sorted(SUPPORTED_TRANSPORTS))}")
+    (
+        transport,
+        model,
+        base_url,
+        caller_operation_id,
+    ) = validate_review_run_controls(
+        transport=optional_str(args, "transport"),
+        model=optional_str(args, "model"),
+        base_url=optional_str(args, "base_url"),
+        operation_id=args.get("operation_id"),
+    )
+    timeout_seconds, max_tokens = validate_review_transport_limits(
+        timeout_seconds=optional_int(
+            args,
+            "timeout_seconds",
+            REVIEW_DEFAULT_RUN_TIMEOUT_SECONDS,
+        ),
+        max_tokens=optional_int(
+            args,
+            "max_tokens",
+            REVIEW_DEFAULT_MAX_TOKENS,
+        ),
+    )
 
     def action(operation: OperationGuard) -> JSON:
         result = run_review_job(
             root,
             job_id=require_str(args, "job_id"),
             transport=transport,
-            model=optional_str(args, "model"),
-            base_url=optional_str(args, "base_url"),
-            timeout_seconds=optional_int(args, "timeout_seconds", 900),
-            max_tokens=optional_int(args, "max_tokens", 4096),
-            operation_id=operation.operation_id,
+            model=model,
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+            operation_id=caller_operation_id or operation.operation_id,
         )
         operation.cursor({"phase": "review_job_ran", "job_id": args.get("job_id"), "status": result.get("status")})
         return result
@@ -1467,7 +1581,13 @@ def tool_review_run(args: JSON) -> Any:
         root,
         operation_type="mcp_review_run",
         title=f"Run review relay job {args.get('job_id')}",
-        intent={"job_id": args.get("job_id"), "transport": transport},
+        intent={
+            "job_id": args.get("job_id"),
+            "transport": transport,
+            "operation_id": caller_operation_id,
+            "timeout_seconds": timeout_seconds,
+            "max_tokens": max_tokens,
+        },
         snapshot_policy="none",
         snapshot_reason="review run writes export artifacts only",
         result_touched_paths=lambda result: [
@@ -2182,18 +2302,74 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["subject", "prompt"],
             "properties": {
                 "root": {"type": "string"},
-                "subject": {"type": "string"},
-                "prompt": {"type": "string"},
-                "reviewer_id": {"type": "string"},
+                "subject": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_CONTROL_PATH_BYTES,
+                },
+                "prompt": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_PROMPT_BYTES,
+                },
+                "reviewer_id": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_REVIEWER_ID_BYTES,
+                },
                 "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
-                "model": {"type": "string"},
-                "base_url": {"type": "string"},
+                "model": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_MODEL_BYTES,
+                },
+                "base_url": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_BASE_URL_BYTES,
+                },
                 "include_diff": {"type": "boolean"},
-                "max_packet_bytes": {"type": "integer"},
-                "max_file_bytes": {"type": "integer"},
-                "max_files": {"type": "integer"},
-                "secret_allowlist_patterns": {"type": "array", "items": {"type": "string"}},
-                "secret_allowlist_files": {"type": "array", "items": {"type": "string"}},
+                "max_packet_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_PACKET_BYTES,
+                },
+                "max_file_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_FILE_SAMPLE_BYTES,
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_FILES,
+                },
+                "max_subject_file_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_SUBJECT_FILE_BYTES,
+                },
+                "max_subject_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_SUBJECT_BYTES,
+                },
+                "prepare_timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
+                },
+                "secret_allowlist_patterns": {
+                    "type": "array",
+                    "maxItems": REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS,
+                    "items": {
+                        "type": "string",
+                        "maxLength": REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES,
+                    },
+                },
+                "secret_allowlist_files": {
+                    "type": "array",
+                    "maxItems": REVIEW_SECRET_ALLOWLIST_MAX_FILES,
+                    "items": {
+                        "type": "string",
+                        "maxLength": REVIEW_MAX_CONTROL_PATH_BYTES,
+                    },
+                },
             },
             "additionalProperties": False,
         },
@@ -2208,10 +2384,30 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "root": {"type": "string"},
                 "job_id": {"type": "string"},
                 "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
-                "model": {"type": "string"},
-                "base_url": {"type": "string"},
-                "timeout_seconds": {"type": "integer"},
-                "max_tokens": {"type": "integer"},
+                "model": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_MODEL_BYTES,
+                },
+                "base_url": {
+                    "type": "string",
+                    "maxLength": REVIEW_MAX_BASE_URL_BYTES,
+                },
+                "operation_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": REVIEW_MAX_TOKENS,
+                },
             },
             "additionalProperties": False,
         },
@@ -2260,7 +2456,12 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "properties": {
                 "root": {"type": "string"},
                 "job_id": {"type": "string"},
-                "operation_id": {"type": "string"},
+                "operation_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                },
             },
             "additionalProperties": False,
         },

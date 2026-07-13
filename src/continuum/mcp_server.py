@@ -1538,7 +1538,11 @@ def tool_review_browser_attempt_start(args: JSON) -> Any:
     root = root_arg(args)
 
     def action(operation: OperationGuard) -> JSON:
-        result = review_browser_attempt_start(root, job_id=require_str(args, "job_id"))
+        result = review_browser_attempt_start(
+            root,
+            job_id=require_str(args, "job_id"),
+            operation_id=optional_str(args, "operation_id") or operation.operation_id,
+        )
         operation.cursor({"phase": "review_browser_attempt_reserved", "job_id": args.get("job_id"), "attempt": result.get("attempt")})
         return result
 
@@ -1546,14 +1550,13 @@ def tool_review_browser_attempt_start(args: JSON) -> Any:
         root,
         operation_type="mcp_review_browser_attempt_start",
         title=f"Reserve browser review response path {args.get('job_id')}",
-        intent={"job_id": args.get("job_id")},
+        intent={"job_id": args.get("job_id"), "operation_id": args.get("operation_id")},
         snapshot_policy="none",
         snapshot_reason="browser attempt reservation writes review export artifacts only",
-        result_touched_paths=lambda result: [
-            path
-            for path in [result.get("response_uri"), result.get("attempt_uri"), result.get("browser_handoff_uri")]
-            if path
-        ],
+        # The DB-first reservation phase and its exact artifact rows are already the
+        # authority. Registering these same paths as generic proof inputs would
+        # mutate their catalog metadata through the shared (uri, sha256) key.
+        result_touched_paths=lambda _result: [],
         action=action,
     )
 
@@ -2254,7 +2257,11 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         {
             "type": "object",
             "required": ["job_id"],
-            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "properties": {
+                "root": {"type": "string"},
+                "job_id": {"type": "string"},
+                "operation_id": {"type": "string"},
+            },
             "additionalProperties": False,
         },
         tool_review_browser_attempt_start,

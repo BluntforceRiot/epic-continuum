@@ -1038,6 +1038,11 @@ class ResumeLatestTests(unittest.TestCase):
                 project_id="scroll-only-project",
                 dry_run=True,
             )
+            resumed = resume_latest(
+                root,
+                project_id="scroll-only-project",
+                model_assist=False,
+            )
 
             self.assertTrue(semantic["ok"], semantic)
             self.assertEqual(
@@ -1046,6 +1051,8 @@ class ResumeLatestTests(unittest.TestCase):
             )
             self.assertTrue(preview["ok"], preview)
             self.assertEqual(preview["quarantined_count"], 0)
+            self.assertFalse(resumed["ok"], resumed)
+            self.assertEqual(resumed["reason"], "no_resume_state")
 
     def test_duplicate_exact_graph_refs_cannot_hide_source_authority(self) -> None:
         for scenario in ("deleted", "combined_drift"):
@@ -1906,13 +1913,8 @@ class ResumeLatestTests(unittest.TestCase):
                 conn.close()
             sync_card_sidecars_after_commit(root, [str(hidden["card_id"])])
 
-            results = (
+            authorized_results = (
                 resume_latest(root, session_id=session_id, model_assist=False),
-                resume_latest(
-                    root,
-                    project_id="coordinate-dual-project",
-                    model_assist=False,
-                ),
                 resume_latest(
                     root,
                     session_id=session_id,
@@ -1921,10 +1923,21 @@ class ResumeLatestTests(unittest.TestCase):
                 ),
                 resume_latest(root, model_assist=False),
             )
+            project_only = resume_latest(
+                root,
+                project_id="coordinate-dual-project",
+                model_assist=False,
+            )
 
-            for result in results:
+            for result in authorized_results:
                 self.assertFalse(result["ok"], result)
                 self.assertEqual(result["reason"], "authority_corrupt")
+            self.assertFalse(project_only["ok"], project_only)
+            self.assertEqual(project_only["reason"], "no_resume_state")
+            serialized = json.dumps(project_only, sort_keys=True)
+            self.assertNotIn(str(hidden["card_id"]), serialized)
+            self.assertNotIn(str(hidden["event_id"]), serialized)
+            self.assertNotIn(session_id, serialized)
             self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_source_metadata_boundary_survives_corrupt_card_metadata(self) -> None:
@@ -3058,9 +3071,20 @@ class ResumeLatestTests(unittest.TestCase):
                 expected_reason = (
                     "authority_corrupt"
                     if mutation in {"project_mismatch", "scope_mismatch"}
-                    else "invalid_project_state_checkpoint"
+                    else (
+                        "no_current_project_state"
+                        if mutation in {"missing", "non_project_large"}
+                        else "invalid_project_state_checkpoint"
+                    )
                 )
                 self.assertEqual(result["reason"], expected_reason)
+                if mutation in {"missing", "non_project_large"}:
+                    serialized_result = json.dumps(result, sort_keys=True)
+                    self.assertNotIn(state["card_id"], serialized_result)
+                    self.assertNotIn(state["event_id"], serialized_result)
+                    self.assertNotIn("invalid_checkpoint", result)
+                    self.assertNotIn("repair_required", result)
+                    self.assertNotIn("repair_command", result)
                 self.assertFalse((root / "exports" / "thread_recovery").exists())
 
     def test_resume_fails_closed_when_project_state_structured_payload_is_mutated(
@@ -3240,6 +3264,253 @@ class ResumeLatestTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             self.assertIn(state["event_id"], result["context"]["context_text"])
             self.assertIn(objective_tail, result["packet_text"])
+
+    def test_v021_official_source_orphan_is_detected_after_card_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            session_id = "v021-orphan-session"
+            project_id = "v021-orphan-project"
+            agent_id = "v021-orphan-agent"
+            content = "\n".join(
+                [
+                    f"Project state for {project_id}",
+                    f"Agent: {agent_id}",
+                    "Objective: V021 OFFICIAL SOURCE ORPHAN",
+                ]
+            )
+            metadata = {
+                "agent_id": agent_id,
+                "project_id": project_id,
+                "session_id": session_id,
+                "source_type": "project_state",
+                "trust_level": "agent_reported_local_evidence",
+                "instruction_authority": "user_level_evidence",
+                "visibility_scope": "project",
+            }
+            event = append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="project_state",
+                role="agent",
+                content=content,
+                metadata=metadata,
+            )
+            source_refs = [
+                {
+                    "event_id": event["event_id"],
+                    "session_id": session_id,
+                    "seq": event["seq"],
+                }
+            ]
+            expected_card_id = store_module.stable_id(
+                "card",
+                "project",
+                session_id,
+                project_id,
+                "project_state",
+                f"{project_id} project state from {agent_id}",
+                store_module.content_hash(
+                    store_module.summarize_text(content, limit=900)
+                ),
+                store_module.json_dumps(source_refs),
+            )
+            conn = connect(root)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=70,
+                    payload={
+                        "card_id": expected_card_id,
+                        "event_id": event["event_id"],
+                        "session_id": session_id,
+                        "project_id": project_id,
+                        "visibility_scope": "project",
+                    },
+                    related_card_ids=[expected_card_id],
+                    dedupe_key=f"card:{expected_card_id}",
+                )
+                conn.execute("DELETE FROM graph_edge_sources")
+                conn.execute("DELETE FROM graph_edges")
+                conn.execute("DELETE FROM graph_nodes")
+                conn.commit()
+            finally:
+                conn.close()
+
+            semantic = store_module.semantic_integrity_report(root)
+            resumed = resume_latest(
+                root,
+                project_id=project_id,
+                model_assist=False,
+            )
+            preview = store_module.repair_invalid_project_state_checkpoints(
+                root,
+                project_id=project_id,
+                dry_run=True,
+            )
+
+            self.assertFalse(semantic["ok"], semantic)
+            self.assertEqual(
+                semantic["checks"]["orphan_project_state_source_events"],
+                1,
+            )
+            self.assertFalse(resumed["ok"], resumed)
+            self.assertEqual(resumed["reason"], "authority_corrupt")
+            self.assertTrue(resumed["repair_required"])
+            self.assertFalse(preview["ok"], preview)
+            self.assertIn(
+                "orphan_project_state_source_event",
+                {
+                    issue["type"]
+                    for issue in preview["authority_topology_issues"]
+                },
+            )
+
+    def test_v021_orphan_requires_exact_historical_placement_job_footprint(
+        self,
+    ) -> None:
+        scenarios = (
+            ("exact", True),
+            ("wrong_role", False),
+            ("raw_dedupe", False),
+            ("extra_related_id", False),
+            ("extra_payload_field", False),
+            ("drifted_project", False),
+        )
+        for scenario, should_prove in scenarios:
+            with self.subTest(
+                scenario=scenario
+            ), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                session_id = f"v021-footprint-{scenario}-session"
+                project_id = "v021-footprint-project"
+                agent_id = "v021-footprint-agent"
+                content = "\n".join(
+                    [
+                        f"Project state for {project_id}",
+                        f"Agent: {agent_id}",
+                        f"Objective: V021 EXACT FOOTPRINT {scenario}",
+                    ]
+                )
+                event = append_scroll_event(
+                    root,
+                    session_id=session_id,
+                    event_type="project_state",
+                    role="agent",
+                    content=content,
+                    metadata={
+                        "agent_id": agent_id,
+                        "project_id": project_id,
+                        "session_id": session_id,
+                        "source_type": "project_state",
+                        "trust_level": "agent_reported_local_evidence",
+                        "instruction_authority": "user_level_evidence",
+                        "visibility_scope": "project",
+                    },
+                )
+                source_refs = [
+                    {
+                        "event_id": event["event_id"],
+                        "session_id": session_id,
+                        "seq": event["seq"],
+                    }
+                ]
+                expected_card_id = store_module.stable_id(
+                    "card",
+                    "project",
+                    session_id,
+                    project_id,
+                    "project_state",
+                    f"{project_id} project state from {agent_id}",
+                    store_module.content_hash(
+                        store_module.summarize_text(content, limit=900)
+                    ),
+                    store_module.json_dumps(source_refs),
+                )
+                conn = connect(root)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    enqueue_job(
+                        conn,
+                        role="librarian",
+                        job_type="review_card_placement",
+                        priority=70,
+                        payload={
+                            "card_id": expected_card_id,
+                            "event_id": event["event_id"],
+                            "session_id": session_id,
+                            "project_id": project_id,
+                            "visibility_scope": "project",
+                        },
+                        related_card_ids=[expected_card_id],
+                        dedupe_key=f"card:{expected_card_id}",
+                    )
+                    expected_dedupe = "queue_v1_" + store_module.content_hash(
+                        store_module.json_dumps(
+                            [
+                                "librarian",
+                                "review_card_placement",
+                                f"card:{expected_card_id}",
+                            ]
+                        )
+                    )
+                    stored_dedupe = str(
+                        conn.execute(
+                            "SELECT dedupe_key FROM queue_jobs "
+                            "WHERE job_type = 'review_card_placement'"
+                        ).fetchone()[0]
+                    )
+                    self.assertEqual(stored_dedupe, expected_dedupe)
+                    if scenario == "wrong_role":
+                        conn.execute(
+                            "UPDATE queue_jobs SET role = 'scribe' "
+                            "WHERE job_type = 'review_card_placement'"
+                        )
+                    elif scenario == "raw_dedupe":
+                        conn.execute(
+                            "UPDATE queue_jobs SET dedupe_key = ? "
+                            "WHERE job_type = 'review_card_placement'",
+                            (f"card:{expected_card_id}",),
+                        )
+                    elif scenario == "extra_related_id":
+                        conn.execute(
+                            "UPDATE queue_jobs SET related_card_ids_json = ? "
+                            "WHERE job_type = 'review_card_placement'",
+                            (
+                                store_module.json_dumps(
+                                    [expected_card_id, "unexpected-card"]
+                                ),
+                            ),
+                        )
+                    elif scenario == "extra_payload_field":
+                        conn.execute(
+                            "UPDATE queue_jobs SET payload_json = "
+                            "json_set(payload_json, '$.unexpected', 'extra') "
+                            "WHERE job_type = 'review_card_placement'"
+                        )
+                    elif scenario == "drifted_project":
+                        conn.execute(
+                            "UPDATE queue_jobs SET payload_json = "
+                            "json_set(payload_json, '$.project_id', 'other-project') "
+                            "WHERE job_type = 'review_card_placement'"
+                        )
+                    conn.execute("DELETE FROM graph_edge_sources")
+                    conn.execute("DELETE FROM graph_edges")
+                    conn.execute("DELETE FROM graph_nodes")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                semantic = store_module.semantic_integrity_report(root)
+
+                self.assertEqual(
+                    semantic["checks"]["orphan_project_state_source_events"],
+                    int(should_prove),
+                    semantic,
+                )
+                self.assertEqual(semantic["ok"], not should_prove, semantic)
 
     def test_resume_pins_selected_scroll_checkpoint_beyond_the_fetch_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

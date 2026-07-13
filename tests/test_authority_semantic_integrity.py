@@ -703,12 +703,42 @@ class AuthoritySemanticIntegrityTest(unittest.TestCase):
                     )
                     _sync_cards(root, conn, str(second["card_id"]))
                     conn.commit()
+                    moved_row_before = tuple(
+                        conn.execute(
+                            "SELECT * FROM cards WHERE id = ?",
+                            (second["card_id"],),
+                        ).fetchone()
+                    )
                 finally:
                     conn.close()
 
-                repaired = repair_invalid_project_state_checkpoints(
+                moved_scope = repair_invalid_project_state_checkpoints(
                     root,
                     project_id="moved-receipt-project",
+                    dry_run=False,
+                )
+                conn = connect(root)
+                try:
+                    moved_row_after = tuple(
+                        conn.execute(
+                            "SELECT * FROM cards WHERE id = ?",
+                            (second["card_id"],),
+                        ).fetchone()
+                    )
+                finally:
+                    conn.close()
+
+                self.assertEqual(moved_scope["quarantined_count"], 0)
+                self.assertEqual(moved_scope["sidecar_sync"]["synced"], 0)
+                self.assertNotIn(
+                    str(second["card_id"]),
+                    json.dumps(moved_scope, sort_keys=True),
+                )
+                self.assertEqual(moved_row_after, moved_row_before)
+
+                repaired = repair_invalid_project_state_checkpoints(
+                    root,
+                    project_id="receipt-boundary-project",
                     dry_run=False,
                 )
                 report = semantic_integrity_report(root)

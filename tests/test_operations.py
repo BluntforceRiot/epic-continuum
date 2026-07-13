@@ -20,6 +20,11 @@ from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
 from continuum.core.permissions import secure_write_text
 from continuum.core.proof_archive import apply_legacy_catalog_archive, configured_archive_root
+from continuum.core.review_bridge import (
+    create_review_job,
+    review_browser_attempt_start,
+    review_job_status,
+)
 from continuum.core.writer_claim import claim_writer
 from continuum.core.store import (
     audit_secrets,
@@ -75,6 +80,29 @@ def proof_item_path(root: Path, item: dict) -> Path:
 
 def root_uri(root: Path, path: str | Path) -> str:
     return Path(path).resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+
+
+def downgrade_snapshot_manifest_to_legacy_without_review_pair(root: Path, snapshot_path: Path) -> dict:
+    manifest_path = snapshot_manifest_path(snapshot_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pair = manifest.pop("review_bridge_jobs")
+    pair_path = root / str(pair["uri"])
+    if pair_path.exists():
+        shutil.rmtree(pair_path)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    conn = connect(root)
+    try:
+        conn.execute(
+            "UPDATE snapshots SET manifest_hash = ? WHERE snapshot_uri = ?",
+            (hashlib.sha256(manifest_path.read_bytes()).hexdigest(), root_uri(root, snapshot_path)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return manifest
 
 
 def make_link_like_dir(testcase: unittest.TestCase, link: Path, target: Path) -> None:
@@ -507,6 +535,54 @@ class OperationLedgerTest(unittest.TestCase):
                 ledger.close()
             legacy_verification = verify_proof_pack(proof_path, root=root)
             self.assertTrue(legacy_verification["ok"], legacy_verification["errors"])
+
+    def test_proof_pack_preserves_existing_canonical_artifact_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            artifact_path = root / "exports" / "canonical.json"
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text('{"canonical":true}\n', encoding="utf-8")
+            artifact_uri = root_uri(root, artifact_path)
+            artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            canonical_metadata = {"authority": "domain", "revision": 1}
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="canonical_domain_artifact",
+                    uri=artifact_uri,
+                    sha256=artifact_sha256,
+                    size_bytes=artifact_path.stat().st_size,
+                    operation_id="op_domain_authority",
+                    immutable=True,
+                    source_type="domain_authority",
+                    trust_level="local_generated",
+                    metadata=canonical_metadata,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            started = start_operation(root, operation_type="proof_reference", title="Reference canonical artifact")
+            finish_operation(root, started["operation_id"], status="succeeded", result={"ok": True})
+            create_proof_pack(root, started["operation_id"], touched_paths=[artifact_path])
+
+            conn = connect_existing(root)
+            try:
+                rows = conn.execute(
+                    "SELECT kind, operation_id, source_type, trust_level, metadata_json "
+                    "FROM artifacts WHERE uri = ? AND sha256 = ?",
+                    (artifact_uri, artifact_sha256),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "canonical_domain_artifact")
+            self.assertEqual(rows[0]["operation_id"], "op_domain_authority")
+            self.assertEqual(rows[0]["source_type"], "domain_authority")
+            self.assertEqual(rows[0]["trust_level"], "local_generated")
+            self.assertEqual(json.loads(rows[0]["metadata_json"]), canonical_metadata)
 
     def test_proof_pack_freezes_mutable_catalog_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1544,33 +1620,19 @@ class OperationLedgerTest(unittest.TestCase):
 
     def test_restore_drill_preserves_review_bridge_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "epic-continuum"
-            init_db(root)
-            review_artifact = (
-                root
-                / "exports"
-                / "review_bridge"
-                / "jobs"
-                / "review_restore_fixture"
-                / "findings"
-                / "findings-001.json"
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Restore fixture\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Review restore fixture.",
+                transport="manual",
             )
-            payload = b'{"review_complete":true}\n'
-            review_artifact.parent.mkdir(parents=True, exist_ok=True)
-            review_artifact.write_bytes(payload)
-            conn = connect(root)
-            try:
-                record_artifact(
-                    conn,
-                    kind="review_findings_json",
-                    uri=root_uri(root, review_artifact),
-                    sha256=hashlib.sha256(payload).hexdigest(),
-                    size_bytes=len(payload),
-                    immutable=True,
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            review_artifact = Path(job["packet_uri"])
+            payload = review_artifact.read_bytes()
             snap = snapshot(root, reason="review_bridge_restore")
 
             result = restore_drill(
@@ -1589,33 +1651,183 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(result["artifact_ledger"]["ok"], result["artifact_ledger"])
             self.assertEqual(result["artifact_ledger"]["missing"], 0)
 
-    def test_restore_drill_checks_artifact_ledger_beyond_500_rows(self) -> None:
+    def test_snapshot_refuses_missing_immutable_artifact_ledger_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
             init_db(root)
-            artifact_dir = (
-                root
-                / "exports"
-                / "review_bridge"
-                / "jobs"
-                / "review_large_ledger_fixture"
-                / "findings"
+            artifact = root / "exports" / "local-proof.txt"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            payload = b"durable proof\n"
+            artifact.write_bytes(payload)
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="local_proof",
+                    uri=root_uri(root, artifact),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                    size_bytes=len(payload),
+                    source_type="local_test",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            artifact.unlink()
+
+            with self.assertRaisesRegex(ValueError, "immutable artifact ledger"):
+                snapshot(root, reason="missing_immutable_artifact")
+
+    def test_restore_drill_uses_snapshot_paired_review_jobs_after_later_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Snapshot-paired review\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            review_browser_attempt_start(root, job_id=job["job_id"])
+            frozen = snapshot(root, reason="review_pair_before_later_attempts")
+            frozen_manifest = json.loads(Path(frozen["snapshot_manifest_uri"]).read_text(encoding="utf-8"))
+            paired_jobs = root / str(frozen_manifest["review_bridge_jobs"]["uri"])
+            self.assertTrue((paired_jobs / job["job_id"] / "attempts" / "attempt-001.json").is_file())
+
+            review_browser_attempt_start(root, job_id=job["job_id"])
+            review_browser_attempt_start(root, job_id=job["job_id"])
+            self.assertEqual(review_job_status(root, job_id=job["job_id"])["attempt_count"], 3)
+
+            result = restore_drill(
+                root,
+                snapshot_uri=frozen["snapshot_uri"],
+                verify_recent_proof_packs=0,
             )
-            artifact_dir.mkdir(parents=True, exist_ok=True)
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(result["review_bridge_jobs_restore"]["mode"], "snapshot_pair")
+            self.assertIn("exports/review_bridge/jobs", result["copied_durable_paths"])
+            drill_root = Path(result["drill_root"])
+            restored_status = review_job_status(drill_root, job_id=job["job_id"])
+            self.assertEqual(restored_status["attempt_count"], 1)
+            self.assertEqual(Path(restored_status["last_attempt_uri"]).name, "attempt-001.json")
+            restored_attempts = drill_root / "exports" / "review_bridge" / "jobs" / job["job_id"] / "attempts"
+            self.assertEqual(
+                sorted(path.name for path in restored_attempts.glob("attempt-*.json")),
+                ["attempt-001.json"],
+            )
+            self.assertTrue(result["semantic_integrity"]["ok"], result["semantic_integrity"])
+            self.assertTrue(result["artifact_ledger"]["ok"], result["artifact_ledger"])
+
+    def test_legacy_snapshot_without_review_evidence_restores_empty_jobs_not_live_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            init_db(root)
+            frozen = snapshot(root, reason="legacy_pre_review_snapshot")
+            legacy_manifest = downgrade_snapshot_manifest_to_legacy_without_review_pair(
+                root,
+                Path(frozen["snapshot_uri"]),
+            )
+            self.assertEqual(legacy_manifest["schema"], "epic_continuum.snapshot_manifest.v2")
+            subject = base / "later-subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Later review\n", encoding="utf-8")
+            live_job = create_review_job(root, subject_path=subject, prompt="Review later.", transport="manual")
+            self.assertTrue(Path(live_job["job_dir"]).is_dir())
+
+            result = restore_drill(
+                root,
+                snapshot_uri=frozen["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(result["review_bridge_jobs_restore"]["mode"], "legacy_empty_catalog")
+            self.assertNotIn("exports/review_bridge/jobs", result["copied_durable_paths"])
+            restored_jobs = Path(result["drill_root"]) / "exports" / "review_bridge" / "jobs"
+            self.assertFalse(restored_jobs.exists())
+
+    def test_legacy_snapshot_with_review_evidence_but_no_pair_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Legacy review evidence\n", encoding="utf-8")
+            create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            frozen = snapshot(root, reason="legacy_review_snapshot")
+            downgrade_snapshot_manifest_to_legacy_without_review_pair(root, Path(frozen["snapshot_uri"]))
+
+            result = restore_drill(
+                root,
+                snapshot_uri=frozen["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "legacy_snapshot_review_bridge_jobs_unbound")
+            self.assertGreater(result["frozen_review_bridge_evidence"]["count"], 0)
+
+    def test_snapshot_review_jobs_manifest_rejects_extra_and_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Review tree manifest\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="manual")
+            for mutation in ("extra", "missing"):
+                with self.subTest(mutation=mutation):
+                    frozen = snapshot(root, reason=f"review_tree_{mutation}")
+                    manifest = json.loads(Path(frozen["snapshot_manifest_uri"]).read_text(encoding="utf-8"))
+                    paired_jobs = root / str(manifest["review_bridge_jobs"]["uri"])
+                    if mutation == "extra":
+                        (paired_jobs / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+                    else:
+                        (paired_jobs / job["job_id"] / "status.json").unlink()
+                    verification = store_module.verify_snapshot_manifest_for_root(
+                        Path(frozen["snapshot_uri"]),
+                        root=root,
+                        require_catalog_binding=True,
+                    )
+                    self.assertFalse(verification["ok"])
+                    self.assertTrue(
+                        any(
+                            error.get("error") == "review_bridge_jobs_tree_mismatch"
+                            for error in verification["errors"]
+                        ),
+                        verification["errors"],
+                    )
+
+    def test_restore_drill_checks_artifact_ledger_beyond_500_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            init_db(root)
+            artifact_dir = root / "exports" / "proof_artifacts" / "large-ledger"
+            artifact_dir.mkdir(parents=True)
             oldest_artifact: Path | None = None
             oldest_artifact_id: str | None = None
             conn = connect(root)
             try:
+                baseline_immutable_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM artifacts WHERE immutable = 1"
+                    ).fetchone()["count"]
+                )
                 for index in range(501):
-                    artifact = artifact_dir / f"finding-{index:03d}.json"
+                    artifact = artifact_dir / f"findings-{index + 1:03d}.json"
                     payload = f'{{"finding":{index}}}\n'.encode()
                     artifact.write_bytes(payload)
                     artifact_id = record_artifact(
                         conn,
-                        kind="review_findings_json",
+                        kind="large_ledger_proof",
                         uri=root_uri(root, artifact),
                         sha256=hashlib.sha256(payload).hexdigest(),
                         size_bytes=len(payload),
+                        source_type="local_generated",
+                        trust_level="local_artifact",
+                        metadata={"fixture": "large-ledger", "index": index},
                         immutable=True,
                     )
                     if index == 0:
@@ -1643,13 +1855,16 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertFalse(result["ok"], result["checks"])
             ledger = result["artifact_ledger"]
             self.assertFalse(ledger["ok"], ledger)
-            self.assertEqual(ledger["row_count"], 501)
+            self.assertEqual(ledger["row_count"], baseline_immutable_count + 501)
             self.assertEqual(ledger["missing"], 1)
             self.assertEqual(ledger["missing_artifacts"][0]["uri"], oldest_uri)
 
             source_ledger = _verify_artifact_ledger(root)
             self.assertFalse(source_ledger["ok"], source_ledger)
-            self.assertEqual(source_ledger["row_count"], 501)
+            self.assertGreaterEqual(
+                source_ledger["row_count"],
+                baseline_immutable_count + 501,
+            )
             self.assertEqual(source_ledger["missing"], 1)
 
     def test_restore_drill_uses_source_bound_archive_without_transplanting_machine_config(self) -> None:
@@ -2045,6 +2260,61 @@ class OperationLedgerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "link-like card sidecar"):
                 snapshot(root, reason="sidecar_link_guard")
 
+    def test_snapshot_binds_empty_review_jobs_pair_and_rootless_manifest_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+
+            created = snapshot(root, reason="empty_review_pair")
+
+            snapshot_path = Path(created["snapshot_uri"])
+            manifest = json.loads(Path(created["snapshot_manifest_uri"]).read_text(encoding="utf-8"))
+            binding = manifest["review_bridge_jobs"]
+            pair_path = root / str(binding["uri"])
+            self.assertTrue(pair_path.is_dir())
+            self.assertEqual(list(pair_path.iterdir()), [])
+            self.assertEqual(binding["source_uri"], "exports/review_bridge/jobs")
+            self.assertEqual(binding["directory_count"], 0)
+            self.assertEqual(binding["file_count"], 0)
+            self.assertEqual(binding["directories"], [])
+            self.assertEqual(binding["files"], {})
+            rootless = store_module.verify_snapshot_manifest(snapshot_path)
+            self.assertTrue(rootless["ok"], rootless)
+
+    def test_snapshot_manifest_failure_cleans_moved_catalog_and_review_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            observed_pair: Path | None = None
+
+            def fail_after_pair_move(*_args: object, **kwargs: object) -> Path:
+                nonlocal observed_pair
+                observed_pair = Path(str(kwargs["review_bridge_jobs_path"]))
+                self.assertTrue(observed_pair.is_dir())
+                raise RuntimeError("synthetic snapshot manifest failure")
+
+            with patch.object(
+                store_module,
+                "write_snapshot_manifest",
+                side_effect=fail_after_pair_move,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic snapshot manifest failure"):
+                    snapshot(root, reason="manifest_failure_cleanup")
+
+            self.assertIsNotNone(observed_pair)
+            assert observed_pair is not None
+            self.assertFalse(observed_pair.exists())
+            snapshots_dir = root / "snapshots"
+            self.assertEqual(list(snapshots_dir.glob("continuum_catalog_*.sqlite3")), [])
+            self.assertEqual(list(snapshots_dir.glob("continuum_snapshot_*.manifest.json")), [])
+            self.assertEqual(list(snapshots_dir.glob("continuum_cards_*")), [])
+            self.assertEqual(list(snapshots_dir.glob("continuum_review_bridge_jobs_*")), [])
+            conn = connect(root)
+            try:
+                self.assertEqual(conn.execute("SELECT count(*) FROM snapshots").fetchone()[0], 0)
+            finally:
+                conn.close()
+
     def test_snapshot_retention_removes_catalog_rows_for_deleted_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -2067,6 +2337,10 @@ class OperationLedgerTest(unittest.TestCase):
 
             snapshots = sorted((root / "snapshots").glob("continuum_catalog_*.sqlite3"))
             self.assertEqual(len(snapshots), 20)
+            review_job_trees = sorted(
+                (root / "snapshots").glob("continuum_review_bridge_jobs_*")
+            )
+            self.assertEqual(len(review_job_trees), 20)
             conn = sqlite3.connect(root / "catalog" / "catalog.sqlite3")
             conn.row_factory = sqlite3.Row
             try:

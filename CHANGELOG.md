@@ -13,18 +13,78 @@
   corrupt Card to disappear from the authority decision. Page sizes no longer
   impose 256-, 512-, or 1,000-checkpoint lifetime ceilings; long project chains
   and shared roots remain resumable, semantically verifiable, and snapshottable.
+  Unscoped discovery also pages to exhaustion before selecting authority, and
+  raw project-state Scroll events are never promoted through generic fallback.
+  Modern source identity is reconstructed from durable Scroll and operation
+  evidence even when every derived Card and graph row is missing, so that loss
+  fails semantic, snapshot, restore, and bundle verification.
+  Official v0.2.1 sources receive the same fail-closed orphan detection through
+  their exact deterministic Card identity plus legacy placement-queue and
+  append-audit bindings. Modern and v0.2.1 placement evidence must match the
+  canonical librarian role, opaque queue dedupe key, five-field payload, and
+  single related-Card list exactly; lookalike or drifted jobs are not promoted.
 - Made invalid-checkpoint repair scope explicit across CLI and MCP. Repair now
   requires a project, session, or deliberate global scope; session-scoped and
   private visibility expansions are separate opt-ins, preview and apply share
   one capability scope, and applied operation receipts bind every scope flag.
   MCP agents can now perform the same guarded remediation that resume reports.
+  When a source row is missing, repair derives the narrowest surviving boundary
+  from durable Card and receipt evidence; absent or uncertain evidence never
+  broadens a project-only repair into session/private authority.
+  Boundary, link, conflict-group, and receipt expansion now rechecks every
+  member against that capability; narrower or unresolved members are redacted
+  and are never mutated by a broader scoped repair.
 - Restore drills now preserve the durable review-relay `jobs` tree, so review
   packets, capsules, findings, and receipts referenced by the artifact ledger
-  survive a root restore and verify by hash in the disposable rehearsal. Strict
+  survive a root restore and verify by hash in the disposable rehearsal. Each
+  catalog snapshot now has an exact manifest-bound sibling copy of the jobs
+  tree, and restore selects that historical pair instead of copying later live
+  jobs. Legacy snapshots restore with an empty jobs tree only when their frozen
+  catalog has no Review Relay evidence; otherwise they fail closed. Strict
   root and restore checks now verify the complete immutable artifact ledger
   instead of silently stopping at the newest 500 rows. Review Relay internal
   references are root-relative, and legacy absolute references rebase only to
-  matching evidence inside the active restored job.
+  matching evidence inside the active restored job. Typed reference grammar,
+  link-free job-directory checks, exclusive monotonically numbered attempts,
+  and pre-write confinement prevent mutable status or redirected subdirectories
+  from overwriting immutable evidence or files outside the active root.
+  Finalized attempts now receive append-only, immutable-artifact-bound receipts;
+  exact lifecycle/counter/reference coherence and contiguous attempt history are
+  shared by semantic, snapshot, restore, and bundle gates. An explicit dry-run
+  capable upgrader safely binds a finalized single-attempt development-era job.
+  A separate dry-run/apply legacy quarantine now accepts only the exact known
+  active one-attempt browser shape or exact failed multi-attempt browser history,
+  requires a distinct replacement job that passes current integrity, and freezes
+  the old tree and catalog authority without deleting or rewriting its evidence.
+  Apply commits a compact immutable DB-first receipt to the catalog before
+  materializing its file, so interruption recovery reconstructs the same
+  receipt. The upgrader itself still refuses active and multi-attempt histories,
+  while contradictory or otherwise unknown legacy shapes remain fail-closed.
+  Accepted ingests also bind their response, output paths, operation identity,
+  and exact browser, automated, or untracked context in an immutable receipt.
+  Interrupted retries certify that durable receipt before writing, so mutable
+  status cannot silently discard an attempt or downgrade a tracked ingest.
+- Made Review Relay job authority exact across the complete job tree, artifact
+  catalog, and `source-manifest.json`. Fixed and dynamic paths must be expected
+  and bound, required artifacts must have their canonical kind, URI, identity,
+  provenance, size, and hash, and the frozen subject directory/member set must
+  match the manifest exactly. Missing, extra, unbound, or drifted evidence now
+  blocks semantic, snapshot, restore, and bundle promotion.
+- Made browser-attempt reservation DB-first. The immutable reservation phase
+  binds the empty response slot, attempt, numbered and latest handoffs, target
+  status, and artifact rows before filesystem materialization. Retrying with the
+  same explicit operation ID reconciles and returns that exact attempt without a
+  new sequence; a different operation deliberately supersedes an unfinished
+  current attempt and advances.
+- Applied one canonical 4,000,000-byte valid-UTF-8 limit to direct transport
+  wrappers, extracted reviewer content, Hermes output, inline content, browser
+  files, external result paths, and all durable resume reads. Oversized automated
+  output finalizes the reserved attempt as `transport_failed` without persisting
+  the body. Clean and interrupted retries with the same explicit operation ID
+  replay the durable failure without another transport call or sequence,
+  including historical A/B/A retries; browser, inline, and external-path
+  preflight rejection is non-mutating, while a distinct operation may start the
+  next attempt.
 - Made same-agent project-state checkpoints one atomic temporal authority chain:
   only the newest checkpoint is current, while predecessors remain historical
   evidence. Added bounded checkpoint/MCP inputs, explicit invalid-checkpoint

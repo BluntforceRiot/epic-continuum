@@ -55,8 +55,12 @@ shared root. A selected latest head that itself fails checkpoint validation
 retains the compatibility result `invalid_project_state_checkpoint`.
 Checkpoint repair uses the same raw-boundary view and refuses partial or
 unrepairable mutations. Exact source identity also detects a changed Card type,
-while modern Scroll-plus-graph evidence detects a missing derived authority
-Card.
+while modern Scroll plus durable operation/audit evidence detects a missing
+derived authority Card even when all graph proof disappeared. Unscoped resume
+pages every eligible boundary and never promotes a project-state Scroll event
+through generic fallback. Repair reconstructs the narrowest surviving
+visibility boundary, so missing source rows cannot turn session/private state
+into project-only repair authority.
 
 Temporal conflict dismissal and supersession are Continuum-owned state. A valid
 resolution receipt binds the exact component fingerprint, complete member set,

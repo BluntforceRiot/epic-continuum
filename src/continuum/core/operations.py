@@ -87,7 +87,6 @@ RESTORE_DRILL_DURABLE_REL_PATHS = (
     Path("exports/operation_receipts"),
     Path("exports/operation_recovery"),
     Path("exports/recovery_drills"),
-    Path("exports/review_bridge/jobs"),
     Path("exports/restore_drills"),
     Path("exports/thread_recovery"),
 )
@@ -1412,11 +1411,24 @@ def _record_proof_artifacts(
         for item in described_paths:
             if item.get("kind") != "file" or not item.get("exists") or not item.get("sha256"):
                 continue
+            uri = str(item.get("uri") or item["path"])
+            sha256 = str(item["sha256"])
+            # A proof pack may cite an artifact that already has a canonical
+            # domain-specific ledger binding.  Re-registering the same
+            # (uri, sha256) tuple as a generic proof input would collide with
+            # that binding and replace its exact metadata.  The existing row
+            # already proves the bytes; keep it authoritative and let the
+            # proof pack reference it without mutating the catalog.
+            if conn.execute(
+                "SELECT 1 FROM artifacts WHERE uri = ? AND sha256 = ? LIMIT 1",
+                (uri, sha256),
+            ).fetchone():
+                continue
             record_artifact(
                 conn,
                 kind="proof_input",
-                uri=str(item.get("uri") or item["path"]),
-                sha256=str(item["sha256"]),
+                uri=uri,
+                sha256=sha256,
                 size_bytes=int(item.get("size_bytes") or 0),
                 operation_id=operation_id,
                 immutable=True,
@@ -2869,6 +2881,37 @@ def _snapshot_sidecars_path(snapshot_path: Path) -> Path | None:
     return store_snapshot_sidecars_path(snapshot_path)
 
 
+def _snapshot_review_bridge_evidence(snapshot_path: Path) -> dict[str, Any]:
+    """Count catalog-proven Review Relay evidence in one frozen snapshot."""
+    conn = sqlite3.connect(sqlite_readonly_uri(snapshot_path, immutable=True), uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
+        ).fetchone()
+        if table is None:
+            return {"table_exists": False, "count": 0}
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+        }
+        clauses: list[str] = []
+        if "source_type" in columns:
+            clauses.append("source_type = 'review_bridge'")
+        if "kind" in columns:
+            clauses.append("kind LIKE 'review_%'")
+        if "uri" in columns:
+            clauses.append("instr(replace(uri, char(92), '/'), 'exports/review_bridge/jobs/') > 0")
+        if not clauses:
+            return {"table_exists": True, "count": 0}
+        row = conn.execute(
+            f"SELECT count(*) AS n FROM artifacts WHERE {' OR '.join(clauses)}"
+        ).fetchone()
+        return {"table_exists": True, "count": int(row["n"] if row else 0)}
+    finally:
+        conn.close()
+
+
 def _schema_version_for_root(root: Path) -> str | None:
     conn = connect_existing(root)
     try:
@@ -3650,6 +3693,34 @@ def restore_drill(
         atomic_write_json(out_path, stored_result)
         return result
 
+    review_jobs_manifest = selected_manifest.get("review_bridge_jobs")
+    review_jobs_pair_source: Path | None = None
+    review_jobs_restore_mode = "snapshot_pair"
+    legacy_review_evidence = {"table_exists": False, "count": 0}
+    if review_jobs_manifest is None:
+        legacy_review_evidence = _snapshot_review_bridge_evidence(selected_snapshot)
+        if int(legacy_review_evidence.get("count") or 0) > 0:
+            blocked = _blocked_restore_drill_result(
+                root,
+                drill_name=drill_name,
+                snapshot_uri=str(selected_snapshot),
+                created_seed_snapshot=created_seed_snapshot,
+                reason="legacy_snapshot_review_bridge_jobs_unbound",
+                output_audit=output_audit,
+                source_audit=source_audit,
+            )
+            blocked["frozen_review_bridge_evidence"] = legacy_review_evidence
+            blocked["snapshot_manifest"] = selected_manifest
+            return blocked
+        review_jobs_restore_mode = "legacy_empty_catalog"
+    elif isinstance(review_jobs_manifest, dict):
+        pair_uri = str(review_jobs_manifest.get("uri") or "")
+        if not pair_uri:
+            raise ValueError("snapshot Review Relay jobs binding has no URI")
+        review_jobs_pair_source = resolve_stored_uri(root, pair_uri)
+    else:
+        raise ValueError("snapshot Review Relay jobs binding is malformed")
+
     drill_id = unique_id("restore")
     drill_root = root / "run" / "restore_drills" / drill_id
     restored_db = drill_root / "catalog" / "catalog.sqlite3"
@@ -3705,6 +3776,15 @@ def restore_drill(
         target_path = drill_root / rel_path
         _restore_copytree(root, source_path, target_path, dirs_exist_ok=True)
         copied_durable_paths.append(rel_path.as_posix())
+    review_jobs_target = drill_root / "exports" / "review_bridge" / "jobs"
+    if review_jobs_pair_source is not None:
+        _restore_copytree(
+            root,
+            review_jobs_pair_source,
+            review_jobs_target,
+            dirs_exist_ok=False,
+        )
+        copied_durable_paths.append("exports/review_bridge/jobs")
 
     status_result = status(drill_root, create=False)
     audit_result = audit(drill_root, create=False)
@@ -3765,6 +3845,13 @@ def restore_drill(
             "failing": restored_semantic_integrity.get("failing"),
         },
         {
+            "name": "review_bridge_jobs_snapshot_coherent",
+            "ok": bool(review_jobs_pair_source is not None)
+            or int(legacy_review_evidence.get("count") or 0) == 0,
+            "mode": review_jobs_restore_mode,
+            "source_uri": str(review_jobs_pair_source) if review_jobs_pair_source is not None else None,
+        },
+        {
             "name": "search_index_consistent",
             "ok": bool(search_index.get("ok")),
             "missing_chunks": search_index.get("missing_chunks"),
@@ -3801,6 +3888,12 @@ def restore_drill(
         "restored_card_sidecars_uri": str(restored_sidecars) if restored_sidecars.exists() else None,
         "restored_card_sidecar_count": sidecar_count,
         "copied_durable_paths": copied_durable_paths,
+        "review_bridge_jobs_restore": {
+            "mode": review_jobs_restore_mode,
+            "source_uri": str(review_jobs_pair_source) if review_jobs_pair_source is not None else None,
+            "target_uri": str(review_jobs_target) if review_jobs_target.exists() else None,
+            "frozen_evidence_count": int(legacy_review_evidence.get("count") or 0),
+        },
         "removed_machine_local_config": removed_machine_local_config,
         "restored_writer_claim": restored_writer_claim,
         "restore_drill_output_paths": output_audit,

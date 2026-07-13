@@ -1722,6 +1722,21 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             )
             proof["proof_pack_hash"] = _proof_pack_hash(proof)
             proof_path.write_text(json.dumps(proof, ensure_ascii=True, indent=2), encoding="utf-8")
+            conn = connect(Path(root))
+            try:
+                updated = conn.execute(
+                    "UPDATE artifacts SET sha256 = ?, size_bytes = ? "
+                    "WHERE kind = 'proof_pack' AND operation_id = ?",
+                    (
+                        hashlib.sha256(proof_path.read_bytes()).hexdigest(),
+                        proof_path.stat().st_size,
+                        event["_operation"]["operation_id"],
+                    ),
+                )
+                self.assertEqual(updated.rowcount, 1)
+                conn.commit()
+            finally:
+                conn.close()
 
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
                 restore_result = call_tool(

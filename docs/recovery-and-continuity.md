@@ -54,6 +54,14 @@ payload bindings, reciprocal same-boundary supersession links, acyclic lineage,
 same-agent head uniqueness, conflict-group closure, and exact resolution
 receipts must all agree before the state is accepted.
 
+Snapshots also pair the frozen catalog with the exact Review Relay jobs tree
+that existed at snapshot time. The manifest binds every directory and file in
+that sibling tree, and retention removes the pair together. Restore drills do
+not borrow Review Relay files from the current live root. A legacy snapshot
+without this pair restores an empty jobs tree only when its frozen catalog has
+no Review Relay evidence; otherwise restore fails because the matching evidence
+cannot be reconstructed safely.
+
 ## Handoff Bundles
 
 `pack-root` creates a verified portable bundle. `verify-bundle` checks the archive envelope, manifest, hashes, portability, proof state, and semantic root health, including the temporal authority checks applied to snapshots and restores.
@@ -103,6 +111,18 @@ Scroll source, including legacy session/sequence references, so changing only a
 Card's scope, project, session, or declared type cannot hide it from resume or
 repair. For modern checkpoints, matching Scroll and graph bindings also expose a
 missing derived Card as authority corruption instead of silently erasing it.
+Modern source identity does not depend on the graph surviving: canonical Scroll
+payload markers and durable operation/audit evidence reconstruct the expected
+Card identity when Cards and graph rows disappear together. That state is
+authority corruption and blocks strict verification, snapshots, restores, and
+portable bundles.
+Official v0.2.1 project-state sources are recognized without modern payload
+markers only when the legacy deterministic Card identity, exact librarian
+placement job, and system append audit all agree. The placement footprint must
+have the canonical opaque queue dedupe key, exact five-field payload, and exact
+single related-Card list; role, payload, dedupe, or related-ID drift is not
+official derivation evidence. A missing legacy Card then fails closed as the
+same orphan authority corruption; it is not recreated.
 
 Recovery packets only include evidence visible to the requested session/project
 scope. Pending queue jobs are included only when their referenced Card, segment,
@@ -115,8 +135,13 @@ cannot acquire session-visible evidence, and a session-only request cannot use a
 discovered project identifier to read project-visible evidence. Checkpoint
 selection applies the same rule before any recovery packet is built.
 When one requested capability exposes several independent boundaries, selection
-ranks their live boundary candidates; a newer clean boundary with no current
-head cannot hide a usable live checkpoint in another boundary.
+ranks their live boundary candidates only after bounded pages have exhausted
+every eligible project-state candidate. A newer clean boundary with no current
+head cannot hide a usable live checkpoint in another boundary, and an older
+ambiguous or corrupt boundary cannot be skipped merely because newer historical
+checkpoints filled an interactive page. Generic Scroll fallback excludes
+project-state events; if authority verification cannot complete, resume returns
+an explicit incomplete result and writes no recovery packet.
 
 The selected checkpoint is a mandatory Planner candidate. Its identifier,
 title/content, summary, decisions, open tasks, scope, and source references are
@@ -190,6 +215,18 @@ raw boundary. Apply mode refuses an unrepairable topology or a limit too small
 to close the invalid set atomically; its guarded receipt is failed and the Card
 rows remain unchanged. A successful mutation must pass the semantic catalog
 postcondition in the same transaction.
+
+Authorization is reconstructed from the narrowest surviving durable boundary.
+When the bound source row is missing, Card metadata, source references, audit
+records, repair/conflict receipts, and sidecar evidence are considered before a
+candidate can be mutated. Any surviving session/private signal excludes it from
+project-only repair. Missing or contradictory boundary evidence is reported as
+an unrepairable redacted candidate and requires exact session/private or
+deliberate administrative scope; an empty source set is never authorization.
+The same check is repeated for every Card reached while expanding a boundary,
+supersession link, conflict group, or resolution receipt. A narrower or missing
+member is omitted from scoped output and mutation; an authorized Card that
+points outward still fails closed with only a redacted target count or marker.
 
 Catalog authority changes commit before their derived Card sidecars are
 refreshed. If that post-commit refresh or the full semantic postflight fails,

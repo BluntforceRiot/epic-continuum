@@ -51,10 +51,12 @@ from .core.review_bridge import (
     SUPPORTED_TRANSPORTS,
     create_review_job,
     ingest_review_result,
+    quarantine_legacy_review_job,
     review_browser_attempt_start,
     review_check_current,
     review_job_status,
     run_review_job,
+    upgrade_review_job_integrity,
 )
 from .core.store import (
     append_scroll_event,
@@ -657,6 +659,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_review_status.add_argument("--root", required=True)
     p_review_status.add_argument("--job-id", required=True)
 
+    p_review_upgrade = sub.add_parser(
+        "review-upgrade-integrity",
+        help="Bind one safe pre-0.3 Review Relay job to finalized attempt receipts",
+    )
+    p_review_upgrade.add_argument("--root", required=True)
+    p_review_upgrade.add_argument("--job-id", required=True)
+    p_review_upgrade.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate upgrade eligibility and report planned bindings without changing the root",
+    )
+
+    p_review_quarantine = sub.add_parser(
+        "review-quarantine-legacy",
+        help="Freeze one unupgradable legacy review job behind a clean replacement",
+    )
+    p_review_quarantine.add_argument("--root", required=True)
+    p_review_quarantine.add_argument("--job-id", required=True)
+    p_review_quarantine.add_argument("--replacement-job-id", required=True)
+    p_review_quarantine.add_argument(
+        "--apply",
+        action="store_true",
+        help="Commit the immutable quarantine receipt; without this flag only inspect eligibility",
+    )
+
     p_review_check_current = sub.add_parser("review-check-current", help="Check whether the reviewed subject still matches the frozen review snapshot")
     p_review_check_current.add_argument("--root", required=True)
     p_review_check_current.add_argument("--job-id", required=True)
@@ -664,6 +691,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_review_browser_attempt = sub.add_parser("review-browser-attempt-start", help="Reserve a unique browser-review response path")
     p_review_browser_attempt.add_argument("--root", required=True)
     p_review_browser_attempt.add_argument("--job-id", required=True)
+    p_review_browser_attempt.add_argument(
+        "--operation-id",
+        help="Reuse the same caller id to reconcile and return the same reserved attempt",
+    )
 
     p_hermes = sub.add_parser("install-hermes-adapter", help="Install the Epic Continuum Hermes plugin adapter")
     p_hermes.add_argument("--root", required=True)
@@ -2005,13 +2036,106 @@ def _main(argv: list[str] | None = None) -> int:
         assert root is not None
         return emit_result(review_job_status(root, job_id=args.job_id))
 
+    if args.command == "review-upgrade-integrity":
+        assert root is not None
+        if args.dry_run:
+            return emit_result(
+                upgrade_review_job_integrity(root, job_id=args.job_id, dry_run=True)
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = upgrade_review_job_integrity(root, job_id=args.job_id, dry_run=False)
+            operation.cursor(
+                {
+                    "phase": "review_integrity_upgrade_complete",
+                    "job_id": args.job_id,
+                    "upgraded": bool(result.get("upgraded")),
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_review_upgrade_integrity",
+                title=f"Upgrade Review Relay integrity binding {args.job_id}",
+                intent={"job_id": args.job_id},
+                snapshot_policy="none",
+                snapshot_reason="review integrity upgrade rewrites only guarded legacy relay metadata",
+                result_touched_paths=lambda result: [
+                    path
+                    for path in (
+                        result.get("attempt_uri"),
+                        result.get("attempt_receipt_uri"),
+                        result.get("status_uri"),
+                    )
+                    if path
+                ],
+                action=action,
+            )
+        )
+
+    if args.command == "review-quarantine-legacy":
+        assert root is not None
+        if not args.apply:
+            return emit_result(
+                quarantine_legacy_review_job(
+                    root,
+                    job_id=args.job_id,
+                    replacement_job_id=args.replacement_job_id,
+                    dry_run=True,
+                )
+            )
+
+        def action(operation: OperationGuard) -> dict[str, Any]:
+            result = quarantine_legacy_review_job(
+                root,
+                job_id=args.job_id,
+                replacement_job_id=args.replacement_job_id,
+                dry_run=False,
+                operation_id=operation.operation_id,
+            )
+            operation.cursor(
+                {
+                    "phase": "review_legacy_quarantine_complete",
+                    "job_id": args.job_id,
+                    "replacement_job_id": args.replacement_job_id,
+                }
+            )
+            return result
+
+        return emit_result(
+            guarded_result(
+                root,
+                operation_type="cli_review_quarantine_legacy",
+                title=f"Quarantine legacy Review Relay job {args.job_id}",
+                intent={
+                    "job_id": args.job_id,
+                    "replacement_job_id": args.replacement_job_id,
+                },
+                snapshot_policy="none",
+                snapshot_reason=(
+                    "legacy review quarantine freezes an already non-promotable job "
+                    "without changing its existing evidence"
+                ),
+                result_touched_paths=lambda _result: [],
+                action=action,
+            )
+        )
+
     if args.command == "review-check-current":
         assert root is not None
         return emit_result(review_check_current(root, job_id=args.job_id))
 
     if args.command == "review-browser-attempt-start":
         assert root is not None
-        return emit_result(review_browser_attempt_start(root, job_id=args.job_id))
+        return emit_result(
+            review_browser_attempt_start(
+                root,
+                job_id=args.job_id,
+                operation_id=args.operation_id,
+            )
+        )
 
     if args.command == "install-hermes-adapter":
         assert root is not None

@@ -711,6 +711,11 @@ def snapshot_sidecars_path(snapshot_path: Path) -> Path | None:
     return sidecars if sidecars.exists() else None
 
 
+def snapshot_review_bridge_jobs_path(snapshot_path: Path) -> Path:
+    snapshot_id = snapshot_id_from_catalog_path(snapshot_path) or snapshot_path.stem
+    return snapshot_path.parent / f"continuum_review_bridge_jobs_{snapshot_id}"
+
+
 def snapshot_alias_key_path(snapshot_path: Path) -> Path:
     snapshot_id = snapshot_id_from_catalog_path(snapshot_path) or snapshot_path.stem
     return snapshot_path.parent / f"continuum_partition_alias_{snapshot_id}.key"
@@ -733,6 +738,81 @@ def _sidecar_hashes(sidecars: Path | None) -> dict[str, dict[str, Any]]:
     return output
 
 
+def _snapshot_tree_inventory(tree: Path) -> dict[str, Any]:
+    if not tree.exists() or not tree.is_dir():
+        raise ValueError(f"snapshot paired tree is missing or is not a directory: {tree}")
+    _raise_if_snapshot_source_has_link_like_path(tree, label="Review Relay jobs")
+    directories: list[str] = []
+    files: dict[str, dict[str, Any]] = {}
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(tree).as_posix()
+                reason = _snapshot_link_like_reason(path)
+                if reason:
+                    raise ValueError(
+                        "snapshot paired tree contains a link-like Review Relay jobs path: "
+                        f"{path} ({reason})"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(relative)
+                    stack.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    files[relative] = {
+                        "sha256": file_sha256(path),
+                        "size_bytes": path.stat(follow_symlinks=False).st_size,
+                    }
+                else:
+                    raise ValueError(
+                        f"snapshot paired tree contains an unsupported Review Relay jobs entry: {path}"
+                    )
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError(
+                f"snapshot paired tree could not be inspected: {current}: {exc}"
+            ) from exc
+    directories.sort()
+    files = {name: files[name] for name in sorted(files)}
+    digest_payload = {
+        "directories": directories,
+        "files": files,
+    }
+    return {
+        "directory_count": len(directories),
+        "file_count": len(files),
+        "directories": directories,
+        "files": files,
+        "tree_sha256": content_hash(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+    }
+
+
+def _review_bridge_jobs_snapshot_manifest(
+    root: Path,
+    *,
+    jobs_path: Path,
+    source_path: Path | None,
+) -> dict[str, Any]:
+    return {
+        "schema": "epic_continuum.snapshot_review_bridge_jobs.v1",
+        "uri": continuum_uri(root, jobs_path),
+        "source_uri": continuum_uri(root, source_path) if source_path is not None else "exports/review_bridge/jobs",
+        **_snapshot_tree_inventory(jobs_path),
+    }
+
+
 def build_snapshot_manifest(
     root: Path,
     *,
@@ -740,10 +820,12 @@ def build_snapshot_manifest(
     card_sidecars_path: Path | None,
     alias_key_path: Path | None,
     card_sidecars_source_path: Path | None = None,
+    review_bridge_jobs_path: Path | None = None,
+    review_bridge_jobs_source_path: Path | None = None,
     semantic_integrity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     alias_key = _file_manifest(alias_key_path, root=root) if alias_key_path and alias_key_path.exists() else None
-    return {
+    manifest = {
         "schema": "epic_continuum.snapshot_manifest.v2",
         "created_at": utc_now(),
         "schema_version": SCHEMA_VERSION,
@@ -761,6 +843,13 @@ def build_snapshot_manifest(
         "semantic_integrity": semantic_integrity or {"ok": False, "error": "semantic_integrity_missing"},
         "source_root_hash": content_hash(str(root.resolve(strict=False))),
     }
+    if review_bridge_jobs_path is not None:
+        manifest["review_bridge_jobs"] = _review_bridge_jobs_snapshot_manifest(
+            root,
+            jobs_path=review_bridge_jobs_path,
+            source_path=review_bridge_jobs_source_path,
+        )
+    return manifest
 
 
 def write_snapshot_manifest(
@@ -770,6 +859,8 @@ def write_snapshot_manifest(
     card_sidecars_path: Path | None,
     alias_key_path: Path | None,
     card_sidecars_source_path: Path | None = None,
+    review_bridge_jobs_path: Path | None = None,
+    review_bridge_jobs_source_path: Path | None = None,
     semantic_integrity: dict[str, Any] | None = None,
 ) -> Path:
     manifest_path = snapshot_manifest_path(snapshot_path)
@@ -779,6 +870,8 @@ def write_snapshot_manifest(
         card_sidecars_path=card_sidecars_path,
         alias_key_path=alias_key_path,
         card_sidecars_source_path=card_sidecars_source_path,
+        review_bridge_jobs_path=review_bridge_jobs_path,
+        review_bridge_jobs_source_path=review_bridge_jobs_source_path,
         semantic_integrity=semantic_integrity,
     )
     atomic_write_text_file(manifest_path, json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
@@ -866,6 +959,71 @@ def _snapshot_catalog_binding_errors(root: Path, snapshot_path: Path) -> list[di
     return errors
 
 
+def _snapshot_review_bridge_jobs_errors(
+    snapshot_path: Path,
+    manifest: dict[str, Any],
+    *,
+    root: Path | None,
+) -> list[dict[str, Any]]:
+    if "review_bridge_jobs" not in manifest:
+        return []
+    expected = manifest.get("review_bridge_jobs")
+    if not isinstance(expected, dict):
+        return [
+            {
+                "error": "review_bridge_jobs_tree_mismatch",
+                "detail": "snapshot Review Relay jobs binding is not an object",
+            }
+        ]
+    pair_path = snapshot_review_bridge_jobs_path(snapshot_path)
+    expected_uri = (
+        continuum_uri(root, pair_path)
+        if root is not None
+        else f"{snapshot_path.parent.name}/{pair_path.name}"
+    )
+    metadata_mismatches: list[str] = []
+    if expected.get("schema") != "epic_continuum.snapshot_review_bridge_jobs.v1":
+        metadata_mismatches.append("schema")
+    if expected.get("uri") != expected_uri:
+        metadata_mismatches.append("uri")
+    if expected.get("source_uri") != "exports/review_bridge/jobs":
+        metadata_mismatches.append("source_uri")
+    try:
+        actual_inventory = _snapshot_tree_inventory(pair_path)
+    except Exception as exc:
+        return [
+            {
+                "error": "review_bridge_jobs_tree_mismatch",
+                "detail": str(exc),
+                "mismatched_fields": sorted(set(metadata_mismatches + ["tree"])),
+            }
+        ]
+    inventory_fields = (
+        "directory_count",
+        "file_count",
+        "directories",
+        "files",
+        "tree_sha256",
+    )
+    metadata_mismatches.extend(
+        field for field in inventory_fields if expected.get(field) != actual_inventory[field]
+    )
+    if not metadata_mismatches:
+        return []
+    return [
+        {
+            "error": "review_bridge_jobs_tree_mismatch",
+            "mismatched_fields": sorted(set(metadata_mismatches)),
+            "expected_directory_count": expected.get("directory_count"),
+            "actual_directory_count": actual_inventory["directory_count"],
+            "expected_file_count": expected.get("file_count"),
+            "actual_file_count": actual_inventory["file_count"],
+            "expected_tree_sha256": expected.get("tree_sha256"),
+            "actual_tree_sha256": actual_inventory["tree_sha256"],
+        }
+    ]
+
+
 def verify_snapshot_manifest_for_root(
     snapshot_path: Path,
     *,
@@ -919,6 +1077,13 @@ def verify_snapshot_manifest_for_root(
     actual_sidecars = _sidecar_hashes(sidecars_path)
     if actual_sidecars != expected_sidecars:
         errors.append({"error": "snapshot_sidecars_mismatch", "expected_count": len(expected_sidecars), "actual_count": len(actual_sidecars)})
+    errors.extend(
+        _snapshot_review_bridge_jobs_errors(
+            snapshot_path,
+            manifest,
+            root=root,
+        )
+    )
     alias_manifest = manifest.get("partition_alias_key")
     alias_path = snapshot_alias_key_path(snapshot_path)
     if alias_manifest:
@@ -9502,9 +9667,8 @@ def _record_project_state_quarantine(
     return record
 
 
-# These values are page/work-window sizes, not lifetime catalog ceilings.  Full
-# authority maintenance walks every page; unscoped interactive discovery uses
-# one newest-first window and then validates the selected boundary completely.
+# These values are page/work-window sizes, not lifetime catalog ceilings.  Every
+# authority discovery and maintenance path walks complete data in bounded pages.
 PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT = 256
 PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT = 512
 PROJECT_STATE_REPAIR_SCAN_LIMIT = 1000
@@ -9683,10 +9847,10 @@ def _project_state_boundary_rows(
     return _fetch_rows_in_pages(cursor, page_size=limit)
 
 
-def _source_bound_project_state_deterministic_identity_proven(
+def _source_bound_project_state_deterministic_identity_boundaries(
     row: ProjectStateRow,
-) -> bool:
-    """Prove a source-bound Card ID from bounded durable coordinate candidates."""
+) -> set[tuple[str, str, str]]:
+    """Return authority boundaries that reproduce the deterministic Card ID."""
 
     card_metadata = json_loads(
         (
@@ -9753,11 +9917,17 @@ def _source_bound_project_state_deterministic_identity_proven(
     )
     add_candidate(
         row["source_visibility_scope"],
-        row["source_project_id"],
+        (
+            row["source_project_id"]
+            or source_metadata.get("project_id")
+            or card_metadata.get("project_id")
+            or row["project_id"]
+        ),
         row["source_session_id"] or reference_session,
     )
     event_id = str(row["bound_source_event_id"] or "")
     source_seq = int(row["source_seq"])
+    matching_boundaries: set[tuple[str, str, str]] = set()
     for visibility_scope, project_id, session_id in coordinate_candidates:
         expected_card_id = stable_id(
             "card",
@@ -9778,8 +9948,26 @@ def _source_bound_project_state_deterministic_identity_proven(
             ),
         )
         if str(row["id"]) == expected_card_id:
-            return True
-    return False
+            matching_boundaries.add(
+                (
+                    visibility_scope,
+                    project_id if visibility_scope != "global" else "",
+                    (
+                        session_id
+                        if visibility_scope in {"session", "private"}
+                        else ""
+                    ),
+                )
+            )
+    return matching_boundaries
+
+
+def _source_bound_project_state_deterministic_identity_proven(
+    row: ProjectStateRow,
+) -> bool:
+    """Prove a source-bound Card ID from bounded durable coordinates."""
+
+    return bool(_source_bound_project_state_deterministic_identity_boundaries(row))
 
 
 def _source_bound_project_state_rows(
@@ -9794,6 +9982,7 @@ def _source_bound_project_state_rows(
 
     limit_sql = "" if complete else "LIMIT ?"
     query_params: tuple[Any, ...] = (
+        MAX_STORED_PROJECT_STATE_BYTES,
         MAX_STORED_PROJECT_STATE_BYTES,
         MAX_STORED_PROJECT_STATE_METADATA_BYTES,
         MAX_STORED_PROJECT_STATE_BYTES,
@@ -9813,6 +10002,12 @@ def _source_bound_project_state_rows(
                source.session_id AS source_session_id,
                source.project_id AS source_project_id,
                source.seq AS source_seq,
+               length(CAST(source.content AS BLOB)) AS source_content_bytes,
+               CASE
+                   WHEN length(CAST(source.content AS BLOB)) <= ?
+                   THEN source.content
+                   ELSE NULL
+               END AS bounded_source_content,
                length(CAST(source.metadata_json AS BLOB))
                    AS source_metadata_bytes,
                CASE
@@ -10149,10 +10344,6 @@ def _project_state_source_authority_boundary(
     )
     project_id = str(row["source_project_id"] or "")
     session_id = str(row["source_session_id"] or "")
-    if scope == "project":
-        return (scope, project_id, "")
-    if scope == "global":
-        return (scope, "", "")
     if not project_id and int(row["source_metadata_bytes"] or 0) <= (
         MAX_STORED_PROJECT_STATE_BYTES
     ):
@@ -10173,6 +10364,10 @@ def _project_state_source_authority_boundary(
             project_id = str(card_metadata.get("project_id") or "")
     if not project_id:
         project_id = str(row["project_id"] or "")
+    if scope == "project":
+        return (scope, project_id, "")
+    if scope == "global":
+        return (scope, "", "")
     return (scope, project_id, session_id)
 
 
@@ -10236,6 +10431,311 @@ def _project_state_graph_source_binding_proven(
     )
 
 
+def _official_project_state_source_identity_claim(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    expected_card_id: str,
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Bind one exact official Scroll event to its deterministic Card identity."""
+
+    cache_key = (event_id, expected_card_id)
+    source_cache = (
+        proof_cache.setdefault("source_identity", {})
+        if proof_cache is not None
+        else None
+    )
+    if source_cache is not None and cache_key in source_cache:
+        cached = source_cache[cache_key]
+        return dict(cached) if isinstance(cached, dict) else None
+
+    def finish(value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if source_cache is not None:
+            source_cache[cache_key] = dict(value) if value is not None else None
+        return value
+
+    if (
+        re.fullmatch(r"evt_[0-9a-f]{24}", event_id) is None
+        or re.fullmatch(r"card_[0-9a-f]{24}", expected_card_id) is None
+    ):
+        return finish(None)
+    source = conn.execute(
+        """
+        SELECT session_id, seq, content, visibility_scope, project_id,
+               metadata_json,
+               length(CAST(content AS BLOB)) AS content_bytes,
+               length(CAST(metadata_json AS BLOB)) AS metadata_bytes
+        FROM scroll_events
+        WHERE id = ? AND event_type = 'project_state'
+        """,
+        (event_id,),
+    ).fetchone()
+    if (
+        source is None
+        or int(source["content_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES
+        or int(source["metadata_bytes"] or 0) > MAX_STORED_PROJECT_STATE_BYTES
+    ):
+        return finish(None)
+    metadata = json_loads(source["metadata_json"], None)
+    metadata_claim = _official_project_state_metadata_claim(
+        metadata,
+        require_instruction_authority=True,
+    )
+    if metadata_claim is None or not isinstance(metadata, dict):
+        return finish(None)
+    session_id = str(source["session_id"] or "")
+    source_scope = str(source["visibility_scope"] or "")
+    source_project_id = str(source["project_id"] or "")
+    scope = str(metadata_claim["visibility_scope"])
+    project_id = str(metadata_claim["project_id"])
+    if (
+        session_id != metadata_claim["session_id"]
+        or source_scope != scope
+        or (scope == "project" and source_project_id != project_id)
+        or (scope in {"session", "private"} and source_project_id)
+    ):
+        return finish(None)
+    content = str(source["content"] or "")
+    content_lines = content.splitlines()
+    if (
+        len(content_lines) < 2
+        or content_lines[0] != f"Project state for {project_id}"
+        or content_lines[1] != f"Agent: {metadata_claim['agent_id']}"
+        or (
+            metadata_claim["variant"] == "modern"
+            and _project_state_payload_marker_hash(content)
+            != metadata_claim["state_payload_hash"]
+        )
+    ):
+        return finish(None)
+    seq = int(source["seq"])
+    source_ref = {
+        "event_id": event_id,
+        "session_id": session_id,
+        "seq": seq,
+    }
+    derived_card_id = stable_id(
+        "card",
+        scope,
+        session_id,
+        project_id,
+        "project_state",
+        f"{project_id} project state from {metadata_claim['agent_id']}",
+        content_hash(summarize_text(content, limit=900)),
+        json_dumps([source_ref]),
+    )
+    if derived_card_id != expected_card_id:
+        return finish(None)
+    expected_audit_payload = {
+        "session_id": session_id,
+        "seq": seq,
+        "project_id": project_id,
+        "visibility_scope": scope,
+    }
+    audit_rows = _fetch_rows_in_pages(
+        conn.execute(
+            """
+            SELECT actor, payload_json
+            FROM audit_events
+            WHERE action = 'append_scroll_event'
+              AND target_type = 'scroll_event'
+              AND target_id = ?
+              AND length(CAST(payload_json AS BLOB)) <= ?
+            ORDER BY created_at, id
+            """,
+            (event_id, MAX_STORED_PROJECT_STATE_BYTES),
+        ),
+        page_size=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    )
+    if not any(
+        str(audit_row["actor"] or "") == "system"
+        and json_loads(audit_row["payload_json"], None)
+        == expected_audit_payload
+        for audit_row in audit_rows
+    ):
+        return finish(None)
+    return finish({**metadata_claim, "event_id": event_id, "seq": seq})
+
+
+def _project_state_placement_job_evidence_proven(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    expected_card_id: str,
+    session_id: str,
+    project_id: str,
+    visibility_scope: str,
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> bool:
+    """Match the exact durable placement-job footprint emitted by Continuum."""
+
+    cache_key = (
+        event_id,
+        expected_card_id,
+        session_id,
+        project_id,
+        visibility_scope,
+    )
+    placement_cache = (
+        proof_cache.setdefault("placement", {})
+        if proof_cache is not None
+        else None
+    )
+    if placement_cache is not None and cache_key in placement_cache:
+        return bool(placement_cache[cache_key])
+
+    def finish(value: bool) -> bool:
+        if placement_cache is not None:
+            placement_cache[cache_key] = value
+        return value
+
+    source_claim = _official_project_state_source_identity_claim(
+        conn,
+        event_id=event_id,
+        expected_card_id=expected_card_id,
+        proof_cache=proof_cache,
+    )
+    if (
+        source_claim is None
+        or session_id != source_claim["session_id"]
+        or project_id != source_claim["project_id"]
+        or visibility_scope != source_claim["visibility_scope"]
+    ):
+        return finish(False)
+    expected_payload = {
+        "card_id": expected_card_id,
+        "event_id": event_id,
+        "session_id": session_id,
+        "project_id": project_id,
+        "visibility_scope": visibility_scope,
+    }
+    expected_related_card_ids = [expected_card_id]
+    expected_dedupe_key = "queue_v1_" + content_hash(
+        json_dumps(
+            [
+                "librarian",
+                "review_card_placement",
+                f"card:{expected_card_id}",
+            ]
+        )
+    )
+    queue_rows = _fetch_rows_in_pages(
+        conn.execute(
+            """
+            SELECT role, payload_json, related_card_ids_json, dedupe_key
+            FROM queue_jobs
+            WHERE role = 'librarian'
+              AND job_type = 'review_card_placement'
+              AND dedupe_key = ?
+              AND length(CAST(payload_json AS BLOB)) <= ?
+              AND length(CAST(related_card_ids_json AS BLOB)) <= ?
+              AND json_extract(
+                    CASE WHEN json_valid(payload_json)
+                         THEN payload_json ELSE '{}' END,
+                    '$.card_id'
+                  ) = ?
+            ORDER BY created_at, id
+            """,
+            (
+                expected_dedupe_key,
+                MAX_STORED_PROJECT_STATE_BYTES,
+                MAX_STORED_PROJECT_STATE_BYTES,
+                expected_card_id,
+            ),
+        ),
+        page_size=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    )
+    return finish(any(
+        str(queue_row["role"] or "") == "librarian"
+        and str(queue_row["dedupe_key"] or "") == expected_dedupe_key
+        and json_loads(queue_row["payload_json"], None) == expected_payload
+        and json_loads(queue_row["related_card_ids_json"], None)
+        == expected_related_card_ids
+        for queue_row in queue_rows
+    ))
+
+
+def _project_state_derivation_evidence_proven(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    expected_card_id: str,
+    session_id: str,
+    project_id: str,
+    visibility_scope: str,
+    metadata: dict[str, Any],
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> bool:
+    """Prove a modern source-to-Card derivation by its exact placement row.
+
+    Append and Card-sidecar audits are separate generic lifecycle records. They
+    do not bind one source event to one Card and therefore cannot be composed as
+    derivation proof. Exact graph-source binding is checked by the callers that
+    retain it as an independent source-to-Card footprint.
+    """
+
+    continuum_owned_metadata = bool(
+        metadata.get("trust_level") == "agent_reported_local_evidence"
+        and metadata.get("instruction_authority") == "user_level_evidence"
+        and metadata.get("continuum_disable_exact_memory") is True
+    )
+    if not continuum_owned_metadata:
+        return False
+
+    return _project_state_placement_job_evidence_proven(
+        conn,
+        event_id=event_id,
+        expected_card_id=expected_card_id,
+        session_id=session_id,
+        project_id=project_id,
+        visibility_scope=visibility_scope,
+        proof_cache=proof_cache,
+    )
+
+
+def _legacy_project_state_derivation_evidence_proven(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    expected_card_id: str,
+    session_id: str,
+    project_id: str,
+    visibility_scope: str,
+    seq: int,
+    metadata: dict[str, Any],
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> bool:
+    """Prove a v0.2.1 checkpoint from its exact queue and audit footprint."""
+
+    if not (
+        metadata.get("source_type") == "project_state"
+        and metadata.get("trust_level") == "agent_reported_local_evidence"
+        and metadata.get("instruction_authority") == "user_level_evidence"
+        and "state_payload_hash" not in metadata
+        and "continuum_disable_exact_memory" not in metadata
+    ):
+        return False
+
+    if not _project_state_placement_job_evidence_proven(
+        conn,
+        event_id=event_id,
+        expected_card_id=expected_card_id,
+        session_id=session_id,
+        project_id=project_id,
+        visibility_scope=visibility_scope,
+        proof_cache=proof_cache,
+    ):
+        return False
+    source_claim = _official_project_state_source_identity_claim(
+        conn,
+        event_id=event_id,
+        expected_card_id=expected_card_id,
+        proof_cache=proof_cache,
+    )
+    return source_claim is not None and source_claim["seq"] == seq
+
+
 def _proven_project_state_source_event_rows(
     conn: sqlite3.Connection,
     *,
@@ -10280,14 +10780,6 @@ def _proven_project_state_source_event_rows(
                 END,
                 '$.source_type'
               ) = 'project_state'
-          AND coalesce(json_extract(
-                CASE
-                    WHEN json_valid(source.metadata_json)
-                    THEN source.metadata_json
-                    ELSE '{{}}'
-                END,
-                '$.state_payload_hash'
-              ), '') != ''
           AND {source_visibility_clause}
         ORDER BY source.created_at DESC, source.rowid DESC
         {limit_sql}
@@ -10301,6 +10793,7 @@ def _proven_project_state_source_event_rows(
     )
     scan_overflow = not complete and len(rows) > int(limit)
     proven: list[dict[str, Any]] = []
+    proof_cache: dict[str, dict[Any, Any]] = {}
     for row in rows:
         metadata = json_loads(row["bounded_source_metadata_json"], None)
         if not isinstance(metadata, dict):
@@ -10312,6 +10805,15 @@ def _proven_project_state_source_event_rows(
         payload_hash = str(metadata.get("state_payload_hash") or "")
         source_content = str(row["source_content"] or "")
         source_lines = source_content.splitlines()
+        modern_payload_proven = bool(
+            payload_hash
+            and _project_state_payload_marker_hash(source_content) == payload_hash
+        )
+        legacy_payload_shape = bool(
+            not payload_hash
+            and source_lines
+            and source_lines[0] == f"Project state for {project_id}"
+        )
         if (
             not agent_id
             or not project_id
@@ -10320,9 +10822,9 @@ def _proven_project_state_source_event_rows(
                 and metadata_project_id
                 and source_project_id != metadata_project_id
             )
-            or _project_state_payload_marker_hash(source_content) != payload_hash
             or len(source_lines) < 2
             or source_lines[1] != f"Agent: {agent_id}"
+            or not (modern_payload_proven or legacy_payload_shape)
         ):
             continue
         try:
@@ -10352,11 +10854,39 @@ def _proven_project_state_source_event_rows(
             content_hash(summarize_text(source_content, limit=900)),
             json_dumps([source_ref]),
         )
-        if not _project_state_graph_source_binding_proven(
-            conn,
-            event_id=str(row["bound_source_event_id"]),
-            expected_card_id=expected_card_id,
-        ):
+        event_id = str(row["bound_source_event_id"])
+        source_session_id = str(row["source_session_id"] or "")
+        modern_derivation_proven = modern_payload_proven and (
+            _project_state_graph_source_binding_proven(
+                conn,
+                event_id=event_id,
+                expected_card_id=expected_card_id,
+            )
+            or _project_state_derivation_evidence_proven(
+                conn,
+                event_id=event_id,
+                expected_card_id=expected_card_id,
+                session_id=source_session_id,
+                project_id=project_id,
+                visibility_scope=effective_scope,
+                metadata=metadata,
+                proof_cache=proof_cache,
+            )
+        )
+        legacy_derivation_proven = legacy_payload_shape and (
+            _legacy_project_state_derivation_evidence_proven(
+                conn,
+                event_id=event_id,
+                expected_card_id=expected_card_id,
+                session_id=source_session_id,
+                project_id=project_id,
+                visibility_scope=effective_scope,
+                seq=int(row["source_seq"]),
+                metadata=metadata,
+                proof_cache=proof_cache,
+            )
+        )
+        if not (modern_derivation_proven or legacy_derivation_proven):
             continue
         proven.append(
             {
@@ -10378,7 +10908,7 @@ def _source_proven_project_state_card_rows(
     limit: int,
     complete: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Fetch authority Cards by graph-proven source-derived deterministic ID."""
+    """Fetch authority Cards by durably proven source-derived deterministic ID."""
 
     source_rows, source_scan_overflow = _proven_project_state_source_event_rows(
         conn,
@@ -10462,6 +10992,7 @@ def _project_state_boundary_proven_edges(
     by_id: dict[str, ProjectStateRow],
     valid_agents: dict[str, str],
     allowed_divergent_member_ids: frozenset[str] = frozenset(),
+    row_is_authorized: Callable[[ProjectStateRow], bool] | None = None,
 ) -> tuple[set[tuple[str, str]], bool, list[dict[str, Any]]]:
     """Return exact receipt/audit-proven fan-in edges for one complete boundary."""
 
@@ -10650,6 +11181,29 @@ def _project_state_boundary_proven_edges(
                 receipt_by_id.update(
                     {str(row["id"]): row for row in outside_member_rows}
                 )
+            unauthorized_member_ids = {
+                member_id
+                for member_id in member_ids
+                if member_id not in receipt_by_id
+                or (
+                    row_is_authorized is not None
+                    and not row_is_authorized(receipt_by_id[member_id])
+                )
+            }
+            if unauthorized_member_ids:
+                proof_issues.append(
+                    {
+                        "type": "redacted_cross_authority_conflict_receipt",
+                        "card_ids": sorted(
+                            member_id
+                            for member_id in member_ids
+                            if member_id in receipt_by_id
+                            and member_id not in unauthorized_member_ids
+                        ),
+                        "redacted_member_count": len(unauthorized_member_ids),
+                    }
+                )
+                continue
             quarantined_members = frozenset(
                 member_id
                 for member_id in member_ids
@@ -10767,10 +11321,16 @@ def _bounded_cycle_members(edges: dict[str, set[str]]) -> list[str]:
 def _project_state_authority_boundary_report(
     conn: sqlite3.Connection,
     boundary: tuple[str, str, str],
+    *,
+    row_is_authorized: Callable[[ProjectStateRow], bool] | None = None,
 ) -> dict[str, Any]:
     """Reconstruct and validate one complete authority boundary in pages."""
 
-    rows = _project_state_boundary_rows(conn, boundary)
+    rows = [
+        row
+        for row in _project_state_boundary_rows(conn, boundary)
+        if row_is_authorized is None or row_is_authorized(row)
+    ]
     by_id: dict[str, ProjectStateRow] = {
         str(row["id"]): row for row in rows
     }
@@ -10822,6 +11382,7 @@ def _project_state_authority_boundary_report(
                 str(item["checkpoint_id"])
                 for item in invalid_checkpoints
             ),
+            row_is_authorized=row_is_authorized,
         )
     )
     for proof_issue in proof_issues:
@@ -10854,8 +11415,7 @@ def _project_state_authority_boundary_report(
             placeholders = ", ".join("?" for _ in card_page)
             for linked_row in conn.execute(
                 f"""
-                SELECT id, card_type, visibility_scope, session_id, project_id,
-                       supersedes_card_id, superseded_by_card_id
+                SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
                 FROM cards
                 WHERE supersedes_card_id IN ({placeholders})
                    OR superseded_by_card_id IN ({placeholders})
@@ -10864,7 +11424,13 @@ def _project_state_authority_boundary_report(
                 (*card_page, *card_page),
             ).fetchall():
                 linked_id = str(linked_row["id"])
-                if linked_id not in by_id:
+                if (
+                    linked_id not in by_id
+                    and (
+                        row_is_authorized is None
+                        or row_is_authorized(linked_row)
+                    )
+                ):
                     outside_by_id[linked_id] = linked_row
         outside_rows = [outside_by_id[card_id] for card_id in sorted(outside_by_id)]
         for outside_row in outside_rows:
@@ -10894,15 +11460,28 @@ def _project_state_authority_boundary_report(
             predecessor = by_id.get(predecessor_id)
             if predecessor is None:
                 target = conn.execute(
-                    "SELECT card_type FROM cards WHERE id = ?",
+                    f"SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS} "
+                    "FROM cards WHERE id = ?",
                     (predecessor_id,),
                 ).fetchone()
-                add_issue(
-                    "missing_or_cross_boundary_predecessor",
-                    card_id=card_id,
-                    predecessor_id=predecessor_id,
-                    target_exists=target is not None,
-                )
+                if (
+                    target is not None
+                    and row_is_authorized is not None
+                    and not row_is_authorized(target)
+                ):
+                    add_issue(
+                        "redacted_cross_authority_link",
+                        card_id=card_id,
+                        relationship="predecessor",
+                        target_redacted=True,
+                    )
+                else:
+                    add_issue(
+                        "missing_or_cross_boundary_predecessor",
+                        card_id=card_id,
+                        predecessor_id=predecessor_id,
+                        target_exists=target is not None,
+                    )
             else:
                 edges[predecessor_id].add(card_id)
                 if (
@@ -10932,15 +11511,28 @@ def _project_state_authority_boundary_report(
             successor = by_id.get(successor_id)
             if successor is None:
                 target = conn.execute(
-                    "SELECT card_type FROM cards WHERE id = ?",
+                    f"SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS} "
+                    "FROM cards WHERE id = ?",
                     (successor_id,),
                 ).fetchone()
-                add_issue(
-                    "missing_or_cross_boundary_successor",
-                    card_id=card_id,
-                    successor_id=successor_id,
-                    target_exists=target is not None,
-                )
+                if (
+                    target is not None
+                    and row_is_authorized is not None
+                    and not row_is_authorized(target)
+                ):
+                    add_issue(
+                        "redacted_cross_authority_link",
+                        card_id=card_id,
+                        relationship="successor",
+                        target_redacted=True,
+                    )
+                else:
+                    add_issue(
+                        "missing_or_cross_boundary_successor",
+                        card_id=card_id,
+                        successor_id=successor_id,
+                        target_exists=target is not None,
+                    )
             else:
                 edges[card_id].add(successor_id)
                 direct_predecessor = str(
@@ -11022,15 +11614,32 @@ def _project_state_authority_boundary_report(
             grouped_ids.setdefault(group, []).append(card_id)
     for group, boundary_member_ids in sorted(grouped_ids.items()):
         group_rows = conn.execute(
-            """
-            SELECT id, card_type, status, visibility_scope, session_id, project_id
+            f"""
+            SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
             FROM cards
             WHERE conflict_group = ?
             ORDER BY id
             """,
             (group,),
         ).fetchall()
-        group_member_ids = [str(group_row["id"]) for group_row in group_rows]
+        authorized_group_rows = [
+            group_row
+            for group_row in group_rows
+            if row_is_authorized is None or row_is_authorized(group_row)
+        ]
+        redacted_group_member_count = len(group_rows) - len(
+            authorized_group_rows
+        )
+        group_member_ids = [
+            str(group_row["id"]) for group_row in authorized_group_rows
+        ]
+        if redacted_group_member_count:
+            add_issue(
+                "redacted_cross_authority_conflict_group",
+                conflict_group=group,
+                card_ids=sorted(boundary_member_ids),
+                redacted_member_count=redacted_group_member_count,
+            )
         if len(group_member_ids) < 2:
             add_issue(
                 "invalid_conflict_group",
@@ -11165,6 +11774,883 @@ def _annotate_orphan_project_state_source_event(
     report["ok"] = False
 
 
+def _durable_project_state_boundary_claim(
+    *,
+    visibility_scope: Any,
+    project_id: Any,
+    session_id: Any,
+) -> tuple[str, str, str] | None:
+    """Normalize one retained authority claim without broadening it."""
+
+    try:
+        scope = normalize_visibility_scope(
+            str(visibility_scope or ""),
+            field="durable project-state authority visibility_scope",
+        )
+    except ValueError:
+        return None
+    project = str(project_id or "")
+    session = str(session_id or "")
+    if scope == "project":
+        return (scope, project, "") if project else None
+    if scope == "global":
+        return (scope, "", "") if not project else None
+    return (scope, project, session) if session else None
+
+
+def _official_project_state_metadata_claim(
+    payload: Any,
+    *,
+    require_instruction_authority: bool,
+) -> dict[str, Any] | None:
+    """Return one boundary only for an official modern or v0.2.1 metadata shape.
+
+    Scroll metadata always carries the instruction-authority marker. Current and
+    v0.2.1 Card writers persisted their transaction metadata before append-time
+    enrichment, so Card metadata may omit that marker; if present it must still
+    have the exact official value.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    instruction_authority = payload.get("instruction_authority")
+    instruction_authority_present = "instruction_authority" in payload
+    if (
+        payload.get("source_type") != "project_state"
+        or payload.get("trust_level") != "agent_reported_local_evidence"
+        or (
+            require_instruction_authority
+            and instruction_authority != "user_level_evidence"
+        )
+        or (
+            not require_instruction_authority
+            and instruction_authority_present
+            and instruction_authority != "user_level_evidence"
+        )
+    ):
+        return None
+    agent_id = str(payload.get("agent_id") or "")
+    session_id = str(payload.get("session_id") or "")
+    project_id = str(payload.get("project_id") or "")
+    if not agent_id or not session_id or not project_id:
+        return None
+    visibility_scope = str(payload.get("visibility_scope") or "")
+    boundary = _durable_project_state_boundary_claim(
+        visibility_scope=visibility_scope,
+        project_id=project_id,
+        session_id=session_id,
+    )
+    if boundary is None:
+        return None
+    payload_hash = str(payload.get("state_payload_hash") or "")
+    modern = bool(
+        payload.get("continuum_disable_exact_memory") is True
+        and re.fullmatch(r"[0-9a-f]{64}", payload_hash) is not None
+    )
+    legacy = bool(
+        "state_payload_hash" not in payload
+        and "continuum_disable_exact_memory" not in payload
+    )
+    if modern == legacy:
+        return None
+    return {
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "project_id": project_id,
+        "visibility_scope": visibility_scope,
+        "state_payload_hash": payload_hash,
+        "boundary": boundary,
+        "variant": "modern" if modern else "v0.2.1",
+    }
+
+
+def _project_state_source_proven_authority_claims(
+    conn: sqlite3.Connection,
+    source_row: ProjectStateRow,
+    *,
+    expected_card_id: str,
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> set[tuple[str, str, str]]:
+    """Prove source authority by Card identity or exact official derivation."""
+
+    proven = _source_bound_project_state_deterministic_identity_boundaries(
+        source_row
+    )
+    metadata = json_loads(
+        (
+            source_row["bounded_source_metadata_json"]
+            if "bounded_source_metadata_json" in source_row.keys()
+            else None
+        ),
+        None,
+    )
+    metadata_claim = _official_project_state_metadata_claim(
+        metadata,
+        require_instruction_authority=True,
+    )
+    if metadata_claim is None or not isinstance(metadata, dict):
+        return proven
+    boundary = metadata_claim["boundary"]
+    source_session_id = str(source_row["source_session_id"] or "")
+    source_project_id = str(source_row["source_project_id"] or "")
+    source_scope = str(source_row["source_visibility_scope"] or "")
+    if (
+        source_session_id != metadata_claim["session_id"]
+        or source_scope != metadata_claim["visibility_scope"]
+        or (
+            source_project_id
+            and source_project_id != metadata_claim["project_id"]
+        )
+        or (
+            boundary[0] == "project"
+            and source_project_id != metadata_claim["project_id"]
+        )
+    ):
+        return proven
+    event_id = str(source_row["bound_source_event_id"] or "")
+    try:
+        seq = int(source_row["source_seq"])
+    except (TypeError, ValueError):
+        return proven
+    if (
+        re.fullmatch(r"evt_[0-9a-f]{24}", event_id) is None
+        or re.fullmatch(r"card_[0-9a-f]{24}", expected_card_id) is None
+        or seq < 1
+        or int(source_row["source_content_bytes"] or 0)
+        > MAX_STORED_PROJECT_STATE_BYTES
+    ):
+        return proven
+    source_identity_claim = _official_project_state_source_identity_claim(
+        conn,
+        event_id=event_id,
+        expected_card_id=expected_card_id,
+        proof_cache=proof_cache,
+    )
+    if (
+        source_identity_claim is None
+        or source_identity_claim["boundary"] != boundary
+        or source_identity_claim["agent_id"] != metadata_claim["agent_id"]
+    ):
+        return proven
+    source_content = str(source_row["bounded_source_content"] or "")
+    source_lines = source_content.splitlines()
+    if (
+        len(source_lines) < 2
+        or source_lines[0]
+        != f"Project state for {metadata_claim['project_id']}"
+        or source_lines[1] != f"Agent: {metadata_claim['agent_id']}"
+    ):
+        return proven
+    if metadata_claim["variant"] == "modern":
+        derivation_proven = bool(
+            _project_state_payload_marker_hash(source_content)
+            == metadata_claim["state_payload_hash"]
+            and (
+                _project_state_graph_source_binding_proven(
+                    conn,
+                    event_id=event_id,
+                    expected_card_id=expected_card_id,
+                )
+                or _project_state_derivation_evidence_proven(
+                    conn,
+                    event_id=event_id,
+                    expected_card_id=expected_card_id,
+                    session_id=metadata_claim["session_id"],
+                    project_id=metadata_claim["project_id"],
+                    visibility_scope=metadata_claim["visibility_scope"],
+                    metadata=metadata,
+                    proof_cache=proof_cache,
+                )
+            )
+        )
+    else:
+        derivation_proven = _legacy_project_state_derivation_evidence_proven(
+            conn,
+            event_id=event_id,
+            expected_card_id=expected_card_id,
+            session_id=metadata_claim["session_id"],
+            project_id=metadata_claim["project_id"],
+            visibility_scope=metadata_claim["visibility_scope"],
+            seq=seq,
+            metadata=metadata,
+            proof_cache=proof_cache,
+        )
+    if derivation_proven:
+        proven.add(boundary)
+    return proven
+
+
+def _project_state_pair_specific_member_authorities(
+    conn: sqlite3.Connection,
+    *,
+    card_id: str,
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> set[tuple[tuple[str, str, str], str]]:
+    """Return exact source-paired boundary and agent proofs for one Card."""
+
+    member_cache = (
+        proof_cache.setdefault("member_authorities", {})
+        if proof_cache is not None
+        else None
+    )
+    if member_cache is not None and card_id in member_cache:
+        return set(member_cache[card_id])
+    proven: set[tuple[tuple[str, str, str], str]] = set()
+
+    def add_source(event_id: str) -> None:
+        claim = _official_project_state_source_identity_claim(
+            conn,
+            event_id=event_id,
+            expected_card_id=card_id,
+            proof_cache=proof_cache,
+        )
+        if claim is not None:
+            proven.add((claim["boundary"], str(claim["agent_id"])))
+
+    source_rows, _ = _source_bound_project_state_rows(
+        conn,
+        source_visibility_clause="cards.id = ?",
+        source_visibility_params=(card_id,),
+        limit=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    )
+    for source_row in source_rows:
+        add_source(str(source_row["bound_source_event_id"] or ""))
+
+    queue_rows = _fetch_rows_in_pages(
+        conn.execute(
+            """
+            SELECT payload_json
+            FROM queue_jobs
+            WHERE job_type = 'review_card_placement'
+              AND length(CAST(payload_json AS BLOB)) <= ?
+              AND json_extract(
+                    CASE WHEN json_valid(payload_json)
+                         THEN payload_json ELSE '{}' END,
+                    '$.card_id'
+                  ) = ?
+            ORDER BY created_at, id
+            """,
+            (MAX_STORED_PROJECT_STATE_BYTES, card_id),
+        ),
+        page_size=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    )
+    for queue_row in queue_rows:
+        payload = json_loads(queue_row["payload_json"], None)
+        if not isinstance(payload, dict):
+            continue
+        event_id = str(payload.get("event_id") or "")
+        if _project_state_placement_job_evidence_proven(
+            conn,
+            event_id=event_id,
+            expected_card_id=card_id,
+            session_id=str(payload.get("session_id") or ""),
+            project_id=str(payload.get("project_id") or ""),
+            visibility_scope=str(payload.get("visibility_scope") or ""),
+            proof_cache=proof_cache,
+        ):
+            add_source(event_id)
+
+    graph_rows = _fetch_rows_in_pages(
+        conn.execute(
+            """
+            SELECT source_ref_json
+            FROM graph_edge_sources
+            WHERE length(CAST(source_ref_json AS BLOB)) <= ?
+              AND json_extract(
+                    CASE WHEN json_valid(source_ref_json)
+                         THEN source_ref_json ELSE '{}' END,
+                    '$.card_id'
+                  ) = ?
+            ORDER BY edge_id, source_ref_key
+            """,
+            (MAX_STORED_PROJECT_STATE_BYTES, card_id),
+        ),
+        page_size=PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    )
+    for graph_row in graph_rows:
+        source_ref = json_loads(graph_row["source_ref_json"], None)
+        if not isinstance(source_ref, dict):
+            continue
+        event_id = str(source_ref.get("event_id") or "")
+        if _project_state_graph_source_binding_proven(
+            conn,
+            event_id=event_id,
+            expected_card_id=card_id,
+        ):
+            add_source(event_id)
+    if member_cache is not None:
+        member_cache[card_id] = frozenset(proven)
+    return proven
+
+
+def _project_state_supersession_audit_authority_claim(
+    conn: sqlite3.Connection,
+    audit_row: sqlite3.Row,
+    *,
+    candidate_card_id: str,
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Validate the exact official supersession footprint before retaining it."""
+
+    if (
+        str(audit_row["target_type"] or "") != "card"
+        or re.fullmatch(
+            r"card_[0-9a-f]{24}", str(audit_row["target_id"] or "")
+        )
+        is None
+    ):
+        return None
+    payload = json_loads(audit_row["payload_json"], None)
+    if not isinstance(payload, dict) or set(payload) != {
+        "authority",
+        "direct_predecessor_card_id",
+        "superseded_card_ids",
+    }:
+        return None
+    authority = payload.get("authority")
+    predecessor_ids = payload.get("superseded_card_ids")
+    direct_predecessor = str(payload.get("direct_predecessor_card_id") or "")
+    successor_id = str(audit_row["target_id"] or "")
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != {
+            "visibility_scope",
+            "session_id",
+            "project_id",
+            "agent_id",
+        }
+        or not isinstance(predecessor_ids, list)
+        or not predecessor_ids
+        or not all(
+            isinstance(value, str)
+            and re.fullmatch(r"card_[0-9a-f]{24}", value) is not None
+            for value in predecessor_ids
+        )
+        or len(predecessor_ids) != len(set(predecessor_ids))
+        or direct_predecessor not in predecessor_ids
+        or candidate_card_id not in {successor_id, *predecessor_ids}
+    ):
+        return None
+    agent_id = str(authority.get("agent_id") or "")
+    scope = str(authority.get("visibility_scope") or "")
+    project_id = str(authority.get("project_id") or "")
+    session_id = str(authority.get("session_id") or "")
+    boundary = _durable_project_state_boundary_claim(
+        visibility_scope=scope,
+        project_id=project_id,
+        session_id=session_id,
+    )
+    if (
+        not agent_id
+        or str(audit_row["actor"] or "") != agent_id
+        or boundary is None
+        or scope not in {"project", "session", "private"}
+        or (scope == "project" and authority.get("session_id") is not None)
+        or (
+            scope in {"session", "private"}
+            and authority.get("session_id") != session_id
+        )
+    ):
+        return None
+    member_ids = [successor_id, *predecessor_ids]
+    members: dict[str, sqlite3.Row] = {}
+    for offset in range(
+        0, len(member_ids), PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+    ):
+        page = member_ids[
+            offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+        ]
+        placeholders = ", ".join("?" for _ in page)
+        page_rows = conn.execute(
+            f"""
+            SELECT id, card_type, supersedes_card_id, superseded_by_card_id,
+                   metadata_json,
+                   length(CAST(metadata_json AS BLOB)) AS metadata_bytes
+            FROM cards WHERE id IN ({placeholders})
+            """,
+            tuple(page),
+        ).fetchall()
+        members.update({str(member["id"]): member for member in page_rows})
+    if (
+        len(members) != len(set(member_ids))
+        or any(
+            str(members[member_id]["card_type"] or "") != "project_state"
+            for member_id in member_ids
+        )
+        or str(members[successor_id]["supersedes_card_id"] or "")
+        != direct_predecessor
+        or any(
+            str(members[predecessor_id]["superseded_by_card_id"] or "")
+            != successor_id
+            for predecessor_id in predecessor_ids
+        )
+    ):
+        return None
+    for member_id in member_ids:
+        if (
+            boundary,
+            agent_id,
+        ) not in _project_state_pair_specific_member_authorities(
+            conn,
+            card_id=member_id,
+            proof_cache=proof_cache,
+        ):
+            return None
+    return authority
+
+
+def _project_state_bound_source_rows_by_card_id(
+    conn: sqlite3.Connection,
+    card_ids: Iterable[str],
+    *,
+    page_size: int,
+) -> dict[str, list[ProjectStateRow]]:
+    """Fetch every exact bound source for a bounded page of candidate Cards."""
+
+    rows_by_card_id: dict[str, list[ProjectStateRow]] = {}
+    ordered_card_ids = sorted({str(card_id) for card_id in card_ids if card_id})
+    for offset in range(
+        0,
+        len(ordered_card_ids),
+        PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+    ):
+        card_id_page = ordered_card_ids[
+            offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+        ]
+        placeholders = ", ".join("?" for _ in card_id_page)
+        page_source_rows, _ = _source_bound_project_state_rows(
+            conn,
+            source_visibility_clause=f"cards.id IN ({placeholders})",
+            source_visibility_params=tuple(card_id_page),
+            limit=page_size,
+        )
+        for source_row in page_source_rows:
+            rows_by_card_id.setdefault(str(source_row["id"]), []).append(
+                source_row
+            )
+    return rows_by_card_id
+
+
+def _project_state_durable_authority_signals(
+    root: Path,
+    conn: sqlite3.Connection,
+    row: ProjectStateRow,
+    *,
+    source_rows: Iterable[ProjectStateRow] = (),
+    proof_cache: dict[str, dict[Any, Any]] | None = None,
+) -> dict[str, Any]:
+    """Collect retained scope constraints without trusting mutable Card columns.
+
+    A damaged Card can be discovered through either its first-class columns or
+    a bound Scroll event.  Both paths must consult the same retained authority
+    evidence so a source-seeded candidate cannot bypass a narrower metadata,
+    queue, receipt, or sidecar claim.
+    """
+
+    card_id = str(row["id"])
+    material = conn.execute(
+        """
+        SELECT metadata_json, source_refs_json, location_uri,
+               visibility_scope, project_id, session_id
+        FROM cards WHERE id = ?
+        """,
+        (card_id,),
+    ).fetchone()
+    claims: set[tuple[str, str, str]] = set()
+    retained_claims: set[tuple[str, str, str]] = set()
+    mirror_constraint_claims: set[tuple[str, str, str]] = set()
+    source_claims: set[tuple[str, str, str]] = set()
+    identity_proven_claims: set[tuple[str, str, str]] = set()
+    sidecar_claims: set[tuple[str, str, str]] = set()
+    coordinate_sessions: set[str] = set()
+    retained_coordinate_sessions: set[str] = set()
+    mirror_coordinate_sessions: set[str] = set()
+    source_coordinate_sessions: set[str] = set()
+    sidecar_coordinate_sessions: set[str] = set()
+    try:
+        current_card_boundary = _project_state_authority_boundary(row)
+    except ValueError:
+        current_card_boundary = None
+
+    def add_claim(
+        payload: Any,
+        *,
+        claim_bucket: set[tuple[str, str, str]],
+        coordinate_bucket: set[str],
+    ) -> tuple[str, str, str] | None:
+        if not isinstance(payload, dict):
+            return None
+        if "visibility_scope" not in payload:
+            return None
+        boundary = _durable_project_state_boundary_claim(
+            visibility_scope=payload.get("visibility_scope"),
+            project_id=payload.get("project_id"),
+            session_id=payload.get("session_id"),
+        )
+        if boundary is not None:
+            claims.add(boundary)
+            claim_bucket.add(boundary)
+        payload_session = str(payload.get("session_id") or "")
+        if payload_session:
+            coordinate_sessions.add(payload_session)
+            coordinate_bucket.add(payload_session)
+        return boundary
+
+    for source_row in source_rows:
+        deterministic_boundaries = (
+            _source_bound_project_state_deterministic_identity_boundaries(
+                source_row
+            )
+        )
+        identity_proven_claims.update(deterministic_boundaries)
+        proven_source_claims = _project_state_source_proven_authority_claims(
+            conn,
+            source_row,
+            expected_card_id=card_id,
+            proof_cache=proof_cache,
+        )
+        claims.update(proven_source_claims)
+        source_claims.update(proven_source_claims)
+        source_session = str(source_row["source_session_id"] or "")
+        if source_session:
+            coordinate_sessions.add(source_session)
+            source_coordinate_sessions.add(source_session)
+        if "bounded_source_metadata_json" in source_row.keys():
+            source_metadata_text = str(
+                source_row["bounded_source_metadata_json"] or ""
+            )
+            if (
+                source_metadata_text
+                and len(source_metadata_text.encode("utf-8"))
+                <= MAX_STORED_PROJECT_STATE_BYTES
+            ):
+                source_metadata = json_loads(source_metadata_text, None)
+                source_metadata_claim = _official_project_state_metadata_claim(
+                    source_metadata,
+                    require_instruction_authority=True,
+                )
+                if (
+                    source_metadata_claim is not None
+                    and source_metadata_claim["boundary"] in proven_source_claims
+                ):
+                    add_claim(
+                        source_metadata,
+                        claim_bucket=retained_claims,
+                        coordinate_bucket=retained_coordinate_sessions,
+                    )
+
+    if material is not None:
+        metadata_text = str(material["metadata_json"] or "")
+        if len(metadata_text.encode("utf-8")) <= MAX_STORED_PROJECT_STATE_METADATA_BYTES:
+            card_metadata = json_loads(metadata_text, None)
+            card_metadata_claim = _official_project_state_metadata_claim(
+                card_metadata,
+                require_instruction_authority=False,
+            )
+            if (
+                card_metadata_claim is not None
+                and card_metadata_claim["boundary"] != current_card_boundary
+            ):
+                add_claim(
+                    card_metadata,
+                    claim_bucket=mirror_constraint_claims,
+                    coordinate_bucket=mirror_coordinate_sessions,
+                )
+        source_refs_text = str(material["source_refs_json"] or "")
+        if len(source_refs_text.encode("utf-8")) <= MAX_STORED_PROJECT_STATE_BYTES:
+            source_refs = json_loads(source_refs_text, None)
+            if isinstance(source_refs, list):
+                for source_ref in source_refs:
+                    if not isinstance(source_ref, dict):
+                        continue
+                    reference_session = str(source_ref.get("session_id") or "")
+                    if reference_session:
+                        coordinate_sessions.add(reference_session)
+                        source_coordinate_sessions.add(reference_session)
+
+    queue_rows = conn.execute(
+        """
+        SELECT role, job_type, payload_json, related_card_ids_json, dedupe_key
+        FROM queue_jobs
+        WHERE job_type = 'review_card_placement'
+          AND length(CAST(payload_json AS BLOB)) <= ?
+          AND length(CAST(related_card_ids_json AS BLOB)) <= ?
+          AND (
+                dedupe_key = ?
+             OR json_extract(
+                    CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}'
+                    END,
+                    '$.card_id'
+                ) = ?
+             OR EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        CASE WHEN json_valid(related_card_ids_json)
+                             THEN related_card_ids_json ELSE '[]' END
+                    ) AS related_card
+                    WHERE related_card.value = ?
+                )
+          )
+        ORDER BY created_at, id
+        """,
+        (
+            MAX_STORED_PROJECT_STATE_BYTES,
+            MAX_STORED_PROJECT_STATE_BYTES,
+            f"card:{card_id}",
+            card_id,
+            card_id,
+        ),
+    ).fetchall()
+    for queue_row in queue_rows:
+        payload = json_loads(queue_row["payload_json"], None)
+        if (
+            isinstance(payload, dict)
+            and set(payload) == {
+                "card_id",
+                "event_id",
+                "session_id",
+                "project_id",
+                "visibility_scope",
+            }
+            and str(payload.get("card_id") or "") == card_id
+            and _project_state_placement_job_evidence_proven(
+                conn,
+                event_id=str(payload.get("event_id") or ""),
+                expected_card_id=card_id,
+                session_id=str(payload.get("session_id") or ""),
+                project_id=str(payload.get("project_id") or ""),
+                visibility_scope=str(payload.get("visibility_scope") or ""),
+                proof_cache=proof_cache,
+            )
+        ):
+            add_claim(
+                payload,
+                claim_bucket=retained_claims,
+                coordinate_bucket=retained_coordinate_sessions,
+            )
+
+    audit_rows = conn.execute(
+        """
+        SELECT actor, target_type, target_id, payload_json
+        FROM audit_events
+        WHERE action = 'project_state_superseded'
+          AND length(CAST(payload_json AS BLOB)) <= ?
+          AND (
+                target_id = ?
+             OR EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        CASE WHEN json_valid(payload_json)
+                             THEN json_extract(payload_json, '$.superseded_card_ids')
+                             ELSE '[]'
+                        END
+                    ) AS member
+                    WHERE member.value = ?
+                )
+          )
+        ORDER BY created_at, id
+        """,
+        (MAX_STORED_PROJECT_STATE_BYTES, card_id, card_id),
+    ).fetchall()
+    for audit_row in audit_rows:
+        authority = _project_state_supersession_audit_authority_claim(
+            conn,
+            audit_row,
+            candidate_card_id=card_id,
+            proof_cache=proof_cache,
+        )
+        if authority is not None:
+            add_claim(
+                authority,
+                claim_bucket=retained_claims,
+                coordinate_bucket=retained_coordinate_sessions,
+            )
+
+    if {
+        "conflict_resolution_receipts",
+        "conflict_resolution_members",
+    }.issubset(
+        {
+            str(table_row["name"])
+            for table_row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    ):
+        receipt_rows = conn.execute(
+            """
+            SELECT DISTINCT receipt.*
+            FROM conflict_resolution_receipts AS receipt
+            JOIN conflict_resolution_members AS member
+              ON member.receipt_id = receipt.id
+            WHERE member.card_id = ?
+            ORDER BY receipt.created_at, receipt.id
+            """,
+            (card_id,),
+        ).fetchall()
+        for receipt_row in receipt_rows:
+            receipt_id = str(receipt_row["id"] or "")
+            receipt_member_ids = [
+                str(member_row["card_id"] or "")
+                for member_row in conn.execute(
+                    """
+                    SELECT card_id FROM conflict_resolution_members
+                    WHERE receipt_id = ?
+                    ORDER BY member_ordinal, card_id
+                    """,
+                    (receipt_id,),
+                ).fetchall()
+            ]
+            receipt_members: dict[str, ProjectStateRow] = {}
+            for offset in range(
+                0,
+                len(receipt_member_ids),
+                PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
+            ):
+                member_page = receipt_member_ids[
+                    offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
+                ]
+                placeholders = ", ".join("?" for _ in member_page)
+                member_rows = conn.execute(
+                    f"""
+                    SELECT {_PROJECT_STATE_AUTHORITY_SELECT_FIELDS}
+                    FROM cards WHERE id IN ({placeholders})
+                    """,
+                    tuple(member_page),
+                ).fetchall()
+                receipt_members.update(
+                    {str(member_row["id"]): member_row for member_row in member_rows}
+                )
+            if _conflict_resolution_receipt_error(
+                conn,
+                receipt_row,
+                by_id=receipt_members,
+            ) is not None:
+                continue
+            receipt_boundary = _durable_project_state_boundary_claim(
+                visibility_scope=receipt_row["visibility_scope"],
+                project_id=receipt_row["project_id"],
+                session_id=receipt_row["session_id"],
+            )
+            if receipt_boundary is None or any(
+                not any(
+                    member_boundary == receipt_boundary and bool(member_agent)
+                    for member_boundary, member_agent in (
+                        _project_state_pair_specific_member_authorities(
+                            conn,
+                            card_id=member_id,
+                            proof_cache=proof_cache,
+                        )
+                    )
+                )
+                for member_id in receipt_member_ids
+            ):
+                continue
+            add_claim(
+                dict(receipt_row),
+                claim_bucket=retained_claims,
+                coordinate_bucket=retained_coordinate_sessions,
+            )
+
+    sidecar_path = card_sidecar_path(root, card_id)
+    if sidecar_path is not None and sidecar_path.is_file():
+        try:
+            sidecar_payload = load_atomic_yaml(
+                sidecar_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            sidecar_payload = None
+        if (
+            isinstance(sidecar_payload, dict)
+            and str(sidecar_payload.get("card_id") or "") == card_id
+            and sidecar_payload.get("state_hash")
+            == _atomic_card_state_hash(sidecar_payload)
+        ):
+            add_claim(
+                sidecar_payload,
+                claim_bucket=sidecar_claims,
+                coordinate_bucket=sidecar_coordinate_sessions,
+            )
+
+    return {
+        "claims": claims,
+        "retained_claims": retained_claims,
+        "mirror_constraint_claims": mirror_constraint_claims,
+        "source_claims": source_claims,
+        "identity_proven_claims": identity_proven_claims,
+        "sidecar_claims": sidecar_claims,
+        "coordinate_sessions": coordinate_sessions,
+        "retained_coordinate_sessions": retained_coordinate_sessions,
+        "mirror_coordinate_sessions": mirror_coordinate_sessions,
+        "source_coordinate_sessions": source_coordinate_sessions,
+        "sidecar_coordinate_sessions": sidecar_coordinate_sessions,
+    }
+
+
+def _project_state_effective_durable_authority_signals(
+    row: ProjectStateRow,
+    signals: dict[str, Any],
+) -> dict[str, set[Any]]:
+    """Prefer preserved authority material over mutable coordinate copies.
+
+    Card and Scroll first-class columns are the objects being diagnosed. A
+    synchronized sidecar can also merely repeat a damaged Card row. Bounded
+    metadata, placement jobs, receipts, and source references retain the
+    independently recorded boundary; raw source coordinates remain a fallback
+    when none of that material survives. A sidecar that differs from the Card
+    row is preserved evidence and remains an additional constraint.
+    """
+
+    retained_claims = set(signals["retained_claims"])
+    mirror_constraint_claims = set(signals["mirror_constraint_claims"])
+    source_claims = set(signals["source_claims"])
+    identity_proven_claims = set(signals["identity_proven_claims"])
+    sidecar_claims = set(signals["sidecar_claims"])
+    try:
+        card_boundary = _project_state_authority_boundary(row)
+    except ValueError:
+        card_boundary = None
+
+    primary_claims = (
+        identity_proven_claims | retained_claims | source_claims
+    )
+    # A sidecar synchronized after Card drift is only a byte-stable mirror of
+    # that mutable Card row. It cannot become the Card's sole authority merely
+    # by matching it. A preserved sidecar whose boundary differs from the Card
+    # remains a narrower independent constraint and is therefore enforced.
+    enforced_sidecar_claims = {
+        boundary for boundary in sidecar_claims if boundary != card_boundary
+    }
+    mirror_constraints = mirror_constraint_claims | enforced_sidecar_claims
+    effective_claims = set(primary_claims)
+    if not primary_claims and mirror_constraints and card_boundary is not None:
+        effective_claims.add(card_boundary)
+    effective_claims.update(mirror_constraints)
+
+    mirror_coordinate_sessions = set(signals["mirror_coordinate_sessions"])
+    sidecar_coordinate_sessions = set(
+        signals["sidecar_coordinate_sessions"]
+    )
+    effective_coordinate_sessions: set[str] = set()
+    if primary_claims:
+        effective_coordinate_sessions.update(
+            boundary[2]
+            for boundary in primary_claims
+            if boundary[0] in {"session", "private"} and boundary[2]
+        )
+    elif mirror_constraints and card_boundary is not None:
+        if card_boundary[0] in {"session", "private"} and card_boundary[2]:
+            effective_coordinate_sessions.add(card_boundary[2])
+    effective_coordinate_sessions.update(mirror_coordinate_sessions)
+    if enforced_sidecar_claims:
+        effective_coordinate_sessions.update(sidecar_coordinate_sessions)
+
+    return {
+        "claims": effective_claims,
+        "coordinate_sessions": effective_coordinate_sessions,
+    }
+
+
 def repair_invalid_project_state_checkpoints(
     root: Path,
     *,
@@ -11253,6 +12739,7 @@ def repair_invalid_project_state_checkpoints(
     post_repair_semantic_integrity: dict[str, Any] | None = None
     post_repair_semantic_error = False
     has_more = False
+    withheld_uncertain_candidate_count = 0
     semantic_precondition: dict[str, Any] | None = None
     try:
         if not dry_run:
@@ -11426,60 +12913,114 @@ def repair_invalid_project_state_checkpoints(
         source_seed_rows: list[ProjectStateRow] = list(
             merged_source_seed_rows.values()
         )
-        durable_direct_source_rows: dict[str, list[ProjectStateRow]] = {}
-        direct_seed_card_ids = sorted(
-            {str(row["id"]) for row in direct_seed_rows}
+        candidate_rows_by_card_id: dict[str, ProjectStateRow] = {
+            str(row["id"]): row for row in source_seed_rows
+        }
+        candidate_rows_by_card_id.update(
+            {str(row["id"]): row for row in direct_seed_rows}
         )
-        for offset in range(
-            0,
-            len(direct_seed_card_ids),
-            PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT,
-        ):
-            card_id_page = direct_seed_card_ids[
-                offset : offset + PROJECT_STATE_AUTHORITY_BOUNDARY_SCAN_LIMIT
-            ]
-            placeholders = ", ".join("?" for _ in card_id_page)
-            page_source_rows, _ = _source_bound_project_state_rows(
+        durable_source_rows_by_card_id = (
+            _project_state_bound_source_rows_by_card_id(
                 conn,
-                source_visibility_clause=f"cards.id IN ({placeholders})",
-                source_visibility_params=tuple(card_id_page),
-                limit=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                candidate_rows_by_card_id,
+                page_size=PROJECT_STATE_REPAIR_SCAN_LIMIT,
             )
-            for page_source_row in page_source_rows:
-                durable_direct_source_rows.setdefault(
-                    str(page_source_row["id"]),
-                    [],
-                ).append(page_source_row)
+        )
 
-        def durable_source_is_authorized(
-            source_row: ProjectStateRow,
+        def durable_boundary_is_authorized(
+            boundary: tuple[str, str, str],
         ) -> bool:
-            try:
-                source_boundary = _project_state_source_authority_boundary(
-                    source_row
-                )
-            except ValueError:
-                # An invalid visibility value has no valid narrower capability;
-                # retain it only when the ordinary scoped source query admitted it.
-                return str(source_row["id"]) in merged_source_seed_rows
-            if source_boundary[0] not in authorized_visibility_scopes:
+            if boundary[0] not in authorized_visibility_scopes:
                 return False
-            if project_id and source_boundary[1] != project_id:
+            if project_id and boundary[1] != project_id:
                 return False
-            if session_id and str(source_row["source_session_id"] or "") != session_id:
-                return False
+            if session_id and boundary[0] in {"session", "private"}:
+                return boundary[2] == session_id
             return True
 
+        repair_authorization_cache: dict[str, bool] = {}
+        repair_authority_proof_cache: dict[str, dict[Any, Any]] = {}
+
+        def repair_row_is_authorized(
+            candidate_row: ProjectStateRow,
+            *,
+            durable_source_rows: list[ProjectStateRow] | None = None,
+        ) -> bool:
+            nonlocal withheld_uncertain_candidate_count
+            candidate_id = str(candidate_row["id"])
+            if candidate_id in repair_authorization_cache:
+                return repair_authorization_cache[candidate_id]
+            if durable_source_rows is None:
+                durable_source_rows = (
+                    _project_state_bound_source_rows_by_card_id(
+                        conn,
+                        [candidate_id],
+                        page_size=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+                    ).get(candidate_id, [])
+                )
+            durable_signals = _project_state_durable_authority_signals(
+                root,
+                conn,
+                candidate_row,
+                source_rows=durable_source_rows,
+                proof_cache=repair_authority_proof_cache,
+            )
+            effective_signals = (
+                _project_state_effective_durable_authority_signals(
+                    candidate_row,
+                    durable_signals,
+                )
+            )
+            durable_claims = set(effective_signals["claims"])
+            coordinate_sessions = set(
+                effective_signals["coordinate_sessions"]
+            )
+            if durable_claims and not all(
+                durable_boundary_is_authorized(boundary)
+                for boundary in durable_claims
+            ):
+                repair_authorization_cache[candidate_id] = False
+                return False
+            if session_id:
+                if coordinate_sessions and coordinate_sessions != {session_id}:
+                    repair_authorization_cache[candidate_id] = False
+                    return False
+                if not coordinate_sessions and not durable_claims:
+                    withheld_uncertain_candidate_count += 1
+                    repair_authorization_cache[candidate_id] = False
+                    return False
+            if not durable_claims:
+                if full_root_visibility or (
+                    session_id and coordinate_sessions == {session_id}
+                ):
+                    repair_authorization_cache[candidate_id] = True
+                    return True
+                withheld_uncertain_candidate_count += 1
+                repair_authorization_cache[candidate_id] = False
+                return False
+            repair_authorization_cache[candidate_id] = True
+            return True
+
+        authorized_candidate_ids: set[str] = {
+            candidate_id
+            for candidate_id, candidate_row in candidate_rows_by_card_id.items()
+            if repair_row_is_authorized(
+                candidate_row,
+                durable_source_rows=durable_source_rows_by_card_id.get(
+                    candidate_id,
+                    [],
+                ),
+            )
+        }
         direct_seed_rows = [
             row
             for row in direct_seed_rows
-            if all(
-                durable_source_is_authorized(source_row)
-                for source_row in durable_direct_source_rows.get(
-                    str(row["id"]),
-                    [],
-                )
-            )
+            if str(row["id"]) in authorized_candidate_ids
+        ]
+        source_seed_rows = [
+            row
+            for row in source_seed_rows
+            if str(row["id"]) in authorized_candidate_ids
         ]
         orphan_source_events, orphan_source_scan_overflow = (
             _orphan_project_state_source_events(
@@ -11575,7 +13116,11 @@ def repair_invalid_project_state_checkpoints(
             tuple[str, str, str], dict[str, Any]
         ] = {}
         for boundary in sorted(boundaries):
-            report = _project_state_authority_boundary_report(conn, boundary)
+            report = _project_state_authority_boundary_report(
+                conn,
+                boundary,
+                row_is_authorized=repair_row_is_authorized,
+            )
             reports_by_boundary[boundary] = report
             authority_reports.append(report)
             rows_by_id.update(report["_rows_by_id"])
@@ -11654,14 +13199,20 @@ def repair_invalid_project_state_checkpoints(
                 continue
             if repair_integrity_error(candidate) is not None:
                 invalid_candidate_ids.add(candidate_id)
+        referencing_rows = _fetch_rows_in_pages(
+            conn.execute(
+                f"""
+                SELECT {select_fields} FROM cards
+                WHERE coalesce(supersedes_card_id, '') != ''
+                ORDER BY id
+                """
+            ),
+            page_size=PROJECT_STATE_REPAIR_SCAN_LIMIT,
+        )
         referenced_predecessor_ids = {
             str(row["supersedes_card_id"])
-            for row in conn.execute(
-                """
-                SELECT supersedes_card_id FROM cards
-                WHERE coalesce(supersedes_card_id, '') != ''
-                """
-            ).fetchall()
+            for row in referencing_rows
+            if repair_row_is_authorized(row)
         }
         retirement_candidate_ids = {
             str(candidate["id"])
@@ -11698,7 +13249,7 @@ def repair_invalid_project_state_checkpoints(
                 """,
                 (predecessor_id, head_id),
             ).fetchone()
-            if candidate is None:
+            if candidate is None or not repair_row_is_authorized(candidate):
                 return None
             head_boundary = source_boundaries_by_card_id.get(head_id)
             if head_boundary is None:
@@ -11732,6 +13283,15 @@ def repair_invalid_project_state_checkpoints(
         unrepairable_topology: list[dict[str, Any]] = list(
             source_boundary_seed_issues
         )
+        if withheld_uncertain_candidate_count:
+            unrepairable_topology.append(
+                {
+                    "type": "repair_scope_authority_unproven",
+                    "redacted_candidate_count": (
+                        withheld_uncertain_candidate_count
+                    ),
+                }
+            )
         for report in authority_reports:
             for issue in report["_topology_issues_all"]:
                 if not issue_card_ids(issue).intersection(repair_candidate_ids):
@@ -11747,8 +13307,8 @@ def repair_invalid_project_state_checkpoints(
             )
         for invalid_id in sorted(repair_candidate_ids):
             direct_successors = conn.execute(
-                """
-                SELECT id
+                f"""
+                SELECT {select_fields}
                 FROM cards
                 WHERE supersedes_card_id = ?
                 ORDER BY id
@@ -11757,18 +13317,25 @@ def repair_invalid_project_state_checkpoints(
             ).fetchall()
             for successor_row in direct_successors:
                 successor_id = str(successor_row["id"])
-                if successor_id in repair_candidate_ids:
+                if (
+                    successor_id in repair_candidate_ids
+                    or not repair_row_is_authorized(successor_row)
+                ):
                     continue
                 fan_in_rows = conn.execute(
-                    """
-                    SELECT id
+                    f"""
+                    SELECT {select_fields}
                     FROM cards
                     WHERE superseded_by_card_id = ? AND id != ?
                     ORDER BY id
-                    LIMIT 2
                     """,
                     (successor_id, invalid_id),
                 ).fetchall()
+                fan_in_rows = [
+                    row
+                    for row in fan_in_rows
+                    if repair_row_is_authorized(row)
+                ][:2]
                 if fan_in_rows:
                     unrepairable_topology.append(
                         {
@@ -11801,6 +13368,7 @@ def repair_invalid_project_state_checkpoints(
                     allowed_divergent_member_ids=frozenset(
                         repair_candidate_ids
                     ),
+                    row_is_authorized=repair_row_is_authorized,
                 )
             )
             repair_proven_authority_edges.update(repair_edges)
@@ -11827,8 +13395,8 @@ def repair_invalid_project_state_checkpoints(
             if predecessor is not None:
                 planned_predecessors[head_id] = predecessor
             incoming_rows = conn.execute(
-                """
-                SELECT id, card_type, status FROM cards
+                f"""
+                SELECT {select_fields} FROM cards
                 WHERE superseded_by_card_id = ?
                 ORDER BY id
                 """,
@@ -11839,6 +13407,7 @@ def repair_invalid_project_state_checkpoints(
                 for row in incoming_rows
                 if str(row["id"]) != predecessor_id
                 and str(row["id"]) not in repair_candidate_ids
+                and repair_row_is_authorized(row)
             ]
             proven_peer_rows = [
                 row
@@ -11959,15 +13528,17 @@ def repair_invalid_project_state_checkpoints(
             )
             touched.add(head_id)
             direct_successor_rows = conn.execute(
-                """
-                SELECT id, card_type FROM cards
+                f"""
+                SELECT {select_fields} FROM cards
                 WHERE supersedes_card_id = ?
                 ORDER BY id
                 """,
                 (head_id,),
             ).fetchall()
             direct_successor_ids = [
-                str(row["id"]) for row in direct_successor_rows
+                str(row["id"])
+                for row in direct_successor_rows
+                if repair_row_is_authorized(row)
             ]
             if direct_successor_ids:
                 successor_placeholders = ", ".join(
@@ -11985,18 +13556,26 @@ def repair_invalid_project_state_checkpoints(
                 touched.update(direct_successor_ids)
             if original_conflict_group:
                 grouped_rows = conn.execute(
-                    "SELECT id FROM cards WHERE conflict_group = ?",
+                    f"SELECT {select_fields} FROM cards "
+                    "WHERE conflict_group = ?",
                     (original_conflict_group,),
                 ).fetchall()
-                grouped_ids = [str(row["id"]) for row in grouped_rows]
-                conn.execute(
-                    """
-                    UPDATE cards SET conflict_group = NULL, updated_at = ?
-                    WHERE conflict_group = ?
-                    """,
-                    (now, original_conflict_group),
-                )
-                touched.update(grouped_ids)
+                grouped_ids = [
+                    str(row["id"])
+                    for row in grouped_rows
+                    if repair_row_is_authorized(row)
+                ]
+                if grouped_ids:
+                    group_placeholders = ", ".join("?" for _ in grouped_ids)
+                    conn.execute(
+                        f"""
+                        UPDATE cards SET conflict_group = NULL, updated_at = ?
+                        WHERE id IN ({group_placeholders})
+                          AND conflict_group = ?
+                        """,
+                        (now, *grouped_ids, original_conflict_group),
+                    )
+                    touched.update(grouped_ids)
             if predecessor is not None:
                 predecessor_id = str(predecessor["id"])
                 if conn.execute(
@@ -12122,7 +13701,11 @@ def repair_invalid_project_state_checkpoints(
                         "after": post_value,
                     }
             post_repair_reports = [
-                _project_state_authority_boundary_report(conn, boundary)
+                _project_state_authority_boundary_report(
+                    conn,
+                    boundary,
+                    row_is_authorized=repair_row_is_authorized,
+                )
                 for boundary in sorted(boundaries)
             ]
             post_repair_authority_boundaries = [
@@ -12242,6 +13825,9 @@ def repair_invalid_project_state_checkpoints(
         "has_more": has_more,
         "authority_topology_issue_count": len(unrepairable_topology),
         "authority_topology_issues": unrepairable_topology[:20],
+        "withheld_uncertain_candidate_count": (
+            withheld_uncertain_candidate_count
+        ),
         "authority_boundaries": [
             _public_project_state_authority_report(report)
             for report in authority_reports
@@ -12267,6 +13853,7 @@ def repair_invalid_project_state_checkpoints(
 
 
 def _discover_resume_state(
+    root: Path,
     conn: sqlite3.Connection,
     *,
     requested_session: str,
@@ -12399,16 +13986,11 @@ def _discover_resume_state(
         WHERE {' AND '.join(card_clauses)}
         ORDER BY created_at DESC, card_rowid DESC
     """
-    if scoped_resume:
-        direct_seed_rows = _fetch_rows_in_pages(
-            conn.execute(direct_seed_sql, tuple(card_params)),
-            page_size=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
-        )
-    else:
-        direct_seed_rows = conn.execute(
-            direct_seed_sql + " LIMIT ?",
-            (*card_params, PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT),
-        ).fetchall()
+    direct_seed_rows = _fetch_rows_in_pages(
+        conn.execute(direct_seed_sql, tuple(card_params)),
+        page_size=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+    )
+    direct_seed_card_ids = {str(row["id"]) for row in direct_seed_rows}
     source_visibility_clause, source_visibility_params = (
         authorized_visibility_clause("source")
     )
@@ -12610,7 +14192,7 @@ def _discover_resume_state(
             source_visibility_clause=legacy_source_visibility_clause,
             source_visibility_params=tuple(legacy_source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
-            complete=scoped_resume,
+            complete=True,
         )
     )
     proven_source_seed_rows, proven_source_scan_overflow = (
@@ -12619,7 +14201,7 @@ def _discover_resume_state(
             source_visibility_clause=source_visibility_clause,
             source_visibility_params=tuple(source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
-            complete=scoped_resume,
+            complete=True,
         )
     )
     source_seed_rows_by_id: dict[str, ProjectStateRow] = {}
@@ -12630,31 +14212,110 @@ def _discover_resume_state(
     source_seed_rows: list[ProjectStateRow] = list(
         source_seed_rows_by_id.values()
     )
+    candidate_rows_by_card_id: dict[str, ProjectStateRow] = {
+        str(row["id"]): row for row in source_seed_rows
+    }
+    candidate_rows_by_card_id.update(
+        {str(row["id"]): row for row in direct_seed_rows}
+    )
+    durable_source_rows_by_card_id = (
+        _project_state_bound_source_rows_by_card_id(
+            conn,
+            candidate_rows_by_card_id,
+            page_size=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+        )
+    )
+    resume_authorization_cache: dict[str, bool] = {}
+    resume_authority_proof_cache: dict[str, dict[Any, Any]] = {}
+
+    def resume_row_is_authorized(
+        candidate_row: ProjectStateRow,
+        *,
+        durable_source_rows: list[ProjectStateRow] | None = None,
+    ) -> bool:
+        candidate_id = str(candidate_row["id"])
+        if candidate_id in resume_authorization_cache:
+            return resume_authorization_cache[candidate_id]
+        if durable_source_rows is None:
+            durable_source_rows = _project_state_bound_source_rows_by_card_id(
+                conn,
+                [candidate_id],
+                page_size=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
+            ).get(candidate_id, [])
+        durable_signals = _project_state_durable_authority_signals(
+            root,
+            conn,
+            candidate_row,
+            source_rows=durable_source_rows,
+            proof_cache=resume_authority_proof_cache,
+        )
+        effective_signals = _project_state_effective_durable_authority_signals(
+            candidate_row,
+            durable_signals,
+        )
+        durable_claims = set(effective_signals["claims"])
+        # An oversized Card selected directly through the caller's visibility
+        # capability must remain visible to the boundary report even when its
+        # source is also too large to retain an independent authority claim.
+        # Admit only this observable Card-local corruption as fail-closed
+        # evidence. Missing or unproven source authority remains filtered, and
+        # the boundary integrity pass below prevents this row from promotion.
+        oversized_direct_seed = (
+            not durable_claims
+            and candidate_id in direct_seed_card_ids
+            and any(
+                int(candidate_row[field] or 0) > maximum
+                for field, maximum in {
+                    "title_bytes": MAX_PROJECT_STATE_TITLE_BYTES,
+                    "summary_bytes": MAX_PROJECT_STATE_NOTES_BYTES,
+                    "decisions_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+                    "open_tasks_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+                    "metadata_bytes": MAX_STORED_PROJECT_STATE_METADATA_BYTES,
+                    "source_refs_bytes": MAX_STORED_PROJECT_STATE_BYTES,
+                }.items()
+            )
+        )
+        authorized = oversized_direct_seed or (
+            bool(durable_claims)
+            and all(boundary_is_authorized(boundary) for boundary in durable_claims)
+        )
+        resume_authorization_cache[candidate_id] = authorized
+        return authorized
+
+    authorized_candidate_ids: set[str] = {
+        candidate_id
+        for candidate_id, candidate_row in candidate_rows_by_card_id.items()
+        if resume_row_is_authorized(
+            candidate_row,
+            durable_source_rows=durable_source_rows_by_card_id.get(
+                candidate_id,
+                [],
+            ),
+        )
+    }
+    direct_seed_rows = [
+        row
+        for row in direct_seed_rows
+        if str(row["id"]) in authorized_candidate_ids
+    ]
+    source_seed_rows = [
+        row
+        for row in source_seed_rows
+        if str(row["id"]) in authorized_candidate_ids
+    ]
     orphan_source_events, orphan_source_scan_overflow = (
         _orphan_project_state_source_events(
             conn,
             source_visibility_clause=source_visibility_clause,
             source_visibility_params=tuple(source_visibility_params),
             limit=PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT,
-            complete=scoped_resume,
+            complete=True,
         )
     )
-    direct_seed_window = (
-        direct_seed_rows
-        if scoped_resume
-        else direct_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
-    )
-    source_seed_window = (
-        source_seed_rows
-        if scoped_resume
-        else source_seed_rows[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
-    )
-    orphan_source_window = (
-        orphan_source_events
-        if scoped_resume
-        else orphan_source_events[:PROJECT_STATE_AUTHORIZED_BOUNDARY_SCAN_LIMIT]
-    )
-    seed_overflow = scoped_resume and (
+    direct_seed_window = direct_seed_rows
+    source_seed_window = source_seed_rows
+    orphan_source_window = orphan_source_events
+    seed_overflow = (
         legacy_source_scan_overflow
         or proven_source_scan_overflow
         or orphan_source_scan_overflow
@@ -12772,7 +14433,11 @@ def _discover_resume_state(
             boundaries.add(orphan_boundary)
             orphan_boundaries.append((orphan_boundary, orphan))
         reports_by_boundary = {
-            boundary: _project_state_authority_boundary_report(conn, boundary)
+            boundary: _project_state_authority_boundary_report(
+                conn,
+                boundary,
+                row_is_authorized=resume_row_is_authorized,
+            )
             for boundary in sorted(boundaries)
         }
         for boundary, issue_rows in source_boundary_issues.items():
@@ -12993,6 +14658,7 @@ def _discover_resume_state(
             event_visibility_clause, event_params = authorized_visibility_clause()
             event_clauses = [
                 "coalesce(session_id, '') != ''",
+                "event_type != 'project_state'",
                 event_visibility_clause,
             ]
             if not scoped_resume:
@@ -13304,6 +14970,7 @@ def recover_thread(
             conn = connect(root)
             conn.execute("BEGIN IMMEDIATE")
             revalidated = _discover_resume_state(
+                root,
                 conn,
                 requested_session=str(
                     expected_discovery.get("requested_session_id") or ""
@@ -14036,6 +15703,7 @@ def resume_latest(
     try:
         conn.execute("BEGIN")
         selected = _discover_resume_state(
+            root,
             conn,
             requested_session=requested_session,
             requested_project=requested_project,
@@ -14741,6 +16409,12 @@ def semantic_integrity_report(
         authority_integrity["samples"][
             "unproven_project_state_retirements"
         ] = unproven_project_state_retirements[:20]
+        # Imported lazily because Review Relay uses the store primitives above.
+        # Its report is read-only and bounded; merging it here makes snapshots,
+        # restores, strict root verification, and bundles share one gate.
+        from .review_bridge import review_bridge_integrity_report
+
+        review_bridge_integrity = review_bridge_integrity_report(root)
         checks = {
             "sqlite_integrity_ok": sqlite_integrity_ok,
             "foreign_key_violation_count": len(foreign_key_rows),
@@ -14776,6 +16450,7 @@ def semantic_integrity_report(
                 quarantined_project_state_cards
             ),
             **authority_integrity["checks"],
+            **review_bridge_integrity["checks"],
         }
         failing_counts = {
             key: value
@@ -14801,6 +16476,9 @@ def semantic_integrity_report(
                 orphan_project_state_source_events[:20]
             ),
             "authority_integrity_samples": authority_integrity["samples"],
+            "review_bridge_integrity_samples": review_bridge_integrity[
+                "samples"
+            ],
             "retired_conflict_resolution_receipt_ids": (
                 authority_integrity[
                     "retired_conflict_resolution_receipt_ids"
@@ -14816,11 +16494,23 @@ def semantic_integrity_report(
 def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     policy = str(load_config(root).get("retention", {}).get("snapshot_retention", "last_20"))
     if policy == "keep_all":
-        return {"policy": policy, "deleted": 0, "kept": None, "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root)}
+        return {
+            "policy": policy,
+            "deleted": 0,
+            "kept": None,
+            "paired_review_jobs_deleted": 0,
+            "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
+        }
     keep = 20
     snapshots_dir = root / "snapshots"
     if not snapshots_dir.exists():
-        return {"policy": policy, "deleted": 0, "kept": keep, "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root)}
+        return {
+            "policy": policy,
+            "deleted": 0,
+            "kept": keep,
+            "paired_review_jobs_deleted": 0,
+            "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
+        }
     snapshots = sorted(
         snapshots_dir.glob("continuum_catalog_*.sqlite3"),
         key=lambda item: item.stat().st_mtime,
@@ -14843,6 +16533,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         finally:
             conn.close()
     deleted = 0
+    paired_review_jobs_deleted = 0
     protected = 0
     retired_snapshot_uris: list[str] = []
     retired_snapshot_ids: list[str] = []
@@ -14855,6 +16546,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         if snapshot_id := snapshot_id_from_catalog_path(old_snapshot):
             retired_snapshot_ids.append(snapshot_id)
         sidecars = snapshot_sidecars_path(old_snapshot)
+        review_jobs = snapshot_review_bridge_jobs_path(old_snapshot)
         manifest = snapshot_manifest_path(old_snapshot)
         alias_key = snapshot_alias_key_path(old_snapshot)
         for path in (old_snapshot, manifest, alias_key):
@@ -14874,6 +16566,19 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                     pass
             try:
                 sidecars.rmdir()
+            except OSError:
+                pass
+        if review_jobs.exists() or review_jobs.is_symlink():
+            try:
+                reason = _snapshot_link_like_reason(review_jobs)
+                if reason in {"junction", "reparse_point"}:
+                    os.rmdir(review_jobs)
+                elif reason:
+                    review_jobs.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(review_jobs)
+                deleted += 1
+                paired_review_jobs_deleted += 1
             except OSError:
                 pass
     catalog_rows_retired = _retire_missing_snapshot_catalog_rows(root)
@@ -14896,6 +16601,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         "deleted": deleted,
         "kept": keep,
         "protected": protected,
+        "paired_review_jobs_deleted": paired_review_jobs_deleted,
         "catalog_rows_retired": catalog_rows_retired,
     }
 
@@ -14915,10 +16621,16 @@ def _snapshot_link_like_reason(path: Path) -> str | None:
     return None
 
 
-def _raise_if_snapshot_source_has_link_like_path(source: Path) -> None:
+def _raise_if_snapshot_source_has_link_like_path(
+    source: Path,
+    *,
+    label: str = "card sidecar",
+) -> None:
     reason = _snapshot_link_like_reason(source)
     if reason:
-        raise ValueError(f"snapshot preflight failed: refusing link-like card sidecar path: {source} ({reason})")
+        raise ValueError(
+            f"snapshot preflight failed: refusing link-like {label} path: {source} ({reason})"
+        )
     if not source.exists() or not source.is_dir():
         return
     stack = [source]
@@ -14931,14 +16643,16 @@ def _raise_if_snapshot_source_has_link_like_path(source: Path) -> None:
                     reason = _snapshot_link_like_reason(child)
                     if reason:
                         raise ValueError(
-                            f"snapshot preflight failed: refusing link-like card sidecar path: {child} ({reason})"
+                            f"snapshot preflight failed: refusing link-like {label} path: {child} ({reason})"
                         )
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(child)
         except ValueError:
             raise
         except OSError as exc:
-            raise ValueError(f"snapshot preflight failed: cannot inspect card sidecar path: {current}: {exc}") from exc
+            raise ValueError(
+                f"snapshot preflight failed: cannot inspect {label} path: {current}: {exc}"
+            ) from exc
 
 
 
@@ -14959,6 +16673,53 @@ def _cleanup_snapshot_staging(root: Path, staged_root: Path) -> None:
         shutil.rmtree(staged_root, ignore_errors=True)
 
 
+def _cleanup_snapshot_output_tree(root: Path, path: Path, *, name_prefix: str) -> None:
+    snapshots_dir = (root / "snapshots").absolute()
+    candidate = path.absolute()
+    if candidate.parent != snapshots_dir or not candidate.name.startswith(name_prefix):
+        return
+    if not candidate.exists() and not candidate.is_symlink():
+        return
+    try:
+        reason = _snapshot_link_like_reason(candidate)
+        if reason in {"junction", "reparse_point"}:
+            os.rmdir(candidate)
+        elif reason:
+            candidate.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(candidate)
+    except OSError:
+        pass
+
+
+def _cleanup_uncommitted_snapshot_outputs(
+    root: Path,
+    *,
+    snapshot_path: Path,
+    card_sidecars_path: Path,
+    review_bridge_jobs_path: Path,
+) -> None:
+    _cleanup_snapshot_output_tree(
+        root,
+        review_bridge_jobs_path,
+        name_prefix="continuum_review_bridge_jobs_",
+    )
+    _cleanup_snapshot_output_tree(
+        root,
+        card_sidecars_path,
+        name_prefix="continuum_cards_",
+    )
+    for path in (
+        snapshot_manifest_path(snapshot_path),
+        snapshot_alias_key_path(snapshot_path),
+        snapshot_path,
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     init_db(root)
     reason = enforce_text_secret_policy(root, str(reason), scope="snapshot reason")
@@ -14972,21 +16733,44 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     probe_sidecar = card_sidecar_path(root, "__probe__")
     cards_source = probe_sidecar.parent if probe_sidecar is not None else root / "catalog" / "cards"
     cards_out = root / "snapshots" / f"continuum_cards_{snapshot_id}"
+    review_jobs_source = root / "exports" / "review_bridge" / "jobs"
+    review_jobs_out = snapshot_review_bridge_jobs_path(out_path)
     alias_key_source = _partition_alias_key_path(root)
     alias_key_out = snapshot_alias_key_path(out_path)
     staged_root = root / "snapshots" / f".staging_{snapshot_id}"
     staged_db = staged_root / "catalog" / "catalog.sqlite3"
     staged_cards_out = _snapshot_staged_sidecars_path(root, staged_root, cards_source)
+    staged_review_jobs = staged_root / "exports" / "review_bridge" / "jobs"
     staged_alias_key = _partition_alias_key_path(staged_root)
     out_uri = continuum_uri(root, out_path)
     source_db_uri = continuum_uri(root, source_db)
     cards_out_uri = continuum_uri(root, cards_out)
+    review_jobs_out_uri = continuum_uri(root, review_jobs_out)
+    snapshot_catalog_committed = False
     try:
+        from .operations import _verify_artifact_ledger
+
+        artifact_ledger = _verify_artifact_ledger(root)
+        if not artifact_ledger.get("ok"):
+            raise ValueError(
+                "snapshot preflight failed: immutable artifact ledger is not clean: "
+                f"{artifact_ledger}"
+            )
         semantic_integrity = semantic_integrity_report(root, create=False, conn=conn)
         if not semantic_integrity.get("ok"):
             raise ValueError(f"snapshot preflight failed: semantic integrity is not clean: {semantic_integrity.get('failing')}")
         if cards_source.exists():
             _raise_if_snapshot_source_has_link_like_path(cards_source)
+        if review_jobs_source.exists():
+            if not review_jobs_source.is_dir():
+                raise ValueError(
+                    "snapshot preflight failed: Review Relay jobs path is not a directory: "
+                    f"{review_jobs_source}"
+                )
+            _raise_if_snapshot_source_has_link_like_path(
+                review_jobs_source,
+                label="Review Relay jobs",
+            )
         secure_mkdir(out_path.parent)
         secure_mkdir(staged_db.parent, secure_existing=True)
         if config_path(root).exists():
@@ -15001,6 +16785,19 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
         if cards_source.exists():
             secure_copytree(cards_source, staged_cards_out, dirs_exist_ok=True, symlinks=False)
             card_sidecar_count = sum(1 for item in staged_cards_out.glob("*.yaml"))
+        if review_jobs_source.exists():
+            secure_copytree(
+                review_jobs_source,
+                staged_review_jobs,
+                dirs_exist_ok=False,
+                symlinks=False,
+            )
+        else:
+            secure_mkdir(staged_review_jobs, secure_existing=True)
+        _raise_if_snapshot_source_has_link_like_path(
+            staged_review_jobs,
+            label="copied Review Relay jobs",
+        )
         copied_alias_key_path: Path | None = None
         if alias_key_source.exists():
             secure_copy_file(alias_key_source, staged_alias_key)
@@ -15024,6 +16821,7 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
         secure_sqlite_files(out_path)
         if staged_cards_out.exists():
             staged_cards_out.rename(cards_out)
+        staged_review_jobs.rename(review_jobs_out)
         if staged_alias_key.exists():
             os.replace(staged_alias_key, alias_key_out)
             try:
@@ -15037,8 +16835,12 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
             card_sidecars_path=cards_out if cards_out.exists() else None,
             alias_key_path=copied_alias_key_path,
             card_sidecars_source_path=cards_source,
+            review_bridge_jobs_path=review_jobs_out,
+            review_bridge_jobs_source_path=review_jobs_source,
             semantic_integrity=snapshot_semantic_integrity,
         )
+        written_manifest = load_snapshot_manifest(out_path)
+        review_jobs_binding = dict(written_manifest["review_bridge_jobs"])
         now = utc_now()
         snapshot_hash = file_sha256(out_path)
         manifest_uri = continuum_uri(root, manifest_path)
@@ -15073,12 +16875,17 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 "snapshot_uri": out_uri,
                 "card_sidecars_uri": cards_out_uri,
                 "card_sidecar_count": card_sidecar_count,
+                "review_bridge_jobs_uri": review_jobs_out_uri,
+                "review_bridge_jobs_file_count": review_jobs_binding["file_count"],
+                "review_bridge_jobs_directory_count": review_jobs_binding["directory_count"],
+                "review_bridge_jobs_tree_sha256": review_jobs_binding["tree_sha256"],
                 "snapshot_manifest_uri": manifest_uri,
                 "partition_alias_key_uri": continuum_uri(root, alias_key_out) if copied_alias_key_path else None,
                 "reason": reason,
             },
         )
         conn.commit()
+        snapshot_catalog_committed = True
         retention = enforce_snapshot_retention(root)
         return {
             "snapshot_id": snapshot_id,
@@ -15086,10 +16893,23 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
             "source_db_uri": str(source_db),
             "card_sidecars_uri": str(cards_out),
             "card_sidecar_count": card_sidecar_count,
+            "review_bridge_jobs_uri": str(review_jobs_out),
+            "review_bridge_jobs_file_count": review_jobs_binding["file_count"],
+            "review_bridge_jobs_directory_count": review_jobs_binding["directory_count"],
+            "review_bridge_jobs_tree_sha256": review_jobs_binding["tree_sha256"],
             "snapshot_manifest_uri": str(manifest_path),
             "partition_alias_key_uri": str(copied_alias_key_path) if copied_alias_key_path else None,
             "retention": retention,
         }
+    except Exception:
+        if not snapshot_catalog_committed:
+            _cleanup_uncommitted_snapshot_outputs(
+                root,
+                snapshot_path=out_path,
+                card_sidecars_path=cards_out,
+                review_bridge_jobs_path=review_jobs_out,
+            )
+        raise
     finally:
         conn.close()
         _cleanup_snapshot_staging(root, staged_root)

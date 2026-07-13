@@ -10,8 +10,8 @@ and saves the JSON result.
 
 For strict unattended automation, the OpenAI-compatible transport is the preferred path because it receives
 and returns raw JSON over HTTP. The Hermes transport is supported for agent-mediated review, but it is still
-held to the same schema and hash checks; if Hermes or the selected model returns prose, partial JSON, or a
-tool-loop question, Continuum marks the job `review_failed` and preserves the raw response for diagnosis.
+held to the same schema and hash checks. If its response fits the byte limit but contains prose, partial JSON,
+or a tool-loop question, Continuum marks the job `review_failed` and preserves the raw response for diagnosis.
 
 ## Job Layout
 
@@ -35,6 +35,8 @@ exports/review_bridge/jobs/review_.../
   manual-handoff.md
   browser-handoff.md
   browser-handoffs/
+  attempts/
+  attempt-receipts/
   secret-allowlist-report.json
   responses/
   findings/
@@ -43,15 +45,75 @@ exports/review_bridge/jobs/review_.../
     subject/...
 ```
 
-The `exports/review_bridge/jobs` tree is durable recovery evidence. Root
-restore drills copy it alongside the catalog snapshot and verify every
-immutable artifact-ledger binding before the rehearsal can succeed. Internal
-job references are stored relative to the Continuum root and are resolved only
-through the active job directory. A restored job can therefore reserve a new
-browser attempt and ingest its response after the original root is gone.
+The `exports/review_bridge/jobs` tree is durable recovery evidence. Each new
+catalog snapshot freezes an exact sibling copy of that tree and binds its full
+directory set, file set, sizes, hashes, and aggregate tree digest in the
+snapshot manifest. Restore drills use only the pair belonging to the selected
+catalog snapshot, never the current live jobs tree, and verify every immutable
+artifact-ledger binding before the rehearsal can succeed. A legacy snapshot
+without a paired jobs tree is restorable only when its frozen catalog contains
+no Review Relay evidence; in that case the restored jobs tree is empty. Legacy
+snapshots whose catalog does contain Review Relay evidence fail closed because
+their matching filesystem evidence cannot be proven. Internal job references
+are stored relative to the Continuum root and are resolved only through the
+active job directory. A restored job can therefore reserve a new browser
+attempt and ingest its response after the original root is gone.
 Legacy absolute job references are rebased only when the same in-job evidence
 exists under the active root (and its recorded hash matches when available);
 they are never used to read or write through the old root.
+
+The job tree, artifact catalog, and `source-manifest.json` are one exact
+authority boundary. Integrity checks enumerate the complete bounded job tree,
+reject unexpected directories/files and unbound dynamic evidence, and require
+each immutable job artifact to have its canonical catalog kind, URI, stable
+identity, provenance, size, hash, and metadata. The source manifest separately
+governs the frozen `snapshot/subject/` tree: its subject identity, complete file
+and directory sets, and every member size and SHA-256 must match. The manifest
+itself is an immutable catalog-bound artifact. A missing catalog-backed job,
+missing or extra subject member, unbound response, changed manifest, or catalog
+drift therefore fails the same semantic, snapshot, restore, and bundle gates.
+
+Every internal reference also has an exact path class. Attempt references may
+name only `attempts/attempt-NNN.json`, raw responses only
+`responses/response-NNN.raw.txt`, numbered handoffs only
+`browser-handoffs/handoff-NNN.md`, and findings/receipts only their respective
+directories. Mutable status cannot redirect one class onto packet, capsule,
+request, subject, schema, or manifest evidence. Semantic root verification and
+snapshot/restore/bundle gates reject a job whose stored references violate this
+grammar or whose attempt identity/hash no longer matches.
+
+Attempt, response, and handoff directories are checked component by component
+before any write. Link-like or redirected job paths are refused without creating
+or replacing a file. Attempt records use exclusive creation, and numbering
+advances from the greatest valid existing number so gaps cannot select an older
+record for overwrite.
+
+Every finalized attempt has a matching append-only record under
+`attempt-receipts/`. The receipt binds the exact attempt bytes, job identity,
+attempt number, final state, and completion time; the receipt itself is entered
+in the immutable artifact ledger. Only the current unfinished browser attempt
+is bound through the complete current/last status tuple instead. Verification
+requires a contiguous `1..attempt_count` history, a receipt for every finalized
+attempt, the exact reserved lifecycle for the current attempt, and coherent
+status/ingest counters and terminal references. Semantic, snapshot, restore,
+and bundle gates all use this same certification.
+
+Browser reservation is DB-first. Before the response placeholder, attempt file,
+numbered handoff, mutable latest handoff, status, or artifact rows are relied on,
+Continuum commits one immutable reservation phase that binds their exact target
+bytes and status. A retry with the same explicit operation ID reconciles any
+missing materialization and returns the already-bound attempt and response path;
+it does not allocate another sequence. A different operation ID is a deliberate
+new reservation and supersedes the current unfinished attempt before allocating
+the next number.
+
+Each accepted ingest additionally records an exact `browser_reserved`,
+`automated`, or `untracked` claim. The claim binds the raw response hash and
+timestamp, deterministic output paths, the presence and value of the operation
+ID, and the mode-specific attempt context. Its ingest receipt is bound in the
+immutable artifact ledger. Tracked terminal ingests must resolve to the matching
+finalized attempt and attempt receipt; an untracked direct ingest may have no
+attempt.
 
 For a single-file subject, Continuum copies the file unchanged instead of wrapping it in another ZIP. That
 keeps the reviewed package SHA-256 equal to the original file SHA-256.
@@ -145,6 +207,27 @@ pass the already-built release ZIP as the subject.
 Continuum re-hashes the actual `review-packet.md`, review capsule, and subject artifact at ingest time. It
 does not trust `request.json` alone as the source of truth for artifact binding.
 
+Every reviewer-controlled response must be valid UTF-8 and no larger than
+exactly 4,000,000 encoded bytes. The same predicate covers the direct endpoint's
+transport wrapper and extracted reviewer content, Hermes output, inline ingest,
+reserved browser files, external result paths, and every durable resume read.
+External and network reads stop after the limit plus one byte; Hermes output is
+captured through a file-backed bounded read. Direct transport validates both the
+wrapper and reviewer content before writing either one.
+
+For a fresh oversized automated response, Continuum finalizes the existing
+reservation as `transport_failed`, stores only the bounded error evidence, and
+does not persist the oversized body. Retrying the same explicit operation ID,
+whether the first failure completed cleanly or stopped during terminalization,
+replays that terminal failure without another transport call or attempt number.
+The lookup remains sticky across intervening operations, so an A/B/A retry still
+replays A; a genuinely different operation may reserve the next attempt. An
+oversized browser, inline, or external-path response is rejected before ingest
+status, catalog rows, or output files change, leaving an existing browser
+reservation available for corrected content. Automated API calls without an
+explicit operation ID retain append-only clean retry behavior rather than
+claiming historical operation replay.
+
 This prevents stale copied reviews, mismatched uploads, and accidental "Review7 source with Review8 receipt"
 style collisions from being ingested as current evidence.
 
@@ -188,7 +271,8 @@ reviewer JSON to the reserved path, and ingest that exact file:
 ```bash
 continuum review-browser-attempt-start \
   --root ./.continuum-demo \
-  --job-id review_20260624T000000Z_example
+  --job-id review_20260624T000000Z_example \
+  --operation-id browser-review-001
 
 continuum review-ingest \
   --root ./.continuum-demo \
@@ -196,15 +280,24 @@ continuum review-ingest \
   --result-path ./.continuum-demo/exports/review_bridge/jobs/review_20260624T000000Z_example/responses/response-001.raw.txt
 ```
 
-If the reviewer returns malformed JSON, keep that raw response, run `review-browser-attempt-start` again, and
-use the newly reserved `response-002.raw.txt` path. Continuum writes immutable per-attempt handoffs under
-`browser-handoffs/` and keeps `browser-handoff.md` as a mutable latest pointer. Continuum rejects reused or
-consumed browser response paths, so a failed `response-001.raw.txt` remains evidence rather than becoming a
-retry slot.
+Treat `--operation-id` as the stable identity of one logical reservation. If the
+process stops at any reservation boundary, rerun with the same value to recover
+and receive the exact same attempt. Use a new value only when intentionally
+superseding that unfinished attempt and reserving the next response number.
+
+If the reviewer returns malformed JSON, keep that raw response, run
+`review-browser-attempt-start` again with a new operation ID, and use the newly
+reserved `response-002.raw.txt` path. Continuum writes immutable per-attempt
+handoffs under `browser-handoffs/` and keeps `browser-handoff.md` as a mutable
+latest pointer. Continuum rejects reused or consumed browser response paths, so
+a failed `response-001.raw.txt` remains evidence rather than becoming a retry
+slot.
 
 If a process stops after validation while status is `ingesting`, rerun `review-ingest` with the same reserved
 response path. The pending response hash and deterministic output paths make that continuation idempotent;
-changing the raw response during recovery is rejected.
+changing the raw response during recovery is rejected. If the ingest receipt
+was already made durable, retry first certifies its exact immutable artifact
+binding and mode-specific claim before writing any output or catalog row.
 
 Check status:
 
@@ -213,6 +306,65 @@ continuum review-status \
   --root ./.continuum-demo \
   --job-id review_20260624T000000Z_example
 ```
+
+Roots created by an earlier local 0.3 development build may have one completed
+attempt without the new identity fields, last-attempt hash, or finalization
+receipt. Inspect the explicit one-time upgrade without changing the root, then
+apply it only if the dry run reports `upgrade_available`:
+
+```bash
+continuum review-upgrade-integrity \
+  --root ./.continuum-demo \
+  --job-id review_20260624T000000Z_example \
+  --dry-run
+
+continuum review-upgrade-integrity \
+  --root ./.continuum-demo \
+  --job-id review_20260624T000000Z_example
+```
+
+The guarded upgrade accepts only a finalized single-attempt legacy job. It
+canonicalizes that attempt and binds its current bytes to a new immutable
+receipt transactionally. It does not run from `review-status` or semantic
+verification, and the upgrader itself still refuses active and multi-attempt
+histories.
+
+Two exact pre-0.3 browser shapes instead have a preservation path: the authentic
+active single-attempt reservation with no durable phase/receipt history, and a
+contiguous 2-20-attempt `review_failed` history with the known development-era
+attempt identity/receipt omissions and missing final-attempt hash. First prepare
+a distinct replacement job that passes current Review Relay integrity. Then
+inspect quarantine eligibility without changing either job:
+
+```bash
+continuum review-quarantine-legacy \
+  --root ./.continuum-demo \
+  --job-id review_legacy_example \
+  --replacement-job-id review_replacement_example
+```
+
+Only an exact recognized shape reports `quarantine_available`. Apply the same
+binding explicitly:
+
+```bash
+continuum review-quarantine-legacy \
+  --root ./.continuum-demo \
+  --job-id review_legacy_example \
+  --replacement-job-id review_replacement_example \
+  --apply
+```
+
+Apply rechecks both jobs under their operation locks, commits a compact immutable
+DB-first catalog receipt, and then materializes `receipts/legacy-quarantine.json`.
+The receipt binds the replacement job, operation identity, complete old-tree and
+catalog-binding counts/digests, and an exact counter/digest of the accepted known
+findings; it does not duplicate the full inventory. If the process stops after
+the catalog commit, the same receipt file is reconstructed on retry. The old job
+then reports `quarantined_legacy`, remains immutable historical evidence, and is
+still included in integrity, snapshot, restore, and bundle verification behind
+the clean replacement. Upgradeable jobs, contradictory histories, partial
+bindings, or additional unexplained defects are refused rather than generalized
+into quarantine.
 
 Before applying findings from a long-running external review, check that the active subject still matches
 the frozen review snapshot:

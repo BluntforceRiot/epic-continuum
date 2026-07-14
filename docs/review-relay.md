@@ -20,6 +20,16 @@ initializes the Continuum root. The subject and every existing path component mu
 regular file; a symlink, junction, or reparse-point component is rejected. `review-check-current` repeats the
 same path check and reports an unsafe source as non-current.
 
+Every selected subject basename and every discovered relative path component must be NFC-normalized and
+must not contain Unicode control, format, or surrogate code points. The same rule applies to ZIP member
+paths. On every host, publication names also reject trailing dots or spaces, the Win32-forbidden characters
+`< > : " / \\ | ? *`, reserved device stems (including aliases such as `CON .txt`), and NFC/casefold
+collisions. ZIP validation applies this rule to implicit ancestor directories as well as complete member
+names: distinct spellings cannot merge into one portable directory, a file cannot be an ancestor, and a
+file cannot replace an already implied directory. Preparation rejects an invalid name before publishing a packet or capsule, including invalid
+names that would otherwise be ignored; a name added after preparation makes `review-check-current` fail
+closed.
+
 Preparation copies the subject into a frozen snapshot under a private staging directory. The packet,
 manifest, subject archive, and capsule are all generated from that snapshot, not from later reads of the
 live worktree. Snapshot inputs are opened component by component without following links, must remain
@@ -130,9 +140,24 @@ numbered handoff, mutable latest handoff, status, or artifact rows are relied on
 Continuum commits one immutable reservation phase that binds their exact target
 bytes and status. A retry with the same explicit operation ID reconciles any
 missing materialization and returns the already-bound attempt and response path;
-it does not allocate another sequence. A different operation ID is a deliberate
-new reservation and supersedes the current unfinished attempt before allocating
-the next number.
+it does not allocate another sequence. A reconciled reservation is returned only
+while the persisted job is still `pending_browser_upload` and its current attempt,
+response, and handoff pointers match that phase. If the job has progressed through
+ingest, reconciliation may restore missing historical artifact rows but reports
+the terminal reservation as unusable instead of reactivating it. A different
+operation ID is a deliberate new reservation and supersedes the current unfinished
+attempt before allocating the next number. Replaying an operation after it has
+been superseded validates the historical phase, ledger rows, response placeholder,
+attempt record, and immutable numbered handoff, then reports that the reservation
+is no longer usable.
+
+New reservation phases also bind the exact browser-handoff renderer version.
+That renderer uses root-relative artifact references and `--root .`, so run its
+commands from the active Continuum root. This keeps committed handoff bytes
+stable if the Continuum root is relocated. Pre-version phases remain replayable
+from their already hash-bound embedded handoff text; replay does not reinterpret
+those historical bytes through the current renderer. Existing handoff files are
+size-gated before replay reads them.
 
 Each accepted ingest additionally records an exact `browser_reserved`,
 `automated`, or `untracked` claim. The claim binds the raw response hash and
@@ -159,9 +184,18 @@ review-capsule.zip
   subject/...
 ```
 
-When the subject is a ZIP file, Continuum validates the ZIP, computes an inner member manifest, preserves the
-original archive under `original/`, and expands reviewable members directly under `subject/`. A full-capsule
-review result for such jobs must echo both `inner_archive_manifest_sha256` and `inner_archive_member_count`.
+When the subject is a ZIP file, Continuum requires the central-directory members to account exactly and
+contiguously for every byte before the central directory. Concatenated prefixes, gaps, orphan local records,
+and other unbound raw regions fail closed. Continuum then computes an inner member manifest, preserves the
+original archive under `original/`, and expands reviewable members directly under `subject/`. The manifest's
+member count includes every central-directory file and explicit directory record; explicit directories and
+their portable modes are reproduced in the expanded capsule. A full-capsule review result for such jobs must
+echo both `inner_archive_manifest_sha256` and `inner_archive_member_count`.
+
+`review-packet.md` uses fixed Markdown headings with complete JSON evidence objects. Paths, sampled file
+content, Git metadata, and Git diff text are JSON string values rather than Markdown control text. Each JSON
+object is enclosed by a fence longer than every backtick run in that serialized object. Subject files remain
+available byte-for-byte under `subject/` for full manual review; the packet is only the bounded excerpt view.
 
 The capsule cannot contain its own final SHA-256 because that would change the ZIP. The final capsule hash is
 reported in `status.json`, `manual-handoff.md`, the mutable latest `browser-handoff.md`, `review-status`, and
@@ -229,10 +263,38 @@ as the subject.
 
 Preparation also has one shared resource budget. File copies, hashes, excerpts, archive inspection, ZIP
 creation, capsule creation, generated temporary data, and elapsed time consume that budget; sampling reads
-only the requested bytes plus one, and Git output is drained while Git is running. Git runs with system and
-global configuration disabled, repository executable helpers overridden, optional writes disabled, and
-external/text-conversion diff drivers disabled. The public CLI and MCP surface use the same defaults and hard
-maxima. Waiting for the root-wide preparation/publication lock consumes the same elapsed-time budget:
+only the requested bytes plus one, and Git output is drained while Git is running. Archive and temporary
+ceilings reserve space for the maximum accepted trusted objective, its redacted public-request form, the
+packet, and fixed capsule records independently of subject size, so a small subject does not make an otherwise
+valid maximum-size objective unrepresentable. For Git subjects, temporary capacity additionally reserves one
+complete supported private metadata copy. Work capacity reserves the conservative worst case for every
+private copy and repeated config, index, reference, and object binding: sixteen metadata-limit units during
+preparation (three complete state replays plus diff evidence) and fifteen during currentness (three complete
+state replays). These are capacity ceilings, not eager allocations, so non-Git and small repositories do not
+consume the reserve. Git evidence comes from a
+confined direct `.git` directory, raw HEAD/index plumbing, and staged HEAD-to-index plus unstaged
+index-to-snapshot comparisons with the frozen subject snapshot. Configuration, the object database, and the index are copied through confined no-follow readers
+into a bounded private metadata snapshot; Git receives only those private paths. The live repository's Git
+metadata is rechecked after each evidence-producing pass and again immediately after the final subject replay,
+before any review artifact is published. Review preparation and currentness never ask Git to inspect or
+convert working-tree files. They therefore do not invoke clean, smudge, process, required, text-conversion,
+external-diff, or file-system-monitor helpers configured by the reviewed repository. Linked worktrees,
+redirected worktrees, configuration includes (including `includeIf`), alternate or effective partial-clone
+object stores, intent-to-add entries, sparse/unmerged or split/shared indexes, gitlinks, link-like metadata,
+and other unsupported repository geometries fail before publication. An unborn repository without an index is deliberately
+unsupported and fails closed; ordinary packed references and supported SHA-1/SHA-256 object formats remain
+capturable. Private object graphs are checked with the private HEAD, refs, and index as roots so missing or
+corrupt staged objects fail closed as well as committed objects. Every unique parsed index OID is also checked
+in bounded batches against the private object store and must name that exact blob object. The live object-store bytes are rebound,
+then authority, HEAD, and index are rechecked after that binding. Newly prepared jobs bind the branch, HEAD, raw index entries, verified
+object-graph semantics, worktree comparison, and these semantics as source-fingerprint version 4; older Git jobs require re-preparation before currentness can be
+certified. The public CLI and MCP surface use the same defaults and hard maxima. Waiting for the root-wide
+preparation/publication lock consumes the same elapsed-time budget:
+
+Packet budgeting is structural. Manifest rows are included whole, and sampled content is shortened as a raw
+string value before the enclosing JSON object is serialized. A variable evidence section is appended only
+when its complete JSON and closing fence fit. Continuum never obtains the hard byte limit by slicing rendered
+JSON or a rendered Markdown fence. Coverage warnings identify omitted or shortened evidence.
 
 | Control | Default | Hard maximum |
 | --- | ---: | ---: |
@@ -244,10 +306,12 @@ maxima. Waiting for the root-wide preparation/publication lock consumes the same
 | `prepare_timeout_seconds` | 120 | 600 |
 
 The CLI spellings for the last three are `--max-subject-file-bytes`, `--max-subject-bytes`, and
-`--prepare-timeout-seconds`. The review prompt is non-empty UTF-8 text with a 4,000,000-byte ceiling; a
-`--prompt-file` read stops at that ceiling plus one byte. Values outside the published range, a per-file
-subject limit greater than the total subject limit, and invalid prompts are rejected before the CLI/MCP
-operation guard or a review job is created.
+`--prepare-timeout-seconds`. The review prompt is non-empty UTF-8 text with a literal 4,000,000-byte ceiling;
+a `--prompt-file` read stops at that ceiling plus one byte. The complete accepted prompt is carried into the
+trusted review objective after normal secret redaction and is never silently length-truncated; an oversized
+prompt is rejected. Values outside
+the published range, a per-file subject limit greater than the total subject limit, and invalid prompts are
+rejected before the CLI/MCP operation guard or a review job is created.
 
 Reviewer IDs, models, and base URLs are single-line UTF-8 controls capped at 256, 512, and 2,048 bytes.
 Operation IDs use one portable filename component of at most 128 characters. Preparation accepts at most 32
@@ -259,20 +323,28 @@ them before it validates job storage or reserves an attempt.
 ZIP member count is established from bounded EOCD/ZIP64 and fixed central-directory headers before Python's
 ZIP object is constructed. The central directory is capped at 16,000,000 bytes and member names at 4,096
 bytes, so a forged count cannot defer the 2,000-member rejection until after metadata allocation. ZIP64 uses
-the fixed end record supported by Python's parser, and the locator offset must bind that exact record after
-any concatenated prefix is accounted for. Only
-stored and deflated ZIP members are accepted. Other compression methods are rejected before their Python
-decoder can be allocated, both during inspection and when expanding a subject ZIP into the capsule.
+the fixed end record supported by Python's parser, and the locator offset must bind that exact record. Local
+records must begin at byte zero, agree with their central records, and end contiguously at the central
+directory. Canonical ZIP64 local size records are supported; data-descriptor layouts and other local extra
+fields are deliberately unsupported. Only stored and deflated ZIP members are accepted. Other compression
+methods are rejected before their Python decoder can be allocated, both during inspection and when expanding
+a subject ZIP into the capsule. Every stored regular member must declare equal compressed and uncompressed
+sizes. Every deflated regular member is replayed with bounded streaming and must reach exact deflate EOF at
+the declared compressed boundary, with no trailing or unconsumed bytes; its decoded size and CRC must also
+match. Manifest inspection and capsule expansion repeat this proof, and malformed decoder state is translated
+into a normal review-bridge validation failure rather than leaking a raw decoder exception.
 
 ## Validation
 
 `review-ingest` fails closed unless the returned JSON proves it belongs to the exact job:
 
-- `job_id` or `review_id` must match the request.
+- `job_id` or its accepted alias `review_id` must match the request; accepted responses normalize both names
+  to the canonical job ID. When both are supplied, each must independently match.
 - `packet_sha256` must match `review-packet.md`.
 - `review_capsule_sha256` must match `review-capsule.zip`.
-- `subject_archive_sha256` or `package_sha256` must match `subject.zip` or the unchanged single-file subject
-  copy when an archive exists.
+- `subject_archive_sha256` or its accepted alias `package_sha256` must match `subject.zip` or the unchanged
+  single-file subject copy when an archive exists; normalized evidence records the canonical
+  `subject_archive_sha256` value. When both are supplied, each must independently match.
 - `review_complete` must be `true`.
 - `sentinel` must match `CONTINUUM_REVIEW_COMPLETE:<job_id>:<packet_sha256>`.
 
@@ -283,6 +355,18 @@ Every reviewer-controlled response must be valid UTF-8 and no larger than
 exactly 4,000,000 encoded bytes. The same predicate covers the direct endpoint's
 transport wrapper and extracted reviewer content, Hermes output, inline ingest,
 reserved browser files, external result paths, and every durable resume read.
+The exact raw response is preserved once as immutable evidence. Normalized JSON and rendered findings are
+separate derived artifacts with a 16,000,000-byte ceiling, allowing the full accepted response plus bounded
+normalization overhead without embedding a second copy of the raw payload.
+The response schema accepts at most 2,000 findings. Schema validation retains at
+most 64 error details, and durable failure diagnostics are capped at 64,000 bytes,
+so malformed arrays cannot amplify a bounded response into unbounded error state.
+The published schema carries the same acceptance rules as manual ingest:
+`review_complete` is exactly `true`; full-capsule and local-file reviews require
+`subject_inspected=true` plus a non-empty capsule challenge; packet-only surfaces
+require `subject_inspected=false`; and an unknown surface cannot return a clean
+verdict. Either documented job-ID field and either documented archive-hash field
+satisfy the corresponding required binding before canonical normalization.
 External and network reads stop after the limit plus one byte; Hermes output is
 drained through bounded pipes while the child runs. Continuum terminates the
 Hermes process tree as soon as stdout, diagnostic stderr, or their combined
@@ -483,6 +567,14 @@ continuum review-run \
   --job-id review_20260624T000000Z_example \
   --operation-id direct-review-001
 ```
+
+For direct OpenAI-compatible review, Continuum puts the operator objective, response schema, artifact hashes,
+and binding rules in the system-priority message. The endpoint receives one separate user message labeled as
+untrusted review evidence; its JSON envelope contains packet coverage and `review-packet.md`. Filenames, file
+content, diffs, and apparent instructions inside that evidence cannot replace the system review controls.
+Compatible endpoints must preserve the supplied system/user message roles. The child request carries this
+payload as structured `body_json` and serializes it exactly once for HTTP, so quote- and backslash-heavy
+evidence does not consume a second escaping layer or cross the transport bound spuriously.
 
 `review-run --operation-id` and the MCP `continuum_review_run.operation_id`
 name one logical automated reservation. Reuse the same value after an

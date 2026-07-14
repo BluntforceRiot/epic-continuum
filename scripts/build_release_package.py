@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import tomllib
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -87,6 +88,19 @@ GENERATED_PROVENANCE_PATHS = {
     "src/continuum/assets/RELEASE_PROVENANCE.json",
 }
 
+WINDOWS_RESERVED_ARCHIVE_NAMES = {
+    "con",
+    "conin$",
+    "conout$",
+    "clock$",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+WINDOWS_RESERVED_SUPERSCRIPT_DIGITS = {"\u00b9", "\u00b2", "\u00b3"}
+
 
 ReleaseMember = tuple[Path, str, int, str | None]
 SnapshotMember = tuple[str, int, bytes | None]
@@ -134,16 +148,43 @@ def _git_worktree_is_clean(repo_root: Path) -> bool | None:
     return not status
 
 
+def _git_command(repo_root: Path, args: list[str]) -> list[str]:
+    return ["git", "--no-replace-objects", "-C", str(repo_root), *args]
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
 def _git_output(repo_root: Path, args: list[str], *, text: bool = True) -> str | None:
     proc = subprocess.run(
-        ["git", "-C", str(repo_root), *args],
+        _git_command(repo_root, args),
         check=False,
         capture_output=True,
         text=text,
+        env=_git_environment(),
     )
     if proc.returncode != 0:
         return None
     return proc.stdout.strip()
+
+
+def _git_repository_matches(repo_root: Path) -> bool:
+    discovered = _git_output(repo_root, ["rev-parse", "--show-toplevel"])
+    if not discovered:
+        return False
+    try:
+        actual = Path(discovered).resolve(strict=True)
+        expected = repo_root.resolve(strict=True)
+    except OSError:
+        return False
+    return os.path.normcase(str(actual)) == os.path.normcase(str(expected))
 
 
 def _git_status_short(repo_root: Path) -> list[str] | None:
@@ -162,6 +203,8 @@ def _git_status_short(repo_root: Path) -> list[str] | None:
 
 
 def _parse_source_date_epoch(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
     try:
         epoch = int(value)
     except (TypeError, ValueError):
@@ -327,6 +370,85 @@ def _assert_unique_arcnames(arcnames: list[str]) -> None:
     if duplicates:
         rendered = ", ".join(sorted(duplicates))
         raise RuntimeError(f"refusing to build release archive with duplicate member names: {rendered}")
+    _assert_canonical_archive_paths(arcnames)
+
+
+def _is_windows_reserved_archive_component(component: str) -> bool:
+    stem = component.split(".", 1)[0].rstrip(" .").casefold()
+    if stem in WINDOWS_RESERVED_ARCHIVE_NAMES:
+        return True
+    return (
+        len(stem) == 4
+        and stem[:3] in {"com", "lpt"}
+        and stem[3] in WINDOWS_RESERVED_SUPERSCRIPT_DIGITS
+    )
+
+
+def _archive_path_parts(arcname: str) -> tuple[tuple[str, ...], bool]:
+    is_directory = arcname.endswith("/")
+    candidate = arcname[:-1] if is_directory else arcname
+    if (
+        not candidate
+        or arcname.startswith("/")
+        or "\\" in arcname
+        or any(part in {"", ".", ".."} for part in candidate.split("/"))
+    ):
+        raise RuntimeError(
+            "refusing to build release archive with a non-portable member name: "
+            f"{arcname}"
+        )
+    parts = tuple(candidate.split("/"))
+    for component in parts:
+        try:
+            windows_code_units = len(component.encode("utf-16-le")) // 2
+            portable_name_bytes = len(component.encode("utf-8"))
+        except UnicodeEncodeError:
+            windows_code_units = 256
+            portable_name_bytes = 256
+        if (
+            unicodedata.normalize("NFC", component) != component
+            or windows_code_units > 255
+            or portable_name_bytes > 255
+            or component.endswith((".", " "))
+            or any(character in '<>:"|?*' for character in component)
+            or any(
+                unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+                for character in component
+            )
+            or _is_windows_reserved_archive_component(component)
+        ):
+            raise RuntimeError(
+                "refusing to build release archive with a non-portable member name: "
+                f"{arcname}"
+            )
+    return parts, is_directory
+
+
+def _assert_canonical_archive_paths(arcnames: list[str]) -> None:
+    portable_paths: dict[str, tuple[str, str]] = {}
+    for arcname in arcnames:
+        parts, is_directory = _archive_path_parts(arcname)
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            entry_kind = (
+                "directory"
+                if depth < len(parts) or is_directory
+                else "file"
+            )
+            portable_key = unicodedata.normalize("NFC", prefix).casefold()
+            existing = portable_paths.get(portable_key)
+            if existing is not None:
+                if existing[0] != prefix:
+                    raise RuntimeError(
+                        "refusing to build release archive with a portable member "
+                        f"path collision: {existing[0]} and {prefix}"
+                    )
+                if existing[1] != entry_kind:
+                    raise RuntimeError(
+                        "refusing to build release archive with a portable member "
+                        f"file/directory conflict: {prefix}"
+                    )
+            portable_paths[portable_key] = (prefix, entry_kind)
 
 
 def _provenance_payload(
@@ -372,11 +494,18 @@ def _git_tracked_members(
     *,
     allow_missing: bool = False,
     include_untracked: bool = False,
+    treeish: str | None = None,
 ) -> list[ReleaseMember] | None:
+    git_args = (
+        ["ls-tree", "-r", "-z", "--full-tree", treeish]
+        if treeish is not None
+        else ["ls-files", "--stage", "-z"]
+    )
     proc = subprocess.run(
-        ["git", "-C", str(repo_root), "ls-files", "--stage", "-z"],
+        _git_command(repo_root, git_args),
         check=False,
         capture_output=True,
+        env=_git_environment(),
     )
     if proc.returncode != 0:
         return None
@@ -388,12 +517,20 @@ def _git_tracked_members(
             continue
         try:
             raw_header, raw_path = raw_record.split(b"\t", 1)
-            raw_mode, raw_object_id, _raw_stage = raw_header.split()
+            if treeish is not None:
+                raw_mode, raw_object_type, raw_object_id = raw_header.split()
+            else:
+                raw_mode, raw_object_id, _raw_stage = raw_header.split()
+                raw_object_type = b"blob"
             rel = Path(raw_path.decode("utf-8"))
             mode = int(raw_mode.decode("ascii"), 8)
+            object_type = raw_object_type.decode("ascii")
             object_id = raw_object_id.decode("ascii")
         except (IndexError, UnicodeDecodeError, ValueError):
-            raise RuntimeError(f"unable to parse git ls-files record: {raw_record!r}") from None
+            source_label = "tree" if treeish is not None else "index"
+            raise RuntimeError(
+                f"unable to parse Git {source_label} record: {raw_record!r}"
+            ) from None
         path = repo_root / rel
         if mode == 0o120000:
             if should_include(path, repo_root):
@@ -401,6 +538,11 @@ def _git_tracked_members(
             continue
         if not should_include(path, repo_root):
             continue
+        if object_type != "blob" or mode not in {0o100644, 0o100755}:
+            raise RuntimeError(
+                "refusing to package unsupported Git tree entry: "
+                f"{rel.as_posix()} ({raw_mode.decode('ascii', errors='replace')} {object_type})"
+            )
         if not path.exists():
             if allow_missing:
                 continue
@@ -424,9 +566,13 @@ def _git_tracked_members(
 
     if include_untracked:
         untracked = subprocess.run(
-            ["git", "-C", str(repo_root), "ls-files", "--others", "--exclude-standard", "-z"],
+            _git_command(
+                repo_root,
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+            ),
             check=False,
             capture_output=True,
+            env=_git_environment(),
         )
         if untracked.returncode != 0:
             return None
@@ -460,8 +606,13 @@ def _git_tracked_members(
                 parent = parent.parent
 
     for arcname in directory_arcnames:
-        rel = arcname.removeprefix(f"{package_name}/").rstrip("/")
-        members_by_arcname[arcname] = (repo_root / rel, arcname, 0o40755, None)
+        rel_text = arcname.removeprefix(f"{package_name}/").rstrip("/")
+        members_by_arcname[arcname] = (
+            repo_root / rel_text,
+            arcname,
+            0o40755,
+            None,
+        )
 
     return sorted(members_by_arcname.values(), key=lambda item: item[1])
 
@@ -516,9 +667,10 @@ def _walk_members(repo_root: Path, package_name: str) -> list[ReleaseMember]:
 
 def _git_blob(repo_root: Path, object_id: str) -> bytes:
     proc = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "blob", object_id],
+        _git_command(repo_root, ["cat-file", "blob", object_id]),
         check=False,
         capture_output=True,
+        env=_git_environment(),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"unable to read Git blob {object_id} for release snapshot")
@@ -595,11 +747,16 @@ def build_release(repo_root: Path, out_dir: Path, version: str, *, require_clean
             )
         if not git_commit:
             raise RuntimeError("unable to resolve Git HEAD for a clean release archive")
+        if not _git_repository_matches(repo_root):
+            raise RuntimeError(
+                "Git worktree authority does not match the requested repository root"
+            )
     members = _git_tracked_members(
         repo_root,
         package_name,
         allow_missing=not require_clean,
         include_untracked=not require_clean,
+        treeish=git_commit if require_clean else None,
     )
     if members is None:
         if require_clean:

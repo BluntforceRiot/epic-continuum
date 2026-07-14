@@ -3,21 +3,25 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import datetime as dt
 import hashlib
 import importlib.metadata
 import io
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import zipfile
+import zlib
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 
 CANONICAL_TOOLCHAIN = {
@@ -40,10 +44,23 @@ RECEIPT_SCHEMA = "epic_continuum.release_distribution_receipt.v2"
 CONTENT_MANIFEST_SCHEMA = "epic_continuum.package_content_manifest.v1"
 CONTENT_BINDING_SCHEMA = "epic_continuum.package_content_bindings.v1"
 SOURCE_BUILD_VERIFICATION_SCHEMA = "epic_continuum.source_build_verification.v1"
+MAX_SOURCE_DATE_EPOCH = (1 << 32) - 1
 # This is the only package file synthesized by the canonical source builder. It
 # is not permitted to vary: all three artifacts must contain the exact root
 # release-provenance bytes from the canonical source ZIP.
 GENERATED_PACKAGE_FILE_ALLOWANCE = frozenset({WHEEL_PROVENANCE_NAME})
+WINDOWS_RESERVED_ARCHIVE_NAMES = {
+    "con",
+    "conin$",
+    "conout$",
+    "clock$",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+WINDOWS_RESERVED_SUPERSCRIPT_DIGITS = {"\u00b9", "\u00b2", "\u00b3"}
 
 
 def _sha256(payload: bytes) -> str:
@@ -61,7 +78,23 @@ def _assert_unique(names: list[str], *, artifact: Path) -> None:
         raise RuntimeError(f"{artifact.name} contains duplicate member names")
 
 
-def _validate_archive_member_name(name: str, *, artifact: Path) -> None:
+def _is_windows_reserved_archive_component(component: str) -> bool:
+    stem = component.split(".", 1)[0].rstrip(" .").casefold()
+    if stem in WINDOWS_RESERVED_ARCHIVE_NAMES:
+        return True
+    return (
+        len(stem) == 4
+        and stem[:3] in {"com", "lpt"}
+        and stem[3] in WINDOWS_RESERVED_SUPERSCRIPT_DIGITS
+    )
+
+
+def _archive_member_parts(
+    name: str,
+    *,
+    artifact: Path,
+) -> tuple[tuple[str, ...], bool]:
+    is_directory = name.endswith("/")
     candidate = name[:-1] if name.endswith("/") else name
     if (
         not candidate
@@ -70,6 +103,403 @@ def _validate_archive_member_name(name: str, *, artifact: Path) -> None:
         or any(part in {"", ".", ".."} for part in candidate.split("/"))
     ):
         raise RuntimeError(f"{artifact.name} contains an invalid archive member name")
+    parts = tuple(candidate.split("/"))
+    for component in parts:
+        try:
+            windows_code_units = len(component.encode("utf-16-le")) // 2
+            portable_name_bytes = len(component.encode("utf-8"))
+        except UnicodeEncodeError:
+            windows_code_units = 256
+            portable_name_bytes = 256
+        if (
+            unicodedata.normalize("NFC", component) != component
+            or windows_code_units > 255
+            or portable_name_bytes > 255
+            or component.endswith((".", " "))
+            or any(character in '<>:"|?*' for character in component)
+            or any(
+                unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+                for character in component
+            )
+            or _is_windows_reserved_archive_component(component)
+        ):
+            raise RuntimeError(
+                f"{artifact.name} contains a non-portable archive member name: {name}"
+            )
+    return parts, is_directory
+
+
+def _validate_archive_member_name(name: str, *, artifact: Path) -> None:
+    _archive_member_parts(name, artifact=artifact)
+
+
+def _validated_zip_member_name(info: zipfile.ZipInfo, *, artifact: Path) -> str:
+    raw_name = getattr(info, "orig_filename", None)
+    if not isinstance(raw_name, str):
+        raise RuntimeError(f"{artifact.name} contains an invalid raw ZIP member name")
+    _validate_archive_member_name(raw_name, artifact=artifact)
+    if raw_name != info.filename:
+        raise RuntimeError(
+            f"{artifact.name} contains a ZIP member name altered during parsing"
+        )
+    return raw_name
+
+
+def _read_zip_region(handle: IO[bytes], offset: int, size: int) -> bytes:
+    if offset < 0 or size < 0:
+        raise zipfile.BadZipFile("negative ZIP record boundary")
+    handle.seek(offset)
+    payload = handle.read(size)
+    if len(payload) != size:
+        raise zipfile.BadZipFile("truncated ZIP record")
+    return payload
+
+
+def _validate_zip_member_streams(
+    handle: IO[bytes],
+    members: list[dict[str, int | bytes]],
+) -> None:
+    for member in members:
+        compression = int(member["compression"])
+        compressed_size = int(member["compressed_size"])
+        uncompressed_size = int(member["uncompressed_size"])
+        expected_crc32 = int(member["crc32"])
+        filename = bytes(member["filename"])
+        if filename.endswith(b"/") and (
+            uncompressed_size != 0 or expected_crc32 != 0
+        ):
+            raise zipfile.BadZipFile("ZIP directory member is not empty")
+        handle.seek(int(member["data_offset"]))
+        remaining = compressed_size
+        observed = 0
+        crc32 = 0
+        if compression == zipfile.ZIP_STORED:
+            if compressed_size != uncompressed_size:
+                raise zipfile.BadZipFile(
+                    "stored ZIP member compressed and uncompressed sizes disagree"
+                )
+            while remaining:
+                chunk = handle.read(min(1_048_576, remaining))
+                if not chunk:
+                    raise zipfile.BadZipFile("stored ZIP member stream is truncated")
+                remaining -= len(chunk)
+                observed += len(chunk)
+                crc32 = zlib.crc32(chunk, crc32)
+        else:
+            decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+            while remaining:
+                chunk = handle.read(min(1_048_576, remaining))
+                if not chunk:
+                    raise zipfile.BadZipFile("deflated ZIP member stream is truncated")
+                remaining -= len(chunk)
+                pending = chunk
+                while pending:
+                    output_limit = min(
+                        1_048_576,
+                        max(1, uncompressed_size - observed + 1),
+                    )
+                    output = decompressor.decompress(pending, output_limit)
+                    observed += len(output)
+                    if observed > uncompressed_size:
+                        raise zipfile.BadZipFile(
+                            "deflated ZIP member exceeds its declared size"
+                        )
+                    crc32 = zlib.crc32(output, crc32)
+                    if decompressor.unused_data or (decompressor.eof and remaining):
+                        raise zipfile.BadZipFile(
+                            "deflated ZIP member has trailing compressed bytes"
+                        )
+                    next_pending = decompressor.unconsumed_tail
+                    if next_pending and next_pending == pending and not output:
+                        raise zipfile.BadZipFile(
+                            "deflated ZIP member stream made no progress"
+                        )
+                    pending = next_pending
+            if (
+                not decompressor.eof
+                or decompressor.unconsumed_tail
+                or decompressor.unused_data
+            ):
+                raise zipfile.BadZipFile("deflated ZIP member stream is incomplete")
+        if observed != uncompressed_size:
+            raise zipfile.BadZipFile(
+                "ZIP member stream does not match its declared size"
+            )
+        if (crc32 & 0xFFFFFFFF) != expected_crc32:
+            raise zipfile.BadZipFile("ZIP member stream CRC does not match")
+
+
+def _validate_zip_raw_geometry(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+    *,
+    artifact: Path,
+) -> None:
+    """Bind one canonical ZIP's central records, local records, and streams."""
+    handle = archive.fp
+    if handle is None:
+        raise RuntimeError(f"{artifact.name} ZIP stream is unavailable")
+    original_position = handle.tell()
+    try:
+        handle.seek(0, os.SEEK_END)
+        archive_size = handle.tell()
+        if archive_size < 22:
+            raise zipfile.BadZipFile("ZIP end record is missing")
+        tail_size = min(archive_size, 22 + 65_535)
+        tail_offset = archive_size - tail_size
+        tail = _read_zip_region(handle, tail_offset, tail_size)
+        eocd_relative = tail.rfind(b"PK\x05\x06")
+        eocd_offset = -1
+        eocd: tuple[Any, ...] | None = None
+        while eocd_relative >= 0:
+            if eocd_relative + 22 <= len(tail):
+                candidate = struct.unpack_from("<4s4H2LH", tail, eocd_relative)
+                comment_size = int(candidate[-1])
+                candidate_offset = tail_offset + eocd_relative
+                if candidate_offset + 22 + comment_size == archive_size:
+                    eocd_offset = candidate_offset
+                    eocd = candidate
+                    break
+            eocd_relative = tail.rfind(b"PK\x05\x06", 0, eocd_relative)
+        if eocd is None:
+            raise zipfile.BadZipFile("ZIP end record is missing or has trailing bytes")
+
+        (
+            _signature,
+            disk_number,
+            central_disk_number,
+            disk_entries,
+            total_entries,
+            central_size,
+            central_offset,
+            comment_size,
+        ) = eocd
+        if comment_size or archive.comment:
+            raise zipfile.BadZipFile("ZIP archive comments are not supported")
+        if (
+            disk_number != 0
+            or central_disk_number != 0
+            or disk_entries != total_entries
+        ):
+            raise zipfile.BadZipFile("multi-disk ZIP archives are not supported")
+        if (
+            total_entries == 0xFFFF
+            or central_size == 0xFFFFFFFF
+            or central_offset == 0xFFFFFFFF
+        ):
+            raise zipfile.BadZipFile("ZIP64 archives are not supported")
+        if eocd_offset >= 20 and _read_zip_region(
+            handle,
+            eocd_offset - 20,
+            4,
+        ) == b"PK\x06\x07":
+            raise zipfile.BadZipFile("ZIP64 archives are not supported")
+        central_size = int(central_size)
+        central_offset = int(central_offset)
+        if central_offset < 0 or central_offset + central_size != eocd_offset:
+            raise zipfile.BadZipFile(
+                "ZIP central directory has a prefix, gap, overlap, or invalid boundary"
+            )
+
+        central_members: list[dict[str, int | bytes]] = []
+        position = central_offset
+        observed = 0
+        while position < eocd_offset:
+            header = _read_zip_region(handle, position, 46)
+            if header[:4] != b"PK\x01\x02":
+                raise zipfile.BadZipFile(
+                    "ZIP central directory is not contiguous"
+                )
+            version_needed = int(struct.unpack_from("<H", header, 6)[0])
+            flags = int(struct.unpack_from("<H", header, 8)[0])
+            compression = int(struct.unpack_from("<H", header, 10)[0])
+            modified_time = int(struct.unpack_from("<H", header, 12)[0])
+            modified_date = int(struct.unpack_from("<H", header, 14)[0])
+            crc32 = int(struct.unpack_from("<L", header, 16)[0])
+            compressed_size = int(struct.unpack_from("<L", header, 20)[0])
+            uncompressed_size = int(struct.unpack_from("<L", header, 24)[0])
+            filename_size = int(struct.unpack_from("<H", header, 28)[0])
+            extra_size = int(struct.unpack_from("<H", header, 30)[0])
+            member_comment_size = int(struct.unpack_from("<H", header, 32)[0])
+            member_disk = int(struct.unpack_from("<H", header, 34)[0])
+            local_offset = int(struct.unpack_from("<L", header, 42)[0])
+            if (
+                compressed_size == 0xFFFFFFFF
+                or uncompressed_size == 0xFFFFFFFF
+                or local_offset == 0xFFFFFFFF
+                or member_disk == 0xFFFF
+            ):
+                raise zipfile.BadZipFile("ZIP64 member records are not supported")
+            if member_disk != 0:
+                raise zipfile.BadZipFile("multi-disk ZIP members are not supported")
+            if flags & ~0x0800:
+                raise zipfile.BadZipFile("ZIP member flags are not canonical")
+            if compression not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                raise zipfile.BadZipFile("ZIP compression method is not supported")
+            if extra_size or member_comment_size:
+                raise zipfile.BadZipFile(
+                    "ZIP member extras and comments are not supported"
+                )
+            member_end = position + 46 + filename_size
+            if member_end > eocd_offset:
+                raise zipfile.BadZipFile("ZIP central member exceeds its boundary")
+            filename = _read_zip_region(handle, position + 46, filename_size)
+            if observed >= len(infos):
+                raise zipfile.BadZipFile("ZIP central member count is inconsistent")
+            info = infos[observed]
+            encoding = "utf-8" if flags & 0x0800 else "cp437"
+            try:
+                info_raw_name = str(info.orig_filename).encode(encoding)
+            except UnicodeEncodeError as exc:
+                raise zipfile.BadZipFile(
+                    "ZIP central member name encoding is inconsistent"
+                ) from exc
+            if (
+                filename != info_raw_name
+                or flags != int(info.flag_bits)
+                or compression != int(info.compress_type)
+                or crc32 != int(info.CRC)
+                or compressed_size != int(info.compress_size)
+                or uncompressed_size != int(info.file_size)
+                or local_offset != int(info.header_offset)
+                or version_needed != int(info.extract_version)
+                or info.extra
+                or info.comment
+            ):
+                raise zipfile.BadZipFile(
+                    "ZIP central record does not match its parsed member"
+                )
+            central_members.append(
+                {
+                    "filename": filename,
+                    "version_needed": version_needed,
+                    "flags": flags,
+                    "compression": compression,
+                    "modified_time": modified_time,
+                    "modified_date": modified_date,
+                    "crc32": crc32,
+                    "compressed_size": compressed_size,
+                    "uncompressed_size": uncompressed_size,
+                    "local_offset": local_offset,
+                }
+            )
+            observed += 1
+            position = member_end
+        if (
+            position != eocd_offset
+            or observed != int(total_entries)
+            or observed != len(infos)
+        ):
+            raise zipfile.BadZipFile(
+                "ZIP central directory count or boundary is inconsistent"
+            )
+
+        cursor = 0
+        for member in sorted(
+            central_members,
+            key=lambda item: int(item["local_offset"]),
+        ):
+            local_offset = int(member["local_offset"])
+            if local_offset != cursor:
+                raise zipfile.BadZipFile(
+                    "ZIP local records contain a prefix, gap, overlap, or orphan record"
+                )
+            header = _read_zip_region(handle, local_offset, 30)
+            if header[:4] != b"PK\x03\x04":
+                raise zipfile.BadZipFile("ZIP local-file header is malformed")
+            version_needed = int(struct.unpack_from("<H", header, 4)[0])
+            flags = int(struct.unpack_from("<H", header, 6)[0])
+            compression = int(struct.unpack_from("<H", header, 8)[0])
+            modified_time = int(struct.unpack_from("<H", header, 10)[0])
+            modified_date = int(struct.unpack_from("<H", header, 12)[0])
+            crc32 = int(struct.unpack_from("<L", header, 14)[0])
+            compressed_size = int(struct.unpack_from("<L", header, 18)[0])
+            uncompressed_size = int(struct.unpack_from("<L", header, 22)[0])
+            filename_size = int(struct.unpack_from("<H", header, 26)[0])
+            extra_size = int(struct.unpack_from("<H", header, 28)[0])
+            if compressed_size == 0xFFFFFFFF or uncompressed_size == 0xFFFFFFFF:
+                raise zipfile.BadZipFile("ZIP64 local records are not supported")
+            if extra_size:
+                raise zipfile.BadZipFile("ZIP local extras are not supported")
+            filename = _read_zip_region(
+                handle,
+                local_offset + 30,
+                filename_size,
+            )
+            if (
+                filename != bytes(member["filename"])
+                or version_needed != int(member["version_needed"])
+                or flags != int(member["flags"])
+                or compression != int(member["compression"])
+                or modified_time != int(member["modified_time"])
+                or modified_date != int(member["modified_date"])
+                or crc32 != int(member["crc32"])
+                or compressed_size != int(member["compressed_size"])
+                or uncompressed_size != int(member["uncompressed_size"])
+            ):
+                raise zipfile.BadZipFile(
+                    "ZIP local and central member records disagree"
+                )
+            data_offset = local_offset + 30 + filename_size
+            member["data_offset"] = data_offset
+            cursor = data_offset + int(member["compressed_size"])
+            if cursor > central_offset:
+                raise zipfile.BadZipFile(
+                    "ZIP local member overlaps the central directory"
+                )
+        if cursor != central_offset:
+            raise zipfile.BadZipFile(
+                "ZIP local records leave unbound bytes before the central directory"
+            )
+        _validate_zip_member_streams(handle, central_members)
+    except (OSError, struct.error, zipfile.BadZipFile, zlib.error) as exc:
+        raise RuntimeError(
+            f"{artifact.name} has invalid ZIP record geometry: {exc}"
+        ) from exc
+    finally:
+        handle.seek(original_position)
+
+
+def _assert_canonical_archive_paths(
+    names: list[str],
+    *,
+    artifact: Path,
+    directory_names: set[str] | None = None,
+) -> None:
+    directories = directory_names or set()
+    portable_paths: dict[str, tuple[str, str]] = {}
+    explicit_logical_paths: set[str] = set()
+    for name in names:
+        parts, trailing_directory = _archive_member_parts(name, artifact=artifact)
+        logical_path = "/".join(parts)
+        if logical_path in explicit_logical_paths:
+            raise RuntimeError(
+                f"{artifact.name} contains a duplicate logical archive member: "
+                f"{logical_path}"
+            )
+        explicit_logical_paths.add(logical_path)
+        is_directory = trailing_directory or name in directories
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            entry_kind = (
+                "directory"
+                if depth < len(parts) or is_directory
+                else "file"
+            )
+            portable_key = unicodedata.normalize("NFC", prefix).casefold()
+            existing = portable_paths.get(portable_key)
+            if existing is not None:
+                if existing[0] != prefix:
+                    raise RuntimeError(
+                        f"{artifact.name} contains a portable archive path collision: "
+                        f"{existing[0]} and {prefix}"
+                    )
+                if existing[1] != entry_kind:
+                    raise RuntimeError(
+                        f"{artifact.name} contains a portable archive "
+                        f"file/directory conflict: {prefix}"
+                    )
+            portable_paths[portable_key] = (prefix, entry_kind)
 
 
 def _package_manifest_rows(package_files: dict[str, bytes]) -> list[dict[str, Any]]:
@@ -184,15 +614,91 @@ def require_canonical_wheel_generator(generator: str) -> str:
     return generator
 
 
+def _canonical_source_zip_datetime(
+    source_date_epoch: int,
+) -> tuple[int, int, int, int, int, int]:
+    try:
+        timestamp = dt.datetime.fromtimestamp(source_date_epoch, tz=dt.UTC)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise RuntimeError("source ZIP provenance has an unusable source date") from exc
+    return (
+        max(timestamp.year, 1980),
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second - (timestamp.second % 2),
+    )
+
+
+def _validate_source_zip_builder_metadata(
+    infos: list[zipfile.ZipInfo],
+    *,
+    expected_root: str,
+    source_date_epoch: int,
+    artifact: Path,
+) -> None:
+    expected_datetime = _canonical_source_zip_datetime(source_date_epoch)
+    for info in infos:
+        try:
+            info.filename.encode("ascii")
+        except UnicodeEncodeError:
+            expected_flags = 0x0800
+        else:
+            expected_flags = 0
+        expected_compression = (
+            zipfile.ZIP_STORED
+            if info.filename == expected_root
+            else zipfile.ZIP_DEFLATED
+        )
+        mode = (info.external_attr >> 16) & 0xFFFF
+        actual = {
+            "create_system": int(info.create_system),
+            "create_version": int(info.create_version),
+            "extract_version": int(info.extract_version),
+            "flags": int(info.flag_bits),
+            "compression": int(info.compress_type),
+            "date_time": tuple(info.date_time),
+            "internal_attr": int(info.internal_attr),
+            "external_attr": int(info.external_attr),
+        }
+        expected = {
+            "create_system": 3,
+            "create_version": 20,
+            "extract_version": 20,
+            "flags": expected_flags,
+            "compression": expected_compression,
+            "date_time": expected_datetime,
+            "internal_attr": 0,
+            "external_attr": mode << 16,
+        }
+        mismatches = {
+            key: {"expected": expected_value, "actual": actual[key]}
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"{artifact.name} member metadata does not match the canonical "
+                f"source builder: {info.filename}: {mismatches}"
+            )
+
+
 def _read_source_provenance(
     source_zip: Path,
 ) -> tuple[bytes, dict[str, Any], dict[str, bytes]]:
     with zipfile.ZipFile(source_zip) as archive:
         infos = archive.infolist()
-        names = [info.filename for info in infos]
+        names = [
+            _validated_zip_member_name(info, artifact=source_zip) for info in infos
+        ]
+        _validate_zip_raw_geometry(archive, infos, artifact=source_zip)
         _assert_unique(names, artifact=source_zip)
-        for info in infos:
-            _validate_archive_member_name(info.filename, artifact=source_zip)
+        _assert_canonical_archive_paths(
+            names,
+            artifact=source_zip,
+            directory_names={info.filename for info in infos if info.is_dir()},
+        )
         candidates = [
             name
             for name in names
@@ -230,9 +736,15 @@ def _read_source_provenance(
     manifest_rows: list[dict[str, object]] = []
     package_files: dict[str, bytes] = {}
     with zipfile.ZipFile(source_zip) as manifest_archive:
+        manifest_infos = manifest_archive.infolist()
+        _validate_zip_raw_geometry(
+            manifest_archive,
+            manifest_infos,
+            artifact=source_zip,
+        )
         if not manifest_archive.getinfo(expected_root).is_dir():
             raise RuntimeError("source ZIP root entry is not a directory")
-        for info in manifest_archive.infolist():
+        for info in manifest_infos:
             mode = (info.external_attr >> 16) & 0xFFFF
             file_type = stat.S_IFMT(mode)
             if file_type not in {stat.S_IFREG, stat.S_IFDIR}:
@@ -292,9 +804,13 @@ def _read_source_provenance(
             "expected": "40 lowercase hexadecimal characters",
             "actual": commit,
         }
-    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+    if (
+        isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or not 0 <= epoch <= MAX_SOURCE_DATE_EPOCH
+    ):
         mismatches["source_date_epoch"] = {
-            "expected": "non-negative integer",
+            "expected": f"integer from 0 through {MAX_SOURCE_DATE_EPOCH}",
             "actual": epoch,
         }
     if len(names) != expected_count + 3:
@@ -306,6 +822,13 @@ def _read_source_provenance(
         raise RuntimeError(
             f"source ZIP provenance does not match its members: {mismatches}"
         )
+    assert isinstance(epoch, int) and not isinstance(epoch, bool)
+    _validate_source_zip_builder_metadata(
+        infos,
+        expected_root=expected_root,
+        source_date_epoch=epoch,
+        artifact=source_zip,
+    )
     if package_files.get(WHEEL_PROVENANCE_NAME) != root_bytes:
         raise RuntimeError(
             "source ZIP package provenance does not match root provenance"
@@ -378,11 +901,18 @@ def _read_wheel_provenance(
     metadata_root = f"{EXPECTED_NORMALIZED_NAME}-{version}.dist-info"
     with zipfile.ZipFile(wheel_path) as archive:
         infos = archive.infolist()
-        names = [info.filename for info in infos]
+        names = [
+            _validated_zip_member_name(info, artifact=wheel_path) for info in infos
+        ]
+        _validate_zip_raw_geometry(archive, infos, artifact=wheel_path)
         _assert_unique(names, artifact=wheel_path)
+        _assert_canonical_archive_paths(
+            names,
+            artifact=wheel_path,
+            directory_names={info.filename for info in infos if info.is_dir()},
+        )
         wheel_files: dict[str, bytes] = {}
         for info in infos:
-            _validate_archive_member_name(info.filename, artifact=wheel_path)
             mode = (info.external_attr >> 16) & 0xFFFF
             if info.is_dir() or stat.S_IFMT(mode) not in {0, stat.S_IFREG}:
                 raise RuntimeError(f"{wheel_path.name} contains a non-file member")
@@ -463,6 +993,11 @@ def _read_sdist_provenance(
         members = archive.getmembers()
         names = [member.name for member in members]
         _assert_unique(names, artifact=sdist_path)
+        _assert_canonical_archive_paths(
+            names,
+            artifact=sdist_path,
+            directory_names={member.name for member in members if member.isdir()},
+        )
         for member in members:
             _validate_archive_member_name(member.name, artifact=sdist_path)
             if not (member.isfile() or member.isdir()):
@@ -569,21 +1104,40 @@ def _extract_canonical_source_tree(
     version: str,
 ) -> Path:
     expected_root = f"epic-continuum-{version}/"
-    destination.mkdir(parents=True, exist_ok=False)
     with zipfile.ZipFile(source_zip) as archive:
-        for info in archive.infolist():
+        infos = archive.infolist()
+        names = [
+            _validated_zip_member_name(info, artifact=source_zip) for info in infos
+        ]
+        _validate_zip_raw_geometry(archive, infos, artifact=source_zip)
+        _assert_unique(names, artifact=source_zip)
+        _assert_canonical_archive_paths(
+            names,
+            artifact=source_zip,
+            directory_names={info.filename for info in infos if info.is_dir()},
+        )
+        for info in infos:
             if info.filename == expected_root:
                 continue
             if not info.filename.startswith(expected_root):
                 raise RuntimeError("source ZIP member escaped its canonical root")
+        destination.mkdir(parents=True, exist_ok=False)
+        for info in infos:
+            if info.filename == expected_root:
+                continue
             relative = info.filename.removeprefix(expected_root)
             target = destination.joinpath(*relative.rstrip("/").split("/"))
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as handle:
-                handle.write(archive.read(info.filename))
+            try:
+                with target.open("xb") as handle:
+                    handle.write(archive.read(info))
+            except FileExistsError as exc:
+                raise RuntimeError(
+                    f"source ZIP extraction target already exists: {relative}"
+                ) from exc
             mode = (info.external_attr >> 16) & 0xFFFF
             target.chmod(stat.S_IMODE(mode))
     return destination

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import csv
+import datetime as dt
 import hashlib
 import importlib.util
 import io
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -93,10 +95,29 @@ def _provenance_bytes(toolchain: dict[str, str]) -> bytes:
 
 
 def _write_source_zip(path: Path, provenance: bytes) -> None:
-    with zipfile.ZipFile(path, "w") as archive:
-        root = zipfile.ZipInfo("epic-continuum-0.3.0/")
+    provenance_payload = json.loads(provenance)
+    source_date_epoch = provenance_payload["source_date_epoch"]
+    if isinstance(source_date_epoch, bool) or not isinstance(source_date_epoch, int):
+        raise AssertionError("source fixture provenance needs an integer epoch")
+    timestamp = dt.datetime.fromtimestamp(source_date_epoch, tz=dt.UTC)
+    date_time = (
+        max(timestamp.year, 1980),
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second,
+    )
+    with zipfile.ZipFile(
+        path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        root = zipfile.ZipInfo("epic-continuum-0.3.0/", date_time)
         root.create_system = 3
         root.external_attr = 0o40755 << 16
+        root.compress_type = zipfile.ZIP_STORED
         archive.writestr(root, b"")
         for name, payload in {
             "epic-continuum-0.3.0/RELEASE_PROVENANCE.json": provenance,
@@ -106,9 +127,10 @@ def _write_source_zip(path: Path, provenance: bytes) -> None:
                 for package_path, package_payload in TEST_PACKAGE_FILES.items()
             },
         }.items():
-            info = zipfile.ZipInfo(name)
+            info = zipfile.ZipInfo(name, date_time)
             info.create_system = 3
             info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, payload)
 
 
@@ -184,7 +206,484 @@ def _write_sdist(
             archive.addfile(source_info, io.BytesIO(payload))
 
 
+def _rewrite_zip_member_name_bytes(
+    path: Path,
+    *,
+    original: str,
+    replacement: str,
+) -> None:
+    original_bytes = original.encode("utf-8")
+    replacement_bytes = replacement.encode("utf-8")
+    if len(original_bytes) != len(replacement_bytes):
+        raise AssertionError("ZIP member name rewrite must preserve byte length")
+    payload = path.read_bytes()
+    if payload.count(original_bytes) != 2:
+        raise AssertionError("expected one local and one central ZIP member name")
+    path.write_bytes(payload.replace(original_bytes, replacement_bytes))
+
+
+def _rewrite_first_zip_local_member_name_bytes(
+    path: Path,
+    *,
+    original: str,
+    replacement: str,
+) -> None:
+    original_bytes = original.encode("utf-8")
+    replacement_bytes = replacement.encode("utf-8")
+    if len(original_bytes) != len(replacement_bytes):
+        raise AssertionError("ZIP local member name rewrite must preserve byte length")
+    payload = bytearray(path.read_bytes())
+    local_header = payload.index(b"PK\x03\x04")
+    name_length = int.from_bytes(payload[local_header + 26 : local_header + 28], "little")
+    name_start = local_header + 30
+    self_name = bytes(payload[name_start : name_start + name_length])
+    if self_name != original_bytes:
+        raise AssertionError("unexpected first ZIP local member name")
+    payload[name_start : name_start + name_length] = replacement_bytes
+    path.write_bytes(payload)
+
+
+def _rewrite_zip_local_u32(
+    path: Path,
+    *,
+    member_name: str,
+    field_offset: int,
+    value: int,
+) -> None:
+    with zipfile.ZipFile(path) as archive:
+        local_header = archive.getinfo(member_name).header_offset
+    payload = bytearray(path.read_bytes())
+    if payload[local_header : local_header + 4] != b"PK\x03\x04":
+        raise AssertionError("unexpected ZIP local-file header")
+    struct.pack_into("<L", payload, local_header + field_offset, value)
+    path.write_bytes(payload)
+
+
+def _rewrite_zip_local_u16(
+    path: Path,
+    *,
+    member_name: str,
+    field_offset: int,
+    value: int,
+) -> None:
+    with zipfile.ZipFile(path) as archive:
+        local_header = archive.getinfo(member_name).header_offset
+    payload = bytearray(path.read_bytes())
+    if payload[local_header : local_header + 4] != b"PK\x03\x04":
+        raise AssertionError("unexpected ZIP local-file header")
+    struct.pack_into("<H", payload, local_header + field_offset, value)
+    path.write_bytes(payload)
+
+
+def _insert_zip_bytes_before_central(path: Path, inserted: bytes) -> None:
+    payload = bytearray(path.read_bytes())
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    if eocd_offset < 0 or eocd_offset + 22 != len(payload):
+        raise AssertionError("expected an uncommented terminal ZIP end record")
+    central_offset = int(struct.unpack_from("<L", payload, eocd_offset + 16)[0])
+    payload[central_offset:central_offset] = inserted
+    struct.pack_into(
+        "<L",
+        payload,
+        eocd_offset + len(inserted) + 16,
+        central_offset + len(inserted),
+    )
+    path.write_bytes(payload)
+
+
+def _assert_invalid_zip_geometry(finalizer: Any, path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        finalizer._validate_zip_raw_geometry(
+            archive,
+            archive.infolist(),
+            artifact=path,
+        )
+
+
 class ReleaseDistributionFinalizerTest(unittest.TestCase):
+    def test_finalizer_rejects_nonportable_archive_paths(self) -> None:
+        finalizer = _load_finalizer()
+        artifact = Path("fixture.zip")
+
+        for names in (
+            ["root/docs/Foo.md", "root/docs/foo.md"],
+            ["root/Docs/a.md", "root/docs/b.md"],
+            ["root/docs/straße.md", "root/docs/STRASSE.md"],
+        ):
+            with self.subTest(names=names), self.assertRaisesRegex(
+                RuntimeError,
+                "portable archive path collision",
+            ):
+                finalizer._assert_canonical_archive_paths(names, artifact=artifact)
+
+        for names in (
+            ["root/node", "root/node/child.txt"],
+            ["root/tree/item.txt", "root/tree"],
+        ):
+            with self.subTest(names=names), self.assertRaisesRegex(
+                RuntimeError,
+                "file/directory conflict",
+            ):
+                finalizer._assert_canonical_archive_paths(names, artifact=artifact)
+
+        with self.assertRaisesRegex(RuntimeError, "duplicate logical archive member"):
+            finalizer._assert_canonical_archive_paths(
+                ["root/dir", "root/dir/"],
+                artifact=artifact,
+                directory_names={"root/dir", "root/dir/"},
+            )
+
+        reserved_components = [
+            "CON.txt",
+            "CON .txt",
+            "PRN",
+            "AUX.log",
+            "NUL",
+            "CLOCK$.txt",
+            "CONIN$",
+            "CONOUT$.json",
+            *(f"COM{index}.txt" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+            *(f"COM{digit}.txt" for digit in "¹²³"),
+            *(f"LPT{digit}" for digit in "¹²³"),
+        ]
+        invalid_components = [
+            "cafe\u0301.md",
+            "trailing.",
+            "trailing ",
+            "alternate:stream",
+            "zero\u200bwidth",
+            "a" * 256,
+            "\u00e9" * 128,
+            *reserved_components,
+        ]
+        for component in invalid_components:
+            with self.subTest(component=component), self.assertRaisesRegex(
+                RuntimeError,
+                "non-portable archive member name",
+            ):
+                finalizer._validate_archive_member_name(
+                    f"root/docs/{component}",
+                    artifact=artifact,
+                )
+
+        finalizer._assert_canonical_archive_paths(
+            ["root", "root/docs/a.md", "root/docs/b.md"],
+            artifact=artifact,
+            directory_names={"root"},
+        )
+
+    def test_finalizer_rejects_portable_collisions_in_all_distribution_readers(
+        self,
+    ) -> None:
+        finalizer = _load_finalizer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_zip = root / "epic-continuum-0.3.0.zip"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr("epic-continuum-0.3.0/Docs/a.md", b"a")
+                archive.writestr("epic-continuum-0.3.0/docs/b.md", b"b")
+
+            wheel = root / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("continuum/Foo.py", b"a")
+                archive.writestr("continuum/foo.py", b"b")
+
+            sdist = root / "epic_continuum_memory-0.3.0.tar.gz"
+            with tarfile.open(sdist, "w:gz") as archive:
+                for name in (
+                    "epic_continuum_memory-0.3.0/src/continuum/Tree/a.py",
+                    "epic_continuum_memory-0.3.0/src/continuum/tree/b.py",
+                ):
+                    info = tarfile.TarInfo(name)
+                    info.size = 1
+                    archive.addfile(info, io.BytesIO(b"x"))
+
+            readers: tuple[
+                tuple[Any, tuple[Any, ...], dict[str, Any]], ...
+            ] = (
+                (finalizer._read_source_provenance, (source_zip,), {}),
+                (finalizer._read_wheel_provenance, (wheel,), {"version": "0.3.0"}),
+                (finalizer._read_sdist_provenance, (sdist,), {"version": "0.3.0"}),
+            )
+            for reader, args, kwargs in readers:
+                with self.subTest(reader=reader.__name__), self.assertRaisesRegex(
+                    RuntimeError,
+                    "portable archive path collision",
+                ):
+                    reader(*args, **kwargs)
+
+    def test_zip_readers_reject_names_truncated_at_embedded_nul(self) -> None:
+        finalizer = _load_finalizer()
+        cases = (
+            (
+                "source",
+                "epic-continuum-0.3.0/badXname.txt",
+                "epic-continuum-0.3.0/bad\x00name.txt",
+                finalizer._read_source_provenance,
+            ),
+            (
+                "wheel",
+                "continuum/badXname.py",
+                "continuum/bad\x00name.py",
+                finalizer._read_wheel_provenance,
+            ),
+        )
+        for kind, original, replacement, reader in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                suffix = ".zip" if kind == "source" else "-py3-none-any.whl"
+                path = Path(tmp) / (
+                    "epic-continuum-0.3.0.zip"
+                    if kind == "source"
+                    else f"epic_continuum_memory-0.3.0{suffix}"
+                )
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr(original, b"payload")
+                _rewrite_zip_member_name_bytes(
+                    path,
+                    original=original,
+                    replacement=replacement,
+                )
+
+                kwargs = {} if kind == "source" else {"version": "0.3.0"}
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "non-portable archive member name",
+                ):
+                    reader(path, **kwargs)
+
+    def test_source_reader_rejects_local_central_directory_name_mismatch(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        with tempfile.TemporaryDirectory() as tmp:
+            source_zip = Path(tmp) / "epic-continuum-0.3.0.zip"
+            _write_source_zip(source_zip, provenance)
+            _rewrite_first_zip_local_member_name_bytes(
+                source_zip,
+                original="epic-continuum-0.3.0/",
+                replacement="epic-continuum-0.3.0X",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "invalid ZIP record geometry"):
+                finalizer._read_source_provenance(source_zip)
+
+    def test_source_reader_rejects_local_header_metadata_mismatches(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        regular_name = "epic-continuum-0.3.0/RELEASE_PROVENANCE.json"
+        cases: tuple[tuple[str, str, int, int, int], ...] = (
+            ("directory CRC", "epic-continuum-0.3.0/", 32, 14, 1),
+            ("regular version", regular_name, 16, 4, 45),
+            ("regular flags", regular_name, 16, 6, 0x0800),
+            ("regular compression", regular_name, 16, 8, zipfile.ZIP_STORED),
+            ("regular time", regular_name, 16, 10, 1),
+            ("regular date", regular_name, 16, 12, 1),
+            ("regular CRC", regular_name, 32, 14, 1),
+            (
+                "regular compressed size",
+                regular_name,
+                32,
+                18,
+                len(provenance) + 1,
+            ),
+            (
+                "regular uncompressed size",
+                regular_name,
+                32,
+                22,
+                len(provenance) + 1,
+            ),
+        )
+        for label, member_name, width, field_offset, value in cases:
+            with self.subTest(field=label), tempfile.TemporaryDirectory() as tmp:
+                source_zip = Path(tmp) / "epic-continuum-0.3.0.zip"
+                _write_source_zip(source_zip, provenance)
+                rewrite = (
+                    _rewrite_zip_local_u16
+                    if width == 16
+                    else _rewrite_zip_local_u32
+                )
+                rewrite(
+                    source_zip,
+                    member_name=member_name,
+                    field_offset=field_offset,
+                    value=value,
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "ZIP local and central member records disagree",
+                ):
+                    finalizer._read_source_provenance(source_zip)
+
+    def test_source_reader_rejects_coordinated_noncanonical_builder_metadata(
+        self,
+    ) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        for kind in ("timestamp", "creator", "external attributes"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                source_zip = Path(tmp) / "epic-continuum-0.3.0.zip"
+                _write_source_zip(source_zip, provenance)
+                payload = bytearray(source_zip.read_bytes())
+                local_offset = payload.index(b"PK\x03\x04")
+                central_offset = payload.index(b"PK\x01\x02")
+                if kind == "timestamp":
+                    struct.pack_into("<H", payload, local_offset + 10, 1)
+                    struct.pack_into("<H", payload, central_offset + 12, 1)
+                elif kind == "creator":
+                    payload[central_offset + 5] = 0
+                else:
+                    external_attr = int(
+                        struct.unpack_from("<L", payload, central_offset + 38)[0]
+                    )
+                    struct.pack_into(
+                        "<L", payload, central_offset + 38, external_attr | 1
+                    )
+                source_zip.write_bytes(payload)
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "canonical source builder",
+                ):
+                    finalizer._read_source_provenance(source_zip)
+
+    def test_zip_geometry_rejects_prefix_gap_and_orphan_local_record(self) -> None:
+        finalizer = _load_finalizer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            template = root / "template.zip"
+            with zipfile.ZipFile(template, "w") as archive:
+                archive.writestr("payload.txt", b"payload")
+            canonical = template.read_bytes()
+            eocd_offset = canonical.rfind(b"PK\x05\x06")
+            central_offset = int(
+                struct.unpack_from("<L", canonical, eocd_offset + 16)[0]
+            )
+            orphan_record = canonical[:central_offset]
+
+            cases = (
+                ("prefix", b"self-extracting-prefix" + canonical),
+                ("gap", canonical),
+                ("orphan", canonical),
+            )
+            for kind, payload in cases:
+                with self.subTest(kind=kind):
+                    candidate = root / f"{kind}.zip"
+                    candidate.write_bytes(payload)
+                    if kind == "gap":
+                        _insert_zip_bytes_before_central(candidate, b"gap")
+                    elif kind == "orphan":
+                        _insert_zip_bytes_before_central(candidate, orphan_record)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "invalid ZIP record geometry",
+                    ):
+                        _assert_invalid_zip_geometry(finalizer, candidate)
+
+    def test_zip_geometry_rejects_extras_descriptors_and_zip64(self) -> None:
+        finalizer = _load_finalizer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            extra = root / "extra.zip"
+            with zipfile.ZipFile(extra, "w") as archive:
+                info = zipfile.ZipInfo("payload.txt")
+                info.extra = struct.pack("<HH", 0x9999, 0)
+                archive.writestr(info, b"payload")
+
+            descriptor = root / "descriptor.zip"
+            with zipfile.ZipFile(descriptor, "w") as archive:
+                archive.writestr("payload.txt", b"payload")
+            descriptor_bytes = bytearray(descriptor.read_bytes())
+            local_offset = descriptor_bytes.index(b"PK\x03\x04")
+            central_offset = descriptor_bytes.index(b"PK\x01\x02")
+            local_flags = int(
+                struct.unpack_from("<H", descriptor_bytes, local_offset + 6)[0]
+            )
+            central_flags = int(
+                struct.unpack_from("<H", descriptor_bytes, central_offset + 8)[0]
+            )
+            struct.pack_into(
+                "<H", descriptor_bytes, local_offset + 6, local_flags | 0x0008
+            )
+            struct.pack_into(
+                "<H", descriptor_bytes, central_offset + 8, central_flags | 0x0008
+            )
+            descriptor.write_bytes(descriptor_bytes)
+
+            zip64 = root / "zip64.zip"
+            with zipfile.ZipFile(zip64, "w") as archive:
+                with archive.open("payload.txt", "w", force_zip64=True) as member:
+                    member.write(b"payload")
+
+            for kind, candidate in (
+                ("extra", extra),
+                ("descriptor", descriptor),
+                ("zip64", zip64),
+            ):
+                with self.subTest(kind=kind), self.assertRaisesRegex(
+                    RuntimeError,
+                    "invalid ZIP record geometry",
+                ):
+                    _assert_invalid_zip_geometry(finalizer, candidate)
+
+    def test_source_extraction_preflights_names_before_creating_destination(
+        self,
+    ) -> None:
+        finalizer = _load_finalizer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_zip = root / "source.zip"
+            destination = root / "source-tree"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr("epic-continuum-0.3.0/", b"")
+                archive.writestr("epic-continuum-0.3.0/Docs/a.md", b"a")
+                archive.writestr("epic-continuum-0.3.0/docs/b.md", b"b")
+
+            with self.assertRaisesRegex(RuntimeError, "portable archive path collision"):
+                finalizer._extract_canonical_source_tree(
+                    source_zip=source_zip,
+                    destination=destination,
+                    version="0.3.0",
+                )
+            self.assertFalse(destination.exists())
+
+    def test_source_extraction_never_overwrites_a_competing_file(self) -> None:
+        finalizer = _load_finalizer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_zip = root / "source.zip"
+            destination = root / "source-tree"
+            with zipfile.ZipFile(source_zip, "w") as archive:
+                archive.writestr("epic-continuum-0.3.0/", b"")
+                archive.writestr("epic-continuum-0.3.0/README.md", b"archive bytes")
+
+            original_open = Path.open
+            injected = False
+
+            def open_with_competing_file(path, mode="r", *args, **kwargs):
+                nonlocal injected
+                if mode == "xb" and not injected:
+                    injected = True
+                    with original_open(path, "wb") as handle:
+                        handle.write(b"competing bytes")
+                return original_open(path, mode, *args, **kwargs)
+
+            with (
+                mock.patch.object(Path, "open", new=open_with_competing_file),
+                self.assertRaisesRegex(RuntimeError, "extraction target already exists"),
+            ):
+                finalizer._extract_canonical_source_tree(
+                    source_zip=source_zip,
+                    destination=destination,
+                    version="0.3.0",
+                )
+
+            self.assertTrue(injected)
+            self.assertEqual((destination / "README.md").read_bytes(), b"competing bytes")
+
     def test_build_boundary_and_ci_use_the_canonical_finalizer(self) -> None:
         finalizer = _load_finalizer()
         pyproject = tomllib.loads(

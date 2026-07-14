@@ -1672,6 +1672,15 @@ class ResumeLatestTests(unittest.TestCase):
                 moved_session = f"legacy-no-graph-moved-{mutation}"
                 conn = connect(root)
                 try:
+                    # This test exercises authority drift, not host clock behavior.
+                    conn.execute(
+                        "UPDATE scroll_events SET created_at = ? WHERE id = ?",
+                        ("2024-01-01T00:00:00+00:00", hidden["event_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE scroll_events SET created_at = ? WHERE id = ?",
+                        ("2024-01-01T00:00:01+00:00", current["event_id"]),
+                    )
                     conn.execute(
                         "UPDATE cards SET source_refs_json = "
                         "json_remove(source_refs_json, '$[0].event_id') "

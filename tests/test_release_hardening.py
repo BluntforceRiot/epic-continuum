@@ -166,6 +166,86 @@ class ReleaseHardeningTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "duplicate member names"):
             module._assert_unique_arcnames(["epic-continuum/a", "epic-continuum/a"])
 
+    def test_release_builder_rejects_nonportable_archive_paths(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location(
+            "build_release_package_portable_paths_test",
+            script,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        collisions = {
+            "leaf casefold": ["epic-continuum/docs/Foo.md", "epic-continuum/docs/foo.md"],
+            "implicit directory casefold": [
+                "epic-continuum/Docs/a.md",
+                "epic-continuum/docs/b.md",
+            ],
+            "unicode casefold": [
+                "epic-continuum/docs/straße.md",
+                "epic-continuum/docs/STRASSE.md",
+            ],
+        }
+        for label, names in collisions.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RuntimeError,
+                "portable member path collision",
+            ):
+                module._assert_unique_arcnames(names)
+
+        for names in (
+            ["epic-continuum/node", "epic-continuum/node/child.txt"],
+            ["epic-continuum/tree/item.txt", "epic-continuum/tree"],
+        ):
+            with self.subTest(names=names), self.assertRaisesRegex(
+                RuntimeError,
+                "file/directory conflict",
+            ):
+                module._assert_unique_arcnames(names)
+
+        reserved_components = [
+            "CON.txt",
+            "CON .txt",
+            "PRN",
+            "AUX.log",
+            "NUL",
+            "CLOCK$.txt",
+            "CONIN$",
+            "CONOUT$.json",
+            *(f"COM{index}.txt" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+            *(f"COM{digit}.txt" for digit in "¹²³"),
+            *(f"LPT{digit}" for digit in "¹²³"),
+        ]
+        invalid_components = [
+            "cafe\u0301.md",
+            "trailing.",
+            "trailing ",
+            "alternate:stream",
+            "zero\u200bwidth",
+            "a" * 256,
+            "\u00e9" * 128,
+            *reserved_components,
+        ]
+        for component in invalid_components:
+            with self.subTest(component=component), self.assertRaisesRegex(
+                RuntimeError,
+                "non-portable member name",
+            ):
+                module._assert_unique_arcnames([f"epic-continuum/docs/{component}"])
+
+        module._assert_unique_arcnames(
+            [
+                "epic-continuum/",
+                "epic-continuum/docs/",
+                "epic-continuum/docs/a.md",
+                "epic-continuum/docs/b.md",
+            ]
+        )
+
     def test_sdist_tar_modes_are_normalized(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
@@ -485,6 +565,7 @@ version = "9.9.9"
             with (
                 patch.object(module, "_git_worktree_is_clean", return_value=True),
                 patch.object(module, "_git_output", return_value="a" * 40),
+                patch.object(module, "_git_repository_matches", return_value=True),
                 patch.object(module, "_git_tracked_members", return_value=None),
                 self.assertRaisesRegex(RuntimeError, "enumerate Git-tracked files"),
             ):
@@ -493,10 +574,240 @@ version = "9.9.9"
             with (
                 patch.object(module, "_git_worktree_is_clean", side_effect=[True, False]),
                 patch.object(module, "_git_output", return_value="a" * 40),
+                patch.object(module, "_git_repository_matches", return_value=True),
                 patch.object(module, "_git_tracked_members", return_value=[]),
                 self.assertRaisesRegex(RuntimeError, "changed during release archive preparation"),
             ):
                 module.build_release(source, base / "changed-during-build", "9.9.9")
+
+    def test_release_builder_clean_mode_reads_head_tree_not_transient_index(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for immutable-tree release builder smoke")
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location(
+            "build_release_package_head_tree_test",
+            script,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        original_run = subprocess.run
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            out = base / "dist"
+            source.mkdir()
+            (source / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            (source / "README.md").write_text("canonical HEAD\n", encoding="utf-8")
+            original_run(
+                ["git", "init"],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            original_run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=source,
+                check=True,
+            )
+            original_run(["git", "add", "."], cwd=source, check=True)
+            original_run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            expected_readme = original_run(
+                ["git", "show", "HEAD:README.md"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            ).stdout
+            alternate_oid = original_run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=source,
+                input=b"transient index bytes\n",
+                check=True,
+                capture_output=True,
+            ).stdout.decode("ascii").strip()
+            enumeration_commands: list[list[str]] = []
+
+            def run_with_transient_index(command, *args, **kwargs):
+                rendered = [str(token) for token in command]
+                is_enumeration = "ls-tree" in rendered or (
+                    "ls-files" in rendered and "--stage" in rendered
+                )
+                if is_enumeration and not enumeration_commands:
+                    enumeration_commands.append(rendered)
+                    original_run(
+                        [
+                            "git",
+                            "update-index",
+                            "--cacheinfo",
+                            f"100644,{alternate_oid},README.md",
+                        ],
+                        cwd=source,
+                        check=True,
+                    )
+                    try:
+                        return original_run(command, *args, **kwargs)
+                    finally:
+                        original_run(
+                            ["git", "reset", "-q", "HEAD", "--", "README.md"],
+                            cwd=source,
+                            check=True,
+                        )
+                return original_run(command, *args, **kwargs)
+
+            with patch.object(module.subprocess, "run", side_effect=run_with_transient_index):
+                module.build_release(source, out, "9.9.9")
+
+            self.assertEqual(len(enumeration_commands), 1)
+            self.assertIn("ls-tree", enumeration_commands[0])
+            self.assertNotIn("ls-files", enumeration_commands[0])
+            status = original_run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(status, "")
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as archive:
+                self.assertEqual(
+                    archive.read("epic-continuum-9.9.9/README.md"),
+                    expected_readme,
+                )
+                provenance = json.loads(
+                    archive.read(
+                        "epic-continuum-9.9.9/RELEASE_PROVENANCE.json"
+                    )
+                )
+            expected_head = original_run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(provenance["git_commit"], expected_head)
+            self.assertFalse(provenance["git_dirty"])
+
+    def test_release_builder_uses_sterile_git_authority(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git is required for replacement-object release builder smoke")
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "build_release_package.py"
+        spec = importlib.util.spec_from_file_location(
+            "build_release_package_replace_object_test",
+            script,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            out = base / "dist"
+            source.mkdir()
+            (source / "pyproject.toml").write_text(
+                '[project]\nname = "epic-continuum-memory"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            canonical_readme = b"canonical HEAD\n"
+            replacement_readme = b"replacement ref bytes\n"
+            (source / "README.md").write_bytes(canonical_readme)
+            subprocess.run(
+                ["git", "init"],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=continuum@example.invalid",
+                    "-c",
+                    "user.name=Continuum Test",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            original_oid = subprocess.run(
+                ["git", "rev-parse", "HEAD:README.md"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            replacement_oid = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=source,
+                input=replacement_readme,
+                check=True,
+                capture_output=True,
+            ).stdout.decode("ascii").strip()
+            subprocess.run(
+                ["git", "replace", original_oid, replacement_oid],
+                cwd=source,
+                check=True,
+            )
+            replaced_blob = subprocess.run(
+                ["git", "cat-file", "blob", original_oid],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(replaced_blob, replacement_readme)
+
+            wrong_worktree = base / "wrong-worktree"
+            wrong_worktree.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(source / ".git"),
+                    "GIT_WORK_TREE": str(wrong_worktree),
+                    "GIT_INDEX_FILE": str(base / "wrong-index"),
+                },
+                clear=False,
+            ):
+                module.build_release(source, out, "9.9.9")
+
+            with zipfile.ZipFile(out / "epic-continuum-9.9.9.zip") as archive:
+                self.assertEqual(
+                    archive.read("epic-continuum-9.9.9/README.md"),
+                    canonical_readme,
+                )
 
     def test_release_builder_refuses_source_mutation_during_archive_write(self) -> None:
         if not shutil.which("git"):

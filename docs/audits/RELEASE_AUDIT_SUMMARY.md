@@ -36,9 +36,18 @@ Repository-wide Ruff, mypy across 31 source files, compileall, fixture-allowlist
 validation at 165 exact fingerprints, Git diff integrity, and mixed-line-ending
 checks passed. Independent blind review found no remaining code defect; its
 only HOLD was the then-unrun release evidence recorded above and the immutable
-artifact/installed-distribution gates. Artifact reproduction and clean-install
-evidence remain explicitly pending until this source patch is committed and can
-be built from an immutable Git snapshot; no artifact pass is implied here.
+artifact/installed-distribution gates. Artifact promotion requires the
+canonical source ZIP to be built and verified from the immutable release
+commit; the wheel and source distribution to be byte-identical across two
+separate source-ZIP extractions; and the distribution finalizer to rebuild both
+distributions from two further separate source-ZIP extractions before emitting
+its schema-v2 receipt and exact five-file release set. Twine validation must
+pass. Fresh Windows wheel and
+source-distribution installs and a fresh WSL wheel install must each verify
+package provenance, import from their own `site-packages`, and run real `init`
+and `status` operations against new roots. The applicable final commit and
+artifact hashes must be bound in the local build-cycle and Continuum receipts
+before promotion.
 
 Release review hardening included:
 

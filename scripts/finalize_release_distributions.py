@@ -49,6 +49,18 @@ MAX_SOURCE_DATE_EPOCH = (1 << 32) - 1
 # is not permitted to vary: all three artifacts must contain the exact root
 # release-provenance bytes from the canonical source ZIP.
 GENERATED_PACKAGE_FILE_ALLOWANCE = frozenset({WHEEL_PROVENANCE_NAME})
+WHEEL_GENERATED_TEXT_FILES = frozenset(
+    {
+        "INSTALLER",
+        "METADATA",
+        "RECORD",
+        "REQUESTED",
+        "WHEEL",
+        "direct_url.json",
+        "entry_points.txt",
+        "top_level.txt",
+    }
+)
 WINDOWS_RESERVED_ARCHIVE_NAMES = {
     "con",
     "conin$",
@@ -881,11 +893,115 @@ def _validate_wheel_record(
             raise RuntimeError(
                 f"{wheel_path.name} RECORD does not match member bytes: {path}"
             )
+    canonical_output = io.StringIO(newline="")
+    writer = csv.writer(canonical_output, lineterminator="\n")
+    for path in sorted(wheel_files):
+        if path == record_name:
+            continue
+        payload = wheel_files[path]
+        encoded_digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        writer.writerow((path, f"sha256={encoded_digest}", str(len(payload))))
+    writer.writerow((record_name, "", ""))
+    canonical_record = canonical_output.getvalue().encode("utf-8")
+    if record_bytes != canonical_record:
+        raise RuntimeError(
+            f"{wheel_path.name} RECORD rows are not in canonical order or encoding"
+        )
     return {
         "schema": "epic_continuum.wheel_record_binding.v1",
         "entry_count": len(rows),
         "sha256": _sha256(record_bytes),
     }
+
+
+def _wheel_source_date_epoch(*, wheel_path: Path, provenance: bytes) -> int:
+    try:
+        payload = json.loads(provenance)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{wheel_path.name} has invalid release provenance") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{wheel_path.name} release provenance must be an object")
+    epoch = payload.get("source_date_epoch")
+    if (
+        isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or not 0 <= epoch <= MAX_SOURCE_DATE_EPOCH
+    ):
+        raise RuntimeError(
+            f"{wheel_path.name} release provenance has an invalid source date"
+        )
+    return epoch
+
+
+def _validate_wheel_builder_metadata(
+    infos: list[zipfile.ZipInfo],
+    *,
+    wheel_path: Path,
+    record_name: str,
+    source_date_epoch: int,
+) -> None:
+    names = [info.filename for info in infos]
+    expected_names = sorted(name for name in names if name != record_name)
+    expected_names.append(record_name)
+    if names != expected_names:
+        raise RuntimeError(
+            f"{wheel_path.name} members are not in canonical lexicographic order "
+            "with RECORD last"
+        )
+
+    expected_datetime = _canonical_source_zip_datetime(source_date_epoch)
+    expected_mode = stat.S_IFREG | 0o644
+    for info in infos:
+        try:
+            info.filename.encode("ascii")
+        except UnicodeEncodeError:
+            expected_flags = 0x0800
+        else:
+            expected_flags = 0
+        mode = (info.external_attr >> 16) & 0xFFFF
+        actual = {
+            "create_system": int(info.create_system),
+            "create_version": int(info.create_version),
+            "extract_version": int(info.extract_version),
+            "flags": int(info.flag_bits),
+            "compression": int(info.compress_type),
+            "date_time": tuple(info.date_time),
+            "internal_attr": int(info.internal_attr),
+            "external_attr": int(info.external_attr),
+            "extra": bytes(info.extra),
+            "comment": bytes(info.comment),
+        }
+        expected = {
+            "create_system": 3,
+            "create_version": 20,
+            "extract_version": 20,
+            "flags": expected_flags,
+            "compression": zipfile.ZIP_STORED,
+            "date_time": expected_datetime,
+            "internal_attr": 0,
+            "external_attr": expected_mode << 16,
+            "extra": b"",
+            "comment": b"",
+        }
+        mismatches = {
+            key: {"expected": expected_value, "actual": actual[key]}
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mode != expected_mode:
+            mismatches["mode"] = {
+                "expected": f"{expected_mode:o}",
+                "actual": f"{mode:o}",
+            }
+        if mismatches:
+            raise RuntimeError(
+                f"{wheel_path.name} member metadata does not match the canonical "
+                f"wheel builder: {info.filename}: {mismatches}"
+            )
 
 
 def _read_wheel_provenance(
@@ -946,6 +1062,23 @@ def _read_wheel_provenance(
             raise RuntimeError(
                 f"{wheel_path.name} must contain exactly one RECORD file"
             )
+        source_date_epoch = _wheel_source_date_epoch(
+            wheel_path=wheel_path,
+            provenance=provenance,
+        )
+        _validate_wheel_builder_metadata(
+            infos,
+            wheel_path=wheel_path,
+            record_name=record_name,
+            source_date_epoch=source_date_epoch,
+        )
+        for generated_name in WHEEL_GENERATED_TEXT_FILES:
+            path = f"{metadata_root}/{generated_name}"
+            if path in wheel_files and b"\r" in wheel_files[path]:
+                raise RuntimeError(
+                    f"{wheel_path.name} generated metadata must use LF line endings: "
+                    f"{path}"
+                )
         wheel_metadata = wheel_files[wheel_metadata_name].decode("utf-8")
         package_metadata = BytesParser(policy=policy.default).parsebytes(
             wheel_files[package_metadata_name]
@@ -1017,6 +1150,26 @@ def _read_sdist_provenance(
             raise RuntimeError(
                 f"{sdist_path.name} is missing canonical provenance or PKG-INFO"
             )
+        for member in members:
+            if not member.isfile():
+                continue
+            relative_parts = member.name.split("/")
+            is_generated_text = (
+                len(relative_parts) == 2
+                and relative_parts[1] in {"PKG-INFO", "setup.cfg"}
+            ) or any(part.endswith(".egg-info") for part in relative_parts[1:-1])
+            if not is_generated_text:
+                continue
+            generated_file = archive.extractfile(member)
+            if generated_file is None:
+                raise RuntimeError(
+                    f"could not read generated metadata from {sdist_path.name}"
+                )
+            if b"\r" in generated_file.read():
+                raise RuntimeError(
+                    f"{sdist_path.name} generated metadata must use LF line endings: "
+                    f"{member.name}"
+                )
         extracted = archive.extractfile(provenance_name)
         if extracted is None:
             raise RuntimeError(f"could not read provenance from {sdist_path.name}")

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import runpy
+import stat
 import shutil
 import sqlite3
 import subprocess
@@ -12,6 +17,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -97,6 +103,34 @@ class ReleaseHardeningTest(unittest.TestCase):
             self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
         with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "999999999999999999999999999"}):
             self.assertEqual(module.reproducible_zip_dt(), module.DEFAULT_ZIP_DT)
+        self.assertEqual(
+            module.reproducible_zip_dt(86_400),
+            (1980, 1, 2, 0, 0, 0),
+        )
+
+    def test_setup_loads_distribution_normalizer_without_source_root_on_sys_path(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        setup_path = repo_root / "setup.py"
+        filtered_path = [
+            entry
+            for entry in sys.path
+            if entry and Path(entry).resolve() != repo_root
+        ]
+
+        original_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        with (
+            patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "86400"}),
+            patch.object(sys, "path", filtered_path),
+            patch("setuptools.setup") as setup_call,
+        ):
+            namespace = runpy.run_path(str(setup_path), run_name="__main__")
+            self.assertEqual(namespace["_source_date_epoch"](), 86_400)
+            self.assertEqual(os.environ["SOURCE_DATE_EPOCH"], "86400")
+
+        setup_call.assert_called_once()
+        cmdclass = setup_call.call_args.kwargs["cmdclass"]
+        self.assertEqual(set(cmdclass), {"bdist_wheel", "sdist"})
+        self.assertEqual(os.environ.get("SOURCE_DATE_EPOCH"), original_epoch)
 
     def test_source_tree_version_precedes_unrelated_installed_distribution(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -246,6 +280,165 @@ class ReleaseHardeningTest(unittest.TestCase):
             ]
         )
 
+    def test_wheel_normalizer_is_cross_platform_and_byte_reproducible(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "canonicalize_distributions.py"
+        spec = importlib.util.spec_from_file_location("canonicalize_distributions_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record_name = "demo-1.0.dist-info/RECORD"
+        base_payloads = {
+            "demo/__init__.py": b"VALUE = 1\n",
+            "demo-1.0.dist-info/METADATA": b"Metadata-Version: 2.4\nName: demo\n",
+            "demo-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
+            "demo-1.0.dist-info/entry_points.txt": b"[console_scripts]\ndemo=demo:main\n",
+            record_name: b"stale record\n",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wheels = [Path(tmp) / "windows.whl", Path(tmp) / "posix.whl"]
+            for index, wheel_path in enumerate(wheels):
+                names = list(base_payloads)
+                if index == 0:
+                    names.reverse()
+                with zipfile.ZipFile(wheel_path, "w") as archive:
+                    for name in names:
+                        payload = base_payloads[name]
+                        if index == 0 and ".dist-info/" in name:
+                            payload = payload.replace(b"\n", b"\r\n")
+                        info = zipfile.ZipInfo(name, (2024, 1, 2, 3, 4, 4 + index * 2))
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        info.create_system = 0 if index == 0 else 3
+                        info.external_attr = (0o100666 if index == 0 else 0o100644) << 16
+                        archive.writestr(info, payload)
+
+                module.normalize_wheel(wheel_path, epoch=1_700_000_001)
+
+            self.assertEqual(wheels[0].read_bytes(), wheels[1].read_bytes())
+            with zipfile.ZipFile(wheels[0]) as canonical:
+                infos = canonical.infolist()
+                expected_names = sorted(name for name in base_payloads if name != record_name)
+                expected_names.append(record_name)
+                self.assertEqual([info.filename for info in infos], expected_names)
+                for info in infos:
+                    self.assertEqual(info.compress_type, zipfile.ZIP_STORED, info.filename)
+                    self.assertEqual(info.create_system, 3, info.filename)
+                    self.assertEqual(info.external_attr >> 16, stat.S_IFREG | 0o644, info.filename)
+                    self.assertEqual(info.date_time, (2023, 11, 14, 22, 13, 20), info.filename)
+                for name in base_payloads:
+                    if ".dist-info/" in name:
+                        self.assertNotIn(b"\r", canonical.read(name), name)
+
+                record_rows = list(
+                    csv.reader(io.StringIO(canonical.read(record_name).decode("utf-8"), newline=""))
+                )
+                self.assertEqual(record_rows[-1], [record_name, "", ""])
+                self.assertEqual(
+                    [row[0] for row in record_rows[:-1]],
+                    sorted(name for name in base_payloads if name != record_name),
+                )
+                for name, digest, size in record_rows[:-1]:
+                    payload = canonical.read(name)
+                    expected_digest = base64.urlsafe_b64encode(
+                        hashlib.sha256(payload).digest()
+                    ).rstrip(b"=")
+                    self.assertEqual(digest, f"sha256={expected_digest.decode('ascii')}")
+                    self.assertEqual(size, str(len(payload)))
+
+    def test_wheel_timestamp_clamps_to_1980_and_truncates_odd_seconds(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "canonicalize_distributions.py"
+        spec = importlib.util.spec_from_file_location("canonicalize_distribution_time_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module._wheel_timestamp(0), (1980, 1, 1, 0, 0, 0))
+        self.assertEqual(module._wheel_timestamp(86_400), (1980, 1, 2, 0, 0, 0))
+        self.assertEqual(module._wheel_timestamp(1_700_000_001), (2023, 11, 14, 22, 13, 20))
+
+    def test_sdist_normalizer_eliminates_generated_line_ending_drift(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "canonicalize_distributions.py"
+        spec = importlib.util.spec_from_file_location("canonicalize_sdist_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        payloads = {
+            "demo-1.0/PKG-INFO": b"Metadata-Version: 2.4\nName: demo\n",
+            "demo-1.0/setup.cfg": b"[egg_info]\ntag_build =\n",
+            "demo-1.0/src/demo.egg-info/SOURCES.txt": b"README.md\nsetup.py\n",
+            "demo-1.0/demo/__init__.py": b"VALUE = 1\n",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archives = [Path(tmp) / "windows.tar.gz", Path(tmp) / "posix.tar.gz"]
+            for index, archive_path in enumerate(archives):
+                with tarfile.open(archive_path, "w:gz") as archive:
+                    for name, original_payload in payloads.items():
+                        payload = original_payload
+                        if index == 0 and (
+                            name.endswith(("/PKG-INFO", "/setup.cfg"))
+                            or ".egg-info/" in name
+                        ):
+                            payload = payload.replace(b"\n", b"\r\n")
+                        member = tarfile.TarInfo(name)
+                        member.mode = 0o666 if index == 0 else 0o644
+                        member.mtime = 100 + index
+                        member.uid = 1000 + index
+                        member.size = len(payload)
+                        archive.addfile(member, io.BytesIO(payload))
+
+                module.normalize_sdist(
+                    archive_path,
+                    gzipped=True,
+                    epoch=1_700_000_000,
+                )
+
+            self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+            with tarfile.open(archives[0], "r:gz") as canonical:
+                for member in canonical.getmembers():
+                    extracted = canonical.extractfile(member)
+                    self.assertIsNotNone(extracted)
+                    assert extracted is not None
+                    payload = extracted.read()
+                    self.assertEqual(member.size, len(payload), member.name)
+                    if member.name.endswith(("/PKG-INFO", "/setup.cfg")) or ".egg-info/" in member.name:
+                        self.assertNotIn(b"\r", payload, member.name)
+
+    def test_wheel_normalizer_rejects_missing_or_duplicate_record_atomically(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "canonicalize_distributions.py"
+        spec = importlib.util.spec_from_file_location("canonicalize_distribution_reject_test", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.whl"
+            with zipfile.ZipFile(missing, "w") as archive:
+                archive.writestr("demo/__init__.py", b"")
+            before = missing.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                module.normalize_wheel(missing, epoch=1_700_000_000)
+            self.assertEqual(missing.read_bytes(), before)
+
+            duplicate = Path(tmp) / "duplicate.whl"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(duplicate, "w") as archive:
+                    archive.writestr("demo-1.0.dist-info/RECORD", b"")
+                    archive.writestr("demo-1.0.dist-info/RECORD", b"")
+            before = duplicate.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "duplicate member names"):
+                module.normalize_wheel(duplicate, epoch=1_700_000_000)
+            self.assertEqual(duplicate.read_bytes(), before)
+
     def test_sdist_tar_modes_are_normalized(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,14 +452,81 @@ class ReleaseHardeningTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             sdist = next(Path(tmp).glob("*.tar.gz"))
             bad_modes: list[tuple[str, int, int]] = []
+            normalized_metadata: list[str] = []
             with tarfile.open(sdist, "r:gz") as tf:
                 for member in tf.getmembers():
                     actual = member.mode & 0o777
                     expected = 0o755 if (member.isdir() or (member.isfile() and member.name.endswith(".sh"))) else 0o644
                     if actual != expected:
                         bad_modes.append((member.name, actual, expected))
+                    parts = Path(member.name).parts
+                    is_generated_metadata = member.isfile() and (
+                        (len(parts) == 2 and parts[-1] in {"PKG-INFO", "setup.cfg"})
+                        or any(part.endswith(".egg-info") for part in parts[:-1])
+                    )
+                    if is_generated_metadata:
+                        extracted = tf.extractfile(member)
+                        self.assertIsNotNone(extracted)
+                        assert extracted is not None
+                        payload = extracted.read()
+                        self.assertNotIn(b"\r", payload, member.name)
+                        self.assertEqual(member.size, len(payload), member.name)
+                        normalized_metadata.append(member.name)
 
         self.assertEqual(bad_modes, [])
+        self.assertTrue(any(name.endswith("/PKG-INFO") for name in normalized_metadata))
+        self.assertTrue(any(name.endswith("/setup.cfg") for name in normalized_metadata))
+        self.assertTrue(any(".egg-info/" in name for name in normalized_metadata))
+
+    def test_built_wheel_has_canonical_archive_metadata(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        epoch = 1_700_000_001
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dist_dir = base / "dist"
+            env = os.environ.copy()
+            env["SOURCE_DATE_EPOCH"] = str(epoch)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "setup.py",
+                    "build",
+                    "--build-base",
+                    str(base / "build"),
+                    "bdist_wheel",
+                    "--bdist-dir",
+                    str(base / "bdist"),
+                    "--dist-dir",
+                    str(dist_dir),
+                ],
+                cwd=repo_root,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            wheel_path = next(dist_dir.glob("*.whl"))
+            with zipfile.ZipFile(wheel_path) as wheel:
+                infos = wheel.infolist()
+                names = [info.filename for info in infos]
+                record_names = [name for name in names if name.endswith(".dist-info/RECORD")]
+                self.assertEqual(len(record_names), 1)
+                record_name = record_names[0]
+                self.assertEqual(names[:-1], sorted(names[:-1]))
+                self.assertEqual(names[-1], record_name)
+                for info in infos:
+                    self.assertEqual(info.compress_type, zipfile.ZIP_STORED, info.filename)
+                    self.assertEqual(info.create_system, 3, info.filename)
+                    self.assertEqual(info.external_attr >> 16, stat.S_IFREG | 0o644, info.filename)
+                    self.assertEqual(info.date_time, (2023, 11, 14, 22, 13, 20), info.filename)
+                    if ".dist-info/" in info.filename and info.filename.rsplit("/", 1)[-1] in {
+                        "METADATA",
+                        "WHEEL",
+                        "entry_points.txt",
+                        "top_level.txt",
+                    }:
+                        self.assertNotIn(b"\r", wheel.read(info), info.filename)
 
     def test_sdist_is_reproducible_with_source_date_epoch(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

@@ -132,6 +132,7 @@ SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION,)
 MAX_MCP_REQUEST_BYTES = 256 * 1024
 MAX_MCP_JSON_DEPTH = 64
 MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
+MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION = "result_unavailable_after_completed_action"
 _runtime_int_digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
 MAX_MCP_JSON_INTEGER_DIGITS = _runtime_int_digit_limit or 4300
 
@@ -393,14 +394,46 @@ def public_partition_label(value: str | None) -> str | None:
     return redact_text_secrets(value) if scan_text_for_secrets(value, max_findings=1) else value
 
 
+def _normalize_json_value(value: Any) -> Any:
+    """Return the exact JSON value that will cross the MCP boundary."""
+
+    return json.loads(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
+
+
+def _completed_action_result_unavailable(exc: BaseException) -> JSON:
+    return {
+        "ok": True,
+        "operation_outcome": "succeeded_result_unavailable",
+        "result_available": False,
+        "retry_advice": "do_not_retry_automatically",
+        "warning": {
+            "code": MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION,
+            "error_type": type(exc).__name__,
+            "message": (
+                "The operation completed, but its result could not be represented as JSON. "
+                "Inspect the operation receipt instead of retrying automatically."
+            ),
+        },
+    }
+
+
 def tool_result(value: Any, *, is_error: bool = False) -> JSON:
-    structured = value if isinstance(value, dict) else {"result": value}
+    normalized = _normalize_json_value(value)
+    structured = normalized if isinstance(normalized, dict) else {"result": normalized}
     return {
         "content": [
             {
                 "type": "text",
                 "text": json.dumps(
-                    value,
+                    normalized,
                     ensure_ascii=True,
                     indent=2,
                     sort_keys=True,
@@ -445,9 +478,28 @@ def guarded_tool(
         catalog_proof_mode=catalog_proof_mode,
     ) as operation:
         result = action(operation)
-        extra_paths = result_touched_paths(result) if result_touched_paths else []
-        operation.succeed(result if isinstance(result, dict) else {"result": result}, touched_paths=extra_paths)
-        return operation.wrap_result(result)
+        extra_paths: list[Path | str] = []
+        try:
+            extra_paths = result_touched_paths(result) if result_touched_paths else []
+            normalized_result = _normalize_json_value(result)
+        except Exception as exc:
+            # The action has already returned and may have committed durable work.
+            # Preserve that completed outcome and give callers an explicit receipt
+            # instead of reporting a retryable tool failure after the fact.
+            try:
+                traceback.print_exc(file=sys.stderr)
+            except Exception:
+                # Diagnostics are best effort at this post-commit boundary. A
+                # broken stderr must not turn completed work into a failed receipt.
+                pass
+            normalized_result = _completed_action_result_unavailable(exc)
+        receipt_result = (
+            normalized_result
+            if isinstance(normalized_result, dict)
+            else {"result": normalized_result}
+        )
+        operation.succeed(receipt_result, touched_paths=extra_paths)
+        return _normalize_json_value(operation.wrap_result(normalized_result))
 
 
 def tool_init(args: JSON) -> Any:
@@ -2740,6 +2792,8 @@ _EMPTY_OPEN_OBJECT_SCHEMA: JSON = {
     "properties": {},
     "additionalProperties": True,
 }
+# The generated MCP 2025-11-25 JSON schema and the official SDK wire
+# validators use string-or-integer tokens even though schema.ts is broader.
 _PROGRESS_TOKEN_SCHEMA: JSON = {"type": ["string", "integer"]}
 _ICON_SCHEMA: JSON = {
     "type": "object",
@@ -2870,8 +2924,10 @@ class _McpSessionState:
         self.phase = "new"
 
 
-def dispatch(request: JSON, session_state: _McpSessionState | None = None) -> JSON | None:
-    session = session_state if session_state is not None else _McpSessionState()
+def dispatch(request: JSON, session_state: _McpSessionState) -> JSON | None:
+    """Dispatch one request within an explicitly owned MCP connection session."""
+
+    session = session_state
     has_request_id = "id" in request
     request_id = request.get("id")
     if has_request_id and not _valid_request_id(request_id):

@@ -35,7 +35,28 @@ from continuum.mcp_server import MAX_MCP_REQUEST_BYTES, TOOLS, dispatch
 
 def ready_session_state() -> mcp_server_module._McpSessionState:
     state = mcp_server_module._McpSessionState()
-    state.phase = "ready"
+    initialized = dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": "test-initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": mcp_server_module.PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+        },
+        state,
+    )
+    assert initialized is not None and "result" in initialized
+    assert (
+        dispatch(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            state,
+        )
+        is None
+    )
+    assert state.phase == "ready"
     return state
 
 
@@ -743,6 +764,96 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(responses[1]["error"], {"code": -32603, "message": "internal error"})
         self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 51, "result": {}})
 
+    def test_mutating_tool_reports_succeeded_receipt_when_result_is_unavailable(self) -> None:
+        for bad_kind in ("nan", "path", "cycle"):
+            with self.subTest(bad_kind=bad_kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                session_id = f"result-unavailable-{bad_kind}"
+                real_append = mcp_server_module.append_scroll_event
+
+                def append_with_bad_result(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                    result = real_append(*args, **kwargs)
+                    if bad_kind == "nan":
+                        result["unencodable"] = float("nan")
+                    elif bad_kind == "path":
+                        result["unencodable"] = Path("not-json")
+                    else:
+                        result["unencodable"] = result
+                    return result
+
+                state = ready_session_state()
+                with (
+                    patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                    patch.object(
+                        mcp_server_module,
+                        "append_scroll_event",
+                        side_effect=append_with_bad_result,
+                    ),
+                    patch.object(
+                        mcp_server_module.traceback,
+                        "print_exc",
+                        side_effect=(
+                            OSError("stderr unavailable")
+                            if bad_kind == "nan"
+                            else None
+                        ),
+                    ) as printed,
+                ):
+                    response = dispatch(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 80,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "continuum_append_event",
+                                "arguments": {
+                                    "root": str(root),
+                                    "session_id": session_id,
+                                    "content": "Commit exactly once before result encoding.",
+                                },
+                            },
+                        },
+                        state,
+                    )
+                    recovery = dispatch(
+                        {"jsonrpc": "2.0", "id": 81, "method": "ping"},
+                        state,
+                    )
+
+                assert response is not None
+                result = response["result"]
+                self.assertFalse(result["isError"], result)
+                payload = json.loads(result["content"][0]["text"])
+                self.assertEqual(result["structuredContent"], payload)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["operation_outcome"], "succeeded_result_unavailable")
+                self.assertFalse(payload["result_available"])
+                self.assertEqual(payload["retry_advice"], "do_not_retry_automatically")
+                self.assertEqual(
+                    payload["warning"]["code"],
+                    mcp_server_module.MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION,
+                )
+                self.assertEqual(payload["_operation"]["status"], "succeeded")
+                printed.assert_called_once()
+                self.assertEqual(recovery, {"jsonrpc": "2.0", "id": 81, "result": {}})
+
+                with closing(connect(root)) as conn:
+                    event_count = conn.execute(
+                        "SELECT COUNT(*) FROM scroll_events WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                self.assertEqual(event_count, 1)
+
+                receipt_path = Path(payload["_operation"]["operation_receipt_uri"])
+                receipt_text = receipt_path.read_text(encoding="utf-8")
+                self.assertNotIn("NaN", receipt_text)
+                receipt = json.loads(receipt_text)
+                self.assertEqual(receipt["status"], "succeeded")
+                self.assertEqual(
+                    receipt["result"]["operation_outcome"],
+                    "succeeded_result_unavailable",
+                )
+
     def test_stdio_rejects_oversized_frame_before_parsing_and_recovers(self) -> None:
         oversized = "x" * (MAX_MCP_REQUEST_BYTES + 1) + "\n"
         recovery = [*stdio_handshake_requests(), {"jsonrpc": "2.0", "id": 7, "method": "ping"}]
@@ -968,7 +1079,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 "id": 1,
                 "method": "initialize",
                 "params": valid_initialize_params(),
-            }
+            },
+            mcp_server_module._McpSessionState(),
         )
 
         self.assertIsNotNone(response)
@@ -984,7 +1096,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 "id": 3,
                 "method": "initialize",
                 "params": valid_initialize_params(),
-            }
+            },
+            mcp_server_module._McpSessionState(),
         )
         self.assertIsNotNone(negotiated)
         assert negotiated is not None
@@ -1120,7 +1233,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 }
                 if params is not None:
                     request["params"] = params
-                response = dispatch(request)
+                response = dispatch(request, mcp_server_module._McpSessionState())
                 assert response is not None
                 self.assertEqual(response["error"]["code"], -32602)
                 self.assertNotIn("result", response)
@@ -1165,7 +1278,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 "id": "initialize-valid",
                 "method": "initialize",
                 "params": params,
-            }
+            },
+            mcp_server_module._McpSessionState(),
         )
 
         assert response is not None

@@ -54,7 +54,11 @@ def _finalize(finalizer: Any, **kwargs: Any) -> dict[str, Any]:
         return finalizer.finalize_distributions(**kwargs)
 
 
-def _provenance_bytes(toolchain: dict[str, str]) -> bytes:
+def _provenance_bytes(
+    toolchain: dict[str, str],
+    *,
+    source_date_epoch: int = 1_700_000_000,
+) -> bytes:
     manifest_rows = [
         {
             "kind": "file",
@@ -81,7 +85,7 @@ def _provenance_bytes(toolchain: dict[str, str]) -> bytes:
                 "git_dirty": False,
                 "git_status_short_count": 0,
                 "git_status_short_sha256": None,
-                "source_date_epoch": 1_700_000_000,
+                "source_date_epoch": source_date_epoch,
                 "distribution_build_toolchain": toolchain,
                 "member_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                 "member_count_without_root_or_provenance": len(manifest_rows),
@@ -144,6 +148,19 @@ def _write_wheel(
     package_files: dict[str, bytes] | None = None,
     extra_dist_info_files: dict[str, bytes] | None = None,
 ) -> None:
+    provenance_payload = json.loads(provenance)
+    source_date_epoch = provenance_payload["source_date_epoch"]
+    if isinstance(source_date_epoch, bool) or not isinstance(source_date_epoch, int):
+        raise AssertionError("wheel fixture provenance needs an integer epoch")
+    timestamp = dt.datetime.fromtimestamp(source_date_epoch, tz=dt.UTC)
+    date_time = (
+        max(timestamp.year, 1980),
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second - (timestamp.second % 2),
+    )
     files = {
         **(TEST_PACKAGE_FILES if package_files is None else package_files),
         "continuum/assets/RELEASE_PROVENANCE.json": provenance,
@@ -162,7 +179,8 @@ def _write_wheel(
     record_name = "epic_continuum_memory-0.3.0.dist-info/RECORD"
     record_buffer = io.StringIO(newline="")
     record_writer = csv.writer(record_buffer, lineterminator="\n")
-    for member_name, payload in files.items():
+    for member_name in sorted(files):
+        payload = files[member_name]
         digest = (
             base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
             .rstrip(b"=")
@@ -171,9 +189,38 @@ def _write_wheel(
         record_writer.writerow((member_name, f"sha256={digest}", str(len(payload))))
     record_writer.writerow((record_name, "", ""))
     files[record_name] = record_buffer.getvalue().encode()
-    with zipfile.ZipFile(path, "w") as archive:
-        for member_name, payload in files.items():
-            archive.writestr(member_name, payload)
+    member_names = sorted(name for name in files if name != record_name)
+    member_names.append(record_name)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for member_name in member_names:
+            info = zipfile.ZipInfo(member_name, date_time=date_time)
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3
+            info.create_version = 20
+            info.extract_version = 20
+            info.external_attr = 0o100644 << 16
+            info.internal_attr = 0
+            archive.writestr(info, files[member_name])
+
+
+def _rewrite_wheel(
+    path: Path,
+    *,
+    info_overrides: dict[str, dict[str, Any]] | None = None,
+    member_names: list[str] | None = None,
+    payload_overrides: dict[str, bytes] | None = None,
+) -> None:
+    with zipfile.ZipFile(path) as archive:
+        infos = {info.filename: info for info in archive.infolist()}
+        payloads = {info.filename: archive.read(info) for info in archive.infolist()}
+        original_names = archive.namelist()
+    payloads.update(payload_overrides or {})
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name in original_names if member_names is None else member_names:
+            info = infos[name]
+            for attribute, value in (info_overrides or {}).get(name, {}).items():
+                setattr(info, attribute, value)
+            archive.writestr(info, payloads[name])
 
 
 def _write_sdist(
@@ -183,27 +230,26 @@ def _write_sdist(
     name: str = "epic-continuum-memory",
     version: str = "0.3.0",
     package_files: dict[str, bytes] | None = None,
+    extra_files: dict[str, bytes] | None = None,
 ) -> None:
-    provenance_name = (
-        "epic_continuum_memory-0.3.0/src/continuum/assets/RELEASE_PROVENANCE.json"
-    )
-    metadata_name = "epic_continuum_memory-0.3.0/PKG-INFO"
+    root_name = "epic_continuum_memory-0.3.0"
     metadata = f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n".encode()
-    provenance_info = tarfile.TarInfo(provenance_name)
-    provenance_info.size = len(provenance)
-    metadata_info = tarfile.TarInfo(metadata_name)
-    metadata_info.size = len(metadata)
+    files = {
+        "src/continuum/assets/RELEASE_PROVENANCE.json": provenance,
+        "PKG-INFO": metadata,
+        **{
+            f"src/{package_path}": payload
+            for package_path, payload in (
+                TEST_PACKAGE_FILES if package_files is None else package_files
+            ).items()
+        },
+        **(extra_files or {}),
+    }
     with tarfile.open(path, "w:gz") as archive:
-        archive.addfile(provenance_info, io.BytesIO(provenance))
-        archive.addfile(metadata_info, io.BytesIO(metadata))
-        for package_path, payload in (
-            TEST_PACKAGE_FILES if package_files is None else package_files
-        ).items():
-            source_info = tarfile.TarInfo(
-                f"epic_continuum_memory-0.3.0/src/{package_path}"
-            )
-            source_info.size = len(payload)
-            archive.addfile(source_info, io.BytesIO(payload))
+        for relative_name, payload in files.items():
+            info = tarfile.TarInfo(f"{root_name}/{relative_name}")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
 
 
 def _rewrite_zip_member_name_bytes(
@@ -272,6 +318,38 @@ def _rewrite_zip_local_u16(
     if payload[local_header : local_header + 4] != b"PK\x03\x04":
         raise AssertionError("unexpected ZIP local-file header")
     struct.pack_into("<H", payload, local_header + field_offset, value)
+    path.write_bytes(payload)
+
+
+def _rewrite_zip_member_flags(
+    path: Path,
+    *,
+    member_name: str,
+    value: int,
+) -> None:
+    with zipfile.ZipFile(path) as archive:
+        local_header = archive.getinfo(member_name).header_offset
+    payload = bytearray(path.read_bytes())
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    if eocd_offset < 0:
+        raise AssertionError("ZIP end record is missing")
+    central_offset = int(struct.unpack_from("<L", payload, eocd_offset + 16)[0])
+    position = central_offset
+    target = member_name.encode("ascii")
+    while position < eocd_offset:
+        if payload[position : position + 4] != b"PK\x01\x02":
+            raise AssertionError("unexpected ZIP central record")
+        filename_size = int(struct.unpack_from("<H", payload, position + 28)[0])
+        extra_size = int(struct.unpack_from("<H", payload, position + 30)[0])
+        comment_size = int(struct.unpack_from("<H", payload, position + 32)[0])
+        filename = bytes(payload[position + 46 : position + 46 + filename_size])
+        if filename == target:
+            struct.pack_into("<H", payload, position + 8, value)
+            break
+        position += 46 + filename_size + extra_size + comment_size
+    else:
+        raise AssertionError("ZIP central member is missing")
+    struct.pack_into("<H", payload, local_header + 6, value)
     path.write_bytes(payload)
 
 
@@ -726,6 +804,202 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             installed_job.index("Install exact test and build tooling"),
         )
 
+    def test_distribution_readers_accept_canonical_metadata_and_tracked_crlf(
+        self,
+    ) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wheel = root / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+            sdist = root / "epic_continuum_memory-0.3.0.tar.gz"
+            _write_wheel(
+                wheel,
+                provenance,
+                generator="setuptools (80.9.0)",
+                extra_dist_info_files={"licenses/LICENSE": b"tracked\r\nlicense\r\n"},
+            )
+            _write_sdist(
+                sdist,
+                provenance,
+                package_files={"continuum/__init__.py": b"tracked\r\nsource\r\n"},
+                extra_files={"README.md": b"tracked\r\nreadme\r\n"},
+            )
+
+            wheel_provenance, generator, _, _ = finalizer._read_wheel_provenance(
+                wheel,
+                version="0.3.0",
+            )
+            sdist_provenance, package_files = finalizer._read_sdist_provenance(
+                sdist,
+                version="0.3.0",
+            )
+
+            self.assertEqual(wheel_provenance, provenance)
+            self.assertEqual(sdist_provenance, provenance)
+            self.assertEqual(generator, "setuptools (80.9.0)")
+            self.assertEqual(
+                package_files["continuum/__init__.py"],
+                b"tracked\r\nsource\r\n",
+            )
+
+    def test_distribution_readers_preserve_pre_1980_epoch_calendar_fields(
+        self,
+    ) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(
+            dict(finalizer.CANONICAL_TOOLCHAIN),
+            source_date_epoch=86_400,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_zip = root / "epic-continuum-0.3.0.zip"
+            wheel = root / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+            sdist = root / "epic_continuum_memory-0.3.0.tar.gz"
+            _write_source_zip(source_zip, provenance)
+            _write_wheel(
+                wheel,
+                provenance,
+                generator="setuptools (80.9.0)",
+            )
+            _write_sdist(sdist, provenance)
+
+            source_provenance, _, _ = finalizer._read_source_provenance(source_zip)
+            wheel_provenance, _, _, _ = finalizer._read_wheel_provenance(
+                wheel,
+                version="0.3.0",
+            )
+            sdist_provenance, _ = finalizer._read_sdist_provenance(
+                sdist,
+                version="0.3.0",
+            )
+
+            self.assertEqual(source_provenance, provenance)
+            self.assertEqual(wheel_provenance, provenance)
+            self.assertEqual(sdist_provenance, provenance)
+
+    def test_wheel_reader_rejects_noncanonical_builder_metadata(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        target = "continuum/__init__.py"
+        cases = {
+            "platform": {"create_system": 0},
+            "mode": {"external_attr": 0o100666 << 16},
+            "compression": {"compress_type": zipfile.ZIP_DEFLATED},
+            "timestamp": {"date_time": (2020, 1, 2, 3, 4, 6)},
+            "create version": {"create_version": 10},
+            "extract version": {"extract_version": 10},
+            "internal attributes": {"internal_attr": 1},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                wheel = (
+                    Path(tmp) / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+                )
+                _write_wheel(
+                    wheel,
+                    provenance,
+                    generator="setuptools (80.9.0)",
+                )
+                _rewrite_wheel(
+                    wheel,
+                    info_overrides={target: overrides},
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "canonical wheel builder",
+                ):
+                    finalizer._read_wheel_provenance(wheel, version="0.3.0")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel = Path(tmp) / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _rewrite_zip_member_flags(wheel, member_name=target, value=0x0800)
+            with self.assertRaisesRegex(RuntimeError, "canonical wheel builder"):
+                finalizer._read_wheel_provenance(wheel, version="0.3.0")
+
+    def test_wheel_reader_rejects_noncanonical_member_and_record_order(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        record_name = "epic_continuum_memory-0.3.0.dist-info/RECORD"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wheel = root / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            with zipfile.ZipFile(wheel) as archive:
+                member_names = archive.namelist()
+            member_names[0], member_names[1] = member_names[1], member_names[0]
+            _rewrite_wheel(wheel, member_names=member_names)
+            with self.assertRaisesRegex(RuntimeError, "lexicographic order"):
+                finalizer._read_wheel_provenance(wheel, version="0.3.0")
+
+            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            with zipfile.ZipFile(wheel) as archive:
+                record_lines = archive.read(record_name).splitlines(keepends=True)
+            record_lines[0], record_lines[1] = record_lines[1], record_lines[0]
+            _rewrite_wheel(
+                wheel,
+                payload_overrides={record_name: b"".join(record_lines)},
+            )
+            with self.assertRaisesRegex(RuntimeError, "RECORD rows are not"):
+                finalizer._read_wheel_provenance(wheel, version="0.3.0")
+
+    def test_wheel_reader_rejects_cr_in_generated_dist_info_text(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        cases = {
+            "METADATA": (
+                b"Metadata-Version: 2.4\r\n"
+                b"Name: epic-continuum-memory\r\nVersion: 0.3.0\r\n"
+            ),
+            "entry_points.txt": b"[console_scripts]\r\ncontinuum = continuum.cli:main\r\n",
+            "direct_url.json": b'{\r\n  "url": "file:///tmp/source"\r\n}\r\n',
+        }
+        for generated_name, payload in cases.items():
+            with (
+                self.subTest(generated_name=generated_name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                wheel = (
+                    Path(tmp) / "epic_continuum_memory-0.3.0-py3-none-any.whl"
+                )
+                _write_wheel(
+                    wheel,
+                    provenance,
+                    generator="setuptools (80.9.0)",
+                    extra_dist_info_files={generated_name: payload},
+                )
+                with self.assertRaisesRegex(RuntimeError, "must use LF"):
+                    finalizer._read_wheel_provenance(wheel, version="0.3.0")
+
+    def test_sdist_reader_rejects_cr_in_generated_metadata_only(self) -> None:
+        finalizer = _load_finalizer()
+        provenance = _provenance_bytes(dict(finalizer.CANONICAL_TOOLCHAIN))
+        cases = {
+            "PKG-INFO": (
+                b"Metadata-Version: 2.4\r\n"
+                b"Name: epic-continuum-memory\r\nVersion: 0.3.0\r\n"
+            ),
+            "setup.cfg": b"[egg_info]\r\ntag_build =\r\n",
+            "src/epic_continuum_memory.egg-info/SOURCES.txt": (
+                b"setup.py\r\nsrc/continuum/__init__.py\r\n"
+            ),
+        }
+        for generated_name, payload in cases.items():
+            with (
+                self.subTest(generated_name=generated_name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                sdist = Path(tmp) / "epic_continuum_memory-0.3.0.tar.gz"
+                _write_sdist(
+                    sdist,
+                    provenance,
+                    extra_files={generated_name: payload},
+                )
+                with self.assertRaisesRegex(RuntimeError, "must use LF"):
+                    finalizer._read_sdist_provenance(sdist, version="0.3.0")
+
     def test_finalizer_binds_reproducible_artifacts_and_provenance(self) -> None:
         finalizer = _load_finalizer()
         canonical = dict(finalizer.CANONICAL_TOOLCHAIN)
@@ -948,9 +1222,12 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             with zipfile.ZipFile(wheel) as archive:
                 members = {name: archive.read(name) for name in archive.namelist()}
             members["continuum/__init__.py"] += b"# changed without RECORD update\n"
-            with zipfile.ZipFile(wheel, "w") as archive:
-                for name, payload in members.items():
-                    archive.writestr(name, payload)
+            _rewrite_wheel(
+                wheel,
+                payload_overrides={
+                    "continuum/__init__.py": members["continuum/__init__.py"]
+                },
+            )
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
 

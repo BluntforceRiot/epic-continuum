@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-import gzip
-import io
+import importlib.util
 import json
 import os
-import tarfile
-import tempfile
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 from setuptools.command.sdist import sdist as _sdist
 
 
-# ZIP-based wheels cannot represent timestamps before 1980-01-01. Use that
-# boundary as the deterministic fallback for every distribution format.
+_NORMALIZER_PATH = Path(__file__).resolve().parent / "scripts" / "canonicalize_distributions.py"
+_NORMALIZER_SPEC = importlib.util.spec_from_file_location(
+    "epic_continuum_distribution_normalizer",
+    _NORMALIZER_PATH,
+)
+if _NORMALIZER_SPEC is None or _NORMALIZER_SPEC.loader is None:
+    raise RuntimeError(f"could not load distribution normalizer from {_NORMALIZER_PATH}")
+_NORMALIZER = importlib.util.module_from_spec(_NORMALIZER_SPEC)
+_NORMALIZER_SPEC.loader.exec_module(_NORMALIZER)
+normalize_sdist = _NORMALIZER.normalize_sdist
+normalize_wheel = _NORMALIZER.normalize_wheel
+
+
+# ZIP-based wheels cannot represent years before 1980. The normalizer clamps
+# only that year while preserving the authoritative epoch's month, day, and time.
 DEFAULT_SOURCE_DATE_EPOCH = 315532800
 MAX_GZIP_MTIME = (1 << 32) - 1
-PAX_TIME_HEADERS = ("mtime", "atime", "ctime")
 
 
 class NormalizedSdist(_sdist):
@@ -25,16 +35,27 @@ class NormalizedSdist(_sdist):
     def make_archive(self, base_name, format, root_dir=None, base_dir=None, owner=None, group=None):
         archive_path = Path(super().make_archive(base_name, format, root_dir, base_dir, owner, group))
         if format in {"gztar", "tar"}:
-            _normalize_tar_modes(archive_path, gzipped=(format == "gztar"))
+            normalize_sdist(
+                archive_path,
+                gzipped=(format == "gztar"),
+                epoch=_source_date_epoch(),
+            )
         return str(archive_path)
 
 
-def _normalized_mode(member: tarfile.TarInfo) -> int:
-    if member.isdir():
-        return 0o755
-    if member.isfile() and member.name.endswith(".sh"):
-        return 0o755
-    return 0o644
+class NormalizedBdistWheel(_bdist_wheel):
+    """Normalize the completed wheel independently of its build platform."""
+
+    def run(self) -> None:
+        super().run()
+        wheel_paths = [
+            Path(path)
+            for command, _python_version, path in self.distribution.dist_files
+            if command == "bdist_wheel"
+        ]
+        if not wheel_paths:
+            raise RuntimeError("bdist_wheel did not register its output archive")
+        normalize_wheel(wheel_paths[-1], epoch=_source_date_epoch())
 
 
 def _source_date_epoch() -> int:
@@ -64,48 +85,7 @@ def _source_date_epoch() -> int:
     return embedded_epoch
 
 
-def _copy_normalized_members(source: tarfile.TarFile, target: tarfile.TarFile, *, epoch: int) -> None:
-    for member in source.getmembers():
-        member.mode = _normalized_mode(member)
-        member.uid = 0
-        member.gid = 0
-        member.uname = ""
-        member.gname = ""
-        member.mtime = epoch
-        for header in PAX_TIME_HEADERS:
-            if header in member.pax_headers:
-                member.pax_headers[header] = str(epoch)
-        extracted = source.extractfile(member) if member.isfile() else None
-        if extracted is None:
-            target.addfile(member)
-        else:
-            target.addfile(member, io.BytesIO(extracted.read()))
-
-
-def _normalize_tar_modes(path: Path, *, gzipped: bool) -> None:
-    read_mode = "r:gz" if gzipped else "r:"
-    epoch = _source_date_epoch()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=path.suffix, dir=path.parent) as handle:
-        temp_path = Path(handle.name)
-    try:
-        with tarfile.open(path, read_mode) as source:
-            if gzipped:
-                with (
-                    temp_path.open("wb") as raw_target,
-                    gzip.GzipFile(filename="", mode="wb", fileobj=raw_target, mtime=epoch) as compressed,
-                    tarfile.open(fileobj=compressed, mode="w:", format=tarfile.PAX_FORMAT) as target,
-                ):
-                    _copy_normalized_members(source, target, epoch=epoch)
-            else:
-                with tarfile.open(temp_path, "w:", format=tarfile.PAX_FORMAT) as target:
-                    _copy_normalized_members(source, target, epoch=epoch)
-        temp_path.replace(path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-
-
 os.environ["SOURCE_DATE_EPOCH"] = str(_source_date_epoch())
 
 
-setup(cmdclass={"sdist": NormalizedSdist})
+setup(cmdclass={"bdist_wheel": NormalizedBdistWheel, "sdist": NormalizedSdist})

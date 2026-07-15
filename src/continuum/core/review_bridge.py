@@ -1280,7 +1280,7 @@ def _attach_windows_kill_job(
                 ("PeakJobMemoryUsed", ctypes.c_size_t),
             ]
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
         kernel32.SetInformationJobObject.argtypes = [
@@ -1325,7 +1325,7 @@ def _resume_windows_process(process: subprocess.Popen[bytes]) -> None:
         import ctypes
         from ctypes import wintypes
 
-        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)  # type: ignore[attr-defined]
         resume = ntdll.NtResumeProcess
         resume.argtypes = [wintypes.HANDLE]
         resume.restype = ctypes.c_long
@@ -6443,7 +6443,7 @@ def _open_plain_directory_fd(
                 ("file_index_low", wintypes.DWORD),
             ]
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         kernel32.CreateFileW.argtypes = [
             wintypes.LPCWSTR,
             wintypes.DWORD,
@@ -6488,7 +6488,7 @@ def _open_plain_directory_fd(
                     None,
                 )
                 if handle == invalid_handle_value:
-                    raise ctypes.WinError(ctypes.get_last_error())
+                    raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
                 handles.append(handle)
                 _opened_path, opened_stat = _plain_absolute_path_stat(candidate)
                 _assert_opened_review_prepare_directory(
@@ -6501,7 +6501,7 @@ def _open_plain_directory_fd(
                     handle,
                     ctypes.byref(handle_information),
                 ):
-                    raise ctypes.WinError(ctypes.get_last_error())
+                    raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
                 handle_file_index = (
                     int(handle_information.file_index_high) << 32
                 ) | int(handle_information.file_index_low)
@@ -6613,7 +6613,7 @@ def _flush_windows_review_path(
             ("file_index_low", wintypes.DWORD),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -6649,14 +6649,14 @@ def _flush_windows_review_path(
         None,
     )
     if handle == invalid_handle_value:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     try:
         information = _ByHandleFileInformation()
         if not kernel32.GetFileInformationByHandle(
             handle,
             ctypes.byref(information),
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
         attributes = int(information.file_attributes)
         handle_is_directory = bool(attributes & 0x10)
         handle_file_index = (
@@ -6671,7 +6671,7 @@ def _flush_windows_review_path(
                 f"review preparation flush target identity changed: {path}"
             )
         if not kernel32.FlushFileBuffers(handle):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     finally:
         kernel32.CloseHandle(handle)
 

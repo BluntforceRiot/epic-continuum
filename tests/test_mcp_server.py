@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from continuum.core.config import default_config, write_config
@@ -24,14 +28,23 @@ from continuum.core.store import (
     recover_thread,
     sync_card_sidecars_after_commit,
 )
-from continuum.core.temporal_authority import conflict_component_fingerprint
-from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT, detect_conflicts
+from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT
 import continuum.mcp_server as mcp_server_module
 from continuum.mcp_server import MAX_MCP_REQUEST_BYTES, TOOLS, dispatch
 
 
+def ready_session_state() -> mcp_server_module._McpSessionState:
+    state = mcp_server_module._McpSessionState()
+    state.phase = "ready"
+    return state
+
+
+def dispatch_ready(request: dict[str, Any]) -> dict[str, Any] | None:
+    return dispatch(request, ready_session_state())
+
+
 def call_tool(name: str, arguments: dict) -> dict:
-    response = dispatch(
+    response = dispatch_ready(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -48,7 +61,7 @@ def call_tool(name: str, arguments: dict) -> dict:
 
 
 def call_tool_raw(name: str, arguments: dict) -> dict:
-    response = dispatch(
+    response = dispatch_ready(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -93,18 +106,40 @@ def tree_fingerprint(root: Path) -> str:
     return digest.hexdigest()
 
 
+def valid_initialize_params() -> dict[str, Any]:
+    return {
+        "protocolVersion": mcp_server_module.PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {"name": "continuum-test-client", "version": "1.0.0"},
+    }
+
+
+def stdio_handshake_requests(*, initialize_id: int = 900) -> list[dict[str, Any]]:
+    return [
+        {
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": valid_initialize_params(),
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+
+
 class EpicContinuumMcpServerTest(unittest.TestCase):
-    def test_stdio_rejects_oversized_frame_before_parsing_and_recovers(self) -> None:
-        oversized = "x" * (MAX_MCP_REQUEST_BYTES + 1) + "\n"
-        valid = json.dumps(
+    def test_stdio_allows_ping_before_and_during_initialize(self) -> None:
+        requests = (
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            *stdio_handshake_requests(initialize_id=2)[:1],
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"},
             {
                 "jsonrpc": "2.0",
-                "id": 7,
-                "method": "initialize",
-                "params": {},
-            }
+                "method": "notifications/initialized",
+                "params": {"_meta": {"progressToken": 0.5, "client": "ready"}},
+            },
+            {"jsonrpc": "2.0", "id": 4, "method": "ping"},
         )
-        stdin = io.StringIO(oversized + valid + "\n")
+        stdin = io.StringIO("\n".join(json.dumps(request) for request in requests) + "\n")
         stdout = io.StringIO()
 
         with (
@@ -114,27 +149,651 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertEqual(mcp_server_module.serve(), 0)
 
         responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
-        self.assertEqual(len(responses), 2)
+        self.assertEqual([response["id"] for response in responses], [1, 2, 3, 4])
+        for response in (responses[0], responses[2], responses[3]):
+            self.assertEqual(response["result"], {})
+        self.assertEqual(responses[1]["result"]["protocolVersion"], mcp_server_module.PROTOCOL_VERSION)
+
+    def test_stdio_rejects_malformed_envelopes_and_recovers_with_ping(self) -> None:
+        malformed: list[tuple[str, int]] = []
+        for request in (
+            {"id": 1, "method": "ping"},
+            {"jsonrpc": "1.0", "id": 2, "method": "ping"},
+            {"jsonrpc": 2.0, "id": 3, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 4, "method": None},
+            {"jsonrpc": "2.0", "id": 5, "method": ""},
+            {"jsonrpc": "2.0", "id": 6, "method": 1},
+            {"jsonrpc": "2.0", "id": 7, "method": []},
+            {"jsonrpc": "2.0", "id": 8, "method": {}},
+        ):
+            malformed.append((json.dumps(request), -32600))
+        for index, params in enumerate((None, False, 0, 0.0, "", []), start=10):
+            malformed.append(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": index,
+                            "method": "ping",
+                            "params": params,
+                        }
+                    ),
+                    -32602,
+                )
+            )
+        malformed.extend(
+            (
+                ('{"jsonrpc":"2.0","id":20,"method":"ping","method":"tools/list"}', -32700),
+                ('{"jsonrpc":"2.0","id":NaN,"method":"ping"}', -32700),
+                ('{"jsonrpc":"2.0","id":Infinity,"method":"ping"}', -32700),
+                ('{"jsonrpc":"2.0","id":-Infinity,"method":"ping"}', -32700),
+                ('{"jsonrpc":"2.0","id":1e400,"method":"ping"}', -32700),
+            )
+        )
+        malformed.append(
+            (
+                '{"jsonrpc":"2.0","id":'
+                + "1" * (mcp_server_module.MAX_MCP_JSON_INTEGER_DIGITS + 1)
+                + ',"method":"ping"}',
+                -32700,
+            )
+        )
+        recovery = [
+            *stdio_handshake_requests(),
+            {"jsonrpc": "2.0", "id": 99, "method": "ping"},
+        ]
+        stdin = io.StringIO(
+            "\n".join(line for line, _code in malformed)
+            + "\n"
+            + "\n".join(json.dumps(request) for request in recovery)
+            + "\n"
+        )
+        stdout = io.StringIO()
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(responses), len(malformed) + 2)
+        self.assertEqual(
+            [response["error"]["code"] for response in responses[: len(malformed)]],
+            [code for _line, code in malformed],
+        )
+        for response in responses[14 : len(malformed)]:
+            self.assertNotIn("id", response)
+        self.assertEqual(responses[-2]["id"], 900)
+        self.assertEqual(responses[-1], {"jsonrpc": "2.0", "id": 99, "result": {}})
+
+    def test_dispatch_rejects_invalid_request_ids(self) -> None:
+        for request_id in (
+            None,
+            True,
+            False,
+            1.5,
+            [],
+            {},
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ):
+            with self.subTest(request_id=request_id):
+                response = dispatch_ready(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "ping",
+                    }
+                )
+                assert response is not None
+                self.assertNotIn("id", response)
+                self.assertEqual(response["error"]["code"], -32600)
+
+        for request_id in (0, -1, 1.0, -0.0, "request-id"):
+            with self.subTest(valid_request_id=request_id):
+                response = dispatch_ready({"jsonrpc": "2.0", "id": request_id, "method": "ping"})
+                assert response is not None
+                self.assertEqual(response, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+
+    def test_real_stdio_process_preserves_exact_integral_ids_and_rejects_fractional_ids(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            part
+            for part in (str(repo_root / "src"), env.get("PYTHONPATH", ""))
+            if part
+        )
+        stdin = "\n".join(
+            (
+                '{"jsonrpc":"2.0","id":9007199254740993.0,"method":"ping"}',
+                '{"jsonrpc":"2.0","id":1.0000000000000001,"method":"ping"}',
+                '{"jsonrpc":"2.0","id":1e-4000,"method":"ping"}',
+                '{"jsonrpc":"2.0","id":7,"method":"ping"}',
+                "",
+            )
+        )
+
+        process = subprocess.run(
+            [sys.executable, "-m", "continuum.mcp_server"],
+            cwd=repo_root,
+            env=env,
+            input=stdin,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(
+            responses[0],
+            {"jsonrpc": "2.0", "id": 9007199254740993, "result": {}},
+        )
+        for response in responses[1:3]:
+            self.assertNotIn("id", response)
+            self.assertEqual(response["error"]["code"], -32600)
+        self.assertEqual(responses[3], {"jsonrpc": "2.0", "id": 7, "result": {}})
+
+    def test_stdio_open_metadata_numbers_remain_serializable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            tool_request = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "continuum_append_event",
+                        "arguments": {
+                            "root": str(root),
+                            "session_id": "numeric-metadata",
+                            "content": "Preserve serializable open metadata.",
+                            "metadata": {
+                                "ratio": "__RATIO__",
+                                "rounded": "__ROUNDED__",
+                                "tiny": "__TINY__",
+                            },
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            )
+            tool_request = (
+                tool_request.replace('"__RATIO__"', "0.5")
+                .replace('"__ROUNDED__"', "1.0000000000000001")
+                .replace('"__TINY__"', "1e-4000")
+            )
+            stdin = io.StringIO(
+                "\n".join(
+                    [
+                        *(json.dumps(request) for request in stdio_handshake_requests()),
+                        tool_request,
+                        "",
+                    ]
+                )
+            )
+            stdout = io.StringIO()
+
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(mcp_server_module.sys, "stdin", stdin),
+                patch.object(mcp_server_module.sys, "stdout", stdout),
+            ):
+                self.assertEqual(mcp_server_module.serve(), 0)
+
+            responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual([response["id"] for response in responses], [900, 5])
+            self.assertFalse(responses[1]["result"]["isError"], responses[1])
+            conn = connect(root)
+            try:
+                row = conn.execute(
+                    "SELECT metadata_json FROM scroll_events WHERE session_id = ?",
+                    ("numeric-metadata",),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(row)
+            metadata = json.loads(row["metadata_json"])
+            self.assertEqual(metadata["ratio"], 0.5)
+            self.assertEqual(metadata["rounded"], 1.0)
+            self.assertEqual(metadata["tiny"], 0.0)
+
+    def test_notifications_do_not_respond_or_execute_request_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            default_root = base / "default-root"
+            requests = (
+                {"jsonrpc": "2.0", "method": "ping"},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "method": "ping", "params": None},
+                {"jsonrpc": "2.0", "method": "tools/call", "params": []},
+                {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "continuum_init", "arguments": {}},
+                },
+                {"jsonrpc": "2.0", "id": 60, "method": "notifications/initialized"},
+                *stdio_handshake_requests(initialize_id=70),
+                {"jsonrpc": "2.0", "id": 61, "method": "ping"},
+            )
+            stdin = io.StringIO("\n".join(json.dumps(request) for request in requests) + "\n")
+            stdout = io.StringIO()
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "CONTINUUM_ROOT": str(default_root),
+                        "CONTINUUM_ALLOWED_ROOTS": str(base),
+                    },
+                ),
+                patch.object(mcp_server_module.sys, "stdin", stdin),
+                patch.object(mcp_server_module.sys, "stdout", stdout),
+            ):
+                self.assertEqual(mcp_server_module.serve(), 0)
+
+            responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual(len(responses), 3)
+            self.assertEqual(responses[0]["id"], 60)
+            self.assertEqual(responses[0]["error"]["code"], -32600)
+            self.assertEqual(responses[1]["id"], 70)
+            self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 61, "result": {}})
+            self.assertFalse(default_root.exists())
+            self.assertEqual(list(base.iterdir()), [])
+
+    def test_invalid_request_metadata_cannot_unlock_or_execute(self) -> None:
+        state = mcp_server_module._McpSessionState()
+        initialize = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": valid_initialize_params(),
+            },
+            state,
+        )
+        self.assertIsNotNone(initialize)
+        self.assertEqual(state.phase, "initializing")
+
+        self.assertIsNone(
+            dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {"_meta": False},
+                },
+                state,
+            )
+        )
+        self.assertEqual(state.phase, "initializing")
+        blocked = dispatch(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            state,
+        )
+        assert blocked is not None
+        self.assertEqual(blocked["error"]["code"], -32600)
+
+        self.assertIsNone(
+            dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {"_meta": {"client": "ready", "progressToken": 0.5}},
+                },
+                state,
+            )
+        )
+        self.assertEqual(state.phase, "ready")
+
+        with patch.object(mcp_server_module, "tool_specs") as tool_specs:
+            for request_id, metadata, expected_error in (
+                (3, False, "params._meta must be an object"),
+                (4, {"progressToken": 0.5}, "params._meta.progressToken must be string or integer"),
+            ):
+                with self.subTest(metadata=metadata):
+                    response = dispatch(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": "tools/list",
+                            "params": {"_meta": metadata},
+                        },
+                        state,
+                    )
+                    assert response is not None
+                    self.assertEqual(response["error"]["code"], -32602)
+                    self.assertIn(expected_error, response["error"]["message"])
+            tool_specs.assert_not_called()
+
+        handler_calls: list[dict[str, Any]] = []
+
+        def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            handler_calls.append(arguments)
+            return {"called": True}
+
+        with patch.dict(
+            mcp_server_module.TOOLS,
+            {
+                "continuum_metadata_probe": (
+                    "Metadata validation probe.",
+                    {"type": "object", "additionalProperties": False},
+                    handler,
+                )
+            },
+        ):
+            tool_response = dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": False,
+                        "name": "continuum_metadata_probe",
+                        "arguments": {},
+                    },
+                },
+                state,
+            )
+        assert tool_response is not None
+        self.assertEqual(tool_response["error"]["code"], -32602)
+        self.assertEqual(handler_calls, [])
+
+        accepted = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "ping",
+                "params": {"_meta": {"progressToken": "progress-5"}},
+            },
+            state,
+        )
+        self.assertEqual(accepted, {"jsonrpc": "2.0", "id": 5, "result": {}})
+
+    def test_list_methods_reject_unissued_or_malformed_cursors(self) -> None:
+        state = ready_session_state()
+        for method in ("tools/list", "resources/list", "prompts/list"):
+            for cursor in (False, 1, [], {}):
+                with self.subTest(method=method, cursor=cursor):
+                    response = dispatch(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": method,
+                            "params": {"cursor": cursor},
+                        },
+                        state,
+                    )
+                    assert response is not None
+                    self.assertEqual(response["error"]["code"], -32602)
+                    self.assertIn("params.cursor must be a string", response["error"]["message"])
+
+            response = dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": method,
+                    "params": {"cursor": "never-issued"},
+                },
+                state,
+            )
+            assert response is not None
+            self.assertEqual(response["error"]["code"], -32602)
+            self.assertIn("did not issue a nextCursor", response["error"]["message"])
+
+    def test_stdio_enforces_initialize_sequence_before_tool_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            default_root = base / "default-root"
+            intended_root = base / "intended-root"
+            requests = (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "continuum_init", "arguments": {}},
+                },
+                *stdio_handshake_requests(initialize_id=2)[:1],
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "continuum_init", "arguments": {}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "initialize",
+                    "params": valid_initialize_params(),
+                },
+                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": []},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "continuum_init", "arguments": {}},
+                },
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "continuum_init",
+                        "arguments": {"root": str(intended_root)},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "initialize",
+                    "params": valid_initialize_params(),
+                },
+                {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+            )
+            stdin = io.StringIO("\n".join(json.dumps(request) for request in requests) + "\n")
+            stdout = io.StringIO()
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "CONTINUUM_ROOT": str(default_root),
+                        "CONTINUUM_ALLOWED_ROOTS": str(base),
+                    },
+                ),
+                patch.object(mcp_server_module.sys, "stdin", stdin),
+                patch.object(mcp_server_module.sys, "stdout", stdout),
+            ):
+                self.assertEqual(mcp_server_module.serve(), 0)
+
+            responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual([response["id"] for response in responses], [1, 2, 3, 4, 5, 6, 8, 7])
+            for index in (0, 2, 3, 4, 6):
+                self.assertEqual(responses[index]["error"]["code"], -32600)
+            self.assertFalse(responses[5]["result"]["isError"])
+            self.assertEqual(responses[7], {"jsonrpc": "2.0", "id": 7, "result": {}})
+            self.assertFalse(default_root.exists())
+            self.assertTrue(intended_root.is_dir())
+
+    def test_stdio_rejects_malformed_init_arguments_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            default_root = base / "default-root"
+            intended_root = base / "intended-root"
+            requests = [json.dumps(request) for request in stdio_handshake_requests()]
+            requests.extend(
+                [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": index,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "continuum_init",
+                            "arguments": arguments,
+                        },
+                    }
+                )
+                for index, arguments in enumerate((None, False, 0, 0.0, "", []), start=1)
+                ]
+            )
+            intended_root_json = json.dumps(str(intended_root))
+            requests.append(
+                '{"jsonrpc":"2.0","id":7,"method":"tools/call",'
+                '"params":{"name":"continuum_init",'
+                f'"arguments":{{"root":{intended_root_json}}},"arguments":[]}}'
+            )
+            requests.append(json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}))
+            stdin = io.StringIO("\n".join(requests) + "\n")
+            stdout = io.StringIO()
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "CONTINUUM_ROOT": str(default_root),
+                        "CONTINUUM_ALLOWED_ROOTS": str(base),
+                    },
+                ),
+                patch.object(mcp_server_module.sys, "stdin", stdin),
+                patch.object(mcp_server_module.sys, "stdout", stdout),
+            ):
+                self.assertEqual(mcp_server_module.serve(), 0)
+
+            responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual(responses[0]["id"], 900)
+            self.assertEqual([item["error"]["code"] for item in responses[1:7]], [-32602] * 6)
+            self.assertEqual(responses[7]["error"]["code"], -32700)
+            self.assertEqual(responses[8], {"jsonrpc": "2.0", "id": 8, "result": {}})
+            self.assertFalse(default_root.exists())
+            self.assertFalse(intended_root.exists())
+            self.assertEqual(list(base.iterdir()), [])
+
+    def test_stdio_recovers_after_unexpected_dispatch_exception(self) -> None:
+        request_items = [
+            *stdio_handshake_requests(),
+            *(
+                {"jsonrpc": "2.0", "id": request_id, "method": "ping"}
+                for request_id in (40, 41)
+            ),
+        ]
+        requests = "\n".join(json.dumps(request) for request in request_items)
+        stdin = io.StringIO(requests + "\n")
+        stdout = io.StringIO()
+        real_dispatch = mcp_server_module.dispatch
+        def controlled_dispatch(
+            request: dict[str, Any],
+            session_state: mcp_server_module._McpSessionState,
+        ) -> dict[str, Any] | None:
+            if request.get("id") == 40:
+                raise RuntimeError("synthetic dispatch failure")
+            return real_dispatch(request, session_state)
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+            patch.object(mcp_server_module, "dispatch", side_effect=controlled_dispatch),
+            patch.object(mcp_server_module.traceback, "print_exc"),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(responses[0]["id"], 900)
+        self.assertEqual(responses[1]["id"], 40)
+        self.assertEqual(responses[1]["error"], {"code": -32603, "message": "internal error"})
+        self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 41, "result": {}})
+
+    def test_stdio_fails_closed_on_nonfinite_response_and_recovers(self) -> None:
+        request_items = [
+            *stdio_handshake_requests(),
+            *(
+                {"jsonrpc": "2.0", "id": request_id, "method": "ping"}
+                for request_id in (50, 51)
+            ),
+        ]
+        requests = "\n".join(json.dumps(request) for request in request_items)
+        stdin = io.StringIO(requests + "\n")
+        stdout = io.StringIO()
+        real_dispatch = mcp_server_module.dispatch
+
+        def controlled_dispatch(
+            request: dict[str, Any],
+            session_state: mcp_server_module._McpSessionState,
+        ) -> dict[str, Any] | None:
+            if request.get("id") == 50:
+                return mcp_server_module.rpc_result(50, {"bad": float("nan")})
+            return real_dispatch(request, session_state)
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+            patch.object(mcp_server_module, "dispatch", side_effect=controlled_dispatch),
+            patch.object(mcp_server_module.traceback, "print_exc"),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        output = stdout.getvalue()
+        self.assertNotIn("NaN", output)
+        responses = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(responses[0]["id"], 900)
+        self.assertEqual(responses[1]["id"], 50)
+        self.assertEqual(responses[1]["error"], {"code": -32603, "message": "internal error"})
+        self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 51, "result": {}})
+
+    def test_stdio_rejects_oversized_frame_before_parsing_and_recovers(self) -> None:
+        oversized = "x" * (MAX_MCP_REQUEST_BYTES + 1) + "\n"
+        recovery = [*stdio_handshake_requests(), {"jsonrpc": "2.0", "id": 7, "method": "ping"}]
+        stdin = io.StringIO(
+            oversized + "\n".join(json.dumps(request) for request in recovery) + "\n"
+        )
+        stdout = io.StringIO()
+
+        with (
+            patch.object(mcp_server_module.sys, "stdin", stdin),
+            patch.object(mcp_server_module.sys, "stdout", stdout),
+        ):
+            self.assertEqual(mcp_server_module.serve(), 0)
+
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(len(responses), 3)
         self.assertEqual(responses[0]["error"]["code"], -32700)
         self.assertIn("request exceeds maximum", responses[0]["error"]["message"])
-        self.assertEqual(responses[1]["id"], 7)
-        self.assertEqual(
-            responses[1]["result"]["protocolVersion"],
-            mcp_server_module.PROTOCOL_VERSION,
-        )
+        self.assertEqual(responses[1]["id"], 900)
+        self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 7, "result": {}})
 
     def test_stdio_rejects_over_nested_json_and_recovers(self) -> None:
         depth = mcp_server_module.MAX_MCP_JSON_DEPTH + 1
         nested = "[" * depth + "0" + "]" * depth
-        valid = json.dumps(
+        deep_value: object = 0
+        for _ in range(depth):
+            deep_value = [deep_value]
+        requests = (
             {
                 "jsonrpc": "2.0",
-                "id": 8,
-                "method": "initialize",
-                "params": {},
-            }
+                "id": 17,
+                "method": "ping",
+                "params": {"vendor": deep_value},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "method": "ping",
+                "params": {"vendor": deep_value},
+            },
+            stdio_handshake_requests()[0],
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {"_meta": {"vendor": deep_value}},
+            },
+            {"jsonrpc": "2.0", "id": 18, "method": "tools/list"},
+            stdio_handshake_requests()[1],
+            {"jsonrpc": "2.0", "id": 8, "method": "ping"},
         )
-        stdin = io.StringIO(nested + "\n" + valid + "\n")
+        stdin = io.StringIO(nested + "\n" + "\n".join(json.dumps(item) for item in requests) + "\n")
         stdout = io.StringIO()
 
         with (
@@ -144,13 +803,17 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertEqual(mcp_server_module.serve(), 0)
 
         responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
-        self.assertEqual(len(responses), 2)
+        self.assertEqual(len(responses), 6)
         self.assertEqual(responses[0]["error"]["code"], -32600)
-        self.assertEqual(responses[1]["id"], 8)
-        self.assertEqual(
-            responses[1]["result"]["protocolVersion"],
-            mcp_server_module.PROTOCOL_VERSION,
-        )
+        self.assertNotIn("id", responses[0])
+        self.assertEqual(responses[1]["id"], 17)
+        self.assertEqual(responses[1]["error"]["code"], -32600)
+        self.assertNotIn("id", responses[2])
+        self.assertEqual(responses[2]["error"]["code"], -32600)
+        self.assertEqual(responses[3]["id"], 900)
+        self.assertEqual(responses[4]["id"], 18)
+        self.assertIn("handshake is incomplete", responses[4]["error"]["message"])
+        self.assertEqual(responses[5], {"jsonrpc": "2.0", "id": 8, "result": {}})
 
     def test_parsed_request_json_has_an_explicit_depth_limit(self) -> None:
         value: object = 0
@@ -163,26 +826,21 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("maximum depth", str(error))
 
     def test_stdio_recovers_after_parser_recursion_error(self) -> None:
-        first = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "initialize"})
-        second = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 10,
-                "method": "initialize",
-                "params": {},
-            }
+        first = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"})
+        recovery = [*stdio_handshake_requests(), {"jsonrpc": "2.0", "id": 10, "method": "ping"}]
+        stdin = io.StringIO(
+            first + "\n" + "\n".join(json.dumps(request) for request in recovery) + "\n"
         )
-        stdin = io.StringIO(first + "\n" + second + "\n")
         stdout = io.StringIO()
         real_loads = json.loads
         call_count = 0
 
-        def controlled_loads(payload: str) -> object:
+        def controlled_loads(payload: str, **kwargs: Any) -> object:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RecursionError("synthetic parser depth failure")
-            return real_loads(payload)
+            return real_loads(payload, **kwargs)
 
         with (
             patch.object(mcp_server_module.sys, "stdin", stdin),
@@ -192,9 +850,10 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertEqual(mcp_server_module.serve(), 0)
 
         responses = [real_loads(line) for line in stdout.getvalue().splitlines()]
-        self.assertEqual(len(responses), 2)
+        self.assertEqual(len(responses), 3)
         self.assertEqual(responses[0]["error"]["code"], -32700)
-        self.assertEqual(responses[1]["id"], 10)
+        self.assertEqual(responses[1]["id"], 900)
+        self.assertEqual(responses[2]["id"], 10)
 
     def test_project_state_limits_reject_before_operation_or_root_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,7 +872,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
 
             self.assertTrue(response["isError"], response)
             payload = json.loads(response["content"][0]["text"])
-            self.assertIn("open_tasks exceeds maximum", payload["error"])
+            self.assertIn("open_tasks must contain at most 64 items", payload["error"])
             self.assertFalse(root.exists())
 
         schema = TOOLS["continuum_record_project_state"][1]
@@ -294,7 +953,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 )
             self.assertTrue(response["isError"], response)
             payload = json.loads(response["content"][0]["text"])
-            self.assertIn("metadata values must be strings", payload["error"])
+            self.assertIn("metadata.source must be string", payload["error"])
             self.assertFalse(root.exists())
 
         schema = TOOLS["continuum_record_project_state"][1]["properties"]["metadata"]
@@ -303,7 +962,14 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(schema["maxProperties"], len(metadata))
 
     def test_initialize_and_list_tools(self) -> None:
-        response = dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": valid_initialize_params(),
+            }
+        )
 
         self.assertIsNotNone(response)
         assert response is not None
@@ -317,14 +983,14 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "initialize",
-                "params": {"protocolVersion": "2025-11-25"},
+                "params": valid_initialize_params(),
             }
         )
         self.assertIsNotNone(negotiated)
         assert negotiated is not None
         self.assertEqual(negotiated["result"]["protocolVersion"], "2025-11-25")
 
-        listed = dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        listed = dispatch_ready({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 
         self.assertIsNotNone(listed)
         assert listed is not None
@@ -386,6 +1052,355 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("title", first_tool)
         self.assertTrue(tools["continuum_pack_root"]["annotations"]["openWorldHint"])
         self.assertTrue(tools["continuum_verify_bundle"]["annotations"]["openWorldHint"])
+
+    def test_initialize_rejects_missing_or_invalid_required_params(self) -> None:
+        invalid_params: tuple[dict[str, Any] | None, ...] = (
+            None,
+            {},
+            {"protocolVersion": 1, "capabilities": {}, "clientInfo": {}},
+            {"protocolVersion": "2025-11-25", "clientInfo": {}},
+            {"protocolVersion": "2025-11-25", "capabilities": [], "clientInfo": {}},
+            {"protocolVersion": "2025-11-25", "capabilities": {}},
+            {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": []},
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"version": "1.0.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"roots": {"listChanged": "yes"}},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"sampling": {"context": []}},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"experimental": {"vendor": []}},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "tasks": {"requests": {"sampling": {"createMessage": False}}},
+                },
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0", "title": 1},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0", "icons": [{}]},
+            },
+            {
+                "_meta": {"progressToken": True},
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+        )
+        for index, params in enumerate(invalid_params, start=1):
+            with self.subTest(params=params):
+                request: dict[str, Any] = {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "initialize",
+                }
+                if params is not None:
+                    request["params"] = params
+                response = dispatch(request)
+                assert response is not None
+                self.assertEqual(response["error"]["code"], -32602)
+                self.assertNotIn("result", response)
+
+    def test_initialize_accepts_valid_nested_capabilities_and_extensions(self) -> None:
+        params = valid_initialize_params()
+        params["_meta"] = {"progressToken": 1.0, "vendor": {"trace": True}}
+        params["capabilities"] = {
+            "roots": {"listChanged": True, "vendor": "extension"},
+            "sampling": {"context": {"mode": "all"}, "tools": {}},
+            "elicitation": {"form": {}, "url": {"version": 1}},
+            "experimental": {"vendor.feature": {"enabled": True}},
+            "tasks": {
+                "list": {},
+                "cancel": {},
+                "requests": {
+                    "sampling": {"createMessage": {}},
+                    "elicitation": {"create": {}},
+                },
+            },
+            "vendorCapability": {"enabled": True},
+        }
+        params["clientInfo"] = {
+            "name": "test-client",
+            "title": "Test Client",
+            "version": "1.0.0",
+            "description": "MCP compatibility fixture",
+            "websiteUrl": "https://example.invalid/client",
+            "icons": [
+                {
+                    "src": "data:image/png;base64,AA==",
+                    "mimeType": "image/png",
+                    "sizes": ["16x16", "any"],
+                    "theme": "dark",
+                }
+            ],
+        }
+
+        response = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "initialize-valid",
+                "method": "initialize",
+                "params": params,
+            }
+        )
+
+        assert response is not None
+        self.assertEqual(response["id"], "initialize-valid")
+        self.assertEqual(response["result"]["protocolVersion"], "2025-11-25")
+
+    def test_tool_call_schema_and_unknown_tool_use_protocol_errors(self) -> None:
+        invalid_params: tuple[dict[str, Any] | None, ...] = (
+            None,
+            {},
+            {"name": 1},
+            {"name": "continuum_init", "arguments": []},
+            {"name": "not-a-continuum-tool", "arguments": {}},
+        )
+        for index, params in enumerate(invalid_params, start=1):
+            with self.subTest(params=params):
+                request: dict[str, Any] = {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "tools/call",
+                }
+                if params is not None:
+                    request["params"] = params
+                response = dispatch_ready(request)
+                assert response is not None
+                self.assertEqual(response["error"]["code"], -32602)
+                self.assertNotIn("result", response)
+
+    def test_tool_argument_schemas_block_invalid_handlers_without_mutation(self) -> None:
+        cases = (
+            ("continuum_init", {"root": None}, "arguments.root must be string"),
+            ("continuum_init", {"unexpected": 1}, "arguments.unexpected is not allowed"),
+            (
+                "continuum_append_event",
+                {"session_id": "schema-session"},
+                "arguments.content is required",
+            ),
+            (
+                "continuum_ingest_file",
+                {"path": "missing.txt", "storage_tier": "invalid"},
+                "arguments.storage_tier must be one of",
+            ),
+            (
+                "continuum_run_workers",
+                {"roles": [1]},
+                "arguments.roles[0] must be string",
+            ),
+            (
+                "continuum_search",
+                {"query": ""},
+                "arguments.query must contain at least 1 characters",
+            ),
+            (
+                "continuum_review_prepare",
+                {
+                    "subject": "missing-subject",
+                    "prompt": "review",
+                    "reviewer_id": "\U0001f40d"
+                    * (mcp_server_module.REVIEW_MAX_REVIEWER_ID_BYTES // 4 + 1),
+                },
+                "arguments.reviewer_id must contain at most 256 UTF-8 bytes",
+            ),
+            (
+                "continuum_review_prepare",
+                {
+                    "subject": "missing-subject",
+                    "prompt": "review",
+                    "secret_allowlist_patterns": [""],
+                },
+                "arguments.secret_allowlist_patterns[0] must contain at least 1 characters",
+            ),
+            (
+                "continuum_review_run",
+                {"job_id": "schema-job", "operation_id": "A\n"},
+                "arguments.operation_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_run",
+                {"job_id": "schema-job", "operation_id": "CON.txt"},
+                "arguments.operation_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_run",
+                {"job_id": "schema-job", "operation_id": "operation."},
+                "arguments.operation_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_run",
+                {"job_id": "A\n"},
+                "arguments.job_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_ingest",
+                {"job_id": "a/b", "content": "review"},
+                "arguments.job_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_status",
+                {"job_id": "\u00e9"},
+                "arguments.job_id does not match the required pattern",
+            ),
+            (
+                "continuum_review_check_current",
+                {"job_id": "j" * 129},
+                "arguments.job_id must contain at most 128 characters",
+            ),
+            (
+                "continuum_review_browser_attempt_start",
+                {"job_id": "CON"},
+                "arguments.job_id does not match the required pattern",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            default_root = Path(tmp) / "default-root"
+            with patch.dict(
+                "os.environ",
+                {
+                    "CONTINUUM_ROOT": str(default_root),
+                    "CONTINUUM_ALLOWED_ROOTS": tmp,
+                },
+            ):
+                for index, (name, arguments, expected_error) in enumerate(cases, start=1):
+                    with self.subTest(tool=name, arguments=arguments):
+                        response = dispatch_ready(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": index,
+                                "method": "tools/call",
+                                "params": {"name": name, "arguments": arguments},
+                            }
+                        )
+                        assert response is not None
+                        result = response["result"]
+                        self.assertTrue(result["isError"], result)
+                        payload = json.loads(result["content"][0]["text"])
+                        self.assertIn(expected_error, payload["error"])
+                        self.assertFalse(default_root.exists())
+
+    def test_tool_schemas_mark_required_strings_nonempty(self) -> None:
+        for name, (_description, schema, _handler) in TOOLS.items():
+            properties = schema.get("properties", {})
+            for key in schema.get("required", []):
+                property_schema = properties.get(key, {})
+                if property_schema.get("type") == "string":
+                    with self.subTest(tool=name, argument=key):
+                        self.assertEqual(property_schema.get("minLength"), 1)
+
+    def test_integral_json_schema_numbers_are_normalized_for_integer_handlers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
+                result = call_tool(
+                    "continuum_search",
+                    {"root": str(root), "query": "no matches", "limit": 1.0},
+                )
+
+        self.assertIsInstance(result, dict)
+
+    def test_mutating_review_handlers_validate_job_id_before_operation_guard(self) -> None:
+        cases = (
+            (mcp_server_module.tool_review_run, {"job_id": "A\n"}),
+            (
+                mcp_server_module.tool_review_ingest,
+                {"job_id": "a/b", "content": "review"},
+            ),
+            (
+                mcp_server_module.tool_review_browser_attempt_start,
+                {"job_id": "CON"},
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(mcp_server_module, "guarded_tool") as guarded,
+            ):
+                for handler, arguments in cases:
+                    with self.subTest(handler=handler.__name__), self.assertRaisesRegex(
+                        ValueError,
+                        "job_id must be a safe portable filename component",
+                    ):
+                        handler({"root": str(root), **arguments})
+                guarded.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_browser_attempt_validates_operation_id_before_operation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(mcp_server_module, "guarded_tool") as guarded,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "operation_id must be a safe portable filename component",
+                ),
+            ):
+                mcp_server_module.tool_review_browser_attempt_start(
+                    {
+                        "root": str(root),
+                        "job_id": "valid-job",
+                        "operation_id": "CON",
+                    }
+                )
+            guarded.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_review_handlers_validate_simple_controls_before_operation_guard(self) -> None:
+        invalid_text = "\ud800"
+        cases = (
+            (
+                mcp_server_module.tool_review_prepare,
+                {"include_diff": "yes"},
+                "include_diff must be a boolean",
+            ),
+            (
+                mcp_server_module.tool_review_ingest,
+                {"job_id": "valid-job", "content": invalid_text},
+                "inline review response is not valid UTF-8 text",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(mcp_server_module, "guarded_tool") as guarded,
+            ):
+                for handler, arguments, expected_error in cases:
+                    with self.subTest(handler=handler.__name__), self.assertRaisesRegex(
+                        ValueError,
+                        expected_error,
+                    ):
+                        handler({"root": str(root), **arguments})
+                guarded.assert_not_called()
+            self.assertFalse(root.exists())
 
     def test_mcp_catalog_proof_policy_separates_routine_and_high_risk_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -482,7 +1497,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             ),
             (
                 {"project_id": "bounded-project", "limit": 1001, "apply": True},
-                "limit must be between 1 and 1000",
+                "limit must be at most 1000",
             ),
         )
         for arguments, expected_error in cases:
@@ -812,7 +1827,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
 
                 self.assertTrue(result["isError"], result)
                 payload = json.loads(result["content"][0]["text"])
-                self.assertIn("must be an array of strings", payload["error"])
+                self.assertIn("superseded_card_ids must be array", payload["error"])
                 self.assertFalse(root.exists())
 
     def test_mcp_resolves_complete_compatible_authority_boundary(self) -> None:
@@ -961,14 +1976,14 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 self.assertNotIn("dismissed_conflict_components", metadata)
                 self.assertNotIn("supersedes_card_id", metadata)
 
-    def test_mcp_project_state_strips_exact_memory_trust_metadata(self) -> None:
+    def test_mcp_project_state_rejects_unadvertised_trust_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = str(Path(tmp) / "continuum")
+            root = Path(tmp) / "continuum"
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
-                result = call_tool(
+                result = call_tool_raw(
                     "continuum_record_project_state",
                     {
-                        "root": root,
+                        "root": str(root),
                         "session_id": "mcp-project-state-exact",
                         "agent_id": "codex",
                         "project_id": "public-mcp-project",
@@ -982,71 +1997,26 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                         },
                     },
                 )
-            self.assertTrue(result["ok"], result)
-            conn = sqlite3.connect(str(Path(root) / "catalog" / "catalog.sqlite3"))
-            conn.row_factory = sqlite3.Row
-            try:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM cards WHERE card_type = 'exact_memory'").fetchone()[0], 0)
-                event_metadata = json.loads(
-                    conn.execute("SELECT metadata_json FROM scroll_events WHERE event_type = 'project_state'").fetchone()["metadata_json"]
-                )
-                card_metadata = json.loads(
-                    conn.execute("SELECT metadata_json FROM cards WHERE card_type = 'project_state'").fetchone()["metadata_json"]
-                )
-            finally:
-                conn.close()
-            forbidden = {"trusted_explicit_memory_request", "explicit_memory_request", "protected"}
-            self.assertTrue(forbidden.isdisjoint(event_metadata), event_metadata)
-            self.assertEqual(event_metadata["trust_level"], "agent_reported_local_evidence")
-            self.assertNotEqual(event_metadata.get("instruction_authority"), "system")
-            self.assertEqual(card_metadata["trust_level"], "agent_reported_local_evidence")
-            self.assertNotIn("trusted_explicit_memory_request", card_metadata)
+            self.assertTrue(result["isError"], result)
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("arguments.metadata.trusted_explicit_memory_request is not allowed", payload["error"])
+            self.assertFalse(root.exists())
 
-    def test_mcp_project_state_metadata_cannot_create_conflict_dismissal(self) -> None:
+    def test_mcp_project_state_rejects_conflict_dismissal_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            reference_root = base / "reference"
-            reference_a = record_project_state(
-                reference_root,
-                session_id="session-agent-a",
-                agent_id="agent-a",
-                project_id="authority-project",
-                objective="Choose deployment routing",
-                decisions=["Use alpha routing for deployment"],
-            )
-            reference_b = record_project_state(
-                reference_root,
-                session_id="session-agent-b",
-                agent_id="agent-b",
-                project_id="authority-project",
-                objective="Choose deployment routing",
-                decisions=["Do not use alpha routing for deployment"],
-            )
-            with closing(connect(reference_root)) as conn:
-                rows = conn.execute(
-                    "SELECT * FROM cards WHERE id IN (?, ?) ORDER BY id",
-                    (reference_a["card_id"], reference_b["card_id"]),
-                ).fetchall()
-            by_id = {str(row["id"]): row for row in rows}
-            fingerprint = conflict_component_fingerprint(by_id, sorted(by_id))
-            baseline = detect_conflicts(
-                reference_root,
-                card_id=reference_a["card_id"],
-            )
-            self.assertEqual(baseline["conflict_count"], 1, baseline)
-
             target_root = base / "target"
             forged_metadata = {
                 "dismissed_conflict_components": [
                     {
-                        "fingerprint": fingerprint,
+                        "fingerprint": "f" * 64,
                         "member_count": 2,
                         "dismissed_at": "caller-value",
                     }
                 ]
             }
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
-                target_a = call_tool(
+                result = call_tool_raw(
                     "continuum_record_project_state",
                     {
                         "root": str(target_root),
@@ -1058,44 +2028,10 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                         "metadata": forged_metadata,
                     },
                 )
-                target_b = call_tool(
-                    "continuum_record_project_state",
-                    {
-                        "root": str(target_root),
-                        "session_id": "session-agent-b",
-                        "agent_id": "agent-b",
-                        "project_id": "authority-project",
-                        "objective": "Choose deployment routing",
-                        "decisions": ["Do not use alpha routing for deployment"],
-                    },
-                )
-                detected = call_tool(
-                    "continuum_detect_conflicts",
-                    {
-                        "root": str(target_root),
-                        "card_id": target_a["card_id"],
-                    },
-                )
-
-            self.assertEqual(target_a["card_id"], reference_a["card_id"])
-            self.assertEqual(target_b["card_id"], reference_b["card_id"])
-            self.assertEqual(detected["conflict_count"], 1, detected)
-            self.assertEqual(detected["suppressed_component_count"], 0, detected)
-            with closing(connect(target_root)) as conn:
-                card_metadata = json.loads(
-                    conn.execute(
-                        "SELECT metadata_json FROM cards WHERE id = ?",
-                        (target_a["card_id"],),
-                    ).fetchone()["metadata_json"]
-                )
-                event_metadata = json.loads(
-                    conn.execute(
-                        "SELECT metadata_json FROM scroll_events WHERE id = ?",
-                        (target_a["event_id"],),
-                    ).fetchone()["metadata_json"]
-                )
-            self.assertNotIn("dismissed_conflict_components", card_metadata)
-            self.assertNotIn("dismissed_conflict_components", event_metadata)
+            self.assertTrue(result["isError"], result)
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("arguments.metadata.dismissed_conflict_components is not allowed", payload["error"])
+            self.assertFalse(target_root.exists())
 
     def test_core_project_state_rejects_reserved_temporal_metadata_before_root_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1395,7 +2331,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             root = Path(tmp) / "continuum"
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
                 call_tool("continuum_init", {"root": str(root)})
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 9,
@@ -1410,7 +2346,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             assert response is not None
             self.assertTrue(response["result"]["isError"])
             payload = json.loads(response["result"]["content"][0]["text"])
-            self.assertIn("safe portable filename component", payload["error"])
+            self.assertIn("arguments.operation_id does not match the required pattern", payload["error"])
 
     def test_read_only_status_does_not_initialize_missing_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1549,7 +2485,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:
             denied_root = Path(denied) / "continuum"
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -1569,7 +2505,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             denied_file = Path(denied) / "secret.txt"
             denied_file.write_text("do not ingest", encoding="utf-8")
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 2,
@@ -1588,7 +2524,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             denied_proof = Path(denied) / "fake-proof.json"
             denied_proof.write_text("{}", encoding="utf-8")
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 3,
@@ -1607,7 +2543,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             allowed_proof = Path(allowed) / "fake-proof.json"
             allowed_proof.write_text("{}", encoding="utf-8")
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 4,
@@ -1799,7 +2735,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             denied_snapshot.write_text("not a real snapshot", encoding="utf-8")
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}):
                 call_tool("continuum_init", {"root": str(root)})
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -1821,7 +2757,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             root = Path(tmp) / "continuum"
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}):
                 call_tool("continuum_init", {"root": str(root)})
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -1836,7 +2772,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             assert response is not None
             self.assertTrue(response["result"]["isError"])
             payload = json.loads(response["result"]["content"][0]["text"])
-            self.assertIn("limit must be an integer", payload["error"])
+            self.assertIn("arguments.limit must be integer", payload["error"])
 
     def test_mcp_search_exposes_session_and_project_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1882,7 +2818,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             palace = Path(tmp) / "palace"
             palace.mkdir()
             with patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}, clear=False):
-                response = dispatch(
+                response = dispatch_ready(
                     {
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -1899,7 +2835,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertIn("CONTINUUM_MCP_ALLOW_PROCESS_STOP", payload["error"])
 
     def test_tool_errors_are_returned_as_mcp_tool_errors(self) -> None:
-        response = dispatch(
+        response = dispatch_ready(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1913,7 +2849,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         result = response["result"]
         self.assertTrue(result["isError"])
         payload = json.loads(result["content"][0]["text"])
-        self.assertIn("content must be a non-empty string", payload["error"])
+        self.assertIn("arguments.content is required", payload["error"])
 
 
 if __name__ == "__main__":

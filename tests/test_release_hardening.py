@@ -23,7 +23,7 @@ from continuum.core.permissions import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, audi
 from continuum.core.store import audit_search_index, ingest_file, init_db, snapshot
 from continuum.integrations import claude_code_adapter, hermes_adapter
 from continuum.integrations.hermes_adapter import REDACTED_SECRET, install_hermes_adapter
-from continuum.mcp_server import dispatch
+from continuum.mcp_server import PROTOCOL_VERSION, _McpSessionState, dispatch
 
 
 def _mode(path: Path) -> int:
@@ -1521,7 +1521,31 @@ version = "9.9.9"
             self.assertFalse(any("model.api_key" in call.args[0] for call in run.call_args_list))
 
     def test_mcp_annotations_are_explicit_for_local_and_destructive_tools(self) -> None:
-        response = dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        session_state = _McpSessionState()
+        initialized = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "release-test", "version": "1.0.0"},
+                },
+            },
+            session_state,
+        )
+        self.assertIsNotNone(initialized)
+        self.assertIsNone(
+            dispatch(
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                session_state,
+            )
+        )
+        response = dispatch(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            session_state,
+        )
 
         self.assertIsNotNone(response)
         assert response is not None

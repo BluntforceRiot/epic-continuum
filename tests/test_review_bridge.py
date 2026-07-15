@@ -199,13 +199,36 @@ def exact_secret_allowlist_entry(source: str, text: str, *, index: int = 0) -> d
 
 
 def call_tool(name: str, arguments: dict) -> dict:
+    session_state = mcp_server_module._McpSessionState()
+    initialized = dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": "review-test-initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": mcp_server_module.PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "review-test", "version": "1.0.0"},
+            },
+        },
+        session_state,
+    )
+    assert initialized is not None and "result" in initialized
+    assert (
+        dispatch(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            session_state,
+        )
+        is None
+    )
     response = dispatch(
         {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
-        }
+        },
+        session_state,
     )
     assert response is not None
     result = response["result"]
@@ -5410,7 +5433,7 @@ class ReviewBridgeTest(unittest.TestCase):
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                    "pattern": mcp_server_module.MCP_PORTABLE_OPERATION_ID_PATTERN,
                 },
             )
 
@@ -6723,6 +6746,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 ("process", "process", False, False),
                 ("long-process", "process", False, True),
             )
+            fixture_timeout_seconds = 30
             for case_name, driver_kind, required, sleeping in cases:
                 with self.subTest(case=case_name):
                     root = base / f"continuum-{case_name}"
@@ -6793,7 +6817,7 @@ class ReviewBridgeTest(unittest.TestCase):
                             check=True,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            timeout=5,
+                            timeout=fixture_timeout_seconds,
                         )
                         target.write_text("new root\n", encoding="utf-8")
                     else:
@@ -6803,7 +6827,7 @@ class ReviewBridgeTest(unittest.TestCase):
                             check=False,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            timeout=5,
+                            timeout=fixture_timeout_seconds,
                         )
                     self.assertTrue(
                         marker.exists(),
@@ -6816,7 +6840,7 @@ class ReviewBridgeTest(unittest.TestCase):
                         subject_path=subject,
                         prompt="Review hard.",
                         transport="manual",
-                        prepare_timeout_seconds=5,
+                        prepare_timeout_seconds=fixture_timeout_seconds,
                     )
                     self.assertFalse(marker.exists())
                     current = review_check_current(root, job_id=job["job_id"])
@@ -9990,7 +10014,15 @@ class ReviewBridgeTest(unittest.TestCase):
             review_bridge_module.REVIEW_MAX_PROMPT_BYTES,
         )
         self.assertEqual(
+            prepare_schema["properties"]["prompt"]["x-continuum-maxUtf8Bytes"],
+            review_bridge_module.REVIEW_MAX_PROMPT_BYTES,
+        )
+        self.assertEqual(
             prepare_schema["properties"]["reviewer_id"]["maxLength"],
+            review_bridge_module.REVIEW_MAX_REVIEWER_ID_BYTES,
+        )
+        self.assertEqual(
+            prepare_schema["properties"]["reviewer_id"]["x-continuum-maxUtf8Bytes"],
             review_bridge_module.REVIEW_MAX_REVIEWER_ID_BYTES,
         )
         self.assertEqual(
@@ -10021,7 +10053,7 @@ class ReviewBridgeTest(unittest.TestCase):
             "type": "string",
             "minLength": 1,
             "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+            "pattern": mcp_server_module.MCP_PORTABLE_OPERATION_ID_PATTERN,
         }
         self.assertEqual(
             run_schema["properties"]["operation_id"],
@@ -10031,6 +10063,18 @@ class ReviewBridgeTest(unittest.TestCase):
             browser_schema["properties"]["operation_id"],
             expected_operation_schema,
         )
+        for tool_name in (
+            "continuum_review_run",
+            "continuum_review_ingest",
+            "continuum_review_status",
+            "continuum_review_check_current",
+            "continuum_review_browser_attempt_start",
+        ):
+            with self.subTest(surface="mcp-job-id", tool=tool_name):
+                self.assertEqual(
+                    TOOLS[tool_name][1]["properties"]["job_id"],
+                    expected_operation_schema,
+                )
 
         parser = cli_module.build_parser()
         for name, maximum in prepare_limits.items():

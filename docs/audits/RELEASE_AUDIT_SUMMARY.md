@@ -17,37 +17,89 @@ The release gate focused on:
 
 ## Current Gate
 
-The current source patch completed its fresh Windows and WSL verification
-loop. Earlier 0.2 release-candidate work also exercised the durability foundation on disposable
-Debian 12 and Debian 13 systems. The public source package intentionally keeps
-this as a summary rather than bundling full local run logs; the repository CI
-matrix remains the cross-platform release gate for the final v0.3 commit.
+On 2026-07-15, the narrow replacement candidate based on immutable reviewed
+commit `c5f6fb8d98fbb8bab93fe3c48af9824bf5fef64a` completed fresh Windows and
+WSL source verification after repairing strict MCP request handling and the
+slow-host test fixture. Earlier 0.2 release-candidate work also exercised the
+durability foundation on disposable Debian 12 and Debian 13 systems. The public
+source package intentionally keeps this as a summary rather than bundling full
+local run logs; the repository CI matrix remains the cross-platform publication
+gate for the final v0.3 commit.
 
-The current pre-promotion Windows patch ran two disjoint pytest partitions. The
-complete Review Relay file passed 210 tests with 6 environment- or
-optional-feature skips and 171 subtests. The other 31 test files passed 778
-tests with 20 explicit skips and 450 subtests. The unique Windows aggregate is
-therefore 988 passed, 26 skipped, and 621 subtests. After the cross-platform
-gate exposed three POSIX proof mismatches, the affected cases passed on both
-Windows and WSL, and WSL/Python 3.12.3 then reran the complete Review Relay file:
-215 passed, 1 explicit skip, and 171 subtests.
+Static pytest discovery collected 1,134 test methods across 32 files: 304 in
+`tests/test_review_bridge.py` and 830 in the other 31 files. Fresh Windows runs
+reported 296 passed, 8 skipped, and 289 subtests for the complete Review Relay
+file, plus 812 passed, 20 skipped, and 655 subtests for the other 31 files.
+Fresh WSL/Python 3.12.3 runs under the pinned distribution toolchain reported
+300 passed, 4 skipped, and 308 subtests for Review Relay, plus 829 passed,
+1 skipped, and 657 subtests for the other files. These are the exact pytest
+command summaries; pytest-subtests includes skipped subtests in its skipped
+result total, so those result counts are not a second method-discovery count.
 
-Repository-wide Ruff, mypy across 31 source files, compileall, fixture-allowlist
-validation at 165 exact fingerprints, Git diff integrity, and mixed-line-ending
-checks passed. Independent blind review found no remaining code defect; its
-only HOLD was the then-unrun release evidence recorded above and the immutable
-artifact/installed-distribution gates. Artifact promotion requires the
-canonical source ZIP to be built and verified from the immutable release
-commit; the wheel and source distribution to be byte-identical across two
-separate source-ZIP extractions; and the distribution finalizer to rebuild both
-distributions from two further separate source-ZIP extractions before emitting
-its schema-v2 receipt and exact five-file release set. Twine validation must
-pass. Fresh Windows wheel and
-source-distribution installs and a fresh WSL wheel install must each verify
-package provenance, import from their own `site-packages`, and run real `init`
-and `status` operations against new roots. The applicable final commit and
-artifact hashes must be bound in the local build-cycle and Continuum receipts
-before promotion.
+The repaired MCP boundary was also replayed directly on Windows and WSL, plus
+through an actual Windows stdio subprocess. The matrix rejects malformed
+versions and methods; boolean, fractional, container, or nonfinite request IDs;
+invalid nested initialization capabilities and client metadata; malformed
+tool-call names, parameters, arguments, and advertised input-schema values;
+duplicate object keys; nonfinite constants; and overflowing finite-number
+syntax. Integral numeric IDs remain interoperable under JSON Schema 2020-12
+and preserve their exact value beyond binary64's safe-integer boundary, while
+fractional spellings that would round or underflow to an integer remain
+rejected. A real child-process regression proves exact echo of
+`9007199254740993.0`, rejection of `1.0000000000000001` and `1e-4000`, and
+recovery on the next frame.
+It proves ID-less notifications receive no response or tool execution, the
+initialize/initialized lifecycle completes before any tool handler can run,
+valid `ping` requests work before, during, and after initialization, repeated or
+out-of-order initialization is rejected, malformed tool inputs create no
+default root or receipt, unknown tools use protocol errors, and a valid `ping`
+is still answered after parse, dispatch, or response serialization failure.
+Advertised schemas now normalize JSON-Schema integral numbers for integer
+handlers, reject empty required strings, enforce explicit UTF-8 byte-bound
+annotations before handlers, and share exact portable operation and review-job
+identifier constraints. Mutating Review Relay tools validate job identifiers
+and caller operation identifiers before an operation receipt can start;
+simple boolean and inline-text controls are likewise validated before the
+guard. Generic request metadata is validated before lifecycle transitions or
+method execution, request progress tokens accept only strings or integers,
+initialized-notification `_meta` remains open extension metadata, and errors
+whose request ID cannot be recovered omit the optional `id` member. Parsed
+over-depth requests preserve a readable valid ID, while equally deep
+notifications remain silent and cannot advance lifecycle state. List methods
+reject malformed or unissued cursors because this server advertises no
+`nextCursor`. The complete MCP file passed 66 tests and 175 subtests on both
+Windows and WSL. The former clean-filter timeout case
+passed all five subtests on both platforms with its test-local Git and
+preparation deadlines widened to 30 seconds; the product's 120-second
+preparation default is unchanged.
+
+Repository-wide Ruff, mypy across 31 source files, compileall, the four-test
+fixture-allowlist gate, and Git diff integrity passed. The fixture allowlist has
+166 parsed fingerprints and 169 physical lines, including its three header
+lines. These results supersede this file's historical 210/778/988 test counts
+and 165-fingerprint claim.
+
+The externally reviewed `c5f6fb8` five-file artifact set, checksums, archive
+audits, finalizer proof, and clean-install behavior all passed and remain
+immutable historical evidence. That exact candidate was held for the MCP
+boundary defect now repaired here. A fresh three-way blind review of the
+replacement then found exact numeric-ID parsing and one pre-guard Review Relay
+validation gap; both are repaired and covered by regressions here. A subsequent
+blind pass found malformed request metadata could still unlock initialization
+or reach a tool method; request `_meta` and progress-token validation now runs
+before either path. A final protocol-focused pass then found request-only
+progress-token typing applied to initialized notifications and unknown request
+IDs serialized as `null`; notification metadata and error response IDs now
+match the protocol's separate schemas. Its fresh re-review found parsed
+over-depth requests still lost readable IDs and over-depth notifications still
+received responses; both correlation and notification silence are now covered
+through lifecycle recovery. Two byte-pinned independent re-reviews passed with
+no residual actionable defect. Promotion now requires an immutable replacement
+commit, reproducible
+source/wheel/sdist rebuilding, exact five-file finalization, installed-artifact
+runtime checks, and final build-cycle and Continuum receipts. The release
+receipt, rather than this non-self-referential source summary, is authoritative
+for the final commit and artifact hashes.
 
 Release review hardening included:
 
@@ -132,6 +184,19 @@ Release review hardening included:
   with transactional exact-member resolution receipts, and extend semantic
   snapshot, restore, pack, and embedded-bundle verification across the complete
   project-state lineage and payload bindings.
+- final MCP boundary fixes that reject malformed JSON-RPC envelopes before tool
+  dispatch, preserve missing-versus-falsy parameter semantics, fail closed on
+  duplicate or nonfinite JSON, and continue serving after bounded per-frame
+  errors without creating default-root state.
+- final MCP lifecycle and contract fixes that allow `ping` throughout
+  initialization, align advertised integer/string/UTF-8 limits with handler
+  behavior, and reject nonportable operation or review-job identifiers before
+  any mutating operation starts.
+- final blind-review fixes that preserve exact integral request IDs across JSON
+  decimal parsing, reject rounded or underflowed fractional IDs, recover after
+  integer-limit failures, and validate browser-review identity and simple Relay
+  controls before any guarded mutation, followed by strict request-metadata
+  validation before lifecycle transitions or method execution.
 
 The Python package version is `0.3.0`, and the catalog capability
 `SCHEMA_VERSION` remains `0.2.0`. This feature release uses additive in-place

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 import traceback
+from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import Any, Callable, overload
 
@@ -57,6 +60,7 @@ from .core.review_bridge import (
     REVIEW_MAX_PREPARE_TIMEOUT_SECONDS,
     REVIEW_MAX_REVIEWER_ID_BYTES,
     REVIEW_MAX_RUN_TIMEOUT_SECONDS,
+    REVIEW_INTEGRITY_MAX_RECORD_BYTES,
     REVIEW_MAX_SUBJECT_BYTES,
     REVIEW_MAX_SUBJECT_FILE_BYTES,
     REVIEW_MAX_TOKENS,
@@ -71,8 +75,11 @@ from .core.review_bridge import (
     review_job_status,
     run_review_job,
     validate_review_prepare_controls,
+    validate_review_job_id,
+    validate_review_operation_id,
     validate_review_prepare_limits,
     validate_review_prompt,
+    validate_review_response_text,
     validate_review_run_controls,
     validate_review_subject_path,
     validate_review_transport_limits,
@@ -125,6 +132,12 @@ SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION,)
 MAX_MCP_REQUEST_BYTES = 256 * 1024
 MAX_MCP_JSON_DEPTH = 64
 MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
+_runtime_int_digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+MAX_MCP_JSON_INTEGER_DIGITS = _runtime_int_digit_limit or 4300
+
+
+class _NonIntegralJsonFloat(float):
+    """A finite JSON decimal that is not mathematically integral."""
 
 
 def default_root() -> Path:
@@ -226,9 +239,18 @@ def optional_int(args: JSON, key: str, default: int | None) -> int | None:
     value = args.get(key, default)
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
         raise ValueError(f"{key} must be an integer")
-    return value
+    if isinstance(value, int):
+        return value
+    if (
+        isinstance(value, float)
+        and not isinstance(value, _NonIntegralJsonFloat)
+        and math.isfinite(value)
+        and value.is_integer()
+    ):
+        return int(value)
+    raise ValueError(f"{key} must be an integer")
 
 
 def optional_bool(args: JSON, key: str, default: bool = False) -> bool:
@@ -377,7 +399,13 @@ def tool_result(value: Any, *, is_error: bool = False) -> JSON:
         "content": [
             {
                 "type": "text",
-                "text": json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True),
+                "text": json.dumps(
+                    value,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
             }
         ],
         "structuredContent": structured,
@@ -1408,6 +1436,7 @@ def tool_restore_drill(args: JSON) -> Any:
 
 
 def tool_review_prepare(args: JSON) -> Any:
+    include_diff = optional_bool(args, "include_diff", True)
     root = root_arg(args)
     subject = validate_review_subject_path(
         root,
@@ -1484,7 +1513,7 @@ def tool_review_prepare(args: JSON) -> Any:
             transport=transport,
             model=model,
             base_url=base_url,
-            include_diff=optional_bool(args, "include_diff", True),
+            include_diff=include_diff,
             max_packet_bytes=max_packet_bytes,
             max_file_bytes=max_file_bytes,
             max_files=max_files,
@@ -1505,6 +1534,7 @@ def tool_review_prepare(args: JSON) -> Any:
         intent={
             "subject": str(subject),
             "transport": transport,
+            "include_diff": include_diff,
             "max_packet_bytes": max_packet_bytes,
             "max_file_bytes": max_file_bytes,
             "max_files": max_files,
@@ -1538,6 +1568,7 @@ def tool_review_prepare(args: JSON) -> Any:
 
 
 def tool_review_run(args: JSON) -> Any:
+    job_id = validate_review_job_id(require_str(args, "job_id"))
     root = root_arg(args)
     (
         transport,
@@ -1566,7 +1597,7 @@ def tool_review_run(args: JSON) -> Any:
     def action(operation: OperationGuard) -> JSON:
         result = run_review_job(
             root,
-            job_id=require_str(args, "job_id"),
+            job_id=job_id,
             transport=transport,
             model=model,
             base_url=base_url,
@@ -1606,17 +1637,20 @@ def tool_review_run(args: JSON) -> Any:
 
 
 def tool_review_ingest(args: JSON) -> Any:
-    root = root_arg(args)
+    job_id = validate_review_job_id(require_str(args, "job_id"))
     result_path = optional_str(args, "result_path")
     content = optional_str(args, "content")
     if not result_path and content is None:
         raise ValueError("result_path or content is required")
+    if content is not None:
+        content = validate_review_response_text(content)
+    root = root_arg(args)
     validated_result_path = validate_allowed_path(Path(result_path), purpose="review result") if result_path else None
 
     def action(operation: OperationGuard) -> JSON:
         result = ingest_review_result(
             root,
-            job_id=require_str(args, "job_id"),
+            job_id=job_id,
             result_path=validated_result_path,
             content=content,
             operation_id=operation.operation_id,
@@ -1647,21 +1681,25 @@ def tool_review_ingest(args: JSON) -> Any:
 
 
 def tool_review_status(args: JSON) -> Any:
-    return review_job_status(root_arg(args), job_id=require_str(args, "job_id"))
+    job_id = validate_review_job_id(require_str(args, "job_id"))
+    return review_job_status(root_arg(args), job_id=job_id)
 
 
 def tool_review_check_current(args: JSON) -> Any:
-    return review_check_current(root_arg(args), job_id=require_str(args, "job_id"))
+    job_id = validate_review_job_id(require_str(args, "job_id"))
+    return review_check_current(root_arg(args), job_id=job_id)
 
 
 def tool_review_browser_attempt_start(args: JSON) -> Any:
+    job_id = validate_review_job_id(require_str(args, "job_id"))
+    caller_operation_id = validate_review_operation_id(args.get("operation_id"))
     root = root_arg(args)
 
     def action(operation: OperationGuard) -> JSON:
         result = review_browser_attempt_start(
             root,
-            job_id=require_str(args, "job_id"),
-            operation_id=optional_str(args, "operation_id") or operation.operation_id,
+            job_id=job_id,
+            operation_id=caller_operation_id or operation.operation_id,
         )
         operation.cursor({"phase": "review_browser_attempt_reserved", "job_id": args.get("job_id"), "attempt": result.get("attempt")})
         return result
@@ -1670,7 +1708,7 @@ def tool_review_browser_attempt_start(args: JSON) -> Any:
         root,
         operation_type="mcp_review_browser_attempt_start",
         title=f"Reserve browser review response path {args.get('job_id')}",
-        intent={"job_id": args.get("job_id"), "operation_id": args.get("operation_id")},
+        intent={"job_id": job_id, "operation_id": caller_operation_id},
         snapshot_policy="none",
         snapshot_reason="browser attempt reservation writes review export artifacts only",
         # The DB-first reservation phase and its exact artifact rows are already the
@@ -1679,6 +1717,20 @@ def tool_review_browser_attempt_start(args: JSON) -> Any:
         result_touched_paths=lambda _result: [],
         action=action,
     )
+
+
+MCP_PORTABLE_OPERATION_ID_PATTERN = (
+    r"^(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|"
+    r"[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\.|$))"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,126}[A-Za-z0-9_-])?(?![\s\S])"
+)
+MCP_PORTABLE_OPERATION_ID_SCHEMA: JSON = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 128,
+    "pattern": MCP_PORTABLE_OPERATION_ID_PATTERN,
+}
+MCP_REVIEW_JOB_ID_SCHEMA: JSON = {**MCP_PORTABLE_OPERATION_ID_SCHEMA}
 
 
 TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
@@ -1724,10 +1776,10 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["session_id", "content"],
             "properties": {
                 "root": {"type": "string"},
-                "session_id": {"type": "string"},
+                "session_id": {"type": "string", "minLength": 1},
                 "event_type": {"type": "string"},
                 "role": {"type": "string"},
-                "content": {"type": "string"},
+                "content": {"type": "string", "minLength": 1},
                 "metadata": {"type": "object"},
             },
             "additionalProperties": False,
@@ -1741,7 +1793,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["session_id", "start_seq", "end_seq"],
             "properties": {
                 "root": {"type": "string"},
-                "session_id": {"type": "string"},
+                "session_id": {"type": "string", "minLength": 1},
                 "start_seq": {"type": "integer"},
                 "end_seq": {"type": "integer"},
             },
@@ -1756,7 +1808,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["path"],
             "properties": {
                 "root": {"type": "string"},
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1},
                 "title": {"type": "string"},
                 "storage_tier": {"type": "string", "enum": ["hot", "warm", "cold", "vault"]},
             },
@@ -1771,7 +1823,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["session_id"],
             "properties": {
                 "root": {"type": "string"},
-                "session_id": {"type": "string"},
+                "session_id": {"type": "string", "minLength": 1},
                 "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
@@ -1791,7 +1843,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["session_id"],
             "properties": {
                 "root": {"type": "string"},
-                "session_id": {"type": "string"},
+                "session_id": {"type": "string", "minLength": 1},
                 "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "token_budget": {"type": "integer"},
@@ -1883,7 +1935,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["query"],
             "properties": {
                 "root": {"type": "string"},
-                "query": {"type": "string"},
+                "query": {"type": "string", "minLength": 1},
                 "limit": {"type": "integer"},
                 "session_id": {"type": "string"},
                 "project_id": {"type": "string"},
@@ -1899,7 +1951,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["cue"],
             "properties": {
                 "root": {"type": "string"},
-                "cue": {"type": "string"},
+                "cue": {"type": "string", "minLength": 1},
                 "session_id": {"type": "string"},
                 "project_id": {"type": "string"},
                 "limit": {"type": "integer"},
@@ -2092,11 +2144,11 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["card_id"],
             "properties": {
                 "root": {"type": "string"},
-                "card_id": {"type": "string"},
+                "card_id": {"type": "string", "minLength": 1},
                 "action": {"type": "string", "enum": ["supersede", "dismiss"]},
                 "superseded_card_ids": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "minLength": 1},
                     "description": (
                         "Confirmation list containing every peer. It is optional "
                         "for a complete detected group, required for ungrouped "
@@ -2133,7 +2185,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         {
             "type": "object",
             "required": ["path"],
-            "properties": {"path": {"type": "string"}, "root": {"type": "string"}},
+            "properties": {"path": {"type": "string", "minLength": 1}, "root": {"type": "string"}},
             "additionalProperties": False,
         },
         tool_verify_proof_pack,
@@ -2160,7 +2212,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["out_path"],
             "properties": {
                 "root": {"type": "string"},
-                "out_path": {"type": "string"},
+                "out_path": {"type": "string", "minLength": 1},
                 "profile": {"type": "string", "enum": ["portable", "shareable"]},
                 "symlink_policy": {"type": "string", "enum": ["fail", "skip"]},
                 "run_restore_drill": {"type": "boolean"},
@@ -2176,7 +2228,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "type": "object",
             "required": ["path"],
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1},
                 "verify_embedded_root": {"type": "boolean"},
             },
             "additionalProperties": False,
@@ -2188,7 +2240,10 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         {
             "type": "object",
             "required": ["path"],
-            "properties": {"path": {"type": "string"}, "operation_id": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "operation_id": {**MCP_PORTABLE_OPERATION_ID_SCHEMA},
+            },
             "additionalProperties": False,
         },
         tool_replay_operation_log,
@@ -2249,7 +2304,7 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["operation_id"],
             "properties": {
                 "root": {"type": "string"},
-                "operation_id": {"type": "string"},
+                "operation_id": {**MCP_PORTABLE_OPERATION_ID_SCHEMA},
             },
             "additionalProperties": False,
         },
@@ -2304,24 +2359,32 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "root": {"type": "string"},
                 "subject": {
                     "type": "string",
+                    "minLength": 1,
                     "maxLength": REVIEW_MAX_CONTROL_PATH_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_CONTROL_PATH_BYTES,
                 },
                 "prompt": {
                     "type": "string",
+                    "minLength": 1,
                     "maxLength": REVIEW_MAX_PROMPT_BYTES,
+                    "pattern": r"\S",
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_PROMPT_BYTES,
                 },
                 "reviewer_id": {
                     "type": "string",
                     "maxLength": REVIEW_MAX_REVIEWER_ID_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_REVIEWER_ID_BYTES,
                 },
                 "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
                 "model": {
                     "type": "string",
                     "maxLength": REVIEW_MAX_MODEL_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_MODEL_BYTES,
                 },
                 "base_url": {
                     "type": "string",
                     "maxLength": REVIEW_MAX_BASE_URL_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_BASE_URL_BYTES,
                 },
                 "include_diff": {"type": "boolean"},
                 "max_packet_bytes": {
@@ -2359,7 +2422,9 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                     "maxItems": REVIEW_SECRET_ALLOWLIST_MAX_PATTERNS,
                     "items": {
                         "type": "string",
+                        "minLength": 1,
                         "maxLength": REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES,
+                        "x-continuum-maxUtf8Bytes": REVIEW_SECRET_ALLOWLIST_MAX_ENTRY_BYTES,
                     },
                 },
                 "secret_allowlist_files": {
@@ -2367,7 +2432,9 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                     "maxItems": REVIEW_SECRET_ALLOWLIST_MAX_FILES,
                     "items": {
                         "type": "string",
+                        "minLength": 1,
                         "maxLength": REVIEW_MAX_CONTROL_PATH_BYTES,
+                        "x-continuum-maxUtf8Bytes": REVIEW_MAX_CONTROL_PATH_BYTES,
                     },
                 },
             },
@@ -2382,22 +2449,19 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["job_id"],
             "properties": {
                 "root": {"type": "string"},
-                "job_id": {"type": "string"},
+                "job_id": {**MCP_REVIEW_JOB_ID_SCHEMA},
                 "transport": {"type": "string", "enum": sorted(SUPPORTED_TRANSPORTS)},
                 "model": {
                     "type": "string",
                     "maxLength": REVIEW_MAX_MODEL_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_MODEL_BYTES,
                 },
                 "base_url": {
                     "type": "string",
                     "maxLength": REVIEW_MAX_BASE_URL_BYTES,
+                    "x-continuum-maxUtf8Bytes": REVIEW_MAX_BASE_URL_BYTES,
                 },
-                "operation_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
-                },
+                "operation_id": {**MCP_PORTABLE_OPERATION_ID_SCHEMA},
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 1,
@@ -2420,9 +2484,12 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["job_id"],
             "properties": {
                 "root": {"type": "string"},
-                "job_id": {"type": "string"},
+                "job_id": {**MCP_REVIEW_JOB_ID_SCHEMA},
                 "result_path": {"type": "string"},
-                "content": {"type": "string"},
+                "content": {
+                    "type": "string",
+                    "x-continuum-maxUtf8Bytes": REVIEW_INTEGRITY_MAX_RECORD_BYTES,
+                },
             },
             "additionalProperties": False,
         },
@@ -2433,7 +2500,10 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         {
             "type": "object",
             "required": ["job_id"],
-            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "properties": {
+                "root": {"type": "string"},
+                "job_id": {**MCP_REVIEW_JOB_ID_SCHEMA},
+            },
             "additionalProperties": False,
         },
         tool_review_status,
@@ -2443,7 +2513,10 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
         {
             "type": "object",
             "required": ["job_id"],
-            "properties": {"root": {"type": "string"}, "job_id": {"type": "string"}},
+            "properties": {
+                "root": {"type": "string"},
+                "job_id": {**MCP_REVIEW_JOB_ID_SCHEMA},
+            },
             "additionalProperties": False,
         },
         tool_review_check_current,
@@ -2455,13 +2528,8 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "required": ["job_id"],
             "properties": {
                 "root": {"type": "string"},
-                "job_id": {"type": "string"},
-                "operation_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
-                },
+                "job_id": {**MCP_REVIEW_JOB_ID_SCHEMA},
+                "operation_id": {**MCP_PORTABLE_OPERATION_ID_SCHEMA},
             },
             "additionalProperties": False,
         },
@@ -2546,27 +2614,310 @@ def rpc_result(request_id: Any, result: Any) -> JSON:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+_UNKNOWN_REQUEST_ID = object()
+
+
 def rpc_error(request_id: Any, code: int, message: str, data: Any | None = None) -> JSON:
     error: JSON = {"code": code, "message": message}
     if data is not None:
         error["data"] = data
-    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+    response: JSON = {"jsonrpc": "2.0", "error": error}
+    if request_id is not _UNKNOWN_REQUEST_ID:
+        response["id"] = request_id
+    return response
 
 
-def dispatch(request: JSON) -> JSON | None:
-    request_id = request.get("id")
-    method = request.get("method")
-    if not method:
-        return rpc_error(request_id, -32600, "missing method")
+def _schema_type_matches(value: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_schema_type_matches(value, item) for item in expected)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            or isinstance(value, float)
+            and not isinstance(value, _NonIntegralJsonFloat)
+            and math.isfinite(value)
+            and value.is_integer()
+        )
+    if expected == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
+        )
+    return False
 
-    if method.startswith("notifications/"):
+
+def _json_schema_error(value: Any, schema: JSON, *, path: str = "arguments") -> str | None:
+    expected_type = schema.get("type")
+    if expected_type is not None and not _schema_type_matches(value, expected_type):
+        rendered = " or ".join(expected_type) if isinstance(expected_type, list) else expected_type
+        return f"{path} must be {rendered}"
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and value not in enum_values:
+        return f"{path} must be one of {enum_values!r}"
+
+    if isinstance(value, dict):
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return f"{path}.{key} is required"
+        max_properties = schema.get("maxProperties")
+        if isinstance(max_properties, int) and len(value) > max_properties:
+            return f"{path} must contain at most {max_properties} properties"
+        properties = schema.get("properties")
+        declared = properties if isinstance(properties, dict) else {}
+        for key, item in value.items():
+            child_schema = declared.get(key)
+            if isinstance(child_schema, dict):
+                error = _json_schema_error(item, child_schema, path=f"{path}.{key}")
+                if error is not None:
+                    return error
+                continue
+            additional = schema.get("additionalProperties", True)
+            if additional is False:
+                return f"{path}.{key} is not allowed"
+            if isinstance(additional, dict):
+                error = _json_schema_error(item, additional, path=f"{path}.{key}")
+                if error is not None:
+                    return error
+
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            return f"{path} must contain at least {min_items} items"
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            return f"{path} must contain at most {max_items} items"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                error = _json_schema_error(item, item_schema, path=f"{path}[{index}]")
+                if error is not None:
+                    return error
+
+    if isinstance(value, str):
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            return f"{path} must contain at least {min_length} characters"
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            return f"{path} must contain at most {max_length} characters"
+        max_utf8_bytes = schema.get("x-continuum-maxUtf8Bytes")
+        if isinstance(max_utf8_bytes, int):
+            try:
+                utf8_size = len(value.encode("utf-8"))
+            except UnicodeEncodeError:
+                return f"{path} must be valid UTF-8 text"
+            if utf8_size > max_utf8_bytes:
+                return f"{path} must contain at most {max_utf8_bytes} UTF-8 bytes"
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.search(pattern, value) is None:
+            return f"{path} does not match the required pattern"
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            return f"{path} must be at least {minimum}"
+        maximum = schema.get("maximum")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            return f"{path} must be at most {maximum}"
+    return None
+
+
+_EMPTY_OPEN_OBJECT_SCHEMA: JSON = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": True,
+}
+_PROGRESS_TOKEN_SCHEMA: JSON = {"type": ["string", "integer"]}
+_ICON_SCHEMA: JSON = {
+    "type": "object",
+    "required": ["src"],
+    "properties": {
+        "src": {"type": "string"},
+        "mimeType": {"type": "string"},
+        "sizes": {"type": "array", "items": {"type": "string"}},
+        "theme": {"type": "string", "enum": ["light", "dark"]},
+    },
+}
+_INITIALIZE_PARAMS_SCHEMA: JSON = {
+    "type": "object",
+    "required": ["protocolVersion", "capabilities", "clientInfo"],
+    "properties": {
+        "_meta": {
+            "type": "object",
+            "properties": {"progressToken": _PROGRESS_TOKEN_SCHEMA},
+        },
+        "protocolVersion": {"type": "string"},
+        "capabilities": {
+            "type": "object",
+            "properties": {
+                "experimental": {
+                    "type": "object",
+                    "additionalProperties": _EMPTY_OPEN_OBJECT_SCHEMA,
+                },
+                "roots": {
+                    "type": "object",
+                    "properties": {"listChanged": {"type": "boolean"}},
+                },
+                "sampling": {
+                    "type": "object",
+                    "properties": {
+                        "context": _EMPTY_OPEN_OBJECT_SCHEMA,
+                        "tools": _EMPTY_OPEN_OBJECT_SCHEMA,
+                    },
+                },
+                "elicitation": {
+                    "type": "object",
+                    "properties": {
+                        "form": _EMPTY_OPEN_OBJECT_SCHEMA,
+                        "url": _EMPTY_OPEN_OBJECT_SCHEMA,
+                    },
+                },
+                "tasks": {
+                    "type": "object",
+                    "properties": {
+                        "list": _EMPTY_OPEN_OBJECT_SCHEMA,
+                        "cancel": _EMPTY_OPEN_OBJECT_SCHEMA,
+                        "requests": {
+                            "type": "object",
+                            "properties": {
+                                "sampling": {
+                                    "type": "object",
+                                    "properties": {
+                                        "createMessage": _EMPTY_OPEN_OBJECT_SCHEMA,
+                                    },
+                                },
+                                "elicitation": {
+                                    "type": "object",
+                                    "properties": {
+                                        "create": _EMPTY_OPEN_OBJECT_SCHEMA,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "clientInfo": {
+            "type": "object",
+            "required": ["name", "version"],
+            "properties": {
+                "name": {"type": "string"},
+                "title": {"type": "string"},
+                "version": {"type": "string"},
+                "description": {"type": "string"},
+                "websiteUrl": {"type": "string"},
+                "icons": {"type": "array", "items": _ICON_SCHEMA},
+            },
+        },
+    },
+}
+
+
+def _valid_request_id(value: Any) -> bool:
+    return isinstance(value, str) or _schema_type_matches(value, "integer")
+
+
+def _initialize_params_error(params: JSON) -> str | None:
+    return _json_schema_error(params, _INITIALIZE_PARAMS_SCHEMA, path="initialize params")
+
+
+def _request_params_metadata_error(params: JSON) -> str | None:
+    if "_meta" not in params:
         return None
+    metadata = params["_meta"]
+    if not isinstance(metadata, dict):
+        return "params._meta must be an object"
+    if "progressToken" in metadata and not _schema_type_matches(
+        metadata["progressToken"],
+        ["string", "integer"],
+    ):
+        return "params._meta.progressToken must be string or integer"
+    return None
+
+
+def _notification_params_metadata_error(params: JSON) -> str | None:
+    if "_meta" in params and not isinstance(params["_meta"], dict):
+        return "params._meta must be an object"
+    return None
+
+
+def _paginated_request_cursor_error(params: JSON) -> str | None:
+    if "cursor" not in params:
+        return None
+    if not isinstance(params["cursor"], str):
+        return "params.cursor must be a string"
+    return "params.cursor is not valid because this server did not issue a nextCursor"
+
+
+class _McpSessionState:
+    __slots__ = ("phase",)
+
+    def __init__(self) -> None:
+        self.phase = "new"
+
+
+def dispatch(request: JSON, session_state: _McpSessionState | None = None) -> JSON | None:
+    session = session_state if session_state is not None else _McpSessionState()
+    has_request_id = "id" in request
+    request_id = request.get("id")
+    if has_request_id and not _valid_request_id(request_id):
+        return rpc_error(_UNKNOWN_REQUEST_ID, -32600, "id must be a string or integer")
+    jsonrpc = request.get("jsonrpc")
+    if not isinstance(jsonrpc, str) or jsonrpc != "2.0":
+        error_id = request_id if has_request_id else _UNKNOWN_REQUEST_ID
+        return rpc_error(error_id, -32600, 'jsonrpc must be exactly "2.0"')
+    method = request.get("method")
+    if not isinstance(method, str) or not method:
+        error_id = request_id if has_request_id else _UNKNOWN_REQUEST_ID
+        return rpc_error(error_id, -32600, "method must be a non-empty string")
+
+    if not has_request_id:
+        params = request["params"] if "params" in request else {}
+        if not isinstance(params, dict):
+            return None
+        if (
+            method == "notifications/initialized"
+            and session.phase == "initializing"
+            and _notification_params_metadata_error(params) is None
+        ):
+            session.phase = "ready"
+        return None
+    params = request["params"] if "params" in request else {}
+    if not isinstance(params, dict):
+        return rpc_error(request_id, -32602, "params must be an object")
+    metadata_error = _request_params_metadata_error(params)
+    if metadata_error is not None:
+        return rpc_error(request_id, -32602, metadata_error)
+    if method.startswith("notifications/"):
+        return rpc_error(request_id, -32600, "notifications must not include an id")
 
     if method == "initialize":
+        if session.phase != "new":
+            return rpc_error(request_id, -32600, "initialize must be the first request")
+        if "params" not in request:
+            return rpc_error(request_id, -32602, "initialize params are required")
+        initialize_error = _initialize_params_error(params)
+        if initialize_error is not None:
+            return rpc_error(request_id, -32602, initialize_error)
+        session.phase = "initializing"
         return rpc_result(
             request_id,
             {
-                "protocolVersion": negotiated_protocol_version(request.get("params")),
+                "protocolVersion": negotiated_protocol_version(params),
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "epic-continuum",
@@ -2577,24 +2928,39 @@ def dispatch(request: JSON) -> JSON | None:
         )
     if method == "ping":
         return rpc_result(request_id, {})
-    if method == "tools/list":
-        return rpc_result(request_id, {"tools": tool_specs()})
-    if method == "resources/list":
-        return rpc_result(request_id, {"resources": []})
-    if method == "prompts/list":
+    if session.phase != "ready":
+        return rpc_error(request_id, -32600, "MCP initialization handshake is incomplete")
+    if method in {"tools/list", "resources/list", "prompts/list"}:
+        cursor_error = _paginated_request_cursor_error(params)
+        if cursor_error is not None:
+            return rpc_error(request_id, -32602, cursor_error)
+        if method == "tools/list":
+            return rpc_result(request_id, {"tools": tool_specs()})
+        if method == "resources/list":
+            return rpc_result(request_id, {"resources": []})
         return rpc_result(request_id, {"prompts": []})
     if method == "tools/call":
-        params = request.get("params") or {}
-        if not isinstance(params, dict):
-            return rpc_error(request_id, -32602, "params must be an object")
+        if "params" not in request:
+            return rpc_error(request_id, -32602, "tool call params are required")
         name = params.get("name")
-        arguments = params.get("arguments") or {}
-        if not isinstance(name, str) or name not in TOOLS:
-            return rpc_result(request_id, tool_result({"error": f"unknown tool: {name}"}, is_error=True))
+        arguments = params["arguments"] if "arguments" in params else {}
         if not isinstance(arguments, dict):
-            return rpc_result(request_id, tool_result({"error": "arguments must be an object"}, is_error=True))
+            return rpc_error(request_id, -32602, "arguments must be an object")
+        if not isinstance(name, str):
+            return rpc_error(request_id, -32602, "tool name must be a string")
+        if name not in TOOLS:
+            return rpc_error(request_id, -32602, "unknown tool")
+        _description, schema, handler = TOOLS[name]
+        arguments_error = _json_schema_error(arguments, schema)
+        if arguments_error is not None:
+            return rpc_result(
+                request_id,
+                tool_result(
+                    {"error": f"invalid tool arguments: {arguments_error}", "tool": name},
+                    is_error=True,
+                ),
+            )
         try:
-            _description, _schema, handler = TOOLS[name]
             return rpc_result(request_id, tool_result(handler(arguments)))
         except Exception as exc:
             if not isinstance(exc, ValueError):
@@ -2655,12 +3021,98 @@ def _request_json_depth_error(value: Any) -> str | None:
     return None
 
 
+def _parsed_request_error_id(request: Any) -> Any:
+    if isinstance(request, dict) and "id" in request and _valid_request_id(request["id"]):
+        return request["id"]
+    return _UNKNOWN_REQUEST_ID
+
+
+def _is_recognizable_notification(request: Any) -> bool:
+    return (
+        isinstance(request, dict)
+        and "id" not in request
+        and request.get("jsonrpc") == "2.0"
+        and isinstance(request.get("method"), str)
+        and bool(request["method"])
+    )
+
+
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> JSON:
+    value: JSON = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number is not permitted: {value}")
+
+
+def _parse_exact_json_integer(value: str) -> int:
+    digits = value.lstrip("-").lstrip("0")
+    if len(digits) > MAX_MCP_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the exact serialization limit")
+    return int(value)
+
+
+def _parse_exact_json_float(value: str) -> int | _NonIntegralJsonFloat:
+    try:
+        parsed = Decimal(value)
+    except DecimalException as exc:
+        raise ValueError("JSON number is outside the exact decimal range") from exc
+    approximate = float(value)
+    if not parsed.is_finite() or not math.isfinite(approximate):
+        raise ValueError("JSON number is outside the finite float range")
+    if parsed != parsed.to_integral_value():
+        return _NonIntegralJsonFloat(approximate)
+    if (
+        not parsed.is_zero()
+        and parsed.adjusted() + 1 > MAX_MCP_JSON_INTEGER_DIGITS
+    ):
+        raise ValueError("JSON integer exceeds the exact serialization limit")
+    return int(parsed)
+
+
+def _load_request_json(line: str) -> Any:
+    return json.loads(
+        line,
+        object_pairs_hook=_reject_duplicate_object_keys,
+        parse_constant=_reject_nonfinite_constant,
+        parse_int=_parse_exact_json_integer,
+        parse_float=_parse_exact_json_float,
+    )
+
+
+def _write_response(response: JSON) -> None:
+    try:
+        payload = json.dumps(
+            response,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError):
+        traceback.print_exc(file=sys.stderr)
+        response_id = response.get("id", _UNKNOWN_REQUEST_ID)
+        if response_id is not _UNKNOWN_REQUEST_ID and not _valid_request_id(response_id):
+            response_id = _UNKNOWN_REQUEST_ID
+        payload = json.dumps(
+            rpc_error(response_id, -32603, "internal error"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    sys.stdout.write(payload + "\n")
+    sys.stdout.flush()
+
+
 def serve() -> int:
+    session_state = _McpSessionState()
     for line, frame_error in _bounded_request_lines(sys.stdin):
         if frame_error is not None:
-            frame_response = rpc_error(None, -32700, frame_error)
-            sys.stdout.write(json.dumps(frame_response, ensure_ascii=True, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+            _write_response(rpc_error(_UNKNOWN_REQUEST_ID, -32700, frame_error))
             continue
         assert line is not None
         line = line.strip()
@@ -2668,20 +3120,32 @@ def serve() -> int:
             continue
         response: JSON | None
         try:
-            request = json.loads(line)
+            request = _load_request_json(line)
         except (ValueError, RecursionError) as exc:
-            response = rpc_error(None, -32700, "parse error", str(exc))
+            response = rpc_error(_UNKNOWN_REQUEST_ID, -32700, "parse error", str(exc))
         else:
             depth_error = _request_json_depth_error(request)
             if depth_error is not None:
-                response = rpc_error(None, -32600, depth_error)
+                if _is_recognizable_notification(request):
+                    response = None
+                else:
+                    response = rpc_error(_parsed_request_error_id(request), -32600, depth_error)
             elif not isinstance(request, dict):
-                response = rpc_error(None, -32600, "request must be an object")
+                response = rpc_error(_UNKNOWN_REQUEST_ID, -32600, "request must be an object")
             else:
-                response = dispatch(request)
+                try:
+                    response = dispatch(request, session_state)
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                    if "id" not in request:
+                        response = None
+                    else:
+                        request_id = request.get("id")
+                        if not _valid_request_id(request_id):
+                            request_id = _UNKNOWN_REQUEST_ID
+                        response = rpc_error(request_id, -32603, "internal error")
         if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+            _write_response(response)
     return 0
 
 

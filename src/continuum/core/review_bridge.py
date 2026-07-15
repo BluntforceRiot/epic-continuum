@@ -742,6 +742,15 @@ def _validated_review_response_text(
     return decoded
 
 
+def validate_review_response_text(
+    value: str,
+    *,
+    label: str = "inline review response",
+) -> str:
+    """Validate caller-supplied reviewer text before durable mutation."""
+    return _validated_review_response_text(value, label=label)
+
+
 def _set_stream_read_timeout(stream: Any, timeout_seconds: float) -> bool:
     """Best-effort propagation of a shrinking deadline to an HTTP socket."""
     pending = [stream]
@@ -1529,8 +1538,17 @@ def review_job_dir(root: Path, job_id: str) -> Path:
 
 def _safe_job_id(job_id: str) -> str:
     value = str(job_id)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
-        raise ReviewBridgeError("job_id must be a safe portable filename component")
+    try:
+        value = validate_core_operation_id(value)
+    except ValueError as exc:
+        raise ReviewBridgeError("job_id must be a safe portable filename component") from exc
+    return value
+
+
+def validate_review_job_id(job_id: str) -> str:
+    """Validate one review job identity before entering a mutating operation."""
+
+    value = _safe_job_id(job_id)
     return value
 
 
@@ -19691,6 +19709,8 @@ def ingest_review_result(
     attempt_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _validate_operation_id(operation_id)
+    if content is not None:
+        content = validate_review_response_text(content)
     safe_job_id = _safe_job_id(job_id)
     _validate_review_job_storage(root, safe_job_id)
     init_db(root)

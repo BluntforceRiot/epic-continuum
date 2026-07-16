@@ -2909,6 +2909,48 @@ class ReviewBridgeTest(unittest.TestCase):
                 challenge = json.loads(zf.read("CAPSULE_CHALLENGE.json").decode("utf-8"))
             self.assertEqual(challenge["capsule_challenge"], request["capsule_challenge"])
 
+    def test_capsule_challenge_uses_scanner_disjoint_hex_encoding(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            expected_challenge = "ab" * 32
+            real_token_hex = review_bridge_module.secrets.token_hex
+
+            def deterministic_token_hex(nbytes: int | None = None) -> str:
+                if nbytes == 32:
+                    return expected_challenge
+                return real_token_hex(nbytes)
+
+            with (
+                patch.object(
+                    review_bridge_module.secrets,
+                    "token_hex",
+                    side_effect=deterministic_token_hex,
+                ) as token_hex,
+                patch.object(
+                    review_bridge_module.secrets,
+                    "token_urlsafe",
+                    side_effect=AssertionError("capsule challenge must not use token_urlsafe"),
+                ),
+            ):
+                job = create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review the release boundary carefully.",
+                    transport="manual",
+                )
+
+            request = json.loads(Path(job["request_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(request["capsule_challenge"], expected_challenge)
+            self.assertIsNotNone(re.fullmatch(r"[0-9a-f]{64}", request["capsule_challenge"]))
+            self.assertEqual(
+                [entry.args for entry in token_hex.call_args_list].count((32,)),
+                1,
+            )
+
     def test_generated_shell_commands_single_quote_expansion_characters(self) -> None:
         value = "root'$(touch owned)`whoami`$HOME"
 

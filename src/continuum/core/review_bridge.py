@@ -18076,7 +18076,7 @@ def create_review_job(
         subject_type=subject_type,
         directories=directory_manifest,
     )
-    capsule_challenge = secrets.token_urlsafe(32)
+    capsule_challenge = secrets.token_hex(32)
     request = {
         "schema": "epic-continuum.review-request/1",
         "schema_version": REVIEW_BRIDGE_VERSION,

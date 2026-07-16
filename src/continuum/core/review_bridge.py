@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from dataclasses import dataclass, field
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterator, Literal, ParamSpec, Sequence, TypeVar, cast
 
 from .operations import operation_lock, validate_operation_id as validate_core_operation_id
@@ -59,6 +59,10 @@ DEFAULT_REVIEW_MODEL = "local-reviewer"
 DEFAULT_REVIEW_BASE_URL = "http://127.0.0.1:8020/v1"
 DEFAULT_REVIEW_TRANSPORT = "direct-openai"
 SUPPORTED_TRANSPORTS = {"direct-openai", "manual", "hermes"}
+_DARWIN_SYSTEM_SYMLINK_ALIASES = {
+    "/tmp": "private/tmp",
+    "/var": "private/var",
+}
 DEFAULT_EXCLUDE_NAMES = {
     ".git",
     ".hg",
@@ -6161,6 +6165,55 @@ def _stat_identity(stat_result: os.stat_result) -> tuple[int, int]:
     return int(stat_result.st_dev), int(stat_result.st_ino)
 
 
+def _verified_darwin_system_alias(path: Path, expected_link: str) -> bool:
+    """Accept only macOS's fixed /tmp and /var aliases to physical /private paths."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        if os.readlink(path) != expected_link:
+            return False
+        for physical_directory in (Path("/private"), Path("/") / expected_link):
+            if not stat.S_ISDIR(os.lstat(physical_directory).st_mode):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _normalize_review_platform_path(path: Path) -> Path:
+    """Return a physical absolute path for the two verified macOS aliases only."""
+    absolute_text = os.path.abspath(path)
+    absolute = Path(absolute_text)
+    posix_absolute = PurePosixPath(absolute_text)
+    if (
+        sys.platform != "darwin"
+        or not posix_absolute.is_absolute()
+        or len(posix_absolute.parts) < 2
+    ):
+        return absolute
+    alias = Path(str(PurePosixPath("/") / posix_absolute.parts[1]))
+    expected_link = _DARWIN_SYSTEM_SYMLINK_ALIASES.get(
+        PurePosixPath(alias.as_posix()).as_posix()
+    )
+    if expected_link is None or not _verified_darwin_system_alias(alias, expected_link):
+        return absolute
+    return Path(
+        str(
+            (PurePosixPath("/") / expected_link).joinpath(
+                *posix_absolute.parts[2:]
+            )
+        )
+    )
+
+
+def _normalize_review_root_alias(path: Path) -> Path:
+    """Preserve root spelling unless a verified macOS alias was translated."""
+    original = Path(path)
+    absolute = Path(os.path.abspath(original))
+    normalized = _normalize_review_platform_path(original)
+    return normalized if normalized != absolute else original
+
+
 def _review_subject_entry(
     path: Path,
     *,
@@ -6173,9 +6226,10 @@ def _review_subject_entry(
         raise ReviewBridgeError(
             f"review subject entry has no stable filesystem identity: {path}"
         )
-    absolute = Path(os.path.abspath(path))
-    relative = "" if absolute == Path(os.path.abspath(subject)) else absolute.relative_to(
-        Path(os.path.abspath(subject))
+    absolute = _normalize_review_platform_path(path)
+    absolute_subject = _normalize_review_platform_path(subject)
+    relative = "" if absolute == absolute_subject else absolute.relative_to(
+        absolute_subject
     ).as_posix()
     return ReviewSubjectEntry(
         path=absolute,
@@ -6224,16 +6278,19 @@ def _review_subject_inventory_entry(
 ) -> ReviewSubjectEntry | None:
     if inventory is None:
         return None
-    normalized = os.path.normcase(os.path.abspath(path))
+    normalized = os.path.normcase(str(_normalize_review_platform_path(path)))
     for entry in (inventory.root, *inventory.directories, *inventory.files):
-        if os.path.normcase(os.path.abspath(entry.path)) == normalized:
+        entry_path = os.path.normcase(
+            str(_normalize_review_platform_path(entry.path))
+        )
+        if entry_path == normalized:
             return entry
     return None
 
 
 def _plain_absolute_path_stat(path: Path) -> tuple[Path, os.stat_result]:
     """Inspect an absolute path component-by-component without following links."""
-    absolute = Path(os.path.abspath(path))
+    absolute = _normalize_review_platform_path(path)
     parts = absolute.parts
     if not parts or not absolute.anchor:
         raise ReviewBridgeError(f"review subject path is not absolute: {absolute}")
@@ -6327,7 +6384,7 @@ def _review_prepare_storage_preflight(
     require_jobs: bool = False,
 ) -> ReviewPrepareStoragePreflight:
     """Freeze the plain internal ancestors used by review publication."""
-    absolute_root = Path(os.path.abspath(root))
+    absolute_root = _normalize_review_platform_path(root)
     bridge_root = absolute_root / "exports" / "review_bridge"
     tmp_root = bridge_root / "tmp"
     jobs_root = bridge_root / "jobs"
@@ -6360,7 +6417,7 @@ def _assert_review_prepare_storage_unchanged(
     root: Path,
     expected: ReviewPrepareStoragePreflight,
 ) -> None:
-    absolute_root = Path(os.path.abspath(root))
+    absolute_root = _normalize_review_platform_path(root)
     if not expected.directories or Path(expected.directories[0][0]) != absolute_root:
         raise ReviewBridgeError("review preparation storage preflight root mismatches")
     current: list[tuple[str, tuple[int, int]]] = []
@@ -6383,9 +6440,11 @@ def _review_prepare_expected_identity(
 ) -> tuple[int, int] | None:
     if expected is None:
         return None
-    normalized = os.path.normcase(os.path.abspath(path))
+    normalized = os.path.normcase(str(_normalize_review_platform_path(path)))
     for path_text, identity in expected.directories:
-        if os.path.normcase(os.path.abspath(path_text)) == normalized:
+        if os.path.normcase(
+            str(_normalize_review_platform_path(Path(path_text)))
+        ) == normalized:
             return identity
     return None
 
@@ -6419,7 +6478,7 @@ def _open_plain_directory_fd(
     """Pin an absolute plain directory and bind it to frozen identities."""
     nofollow_flag = int(getattr(os, "O_NOFOLLOW", 0))
     directory_flag = int(getattr(os, "O_DIRECTORY", 0))
-    absolute = Path(os.path.abspath(path))
+    absolute = _normalize_review_platform_path(path)
     if not absolute.anchor:
         raise ReviewBridgeError(
             f"review preparation directory is not absolute: {absolute}"
@@ -6859,7 +6918,7 @@ def _remove_tree_at_fd(parent_fd: int, name: str) -> None:
 
 
 def _windows_validate_regular_components(base: Path, parts: tuple[str, ...]) -> os.stat_result:
-    final_path = Path(os.path.abspath(base.joinpath(*parts)))
+    final_path = _normalize_review_platform_path(base.joinpath(*parts))
     _absolute, final_stat = _plain_absolute_path_stat(final_path)
     if not stat.S_ISREG(final_stat.st_mode):
         raise ReviewBridgeError(
@@ -6902,7 +6961,7 @@ def _open_confined_regular_file(
         file_fd: int | None = None
         try:
             directory_flags = os.O_RDONLY | directory_flag | nofollow_flag
-            absolute_base = Path(os.path.abspath(base))
+            absolute_base = _normalize_review_platform_path(base)
             if not absolute_base.anchor:
                 raise ReviewBridgeError(
                     f"review subject root is not absolute: {absolute_base}"
@@ -7153,8 +7212,8 @@ def _collect_subject_files(
         REVIEW_MAX_TRAVERSAL_ENTRIES,
         max(1_000, limit * REVIEW_TRAVERSAL_ENTRY_MULTIPLIER),
     )
-    resolved_base = Path(os.path.abspath(subject))
-    resolved_root = Path(root).resolve(strict=False)
+    resolved_base = _normalize_review_platform_path(subject)
+    resolved_root = _normalize_review_platform_path(root).resolve(strict=False)
     ignore_patterns = load_ignore_patterns(root)
     custom_patterns = {
         pattern for pattern in ignore_patterns if pattern not in DEFAULT_IGNORE_PATTERNS
@@ -7360,7 +7419,7 @@ def _collect_subject_files(
 
             regular_file_seen = True
             try:
-                Path(os.path.abspath(path)).relative_to(resolved_base)
+                _normalize_review_platform_path(path).relative_to(resolved_base)
             except ValueError:
                 record_exclusion(
                     relative_path,
@@ -10873,7 +10932,9 @@ def _git_capture_authority(
     if not _path_exists_no_follow(git_dir):
         return None
     _plain_git_metadata_path(git_dir, label="directory", expected_type="directory")
-    if Path(os.path.abspath(git_dir.parent)) != Path(os.path.abspath(subject)):
+    if _normalize_review_platform_path(
+        git_dir.parent
+    ) != _normalize_review_platform_path(subject):
         raise ReviewBridgeError("Git directory is not the direct child of the selected subject")
 
     for redirected_name in (
@@ -11050,9 +11111,9 @@ def _git_capture_authority(
     raw_file_mode = config_values.get("core.filemode", ["true"])[-1]
     file_mode = _git_config_bool(raw_file_mode, label="core.filemode")
     return GitCaptureAuthority(
-        subject=Path(os.path.abspath(subject)),
-        git_dir=Path(os.path.abspath(git_dir)),
-        common_dir=Path(os.path.abspath(git_dir)),
+        subject=_normalize_review_platform_path(subject),
+        git_dir=_normalize_review_platform_path(git_dir),
+        common_dir=_normalize_review_platform_path(git_dir),
         git_executable=git_executable,
         config_identity=_stat_identity(observed_config_stat),
         config_sha256=hashlib.sha256(config_data).hexdigest(),
@@ -12593,7 +12654,7 @@ def _git_capture(
         )
     if state is None:
         return {"is_git_repo": False}
-    if Path(os.path.abspath(subject)) != state.authority.subject:
+    if _normalize_review_platform_path(subject) != state.authority.subject:
         raise ReviewBridgeError("Git capture state is not bound to the selected subject")
     effective_snapshot = snapshot_subject or subject
     effective_manifest = manifest if manifest is not None else _fallback_git_manifest(subject)
@@ -15025,8 +15086,8 @@ def _review_prepare_tree_parent(
     root: Path,
     path: Path,
 ) -> tuple[Path, str, Literal["tmp", "jobs"]]:
-    absolute = Path(os.path.abspath(path))
-    bridge_root = Path(os.path.abspath(review_bridge_root(root)))
+    absolute = _normalize_review_platform_path(path)
+    bridge_root = _normalize_review_platform_path(review_bridge_root(root))
     name = _safe_job_id(absolute.name)
     for parent_name in ("tmp", "jobs"):
         parent = bridge_root / parent_name
@@ -15038,8 +15099,8 @@ def _review_prepare_tree_parent(
 
 
 def _review_prepare_tmp_child(root: Path, path: Path) -> tuple[Path, str]:
-    absolute = Path(os.path.abspath(path))
-    tmp_root = Path(os.path.abspath(review_bridge_root(root) / "tmp"))
+    absolute = _normalize_review_platform_path(path)
+    tmp_root = _normalize_review_platform_path(review_bridge_root(root) / "tmp")
     if absolute.parent != tmp_root or absolute.name in {"", ".", ".."}:
         raise ReviewBridgeError(
             "review preparation temporary file is outside its authority root"
@@ -15748,9 +15809,9 @@ def _catalog_review_prepare_marker(
 ) -> tuple[Path, str]:
     marker_path = _review_prepare_marker_path(root, job_id)
     expected_staging_dir = review_bridge_root(root) / "tmp" / job_id
-    if Path(os.path.abspath(staging_dir)) != Path(
-        os.path.abspath(expected_staging_dir)
-    ):
+    if _normalize_review_platform_path(
+        staging_dir
+    ) != _normalize_review_platform_path(expected_staging_dir):
         raise ReviewBridgeError(
             "review preparation publication marker staging identity mismatches"
         )
@@ -16387,9 +16448,11 @@ def _reconcile_review_prepare_publications(
     for uri, rows in rows_by_uri.items():
         candidate = Path(uri)
         marker_path = candidate if candidate.is_absolute() else Path(root) / candidate
-        expected_parent = Path(os.path.abspath(review_bridge_root(root) / "tmp"))
+        expected_parent = _normalize_review_platform_path(
+            review_bridge_root(root) / "tmp"
+        )
         if (
-            Path(os.path.abspath(marker_path.parent)) != expected_parent
+            _normalize_review_platform_path(marker_path.parent) != expected_parent
             or not marker_path.name.endswith(".ready.json")
         ):
             raise ReviewBridgeError(
@@ -16450,7 +16513,7 @@ def _serialize_review_preparation(
         root_value = args[0] if args else kwargs.get("root")
         if root_value is None:
             raise ReviewBridgeError("review preparation root is required")
-        root = Path(str(root_value))
+        root = _normalize_review_root_alias(Path(str(root_value)))
         subject_path = kwargs.get("subject_path")
         if subject_path is None:
             raise ReviewBridgeError("review preparation subject is required")
@@ -16597,6 +16660,7 @@ def create_review_job(
     secret_allowlist_files: Sequence[Path] | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
+    root = _normalize_review_root_alias(root)
     (
         max_packet_bytes,
         max_file_bytes,
@@ -21180,8 +21244,11 @@ def review_check_current(root: Path, *, job_id: str) -> dict[str, Any]:
         if fingerprint_version == 2
         else 1
     )
+    fingerprint_subject = (
+        subject if effective_fingerprint_version >= 4 else stored_subject
+    )
     current_fingerprint = _source_fingerprint(
-        subject,
+        fingerprint_subject,
         manifest,
         git_info,
         subject_sha256,

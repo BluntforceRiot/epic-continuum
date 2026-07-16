@@ -23,6 +23,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from continuum.core.review_bridge import (
@@ -502,6 +503,204 @@ class CommitThenRaiseConnection:
 
 
 class ReviewBridgeTest(unittest.TestCase):
+    def test_macos_temp_alias_normalization_requires_exact_physical_contract(
+        self,
+    ) -> None:
+        def posix_abspath(path: object) -> str:
+            return str(path).replace("\\", "/")
+
+        def directory_lstat(path: object) -> SimpleNamespace:
+            self.assertIn(
+                Path(path).as_posix(),
+                {"/private", "/private/tmp", "/private/var"},
+            )
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755)
+
+        with (
+            patch.object(review_bridge_module.sys, "platform", "darwin"),
+            patch.object(
+                review_bridge_module.os.path,
+                "abspath",
+                side_effect=posix_abspath,
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "readlink",
+                side_effect=lambda path: {
+                    "/tmp": "private/tmp",
+                    "/var": "private/var",
+                }[Path(path).as_posix()],
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "lstat",
+                side_effect=directory_lstat,
+            ),
+        ):
+            self.assertEqual(
+                review_bridge_module._normalize_review_platform_path(
+                    Path("/var/folders/review-case")
+                ).as_posix(),
+                "/private/var/folders/review-case",
+            )
+            self.assertEqual(
+                review_bridge_module._normalize_review_platform_path(
+                    Path("/tmp/review-case")
+                ).as_posix(),
+                "/private/tmp/review-case",
+            )
+            self.assertEqual(
+                review_bridge_module._normalize_review_platform_path(
+                    Path("/various/review-case")
+                ).as_posix(),
+                "/various/review-case",
+            )
+
+        with (
+            patch.object(review_bridge_module.sys, "platform", "darwin"),
+            patch.object(
+                review_bridge_module.os.path,
+                "abspath",
+                side_effect=posix_abspath,
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "readlink",
+                return_value="redirected/var",
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "lstat",
+                side_effect=lambda path: SimpleNamespace(
+                    st_mode=(
+                        stat.S_IFLNK | 0o777
+                        if Path(path).as_posix() == "/var"
+                        else stat.S_IFDIR | 0o755
+                    )
+                ),
+            ),
+        ):
+            self.assertEqual(
+                review_bridge_module._normalize_review_platform_path(
+                    Path("/var/folders/review-case")
+                ).as_posix(),
+                "/var/folders/review-case",
+            )
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "link-like",
+            ):
+                review_bridge_module._plain_absolute_path_stat(
+                    Path("/var/folders/review-case")
+                )
+
+        with (
+            patch.object(review_bridge_module.sys, "platform", "darwin"),
+            patch.object(
+                review_bridge_module.os.path,
+                "abspath",
+                side_effect=posix_abspath,
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "readlink",
+                return_value="private/var",
+            ),
+            patch.object(
+                review_bridge_module.os,
+                "lstat",
+                side_effect=lambda path: SimpleNamespace(
+                    st_mode=(
+                        stat.S_IFLNK | 0o777
+                        if Path(path).as_posix() == "/private/var"
+                        else stat.S_IFDIR | 0o755
+                    )
+                ),
+            ),
+        ):
+            self.assertEqual(
+                review_bridge_module._normalize_review_platform_path(
+                    Path("/var/folders/review-case")
+                ).as_posix(),
+                "/var/folders/review-case",
+            )
+
+    def test_alias_normalization_precedes_component_and_descriptor_checks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            physical = Path(tmp).absolute()
+            lexical = Path("/var/folders/review-case")
+
+            def normalize(path: Path) -> Path:
+                if Path(path).as_posix() == lexical.as_posix():
+                    return physical
+                return Path(os.path.abspath(path))
+
+            with patch.object(
+                review_bridge_module,
+                "_normalize_review_platform_path",
+                side_effect=normalize,
+            ):
+                absolute, component_stat = (
+                    review_bridge_module._plain_absolute_path_stat(lexical)
+                )
+                self.assertEqual(absolute, physical)
+                self.assertTrue(stat.S_ISDIR(component_stat.st_mode))
+                with review_bridge_module._open_plain_directory_fd(
+                    lexical
+                ) as descriptor:
+                    self.assertTrue(
+                        descriptor is None or isinstance(descriptor, int)
+                    )
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS tempfile alias contract")
+    def test_macos_temp_aliases_support_full_review_create_and_currentness(
+        self,
+    ) -> None:
+        for label, parent in (("default-var", None), ("explicit-tmp", "/tmp")):
+            with self.subTest(alias=label), tempfile.TemporaryDirectory(
+                dir=parent,
+                ignore_cleanup_errors=True,
+            ) as tmp:
+                base = Path(tmp)
+                expected_prefix = "/var/folders/" if parent is None else "/tmp/"
+                self.assertTrue(str(base).startswith(expected_prefix), base)
+                root = base / "continuum"
+                subject = base / "subject"
+                subject.mkdir()
+                (subject / "README.md").write_text(
+                    "# macOS tempfile alias review\n",
+                    encoding="utf-8",
+                )
+
+                job = create_review_job(
+                    root,
+                    subject_path=subject,
+                    prompt="Review the macOS tempfile alias contract.",
+                    transport="manual",
+                )
+                current = review_check_current(root, job_id=job["job_id"])
+
+                self.assertTrue(job["ok"], job)
+                self.assertTrue(current["current"], current)
+                self.assertTrue(str(job["job_dir"]).startswith("/private/"))
+
+                target = base / "linked-target"
+                target.mkdir()
+                linked_subject = base / "linked-subject"
+                linked_subject.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "link-like",
+                ):
+                    create_review_job(
+                        base / "linked-root",
+                        subject_path=linked_subject,
+                        prompt="Reject the arbitrary link.",
+                        transport="manual",
+                    )
+
     def test_create_and_ingest_hash_bound_review(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
@@ -4579,6 +4778,15 @@ class ReviewBridgeTest(unittest.TestCase):
                     subject_path=subject,
                     prompt="Review the relative-root release evidence.",
                     transport="manual",
+                )
+                self.assertEqual(
+                    Path(job["job_dir"]),
+                    review_bridge_module.review_job_dir(
+                        review_bridge_module._normalize_review_root_alias(
+                            relative_root
+                        ),
+                        job["job_id"],
+                    ),
                 )
                 attempt = review_browser_attempt_start(
                     relative_root,
@@ -14380,6 +14588,7 @@ class ReviewBridgeTest(unittest.TestCase):
                 ],
                 "directories": list(manifest["directories"]),
             }
+            request["subject_path"] = str(subject)
             request["source_fingerprint_version"] = 2
             request["source_fingerprint"] = hashlib.sha256(
                 review_bridge_module.json_dumps(legacy_payload).encode("utf-8")

@@ -6,6 +6,7 @@ import os
 import json
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import continuum.core.store as store_module
+import continuum.core.operations as operations_module
+import continuum.core.review_bridge as review_bridge_module
 from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
 from continuum.core.permissions import secure_write_text
@@ -362,6 +365,79 @@ class OperationLedgerTest(unittest.TestCase):
                 actual = hashlib.sha256(proof_item_path(root, item).read_bytes()).hexdigest()
                 self.assertEqual(actual, item["sha256"], item["path"])
 
+    def test_operation_guard_fail_result_preserves_payload_and_proves_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            source = Path(tmp) / "failed-result-evidence.txt"
+            source.write_text("backend failure evidence", encoding="utf-8")
+            result = {
+                "ok": False,
+                "status": "install_failed",
+                "error": "backend reported failure",
+            }
+
+            with OperationGuard(
+                root,
+                operation_type="guarded_failed_result",
+                title="Guarded failed result",
+                touched_paths=[source],
+            ) as operation:
+                operation.cursor({"phase": "install_failed"})
+                operation.fail_result(
+                    result,
+                    error={
+                        "type": "BackendResultFailure",
+                        "message": "failure detail " * 500,
+                        "stage": "install_failed",
+                        "component": "hermes_adapter",
+                    },
+                    proof_extra={"failure_stage": "install_failed"},
+                )
+                wrapped = operation.wrap_result(result)
+
+            self.assertEqual(
+                {key: value for key, value in wrapped.items() if key != "_operation"},
+                result,
+            )
+            self.assertEqual(wrapped["_operation"]["status"], "failed")
+            summary = operation_summary(root, wrapped["_operation"]["operation_id"])
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["result"], result)
+            self.assertEqual(summary["cursor"], {"phase": "install_failed"})
+            self.assertEqual(summary["error"]["type"], "BackendResultFailure")
+            self.assertTrue(summary["error"]["truncated"])
+            self.assertEqual(summary["error"]["stage"], "install_failed")
+            self.assertLessEqual(
+                len(json.dumps(summary["error"], ensure_ascii=True, sort_keys=True)),
+                4000,
+            )
+            proof = json.loads(Path(summary["proof_pack_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(proof["status"], "failed")
+            self.assertEqual(proof["result"], result)
+            self.assertEqual(proof["error"], summary["error"])
+            self.assertEqual(proof["extra"]["failure_stage"], "install_failed")
+            replayed = replay_operation_event_log(
+                Path(summary["operation_event_log_uri"]),
+                operation_id=summary["operation_id"],
+            )
+            self.assertTrue(replayed["ok"], replayed)
+            self.assertEqual(replayed["status"], "failed")
+
+    def test_failed_result_error_bound_applies_to_escaped_unicode(self) -> None:
+        bounded = operations_module._bounded_operation_failure_error(
+            {
+                "type": "🔥" * 500,
+                "message": "🔥" * 5000,
+                "stage": "🔥" * 200,
+                "component": "🔥" * 200,
+            }
+        )
+
+        serialized = json.dumps(bounded, ensure_ascii=True, sort_keys=True)
+        self.assertLessEqual(len(serialized), 4000)
+        self.assertTrue(bounded["truncated"])
+        self.assertEqual(len(bounded["original_sha256"]), 64)
+
     def test_operation_receipts_and_proofs_redact_sensitive_metadata_keys_without_regex_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -616,6 +692,7 @@ class OperationLedgerTest(unittest.TestCase):
                 conn.close()
             self.assertEqual(live_sidecar_artifacts, 0)
 
+    @unittest.skipUnless(os.name == "nt", "identity-bound proof source deletion requires Windows")
     def test_relocated_catalog_proof_verifies_through_root_bound_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -673,6 +750,7 @@ class OperationLedgerTest(unittest.TestCase):
             )
             self.assertNotIn("storage", ordinary_path_check)
 
+    @unittest.skipUnless(os.name == "nt", "identity-bound proof source deletion requires Windows")
     def test_relocated_catalog_proof_and_doctor_fail_closed_on_archive_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1618,6 +1696,904 @@ class OperationLedgerTest(unittest.TestCase):
                 Path(result["drill_root"]).resolve(strict=False),
             )
 
+    @unittest.skipUnless(os.name == "nt", "identity-bound restore cleanup requires Windows")
+    def test_disposable_restore_drill_cleans_root_after_late_copy_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-copy-failure",
+                event_type="message",
+                role="user",
+                content="late copy failure",
+            )
+            snap = snapshot(root, reason="restore_copy_failure")
+            real_copy = operations_module._restore_copy_file
+
+            def copy_then_fail(source_root: Path, source: Path, destination: Path) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("late restore copy failed")
+
+            with (
+                patch(
+                    "continuum.core.operations._restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "late restore copy failed"),
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            drill_parent = root / "run" / "restore_drills"
+            self.assertEqual(list(drill_parent.glob("restore_*")), [])
+
+    def test_retained_restore_drill_keeps_root_after_late_copy_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-retained-failure",
+                event_type="message",
+                role="user",
+                content="retained late failure",
+            )
+            snap = snapshot(root, reason="restore_retained_failure")
+            real_copy = operations_module._restore_copy_file
+
+            def copy_then_fail(source_root: Path, source: Path, destination: Path) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("retained restore copy failed")
+
+            with (
+                patch(
+                    "continuum.core.operations._restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "retained restore copy failed"),
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=True,
+                )
+
+            drill_parent = root / "run" / "restore_drills"
+            retained = list(drill_parent.glob("restore_*"))
+            self.assertEqual(len(retained), 1)
+            self.assertTrue((retained[0] / "catalog" / "catalog.sqlite3").exists())
+
+    @unittest.skipUnless(os.name == "nt", "identity-bound restore cleanup requires Windows")
+    def test_disposable_restore_drill_cleans_root_after_late_check_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-check-failure",
+                event_type="message",
+                role="user",
+                content="late check failure",
+            )
+            snap = snapshot(root, reason="restore_check_failure")
+
+            with (
+                patch(
+                    "continuum.core.operations.status",
+                    side_effect=RuntimeError("late restore check failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "late restore check failed"),
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            drill_parent = root / "run" / "restore_drills"
+            self.assertEqual(list(drill_parent.glob("restore_*")), [])
+
+    def test_cleanup_refusal_does_not_replace_restore_drill_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-cleanup-refusal",
+                event_type="message",
+                role="user",
+                content="cleanup refusal",
+            )
+            snap = snapshot(root, reason="restore_cleanup_refusal")
+            real_copy = operations_module._restore_copy_file
+
+            def copy_then_fail(source_root: Path, source: Path, destination: Path) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("original restore failure")
+
+            with (
+                patch(
+                    "continuum.core.operations._restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                patch(
+                    "continuum.core.operations._cleanup_restore_drill_root",
+                    side_effect=ValueError("cleanup target refused"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "original restore failure") as raised,
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertEqual(len(notes), 1)
+            self.assertIn("cleanup target refused", notes[0])
+            self.assertLessEqual(len(notes[0]), 500)
+
+    def test_restore_drill_collision_is_never_cleaned_as_disposable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-collision",
+                event_type="message",
+                role="user",
+                content="collision",
+            )
+            snap = snapshot(root, reason="restore_collision")
+            drill_id = "restore_collision_fixture"
+            collision = root / "run" / "restore_drills" / drill_id
+            collision.mkdir(parents=True)
+            marker = collision / "unrelated-marker.txt"
+            marker.write_text("must remain", encoding="utf-8")
+
+            with (
+                patch("continuum.core.operations.unique_id", return_value=drill_id),
+                self.assertRaisesRegex(FileExistsError, "already exists"),
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "must remain")
+
+    @unittest.skipUnless(os.name == "nt", "Windows atomic restore-root reservation contract")
+    def test_native_reservation_blocks_swap_before_identity_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-reservation-swap",
+                event_type="message",
+                role="user",
+                content="reservation swap",
+            )
+            snap = snapshot(root, reason="restore_reservation_swap")
+            drill_id = "restore_atomic_reservation_fixture"
+            drill_root = root / "run" / "restore_drills" / drill_id
+            parked = drill_root.with_name(drill_root.name + ".parked")
+            replacement = base / "unrelated-reservation-replacement"
+            replacement.mkdir()
+            marker = replacement / "unrelated-marker.txt"
+            marker.write_text("must remain", encoding="utf-8")
+            real_unique_id = operations_module.unique_id
+            real_fstat = review_bridge_module._WindowsNativeConfinement.fstat
+            attempted = False
+
+            def fixed_restore_id(prefix: str) -> str:
+                return drill_id if prefix == "restore" else real_unique_id(prefix)
+
+            def attempt_swap_before_identity_capture(native: object, handle: int) -> os.stat_result:
+                nonlocal attempted
+                if drill_root.exists() and not attempted:
+                    attempted = True
+                    with self.assertRaises(PermissionError):
+                        os.rename(drill_root, parked)
+                return real_fstat(native, handle)
+
+            with (
+                patch(
+                    "continuum.core.operations.unique_id",
+                    side_effect=fixed_restore_id,
+                ),
+                patch.object(
+                    review_bridge_module._WindowsNativeConfinement,
+                    "fstat",
+                    new=attempt_swap_before_identity_capture,
+                ),
+            ):
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=True,
+                )
+
+            self.assertTrue(attempted)
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(Path(result["drill_root"]), drill_root)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "must remain")
+            self.assertFalse(parked.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows pinned restore-root cleanup contract")
+    def test_cleanup_boundary_root_swap_is_blocked_and_original_exception_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-root-swap",
+                event_type="message",
+                role="user",
+                content="root swap",
+            )
+            snap = snapshot(root, reason="restore_root_swap")
+            replacement = base / "unrelated-replacement"
+            replacement.mkdir()
+            marker = replacement / "unrelated-marker.txt"
+            marker.write_text("must remain", encoding="utf-8")
+            real_copy = operations_module._restore_copy_file
+            real_delete_tree = operations_module._delete_windows_restore_tree
+            observed: dict[str, Path] = {}
+
+            def copy_then_fail(
+                source_root: Path,
+                source: Path,
+                destination: Path,
+            ) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("original failure before cleanup boundary")
+
+            def attempt_swap_at_cleanup_boundary(
+                reservation: object,
+                path: Path,
+                handle: int,
+            ) -> None:
+                if "drill_root" not in observed:
+                    parked = path.with_name(path.name + ".parked")
+                    with self.assertRaises(PermissionError):
+                        os.rename(path, parked)
+                    observed.update(drill_root=path, parked=parked)
+                real_delete_tree(reservation, path, handle)
+
+            with (
+                patch(
+                    "continuum.core.operations._restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                patch(
+                    "continuum.core.operations._delete_windows_restore_tree",
+                    side_effect=attempt_swap_at_cleanup_boundary,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "original failure before cleanup boundary",
+                ) as raised,
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "must remain")
+            self.assertFalse(observed["drill_root"].exists())
+            self.assertFalse(observed["parked"].exists())
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertEqual(notes, [])
+
+    @unittest.skipUnless(os.name == "nt", "identity-bound restore cleanup requires Windows")
+    def test_disposable_restore_drill_normal_cleanup_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-normal-cleanup",
+                event_type="message",
+                role="user",
+                content="normal cleanup",
+            )
+            snap = snapshot(root, reason="restore_normal_cleanup")
+
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+                retain_drill_root=False,
+            )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertFalse(Path(result["drill_root"]).exists())
+            checks = {check["name"]: check for check in result["checks"]}
+            self.assertTrue(checks["drill_root_cleanup"]["ok"])
+
+    def test_unavailable_identity_cleanup_is_retained_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-unavailable-cleanup",
+                event_type="message",
+                role="user",
+                content="retain unavailable cleanup",
+            )
+            snap = snapshot(root, reason="restore_unavailable_cleanup")
+
+            def reserve_without_delete_binding(
+                source_root: Path,
+                drill_root: Path,
+            ) -> object:
+                del source_root
+                drill_root.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(drill_root)
+                metadata = os.lstat(drill_root)
+                return operations_module._RestoreDrillRootReservation(
+                    path=drill_root,
+                    identity=operations_module._restore_drill_root_identity(metadata),
+                )
+
+            with patch(
+                "continuum.core.operations._reserve_restore_drill_root",
+                side_effect=reserve_without_delete_binding,
+            ):
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            self.assertFalse(result["ok"], result["checks"])
+            self.assertTrue(result["drill_root_retained"])
+            self.assertEqual(
+                result["drill_root_cleanup_status"],
+                "identity_capability_unavailable",
+            )
+            self.assertTrue(Path(result["drill_root"]).exists())
+            checks = {check["name"]: check for check in result["checks"]}
+            self.assertEqual(
+                checks["drill_root_cleanup"]["status"],
+                "identity_capability_unavailable",
+            )
+            stored = json.loads(Path(result["receipt_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                stored["drill_root_cleanup_status"],
+                "identity_capability_unavailable",
+            )
+
+    def test_restore_cleanup_lstat_failure_is_not_absence(self) -> None:
+        with (
+            patch.object(
+                operations_module.os,
+                "lstat",
+                side_effect=PermissionError("restore lstat denied"),
+            ),
+            self.assertRaisesRegex(PermissionError, "restore lstat denied"),
+        ):
+            operations_module._strict_path_absent(Path("restore_candidate"))
+
+    def test_restore_cleanup_failure_is_distinct_from_missing_capability(self) -> None:
+        reservation = operations_module._RestoreDrillRootReservation(
+            path=Path("restore_candidate"),
+            identity=(1, 2, stat.S_IFDIR),
+        )
+        with patch.object(
+            operations_module,
+            "_cleanup_restore_drill_root_impl",
+            side_effect=PermissionError("cleanup inspection denied"),
+        ):
+            cleanup = operations_module._cleanup_restore_drill_root(
+                Path("root"),
+                reservation.path,
+                reservation=reservation,
+            )
+
+        self.assertFalse(cleanup["ok"])
+        self.assertEqual(cleanup["status"], "cleanup_failed_or_incomplete")
+        self.assertIn("cleanup inspection denied", cleanup["error"])
+
+    def test_reservation_close_failure_downgrades_successful_cleanup_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-close-status",
+                event_type="message",
+                role="user",
+                content="report close failure as incomplete cleanup",
+            )
+            snap = snapshot(root, reason="restore_close_status")
+            real_close = operations_module._close_restore_drill_reservation
+            fail_once = True
+
+            def close_then_report_failure(reservation: object) -> None:
+                nonlocal fail_once
+                real_close(reservation)
+                if fail_once:
+                    fail_once = False
+                    raise OSError("reservation close failed after cleanup")
+
+            with patch.object(
+                operations_module,
+                "_close_restore_drill_reservation",
+                side_effect=close_then_report_failure,
+            ):
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            checks = {check["name"]: check for check in result["checks"]}
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(
+                result["drill_root_cleanup_status"],
+                "cleanup_failed_or_incomplete",
+            )
+            self.assertFalse(checks["drill_root_cleanup"]["ok"])
+            self.assertEqual(
+                checks["drill_root_cleanup"]["status"],
+                "cleanup_failed_or_incomplete",
+            )
+            self.assertFalse(checks["drill_root_reservation_closed"]["ok"])
+            self.assertEqual(
+                result["drill_root_cleanup_path_state"],
+                "absent" if os.name == "nt" else "bound_inspected_tree_retained",
+            )
+            self.assertEqual(result["drill_root_retained"], os.name != "nt")
+            stored = json.loads(Path(result["receipt_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                stored["drill_root_cleanup_status"],
+                "cleanup_failed_or_incomplete",
+            )
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor-relative cleanup lifecycle")
+    def test_posix_disposable_restore_drill_inspects_and_preserves_bound_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-posix-sanitize",
+                event_type="message",
+                role="user",
+                content="sanitize disposable payload",
+            )
+            snap = snapshot(root, reason="restore_posix_sanitize")
+
+            with patch.object(operations_module.os, "ftruncate") as ftruncate:
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            drill_root = Path(result["drill_root"])
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(
+                result["drill_root_cleanup_status"],
+                "inspected_root_retained",
+            )
+            self.assertTrue(result["drill_root_retained"])
+            self.assertTrue(drill_root.is_dir())
+            retained_files = [path for path in drill_root.rglob("*") if path.is_file()]
+            self.assertGreater(len(retained_files), 0)
+            self.assertTrue(any(path.stat().st_size > 0 for path in retained_files))
+            self.assertFalse(any(path.is_symlink() for path in drill_root.rglob("*")))
+            self.assertEqual(
+                result["drill_root_retained_file_count"],
+                len(retained_files),
+            )
+            self.assertEqual(
+                result["drill_root_retained_bytes"],
+                sum(path.stat().st_size for path in retained_files),
+            )
+            cleanup_check = next(
+                check for check in result["checks"] if check["name"] == "drill_root_cleanup"
+            )
+            self.assertEqual(
+                cleanup_check["retained_file_count"],
+                result["drill_root_retained_file_count"],
+            )
+            self.assertEqual(
+                cleanup_check["retained_bytes"],
+                result["drill_root_retained_bytes"],
+            )
+            ftruncate.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX pinned-directory rename contract")
+    def test_posix_moved_reserved_root_is_inspected_but_never_reported_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            drill_root = root / "run" / "restore_drills" / "restore_moved_fixture"
+            parked = drill_root.with_name(drill_root.name + ".parked")
+            reservation = operations_module._reserve_restore_drill_root(root, drill_root)
+            try:
+                payload = drill_root / "nested" / "payload.txt"
+                payload.parent.mkdir()
+                payload.write_text("disposable", encoding="utf-8")
+                os.rename(drill_root, parked)
+
+                cleanup = operations_module._cleanup_restore_drill_root(
+                    root,
+                    drill_root,
+                    reservation=reservation,
+                )
+
+                self.assertFalse(cleanup["ok"])
+                self.assertNotEqual(cleanup["status"], "cleaned")
+                self.assertEqual(cleanup["status"], "inspected_root_moved")
+                self.assertFalse(os.path.lexists(drill_root))
+                self.assertTrue(parked.is_dir())
+                self.assertTrue((parked / "nested").is_dir())
+                self.assertEqual(
+                    (parked / "nested" / "payload.txt").read_text(encoding="utf-8"),
+                    "disposable",
+                )
+            finally:
+                operations_module._close_restore_drill_reservation(reservation)
+                if parked.exists():
+                    shutil.rmtree(parked)
+
+    @unittest.skipIf(os.name == "nt", "POSIX reservation identity race contract")
+    def test_posix_reservation_failure_never_removes_unbound_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            drill_root = root / "run" / "restore_drills" / "restore_reservation_race"
+            parked = drill_root.with_name(drill_root.name + ".parked")
+            real_fstat = os.fstat
+            real_lstat = os.lstat
+            armed = False
+            swapped = False
+
+            def arm_after_fstat(fd: int) -> os.stat_result:
+                nonlocal armed
+                metadata = real_fstat(fd)
+                armed = True
+                return metadata
+
+            def swap_before_path_identity(path: object) -> os.stat_result:
+                nonlocal swapped
+                candidate = Path(path)
+                if armed and not swapped and candidate == drill_root:
+                    swapped = True
+                    os.rename(drill_root, parked)
+                    os.mkdir(drill_root)
+                return real_lstat(path)
+
+            try:
+                with (
+                    patch.object(operations_module.os, "fstat", side_effect=arm_after_fstat),
+                    patch.object(operations_module.os, "lstat", side_effect=swap_before_path_identity),
+                    self.assertRaisesRegex(ValueError, "not a physical directory"),
+                ):
+                    operations_module._reserve_restore_drill_root(root, drill_root)
+
+                self.assertTrue(swapped)
+                self.assertTrue(parked.is_dir())
+                self.assertTrue(drill_root.is_dir())
+            finally:
+                if drill_root.exists():
+                    drill_root.rmdir()
+                if parked.exists():
+                    parked.rmdir()
+
+    @unittest.skipIf(os.name == "nt", "POSIX nonblocking descriptor-open contract")
+    def test_posix_cleanup_file_swap_to_fifo_fails_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            payload = directory / "payload.txt"
+            payload.write_text("disposable", encoding="utf-8")
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_open = os.open
+            real_stat = os.stat
+            swapped = False
+
+            def swap_after_first_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+                nonlocal swapped
+                metadata = real_stat(path, *args, **kwargs)
+                if path == payload.name and not swapped:
+                    swapped = True
+                    payload.unlink()
+                    os.mkfifo(payload)
+                return metadata
+
+            def require_nonblocking_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == payload.name:
+                    self.assertNotEqual(flags & getattr(os, "O_NONBLOCK", 0), 0)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with (
+                    patch.object(operations_module.os, "stat", side_effect=swap_after_first_stat),
+                    patch.object(operations_module.os, "open", side_effect=require_nonblocking_open),
+                    self.assertRaisesRegex(ValueError, "changed after descriptor open"),
+                ):
+                    operations_module._inspect_posix_retained_restore_tree(directory_fd)
+                self.assertTrue(swapped)
+            finally:
+                os.close(directory_fd)
+                if os.path.lexists(payload):
+                    payload.unlink()
+
+    @unittest.skipIf(os.name == "nt", "POSIX hardlink-preservation contract")
+    def test_posix_cleanup_refuses_hardlink_without_reaching_ftruncate_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            init_db(root)
+            drill_root = root / "run" / "restore_drills" / "restore_hardlink_fixture"
+            reservation = operations_module._reserve_restore_drill_root(root, drill_root)
+            outside = base / "outside-hardlink.txt"
+            payload = drill_root / "payload.txt"
+            original = b"outside hardlink bytes must survive"
+            try:
+                payload.write_bytes(original)
+                os.link(payload, outside)
+
+                with patch.object(operations_module.os, "ftruncate") as ftruncate:
+                    cleanup = operations_module._cleanup_restore_drill_root(
+                        root,
+                        drill_root,
+                        reservation=reservation,
+                    )
+
+                self.assertFalse(cleanup["ok"], cleanup)
+                self.assertEqual(cleanup["status"], "cleanup_failed_or_incomplete")
+                self.assertTrue(cleanup["root_retained"])
+                self.assertIn("multiply linked", cleanup["error"])
+                self.assertEqual(payload.read_bytes(), original)
+                self.assertEqual(outside.read_bytes(), original)
+                self.assertEqual(payload.stat().st_nlink, 2)
+                self.assertEqual(outside.stat().st_nlink, 2)
+                ftruncate.assert_not_called()
+            finally:
+                operations_module._close_restore_drill_reservation(reservation)
+
+    @unittest.skipIf(os.name == "nt", "POSIX hardlink-verification contract")
+    def test_posix_retained_tree_inspection_rejects_hardlinked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            directory = base / "sanitized-root"
+            directory.mkdir()
+            payload = directory / "payload.txt"
+            outside = base / "outside-hardlink.txt"
+            payload.write_bytes(b"preserved hardlink payload")
+            os.link(payload, outside)
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "multiply linked"):
+                    operations_module._inspect_posix_retained_restore_tree(directory_fd)
+                self.assertEqual(payload.read_bytes(), b"preserved hardlink payload")
+                self.assertEqual(outside.read_bytes(), b"preserved hardlink payload")
+                self.assertEqual(outside.stat().st_nlink, 2)
+            finally:
+                os.close(directory_fd)
+
+    @unittest.skipIf(os.name == "nt", "POSIX conservative unlink-boundary contract")
+    def test_posix_cleanup_never_deletes_at_unlink_swap_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            payload = directory / "payload.txt"
+            parked = directory / "payload.txt.parked"
+            payload.write_text("exact original", encoding="utf-8")
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_unlink = os.unlink
+            attempted = False
+
+            def swap_inside_unlink(
+                path: object,
+                *args: object,
+                dir_fd: int | None = None,
+                **kwargs: object,
+            ) -> None:
+                nonlocal attempted
+                attempted = True
+                os.rename(payload, parked)
+                payload.write_text("replacement must survive", encoding="utf-8")
+                real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+            try:
+                with patch.object(
+                    operations_module.os,
+                    "unlink",
+                    side_effect=swap_inside_unlink,
+                ):
+                    operations_module._inspect_posix_retained_restore_tree(directory_fd)
+
+                self.assertFalse(attempted)
+                self.assertFalse(parked.exists())
+                self.assertTrue(payload.is_file())
+                self.assertEqual(payload.read_text(encoding="utf-8"), "exact original")
+                operations_module._inspect_posix_retained_restore_tree(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+    @unittest.skipIf(os.name == "nt", "POSIX conservative rmdir-boundary contract")
+    def test_posix_cleanup_never_deletes_at_rmdir_swap_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            child = directory / "nested"
+            parked = directory / "nested.parked"
+            child.mkdir()
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_rmdir = os.rmdir
+            attempted = False
+
+            def swap_inside_rmdir(
+                path: object,
+                *args: object,
+                dir_fd: int | None = None,
+                **kwargs: object,
+            ) -> None:
+                nonlocal attempted
+                attempted = True
+                os.rename(child, parked)
+                child.mkdir()
+                real_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
+
+            try:
+                with patch.object(
+                    operations_module.os,
+                    "rmdir",
+                    side_effect=swap_inside_rmdir,
+                ):
+                    operations_module._inspect_posix_retained_restore_tree(directory_fd)
+
+                self.assertFalse(attempted)
+                self.assertFalse(parked.exists())
+                self.assertTrue(child.is_dir())
+                operations_module._inspect_posix_retained_restore_tree(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+    def test_unavailable_exception_cleanup_keeps_original_failure_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-unavailable-exception",
+                event_type="message",
+                role="user",
+                content="retain exceptional cleanup",
+            )
+            snap = snapshot(root, reason="restore_unavailable_exception")
+            real_copy = operations_module._restore_copy_file
+            observed: dict[str, Path] = {}
+
+            def reserve_without_delete_binding(
+                source_root: Path,
+                drill_root: Path,
+            ) -> object:
+                del source_root
+                drill_root.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(drill_root)
+                metadata = os.lstat(drill_root)
+                observed["drill_root"] = drill_root
+                return operations_module._RestoreDrillRootReservation(
+                    path=drill_root,
+                    identity=operations_module._restore_drill_root_identity(metadata),
+                )
+
+            def copy_then_fail(source_root: Path, source: Path, destination: Path) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("original restore exception")
+
+            with (
+                patch(
+                    "continuum.core.operations._reserve_restore_drill_root",
+                    side_effect=reserve_without_delete_binding,
+                ),
+                patch(
+                    "continuum.core.operations._restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "original restore exception") as raised,
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            self.assertTrue(observed["drill_root"].exists())
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertEqual(len(notes), 1)
+            self.assertIn("identity-bound restore-drill cleanup is unavailable", notes[0])
+
+    def test_cleanup_and_close_failures_do_not_replace_primary_restore_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-multiple-cleanup-failures",
+                event_type="message",
+                role="user",
+                content="preserve primary cleanup error",
+            )
+            snap = snapshot(root, reason="restore_multiple_cleanup_failures")
+            real_copy = operations_module._restore_copy_file
+            real_close = operations_module._close_restore_drill_reservation
+
+            def copy_then_fail(source_root: Path, source: Path, destination: Path) -> None:
+                real_copy(source_root, source, destination)
+                if destination.name == "catalog.sqlite3":
+                    raise RuntimeError("primary restore error")
+
+            def close_then_fail(reservation: object) -> None:
+                real_close(reservation)
+                raise OSError("reservation close error")
+
+            with (
+                patch.object(
+                    operations_module,
+                    "_restore_copy_file",
+                    side_effect=copy_then_fail,
+                ),
+                patch.object(
+                    operations_module,
+                    "_cleanup_restore_drill_root",
+                    side_effect=ValueError("cleanup refusal error"),
+                ),
+                patch.object(
+                    operations_module,
+                    "_close_restore_drill_reservation",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "primary restore error") as raised,
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertEqual(len(notes), 2)
+            self.assertIn("cleanup refusal error", notes[0])
+            self.assertIn("reservation close error", notes[1])
+            self.assertTrue(all(len(note) <= 500 for note in notes))
+
     def test_restore_drill_preserves_review_bridge_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1867,6 +2843,7 @@ class OperationLedgerTest(unittest.TestCase):
             )
             self.assertEqual(source_ledger["missing"], 1)
 
+    @unittest.skipUnless(os.name == "nt", "identity-bound proof source deletion requires Windows")
     def test_restore_drill_uses_source_bound_archive_without_transplanting_machine_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

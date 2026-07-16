@@ -5,6 +5,10 @@ $root = if ($env:CONTINUUM_ROOT) { $env:CONTINUUM_ROOT } else { Join-Path $HOME 
 $env:PYTHONPATH = "$repo\src"
 
 python -m continuum init --root $root
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m continuum append-event --root $root --session-id demo --role user --type message --content "Continuum starts with a Scroll."
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m continuum append-event --root $root --session-id demo --role assistant --type message --content "The Looking Glass sees only the active pane."
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m continuum status --root $root
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

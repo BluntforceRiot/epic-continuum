@@ -4,6 +4,7 @@ param(
     [string]$Root = $(if ($env:CONTINUUM_ROOT) { $env:CONTINUUM_ROOT } else { Join-Path $HOME ".continuum" }),
     [string]$HermesHome = "$env:LOCALAPPDATA\hermes",
     [string]$Python = $(if ($env:CONTINUUM_PYTHON) { $env:CONTINUUM_PYTHON } else { "python" }),
+    [string]$HermesExe = "",
     [int]$TokenBudget = 1800,
     [switch]$SkipEnable,
     [switch]$DryRun,
@@ -48,5 +49,9 @@ if ($ApiKey) {
 if ($ApiKeyEnv) { $argsList += @("--api-key-env", $ApiKeyEnv) }
 if ($ContextLength -gt 0) { $argsList += @("--context-length", [string]$ContextLength) }
 if ($MaxTokens -gt 0) { $argsList += @("--max-tokens", [string]$MaxTokens) }
+if ($HermesExe) { $argsList += @("--hermes-exe", $HermesExe) }
 
 & $Python @argsList
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

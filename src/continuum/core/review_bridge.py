@@ -1556,6 +1556,842 @@ def validate_review_job_id(job_id: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class _WindowsHandleInformation:
+    attributes: int
+    volume_serial_number: int
+    file_index: int
+    size_bytes: int
+
+
+class _WindowsNativeConfinement:
+    """Small fail-closed Windows native I/O layer for handle-relative traversal."""
+
+    _FILE_READ_DATA = 0x0001
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_WRITE_DATA = 0x0002
+    _FILE_TRAVERSE = 0x0020
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _FILE_WRITE_ATTRIBUTES = 0x0100
+    _DELETE = 0x00010000
+    _SYNCHRONIZE = 0x00100000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
+    _FILE_OPEN = 0x00000001
+    _FILE_CREATE = 0x00000002
+    _FILE_OPEN_IF = 0x00000003
+    _FILE_DIRECTORY_FILE = 0x00000001
+    _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    _FILE_NON_DIRECTORY_FILE = 0x00000040
+    _FILE_OPEN_REPARSE_POINT = 0x00200000
+    _OBJ_CASE_INSENSITIVE = 0x00000040
+    _OBJ_DONT_REPARSE = 0x00001000
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_RENAME_INFO_CLASS = 3
+    _NATIVE_FILE_RENAME_INFORMATION_CLASS = 10
+    _FILE_DISPOSITION_INFO_CLASS = 4
+    _DUPLICATE_SAME_ACCESS = 0x00000002
+    _MAX_COMPONENT_UTF16_BYTES = 255 * 2
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows native confinement is unavailable on this platform")
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _UnicodeString(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.USHORT),
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", wintypes.LPWSTR),
+            ]
+
+        class _ObjectAttributes(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.ULONG),
+                ("RootDirectory", wintypes.HANDLE),
+                ("ObjectName", ctypes.POINTER(_UnicodeString)),
+                ("Attributes", wintypes.ULONG),
+                ("SecurityDescriptor", ctypes.c_void_p),
+                ("SecurityQualityOfService", ctypes.c_void_p),
+            ]
+
+        class _IoStatusBlock(ctypes.Structure):
+            _fields_ = [
+                ("Status", ctypes.c_void_p),
+                ("Information", ctypes.c_size_t),
+            ]
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("file_attributes", wintypes.DWORD),
+                ("creation_time", wintypes.FILETIME),
+                ("last_access_time", wintypes.FILETIME),
+                ("last_write_time", wintypes.FILETIME),
+                ("volume_serial_number", wintypes.DWORD),
+                ("file_size_high", wintypes.DWORD),
+                ("file_size_low", wintypes.DWORD),
+                ("number_of_links", wintypes.DWORD),
+                ("file_index_high", wintypes.DWORD),
+                ("file_index_low", wintypes.DWORD),
+            ]
+
+        class _FileRenameInfo(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", wintypes.BOOLEAN),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * 1),
+            ]
+
+        class _FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+        self.ctypes = ctypes
+        self.msvcrt = msvcrt
+        self.wintypes = wintypes
+        self.UnicodeString = _UnicodeString
+        self.ObjectAttributes = _ObjectAttributes
+        self.IoStatusBlock = _IoStatusBlock
+        self.ByHandleFileInformation = _ByHandleFileInformation
+        self.FileRenameInfo = _FileRenameInfo
+        self.FileDispositionInfo = _FileDispositionInfo
+
+        try:
+            self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)  # type: ignore[attr-defined]
+        except (AttributeError, OSError) as exc:
+            raise OSError("required Windows native libraries are unavailable") from exc
+
+        self.kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        self.kernel32.CreateFileW.restype = wintypes.HANDLE
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        self.kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        self.kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        self.kernel32.FlushFileBuffers.restype = wintypes.BOOL
+        self.kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+        ]
+        self.kernel32.WriteFile.restype = wintypes.BOOL
+        self.kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self.kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        self.kernel32.GetCurrentProcess.argtypes = []
+        self.kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        self.kernel32.DuplicateHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        self.kernel32.DuplicateHandle.restype = wintypes.BOOL
+        self.ntdll.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(_ObjectAttributes),
+            ctypes.POINTER(_IoStatusBlock),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+        ]
+        self.ntdll.NtCreateFile.restype = ctypes.c_long
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IoStatusBlock),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        self.ntdll.NtSetInformationFile.restype = ctypes.c_long
+        self.ntdll.RtlNtStatusToDosError.argtypes = [wintypes.ULONG]
+        self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+
+    def _raise_last_error(self) -> None:
+        raise self.ctypes.WinError(self.ctypes.get_last_error())  # type: ignore[attr-defined]
+
+    def _raise_ntstatus(self, status: int) -> None:
+        unsigned = int(status) & 0xFFFFFFFF
+        winerror = int(self.ntdll.RtlNtStatusToDosError(unsigned))
+        if winerror in {2, 3}:
+            raise FileNotFoundError(winerror, os.strerror(winerror))
+        if winerror in {80, 183}:
+            raise FileExistsError(winerror, os.strerror(winerror))
+        raise self.ctypes.WinError(winerror)  # type: ignore[attr-defined]
+
+    @classmethod
+    def _validate_component(cls, name: str) -> str:
+        value = str(name)
+        if (
+            value in {"", ".", ".."}
+            or "\\" in value
+            or "/" in value
+            or ":" in value
+            or "\x00" in value
+        ):
+            raise ReviewBridgeError(
+                "review path contains an unsafe Windows native component"
+            )
+        try:
+            encoded = value.encode("utf-16-le")
+        except UnicodeEncodeError as exc:
+            raise ReviewBridgeError(
+                "review path contains a component that is not valid UTF-16"
+            ) from exc
+        if (
+            len(encoded) > cls._MAX_COMPONENT_UTF16_BYTES
+            or len(encoded) + 2 > 0xFFFF
+        ):
+            raise ReviewBridgeError(
+                "review path component exceeds the Windows native UTF-16 limit"
+            )
+        return value
+
+    def information(self, handle: int) -> _WindowsHandleInformation:
+        raw = self.ByHandleFileInformation()
+        if not self.kernel32.GetFileInformationByHandle(
+            self.wintypes.HANDLE(handle),
+            self.ctypes.byref(raw),
+        ):
+            self._raise_last_error()
+        return _WindowsHandleInformation(
+            attributes=int(raw.file_attributes),
+            volume_serial_number=int(raw.volume_serial_number),
+            file_index=(int(raw.file_index_high) << 32) | int(raw.file_index_low),
+            size_bytes=(int(raw.file_size_high) << 32) | int(raw.file_size_low),
+        )
+
+    def _assert_plain_type(self, handle: int, *, directory: bool) -> _WindowsHandleInformation:
+        information = self.information(handle)
+        is_directory = bool(information.attributes & self._FILE_ATTRIBUTE_DIRECTORY)
+        if (
+            is_directory != directory
+            or information.attributes & self._FILE_ATTRIBUTE_REPARSE_POINT
+            or information.file_index == 0
+        ):
+            raise ReviewBridgeError(
+                "review path opened as link-like (reparse point), the wrong type, "
+                "or an unstable identity"
+            )
+        return information
+
+    def open_anchor(self, anchor: str) -> int:
+        handle = self.kernel32.CreateFileW(
+            str(anchor),
+            self._FILE_LIST_DIRECTORY
+            | self._FILE_TRAVERSE
+            | self._FILE_READ_ATTRIBUTES
+            | self._SYNCHRONIZE,
+            self._FILE_SHARE_READ
+            | self._FILE_SHARE_WRITE
+            | self._FILE_SHARE_DELETE,
+            None,
+            self._OPEN_EXISTING,
+            self._FILE_FLAG_BACKUP_SEMANTICS | self._FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        invalid = self.wintypes.HANDLE(-1).value
+        if handle == invalid:
+            self._raise_last_error()
+        value = int(handle)
+        try:
+            self._assert_plain_type(value, directory=True)
+        except Exception:
+            self.close(value)
+            raise
+        return value
+
+    def open_relative(
+        self,
+        parent_handle: int,
+        name: str,
+        *,
+        directory: bool,
+        disposition: int | None = None,
+        desired_access: int | None = None,
+        share_access: int | None = None,
+    ) -> int:
+        component = self._validate_component(name)
+        encoded_length = len(component.encode("utf-16-le"))
+        name_buffer = self.ctypes.create_unicode_buffer(component)
+        unicode_name = self.UnicodeString(
+            encoded_length,
+            encoded_length + 2,
+            self.ctypes.cast(name_buffer, self.wintypes.LPWSTR),
+        )
+        attributes = self.ObjectAttributes(
+            self.ctypes.sizeof(self.ObjectAttributes),
+            self.wintypes.HANDLE(parent_handle),
+            self.ctypes.pointer(unicode_name),
+            self._OBJ_CASE_INSENSITIVE | self._OBJ_DONT_REPARSE,
+            None,
+            None,
+        )
+        io_status = self.IoStatusBlock()
+        opened = self.wintypes.HANDLE()
+        access = desired_access
+        if access is None:
+            access = self._FILE_READ_ATTRIBUTES | self._SYNCHRONIZE
+            if directory:
+                access |= self._FILE_LIST_DIRECTORY | self._FILE_TRAVERSE
+            else:
+                access |= self._FILE_READ_DATA
+        create_disposition = self._FILE_OPEN if disposition is None else disposition
+        options = (
+            self._FILE_DIRECTORY_FILE if directory else self._FILE_NON_DIRECTORY_FILE
+        ) | self._FILE_SYNCHRONOUS_IO_NONALERT | self._FILE_OPEN_REPARSE_POINT
+        status = int(
+            self.ntdll.NtCreateFile(
+                self.ctypes.byref(opened),
+                access,
+                self.ctypes.byref(attributes),
+                self.ctypes.byref(io_status),
+                None,
+                self._FILE_ATTRIBUTE_NORMAL,
+                (
+                    self._FILE_SHARE_READ
+                    | self._FILE_SHARE_WRITE
+                    | (self._FILE_SHARE_DELETE if directory else 0)
+                    if share_access is None
+                    else share_access
+                ),
+                create_disposition,
+                options,
+                None,
+                0,
+            )
+        )
+        if status < 0:
+            self._raise_ntstatus(status)
+        handle = int(opened.value or 0)
+        if not handle:
+            raise ReviewBridgeError("Windows native open returned no file handle")
+        try:
+            self._assert_plain_type(handle, directory=directory)
+        except Exception:
+            self.close(handle)
+            raise
+        return handle
+
+    def close(self, handle: int) -> None:
+        if handle and not self.kernel32.CloseHandle(self.wintypes.HANDLE(handle)):
+            self._raise_last_error()
+
+    def fstat(self, handle: int) -> os.stat_result:
+        process = self.kernel32.GetCurrentProcess()
+        duplicate = self.wintypes.HANDLE()
+        if not self.kernel32.DuplicateHandle(
+            process,
+            self.wintypes.HANDLE(handle),
+            process,
+            self.ctypes.byref(duplicate),
+            0,
+            False,
+            self._DUPLICATE_SAME_ACCESS,
+        ):
+            self._raise_last_error()
+        duplicate_value = int(duplicate.value or 0)
+        if not duplicate_value:
+            raise ReviewBridgeError("Windows native duplication returned no file handle")
+        descriptor = -1
+        try:
+            descriptor = self.msvcrt.open_osfhandle(
+                duplicate_value,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            duplicate_value = 0
+            return os.fstat(descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            elif duplicate_value:
+                self.close(duplicate_value)
+
+    def read_handle(self, handle: int, *, max_bytes: int | None = None) -> bytes:
+        descriptor = self.duplicate_descriptor(handle)
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ReviewBridgeError(
+                        "review job record exceeds the integrity byte limit"
+                    )
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    def duplicate_descriptor(self, handle: int) -> int:
+        duplicate = self.wintypes.HANDLE()
+        process = self.kernel32.GetCurrentProcess()
+        if not self.kernel32.DuplicateHandle(
+            process,
+            self.wintypes.HANDLE(handle),
+            process,
+            self.ctypes.byref(duplicate),
+            0,
+            False,
+            self._DUPLICATE_SAME_ACCESS,
+        ):
+            self._raise_last_error()
+        duplicate_value = int(duplicate.value or 0)
+        if not duplicate_value:
+            raise ReviewBridgeError("Windows native duplication returned no file handle")
+        try:
+            descriptor = self.msvcrt.open_osfhandle(
+                duplicate_value,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            duplicate_value = 0
+            return descriptor
+        except Exception:
+            if duplicate_value:
+                self.close(duplicate_value)
+            raise
+
+    def write_all(self, handle: int, data: bytes) -> None:
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset : offset + 1024 * 1024]
+            buffer = self.ctypes.create_string_buffer(chunk)
+            written = self.wintypes.DWORD()
+            if not self.kernel32.WriteFile(
+                self.wintypes.HANDLE(handle),
+                buffer,
+                len(chunk),
+                self.ctypes.byref(written),
+                None,
+            ):
+                self._raise_last_error()
+            if int(written.value) <= 0:
+                raise OSError("short write while writing review job evidence")
+            offset += int(written.value)
+        if not self.kernel32.FlushFileBuffers(self.wintypes.HANDLE(handle)):
+            self._raise_last_error()
+
+    def rename_relative(
+        self,
+        handle: int,
+        parent_handle: int,
+        name: str,
+        *,
+        replace: bool,
+    ) -> None:
+        component = self._validate_component(name)
+        encoded = component.encode("utf-16-le")
+        name_offset = int(self.FileRenameInfo.FileName.offset)
+        buffer = self.ctypes.create_string_buffer(
+            self.ctypes.sizeof(self.FileRenameInfo) + len(encoded)
+        )
+        rename = self.ctypes.cast(
+            buffer,
+            self.ctypes.POINTER(self.FileRenameInfo),
+        ).contents
+        rename.ReplaceIfExists = bool(replace)
+        rename.RootDirectory = self.wintypes.HANDLE(parent_handle)
+        rename.FileNameLength = len(encoded)
+        self.ctypes.memmove(
+            self.ctypes.addressof(buffer) + name_offset,
+            encoded,
+            len(encoded),
+        )
+        io_status = self.IoStatusBlock()
+        status = int(
+            self.ntdll.NtSetInformationFile(
+                self.wintypes.HANDLE(handle),
+                self.ctypes.byref(io_status),
+                buffer,
+                len(buffer),
+                self._NATIVE_FILE_RENAME_INFORMATION_CLASS,
+            )
+        )
+        if status < 0:
+            self._raise_ntstatus(status)
+
+    def mark_delete(self, handle: int) -> None:
+        disposition = self.FileDispositionInfo(True)
+        if not self.kernel32.SetFileInformationByHandle(
+            self.wintypes.HANDLE(handle),
+            self._FILE_DISPOSITION_INFO_CLASS,
+            self.ctypes.byref(disposition),
+            self.ctypes.sizeof(disposition),
+        ):
+            self._raise_last_error()
+
+
+_WINDOWS_NATIVE_CONFINEMENT: _WindowsNativeConfinement | None = None
+
+
+def _windows_native_confinement() -> _WindowsNativeConfinement:
+    global _WINDOWS_NATIVE_CONFINEMENT
+    if os.name != "nt":
+        raise ReviewBridgeError(
+            "Windows native handle-relative confinement is unavailable"
+        )
+    if _WINDOWS_NATIVE_CONFINEMENT is None:
+        try:
+            _WINDOWS_NATIVE_CONFINEMENT = _WindowsNativeConfinement()
+        except Exception as exc:
+            raise ReviewBridgeError(
+                "Windows native handle-relative confinement is unavailable"
+            ) from exc
+    return _WINDOWS_NATIVE_CONFINEMENT
+
+
+@contextmanager
+def _open_windows_plain_directory(
+    path: Path,
+    *,
+    create_final: bool = False,
+    inventory: ReviewSubjectInventory | None = None,
+) -> Iterator[tuple[_WindowsNativeConfinement, int]]:
+    """Pin every component of an absolute directory without pathname reopen."""
+
+    api = _windows_native_confinement()
+    absolute = Path(os.path.abspath(path))
+    if not absolute.anchor or not absolute.parts:
+        raise ReviewBridgeError(f"review path is not absolute: {absolute}")
+    handles: list[int] = []
+    identities: list[_WindowsHandleInformation] = []
+    current = Path(absolute.anchor)
+    try:
+        handles.append(api.open_anchor(absolute.anchor))
+        identities.append(api.information(handles[-1]))
+        expected = _review_subject_inventory_entry(inventory, current)
+        if expected is not None:
+            _assert_review_subject_entry_stat(expected, api.fstat(handles[-1]))
+        final_index = len(absolute.parts) - 1
+        for index, part in enumerate(absolute.parts[1:], start=1):
+            handles.append(
+                api.open_relative(
+                    handles[-1],
+                    part,
+                    directory=True,
+                    disposition=(
+                        api._FILE_OPEN_IF
+                        if create_final and index == final_index
+                        else api._FILE_OPEN
+                    ),
+                )
+            )
+            identities.append(api.information(handles[-1]))
+            current = current / part
+            expected = _review_subject_inventory_entry(inventory, current)
+            if expected is not None:
+                _assert_review_subject_entry_stat(expected, api.fstat(handles[-1]))
+        yield api, handles[-1]
+        for handle, initial in zip(handles, identities, strict=True):
+            final = api._assert_plain_type(handle, directory=True)
+            if (
+                final.volume_serial_number != initial.volume_serial_number
+                or final.file_index != initial.file_index
+            ):
+                raise ReviewBridgeError(
+                    "review directory identity changed while its handle was pinned"
+                )
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"review path changed or could not be opened safely: {absolute}"
+        ) from exc
+    finally:
+        close_error: OSError | None = None
+        for handle in reversed(handles):
+            try:
+                api.close(handle)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None and sys.exc_info()[0] is None:
+            raise ReviewBridgeError("review path handle could not be closed") from close_error
+
+
+@contextmanager
+def _open_windows_review_job_storage(
+    root: Path,
+    job_id: str,
+    *,
+    target_parts: tuple[str, ...] = (),
+) -> Iterator[
+    tuple[_WindowsNativeConfinement, int, Path, dict[str, int]]
+]:
+    """Keep the validated job and mutable directories pinned through one sink."""
+
+    safe_job_id = _safe_job_id(job_id)
+    if _review_job_publication_pending(root, safe_job_id):
+        raise ReviewBridgeError(
+            f"review job publication is not committed yet: {safe_job_id}"
+        )
+    job_dir = Path(os.path.abspath(review_job_dir(root, safe_job_id)))
+    pinned_mutable_directories: dict[str, int] = {}
+    pinned_identities: dict[str, _WindowsHandleInformation] = {}
+    with _open_windows_plain_directory(job_dir) as (api, job_handle):
+        try:
+            for name in REVIEW_JOB_MUTABLE_SUBDIRS:
+                try:
+                    pinned_mutable_directories[name] = api.open_relative(
+                        job_handle,
+                        name,
+                        directory=True,
+                    )
+                    pinned_identities[name] = api.information(
+                        pinned_mutable_directories[name]
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise ReviewBridgeError(
+                        f"review job directory is unavailable or link-like: {name}"
+                    ) from exc
+            for name in (REVIEW_REQUEST_NAME, REVIEW_STATUS_NAME):
+                # The target leaf must be opened exactly once by its sink. Other
+                # required control files are still checked under the pinned job.
+                if target_parts == (name,):
+                    continue
+                handle = 0
+                try:
+                    handle = api.open_relative(
+                        job_handle,
+                        name,
+                        directory=False,
+                        desired_access=api._FILE_READ_ATTRIBUTES | api._SYNCHRONIZE,
+                        share_access=api._FILE_SHARE_READ,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise ReviewBridgeError(
+                        f"review job file is unavailable or link-like: {name}"
+                    ) from exc
+                finally:
+                    if handle:
+                        api.close(handle)
+            yield api, job_handle, job_dir, pinned_mutable_directories
+            for name, handle in pinned_mutable_directories.items():
+                final = api._assert_plain_type(handle, directory=True)
+                initial = pinned_identities[name]
+                if (
+                    final.volume_serial_number != initial.volume_serial_number
+                    or final.file_index != initial.file_index
+                ):
+                    raise ReviewBridgeError(
+                        "review mutable directory identity changed while pinned: "
+                        f"{name}"
+                    )
+        finally:
+            close_error: OSError | None = None
+            for handle in reversed(tuple(pinned_mutable_directories.values())):
+                try:
+                    api.close(handle)
+                except OSError as exc:
+                    close_error = close_error or exc
+            if close_error is not None and sys.exc_info()[0] is None:
+                raise ReviewBridgeError(
+                    "review job directory handle could not be closed"
+                ) from close_error
+
+
+@contextmanager
+def _open_windows_review_job_parent(
+    api: _WindowsNativeConfinement,
+    job_handle: int,
+    pinned_mutable_directories: dict[str, int],
+    parts: tuple[str, ...],
+) -> Iterator[int]:
+    """Open a target parent beneath the already pinned and validated job."""
+
+    opened: list[int] = []
+    identities: list[_WindowsHandleInformation] = []
+    current_handle = job_handle
+    start_index = 0
+    if parts and parts[0] in pinned_mutable_directories:
+        current_handle = pinned_mutable_directories[parts[0]]
+        start_index = 1
+    try:
+        for part in parts[start_index:]:
+            current_handle = api.open_relative(
+                current_handle,
+                part,
+                directory=True,
+            )
+            opened.append(current_handle)
+            identities.append(api.information(current_handle))
+        yield current_handle
+        for handle, initial in zip(opened, identities, strict=True):
+            final = api._assert_plain_type(handle, directory=True)
+            if (
+                final.volume_serial_number != initial.volume_serial_number
+                or final.file_index != initial.file_index
+            ):
+                raise ReviewBridgeError(
+                    "review target parent identity changed while pinned"
+                )
+    except OSError as exc:
+        raise ReviewBridgeError(
+            "review job target parent changed or could not be opened safely"
+        ) from exc
+    finally:
+        close_error: OSError | None = None
+        for handle in reversed(opened):
+            try:
+                api.close(handle)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None and sys.exc_info()[0] is None:
+            raise ReviewBridgeError(
+                "review job target parent handle could not be closed"
+            ) from close_error
+
+
+@contextmanager
+def _open_windows_regular_at(
+    api: _WindowsNativeConfinement,
+    parent_handle: int,
+    name: str,
+    *,
+    display_parts: tuple[str, ...],
+    expected: ReviewSubjectEntry | None = None,
+    desired_access: int | None = None,
+    share_access: int | None = None,
+) -> Iterator[tuple[_WindowsNativeConfinement, int, os.stat_result]]:
+    leaf_handle = 0
+    try:
+        leaf_handle = api.open_relative(
+            parent_handle,
+            name,
+            directory=False,
+            desired_access=desired_access,
+            share_access=share_access,
+        )
+        initial_info = api.information(leaf_handle)
+        opened_stat = api.fstat(leaf_handle)
+        if expected is not None:
+            _assert_review_subject_entry_stat(expected, opened_stat)
+        yield api, leaf_handle, opened_stat
+        final_info = api._assert_plain_type(leaf_handle, directory=False)
+        if (
+            final_info.volume_serial_number != initial_info.volume_serial_number
+            or final_info.file_index != initial_info.file_index
+        ):
+            raise ReviewBridgeError(
+                "review file identity changed while its handle was open"
+            )
+        if expected is not None:
+            _assert_review_subject_entry_stat(
+                expected,
+                api.fstat(leaf_handle),
+            )
+    except OSError as exc:
+        raise ReviewBridgeError(
+            "review file changed or could not be opened safely: "
+            f"{'/'.join(display_parts)}"
+        ) from exc
+    finally:
+        if leaf_handle:
+            api.close(leaf_handle)
+
+
+@contextmanager
+def _open_windows_review_job_regular(
+    root: Path,
+    job_id: str,
+    parts: tuple[str, ...],
+    *,
+    desired_access: int | None = None,
+    share_access: int | None = None,
+) -> Iterator[tuple[_WindowsNativeConfinement, int, os.stat_result]]:
+    if not parts:
+        raise ReviewBridgeError("review job path has no regular-file component")
+    with _open_windows_review_job_storage(
+        root,
+        job_id,
+        target_parts=parts,
+    ) as (api, job_handle, _job_dir, pinned), _open_windows_review_job_parent(
+        api,
+        job_handle,
+        pinned,
+        parts[:-1],
+    ) as parent_handle, _open_windows_regular_at(
+        api,
+        parent_handle,
+        parts[-1],
+        display_parts=parts,
+        desired_access=desired_access,
+        share_access=share_access,
+    ) as opened:
+        yield opened
+
+
+@contextmanager
+def _open_windows_regular_relative(
+    base: Path,
+    parts: tuple[str, ...],
+    *,
+    expected: ReviewSubjectEntry | None = None,
+    inventory: ReviewSubjectInventory | None = None,
+    desired_access: int | None = None,
+    share_access: int | None = None,
+) -> Iterator[tuple[_WindowsNativeConfinement, int, os.stat_result]]:
+    if not parts:
+        raise ReviewBridgeError("review path has no regular-file component")
+    absolute_base = Path(os.path.abspath(base))
+    parent = absolute_base.joinpath(*parts[:-1])
+    expected_entry = expected or _review_subject_inventory_entry(
+        inventory,
+        absolute_base.joinpath(*parts),
+    )
+    with _open_windows_plain_directory(parent, inventory=inventory) as (
+        api,
+        parent_handle,
+    ), _open_windows_regular_at(
+        api,
+        parent_handle,
+        parts[-1],
+        display_parts=parts,
+        expected=expected_entry,
+        desired_access=desired_access,
+        share_access=share_access,
+    ) as opened:
+        yield opened
+
+
 def _link_like_reason(path: Path) -> str | None:
     try:
         stat_result = os.lstat(path)
@@ -1653,6 +2489,12 @@ def _validate_review_job_storage(root: Path, job_id: str) -> Path:
         raise ReviewBridgeError(
             f"review job publication is not committed yet: {safe_job_id}"
         )
+    if os.name == "nt":
+        validated_job_dir = Path(os.path.abspath(review_job_dir(root, safe_job_id)))
+        with _open_windows_review_job_storage(root, safe_job_id):
+            pass
+        return validated_job_dir
+
     root_path = Path(root).resolve(strict=True)
     current = root_path
     for component in ("exports", "review_bridge", "jobs", safe_job_id):
@@ -1671,6 +2513,82 @@ def _validate_review_job_storage(root: Path, job_id: str) -> Path:
 
 
 def _job_path_parts(root: Path, job_id: str, path: Path | str) -> tuple[str, ...]:
+    if os.name == "nt":
+        safe_job_id = _safe_job_id(job_id)
+        job_dir = Path(os.path.abspath(review_job_dir(root, safe_job_id)))
+        marker = ("exports", "review_bridge", "jobs", safe_job_id)
+        raw = Path(str(path))
+        raw_parts = tuple(raw.parts)
+        marker_folded = tuple(part.casefold() for part in marker)
+
+        if not raw.is_absolute():
+            folded = tuple(part.casefold() for part in raw_parts[: len(marker)])
+            if folded == marker_folded:
+                parts = raw_parts[len(marker) :]
+            else:
+                candidate = Path(os.path.abspath(raw))
+                relative_text = os.path.relpath(candidate, job_dir)
+                if (
+                    relative_text == os.pardir
+                    or relative_text.startswith(os.pardir + os.sep)
+                    or os.path.isabs(relative_text)
+                ):
+                    raise ReviewBridgeError(
+                        "review job write target escapes the active job root"
+                    )
+                parts = tuple(Path(relative_text).parts)
+        else:
+            candidate = Path(os.path.abspath(raw))
+            relative_text = os.path.relpath(candidate, job_dir)
+            if not (
+                relative_text == os.pardir
+                or relative_text.startswith(os.pardir + os.sep)
+                or os.path.isabs(relative_text)
+            ):
+                parts = tuple(Path(relative_text).parts)
+            else:
+                candidate_parts = tuple(candidate.parts)
+                match_index: int | None = None
+                for index in range(0, len(candidate_parts) - len(marker) + 1):
+                    if (
+                        tuple(
+                            part.casefold()
+                            for part in candidate_parts[index : index + len(marker)]
+                        )
+                        == marker_folded
+                    ):
+                        match_index = index
+                if match_index is None:
+                    raise ReviewBridgeError(
+                        "review job write target escapes the active job root"
+                    )
+                candidate_job_dir = Path(
+                    *candidate_parts[: match_index + len(marker)]
+                )
+                with _open_windows_plain_directory(job_dir) as (
+                    canonical_api,
+                    canonical_handle,
+                ), _open_windows_plain_directory(candidate_job_dir) as (
+                    candidate_api,
+                    candidate_handle,
+                ):
+                    canonical_info = canonical_api.information(canonical_handle)
+                    candidate_info = candidate_api.information(candidate_handle)
+                    if (
+                        canonical_info.volume_serial_number
+                        != candidate_info.volume_serial_number
+                        or canonical_info.file_index != candidate_info.file_index
+                    ):
+                        raise ReviewBridgeError(
+                            "review job write target escapes the active job root"
+                        )
+                parts = candidate_parts[match_index + len(marker) :]
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise ReviewBridgeError("review job write target is not a safe in-job file")
+        for part in parts:
+            _WindowsNativeConfinement._validate_component(part)
+        return parts
+
     job_dir = review_job_dir(root, job_id).resolve(strict=True)
     candidate = Path(str(path))
     if not candidate.is_absolute():
@@ -1718,6 +2636,24 @@ def _open_job_directory_fd(root: Path, job_id: str, parts: tuple[str, ...] = (),
 def _ensure_confined_subdirectory(root: Path, job_id: str, name: str) -> Path:
     if name not in REVIEW_JOB_MUTABLE_SUBDIRS:
         raise ReviewBridgeError(f"unsupported review job subdirectory: {name}")
+    if os.name == "nt":
+        job_dir = Path(os.path.abspath(review_job_dir(root, job_id)))
+        path = job_dir / name
+        with _open_windows_review_job_storage(
+            root,
+            job_id,
+            target_parts=(name,),
+        ) as (api, job_handle, _job_dir, pinned):
+            if name not in pinned:
+                handle = api.open_relative(
+                    job_handle,
+                    name,
+                    directory=True,
+                    disposition=api._FILE_OPEN_IF,
+                )
+                api.close(handle)
+        return path
+
     job_dir = _validate_review_job_storage(root, job_id)
     path = job_dir / name
     if os.name == "posix":
@@ -1762,6 +2698,19 @@ def _confined_read_bytes(
                 os.close(fd)
         finally:
             os.close(parent_fd)
+    if os.name == "nt":
+        with _open_windows_review_job_regular(
+            root,
+            job_id,
+            parts,
+            share_access=_windows_native_confinement()._FILE_SHARE_READ,
+        ) as (api, handle, opened_stat):
+            if max_bytes is not None and int(opened_stat.st_size) > max_bytes:
+                raise ReviewBridgeError(
+                    "review job record exceeds the integrity byte limit"
+                )
+            return api.read_handle(handle, max_bytes=max_bytes)
+
     candidate = review_job_dir(root, job_id).joinpath(*parts)
     _validate_review_job_storage(root, job_id)
     _require_plain_regular_file(candidate, label="/".join(parts))
@@ -1810,6 +2759,31 @@ def _confined_file_sha256(
         finally:
             os.close(parent_fd)
         return digest.hexdigest()
+    if os.name == "nt":
+        with _open_windows_review_job_regular(
+            root,
+            job_id,
+            parts,
+            share_access=_windows_native_confinement()._FILE_SHARE_READ,
+        ) as (api, native_handle, _opened_stat):
+            descriptor = api.duplicate_descriptor(native_handle)
+            try:
+                while True:
+                    if budget is not None:
+                        budget.check_deadline("hashing review job evidence")
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if budget is not None:
+                        budget.consume_work(
+                            len(chunk),
+                            label="hashing review job evidence",
+                        )
+            finally:
+                os.close(descriptor)
+        return digest.hexdigest()
+
     candidate = review_job_dir(root, job_id).joinpath(*parts)
     _validate_review_job_storage(root, job_id)
     _require_plain_regular_file(candidate, label="/".join(parts))
@@ -1844,6 +2818,19 @@ def _confined_file_size(root: Path, job_id: str, path: Path | str) -> int:
                 os.close(fd)
         finally:
             os.close(parent_fd)
+    if os.name == "nt":
+        with _open_windows_review_job_regular(
+            root,
+            job_id,
+            parts,
+            desired_access=(
+                _windows_native_confinement()._FILE_READ_ATTRIBUTES
+                | _windows_native_confinement()._SYNCHRONIZE
+            ),
+            share_access=_windows_native_confinement()._FILE_SHARE_READ,
+        ) as (_api, _handle, opened_stat):
+            return int(opened_stat.st_size)
+
     candidate = review_job_dir(root, job_id).joinpath(*parts)
     _validate_review_job_storage(root, job_id)
     _require_plain_regular_file(candidate, label="/".join(parts))
@@ -1969,6 +2956,61 @@ def _confined_write_text(
                 except OSError:
                     pass
             os.close(parent_fd)
+    if os.name == "nt":
+        with _open_windows_review_job_storage(
+            root,
+            job_id,
+            target_parts=parts,
+        ) as (api, job_handle, _job_dir, pinned), _open_windows_review_job_parent(
+            api,
+            job_handle,
+            pinned,
+            parts[:-1],
+        ) as parent_handle:
+            temp_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
+            temp_handle = 0
+            published = False
+            try:
+                temp_handle = api.open_relative(
+                    parent_handle,
+                    temp_name,
+                    directory=False,
+                    disposition=api._FILE_CREATE,
+                    desired_access=(
+                        api._FILE_WRITE_DATA
+                        | api._FILE_READ_ATTRIBUTES
+                        | api._FILE_WRITE_ATTRIBUTES
+                        | api._DELETE
+                        | api._SYNCHRONIZE
+                    ),
+                )
+                api.write_all(temp_handle, data)
+                api.rename_relative(
+                    temp_handle,
+                    parent_handle,
+                    parts[-1],
+                    replace=not exclusive,
+                )
+                api._assert_plain_type(temp_handle, directory=False)
+                published = True
+            except FileExistsError as exc:
+                raise ReviewBridgeError(
+                    f"review job evidence already exists: {'/'.join(parts)}"
+                ) from exc
+            except OSError as exc:
+                raise ReviewBridgeError(
+                    f"review job evidence could not be published safely: {'/'.join(parts)}"
+                ) from exc
+            finally:
+                if temp_handle:
+                    if not published:
+                        try:
+                            api.mark_delete(temp_handle)
+                        except OSError:
+                            pass
+                    api.close(temp_handle)
+        return
+
     candidate = review_job_dir(root, job_id).joinpath(*parts)
     _validate_review_job_storage(root, job_id)
     if parts[:-1]:
@@ -2010,6 +3052,40 @@ def _confined_unlink(root: Path, job_id: str, path: Path | str, *, missing_ok: b
         finally:
             os.close(parent_fd)
         return
+    if os.name == "nt":
+        with _open_windows_review_job_storage(
+            root,
+            job_id,
+            target_parts=parts,
+        ) as (api, job_handle, _job_dir, pinned), _open_windows_review_job_parent(
+            api,
+            job_handle,
+            pinned,
+            parts[:-1],
+        ) as parent_handle:
+            handle = 0
+            try:
+                handle = api.open_relative(
+                    parent_handle,
+                    parts[-1],
+                    directory=False,
+                    desired_access=(
+                        api._DELETE | api._FILE_READ_ATTRIBUTES | api._SYNCHRONIZE
+                    ),
+                )
+                api.mark_delete(handle)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            except OSError as exc:
+                raise ReviewBridgeError(
+                    f"review job evidence could not be deleted safely: {'/'.join(parts)}"
+                ) from exc
+            finally:
+                if handle:
+                    api.close(handle)
+        return
+
     candidate = review_job_dir(root, job_id).joinpath(*parts)
     _validate_review_job_storage(root, job_id)
     candidate.unlink(missing_ok=missing_ok)
@@ -6956,6 +8032,25 @@ def _open_confined_regular_file(
     parts = _relative_path_parts(relative)
     nofollow_flag = int(getattr(os, "O_NOFOLLOW", False))
     directory_flag = int(getattr(os, "O_DIRECTORY", False))
+    if os.name == "nt":
+        absolute_base = Path(os.path.abspath(base))
+        with _open_windows_regular_relative(
+            absolute_base,
+            parts,
+            expected=expected,
+            inventory=inventory,
+            share_access=_windows_native_confinement()._FILE_SHARE_READ,
+        ) as (api, native_handle, opened_stat):
+            descriptor = api.duplicate_descriptor(native_handle)
+            try:
+                with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                    descriptor = -1
+                    yield handle, opened_stat
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        return
+
     if os.name != "nt" and nofollow_flag and directory_flag:
         directory_fds: list[int] = []
         file_fd: int | None = None

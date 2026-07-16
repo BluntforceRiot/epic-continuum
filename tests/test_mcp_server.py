@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -704,6 +704,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         requests = "\n".join(json.dumps(request) for request in request_items)
         stdin = io.StringIO(requests + "\n")
         stdout = io.StringIO()
+        stderr = io.StringIO()
         real_dispatch = mcp_server_module.dispatch
         def controlled_dispatch(
             request: dict[str, Any],
@@ -717,7 +718,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             patch.object(mcp_server_module.sys, "stdin", stdin),
             patch.object(mcp_server_module.sys, "stdout", stdout),
             patch.object(mcp_server_module, "dispatch", side_effect=controlled_dispatch),
-            patch.object(mcp_server_module.traceback, "print_exc"),
+            redirect_stderr(stderr),
         ):
             self.assertEqual(mcp_server_module.serve(), 0)
 
@@ -726,6 +727,11 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(responses[1]["id"], 40)
         self.assertEqual(responses[1]["error"], {"code": -32603, "message": "internal error"})
         self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 41, "result": {}})
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "Epic Continuum MCP diagnostic: event=dispatch_failed; "
+            "error=RuntimeError; details redacted",
+        )
 
     def test_stdio_fails_closed_on_nonfinite_response_and_recovers(self) -> None:
         request_items = [
@@ -738,6 +744,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         requests = "\n".join(json.dumps(request) for request in request_items)
         stdin = io.StringIO(requests + "\n")
         stdout = io.StringIO()
+        stderr = io.StringIO()
         real_dispatch = mcp_server_module.dispatch
 
         def controlled_dispatch(
@@ -752,7 +759,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             patch.object(mcp_server_module.sys, "stdin", stdin),
             patch.object(mcp_server_module.sys, "stdout", stdout),
             patch.object(mcp_server_module, "dispatch", side_effect=controlled_dispatch),
-            patch.object(mcp_server_module.traceback, "print_exc"),
+            redirect_stderr(stderr),
         ):
             self.assertEqual(mcp_server_module.serve(), 0)
 
@@ -763,8 +770,18 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertEqual(responses[1]["id"], 50)
         self.assertEqual(responses[1]["error"], {"code": -32603, "message": "internal error"})
         self.assertEqual(responses[2], {"jsonrpc": "2.0", "id": 51, "result": {}})
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "Epic Continuum MCP diagnostic: event=response_encoding_failed; "
+            "error=ValueError; details redacted",
+        )
 
     def test_mutating_tool_reports_succeeded_receipt_when_result_is_unavailable(self) -> None:
+        class FailingDiagnosticStream(io.StringIO):
+            def write(self, value: str) -> int:
+                super().write(value)
+                raise OSError("stderr unavailable")
+
         for bad_kind in ("nan", "path", "cycle"):
             with self.subTest(bad_kind=bad_kind), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "continuum"
@@ -782,6 +799,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     return result
 
                 state = ready_session_state()
+                stderr = FailingDiagnosticStream() if bad_kind == "nan" else io.StringIO()
                 with (
                     patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
                     patch.object(
@@ -789,15 +807,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                         "append_scroll_event",
                         side_effect=append_with_bad_result,
                     ),
-                    patch.object(
-                        mcp_server_module.traceback,
-                        "print_exc",
-                        side_effect=(
-                            OSError("stderr unavailable")
-                            if bad_kind == "nan"
-                            else None
-                        ),
-                    ) as printed,
+                    redirect_stderr(stderr),
                 ):
                     response = dispatch(
                         {
@@ -834,7 +844,13 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     mcp_server_module.MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION,
                 )
                 self.assertEqual(payload["_operation"]["status"], "succeeded")
-                printed.assert_called_once()
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "Epic Continuum MCP diagnostic: "
+                    "event=completed_action_result_unavailable; "
+                    f"error={'TypeError' if bad_kind == 'path' else 'ValueError'}; "
+                    "details redacted",
+                )
                 self.assertEqual(recovery, {"jsonrpc": "2.0", "id": 81, "result": {}})
 
                 with closing(connect(root)) as conn:
@@ -2429,7 +2445,7 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 missing = set(TOOLS) - set(smoke_args)
                 self.assertFalse(missing, f"missing MCP smoke args for: {sorted(missing)}")
 
-                with patch("continuum.mcp_server.traceback.print_exc"):
+                with patch.object(mcp_server_module, "_emit_mcp_diagnostic"):
                     for name in sorted(TOOLS):
                         with self.subTest(tool=name):
                             result = call_tool_raw(name, smoke_args[name])
@@ -2964,6 +2980,188 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertTrue(result["isError"])
         payload = json.loads(result["content"][0]["text"])
         self.assertIn("arguments.content is required", payload["error"])
+
+    def test_tool_handler_errors_redact_spaced_absolute_paths(self) -> None:
+        def failing_handler(_arguments: dict[str, Any]) -> Any:
+            raise ValueError(
+                'cannot open "C:\\Private Folder\\Sensitive Final Name.txt"'
+            )
+
+        test_tool = (
+            "Test shared handler error redaction.",
+            {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            failing_handler,
+        )
+        with patch.dict(mcp_server_module.TOOLS, {"continuum_redaction_test": test_tool}):
+            response = dispatch_ready(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "continuum_redaction_test",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        self.assertIsNotNone(response)
+        assert response is not None
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertIn("<redacted-path:Sensitive Final Name.txt>", payload["error"])
+        self.assertNotIn("Private Folder", json.dumps(result, ensure_ascii=True))
+
+    def test_tool_handler_errors_redact_quoted_ambiguous_path_field_after_uri(self) -> None:
+        message = "endpoint=https://example.com/status,file='/ Private Folder/secret.txt'"
+
+        def failing_handler(_arguments: dict[str, Any]) -> Any:
+            raise ValueError(message)
+
+        test_tool = (
+            "Test shared compact-field path redaction.",
+            {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            failing_handler,
+        )
+        with patch.dict(
+            mcp_server_module.TOOLS,
+            {"continuum_compact_field_redaction_test": test_tool},
+        ):
+            response = dispatch_ready(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "continuum_compact_field_redaction_test",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        self.assertIsNotNone(response)
+        assert response is not None
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(
+            payload["error"],
+            "endpoint=https://example.com/status,file='<redacted-path:secret.txt>'",
+        )
+        self.assertNotIn("Private Folder", json.dumps(result, ensure_ascii=True))
+
+    def test_tool_handler_errors_parse_fields_after_outer_single_quoted_uri(self) -> None:
+        cases = (
+            (
+                "endpoint='https://example.com/status',path=relative/file;"
+                "cwd='/ Private Folder/secret.txt'; retry",
+                "endpoint='https://example.com/status',path=relative/file;"
+                "cwd='<redacted-path:secret.txt>'; retry",
+            ),
+            (
+                "endpoint='https://[v1.a'b]:8443/status',path=relative/file;"
+                "cwd='/ Private Folder/secret.txt'; retry",
+                "endpoint='https://[v1.a'b]:8443/status',path=relative/file;"
+                "cwd='<redacted-path:secret.txt>'; retry",
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                def failing_handler(_arguments: dict[str, Any]) -> Any:
+                    raise ValueError(message)
+
+                test_tool = (
+                    "Test shared quoted-URI field tokenization.",
+                    {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    failing_handler,
+                )
+                with patch.dict(
+                    mcp_server_module.TOOLS,
+                    {"continuum_quoted_uri_field_test": test_tool},
+                ):
+                    response = dispatch_ready(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "continuum_quoted_uri_field_test",
+                                "arguments": {},
+                            },
+                        }
+                    )
+
+                self.assertIsNotNone(response)
+                assert response is not None
+                result = response["result"]
+                self.assertTrue(result["isError"])
+                payload = json.loads(result["content"][0]["text"])
+                self.assertEqual(payload["error"], expected)
+                self.assertNotIn("Private Folder", json.dumps(result, ensure_ascii=True))
+
+    def test_runtime_tool_handler_error_redacts_json_and_stderr(self) -> None:
+        def failing_handler(_arguments: dict[str, Any]) -> Any:
+            raise RuntimeError(
+                'cannot open "C:\\Private Folder\\api_key=supersecretvalue123.txt"'
+            )
+
+        test_tool = (
+            "Test shared runtime handler error redaction.",
+            {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            failing_handler,
+        )
+        stderr = io.StringIO()
+        with patch.dict(
+            mcp_server_module.TOOLS,
+            {"continuum_runtime_redaction_test": test_tool},
+        ), redirect_stderr(stderr):
+            response = dispatch_ready(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "continuum_runtime_redaction_test",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        self.assertIsNotNone(response)
+        assert response is not None
+        rendered = json.dumps(response, ensure_ascii=True)
+        diagnostic = stderr.getvalue()
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("<redacted-path", rendered)
+        for forbidden in (
+            "Private Folder",
+            "supersecretvalue123",
+            str(Path(__file__).resolve()),
+        ):
+            self.assertNotIn(forbidden, rendered)
+            self.assertNotIn(forbidden, diagnostic)
+        self.assertEqual(
+            diagnostic.strip(),
+            "Epic Continuum MCP diagnostic: event=tool_handler_failed; "
+            "error=RuntimeError; details redacted",
+        )
 
 
 if __name__ == "__main__":

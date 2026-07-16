@@ -39,8 +39,18 @@ $StageMarketplaceRoot = $StageMarketplaceRoot.Trim()
 
 if (-not $StageOnly) {
   codex plugin marketplace add $StageMarketplaceRoot
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
   codex plugin add continuum@epic-continuum
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
 }
 
-Write-Host "Epic Continuum Codex plugin installed from staged marketplace: $(Join-Path $StageMarketplaceRoot '.agents\plugins\marketplace.json')"
+if ($StageOnly) {
+  Write-Host "Epic Continuum Codex plugin staged without registration: $(Join-Path $StageMarketplaceRoot '.agents\plugins\marketplace.json')"
+} else {
+  Write-Host "Epic Continuum Codex plugin installed from staged marketplace: $(Join-Path $StageMarketplaceRoot '.agents\plugins\marketplace.json')"
+}
 Write-Host "Epic Continuum root: $Root"

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,7 +14,20 @@ from .core.config import (
     optimize_config,
     write_default_config,
 )
-from .core.bundle import pack_root, verify_root_bundle
+from .core.bundle import (
+    BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+    BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO,
+    BUNDLE_ABSOLUTE_MAX_ENTRIES,
+    BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+    BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+    BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+    BUNDLE_DEFAULT_MAX_ENTRIES,
+    BUNDLE_DEFAULT_MAX_EXPANDED_BYTES,
+    BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS,
+    pack_root,
+    verify_root_bundle,
+)
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace, progress_bar
@@ -124,12 +136,15 @@ from .core.workers import (
     validate_prune_memory_limit,
     validate_prune_memory_scope,
 )
-from .core.safety import redact_text_secrets, scan_text_for_secrets
+from .core.safety import (
+    redact_error_message_paths,
+    redact_text_secrets,
+    scan_text_for_secrets,
+)
 from .core.writer_claim import claim_writer, writer_claim_status
 from .integrations.hermes_adapter import install_hermes_adapter
 
 
-ABSOLUTE_PATH_RE = re.compile(r"(?i)(?:[A-Z]:[\\/][^\s\"'<>|]+|/[^\s\"'<>]+)")
 MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
 
 
@@ -186,16 +201,7 @@ def read_bounded_cli_text_file(path: Path, *, max_bytes: int) -> str:
 
 
 def redact_cli_error_message(message: str) -> str:
-    redacted = redact_text_secrets(str(message))
-
-    def replace_path(match: re.Match[str]) -> str:
-        raw = match.group(0).rstrip(".,;:)")
-        suffix = match.group(0)[len(raw):]
-        name = re.split(r"[\\/]", raw)[-1] or "path"
-        safe_name = redact_text_secrets(name)
-        return f"<redacted-path:{safe_name}>{suffix}"
-
-    return ABSOLUTE_PATH_RE.sub(replace_path, redacted)
+    return redact_error_message_paths(message)
 
 
 def emit(value: object) -> None:
@@ -272,6 +278,7 @@ def guarded_result(
     snapshot_reason: str | None = None,
     touched_paths: list[Path | str] | None = None,
     result_touched_paths: Callable[[Any], list[Path | str]] | None = None,
+    result_failure: Callable[[Any], dict[str, Any] | None] | None = None,
     action: Callable[[OperationGuard], Any],
     actor: str | None = None,
     proof: bool = True,
@@ -291,7 +298,12 @@ def guarded_result(
     ) as operation:
         result = action(operation)
         extra_paths = result_touched_paths(result) if result_touched_paths else []
-        operation.succeed(result if isinstance(result, dict) else {"result": result}, touched_paths=extra_paths)
+        failure = result_failure(result) if result_failure else None
+        operation_result = result if isinstance(result, dict) else {"result": result}
+        if failure is None:
+            operation.succeed(operation_result, touched_paths=extra_paths)
+        else:
+            operation.fail_result(operation_result, error=failure, touched_paths=extra_paths)
         return operation.wrap_result(result)
 
 
@@ -610,6 +622,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_verify_bundle = sub.add_parser("verify-bundle", help="Verify a packed Continuum ZIP manifest and every member hash")
     p_verify_bundle.add_argument("--path", required=True)
+    p_verify_bundle.add_argument(
+        "--envelope-only",
+        action="store_true",
+        help="Verify ZIP/manifest binding without reconstructing the embedded root",
+    )
+    p_verify_bundle.add_argument(
+        "--max-entries",
+        type=bounded_cli_integer("max_entries", BUNDLE_ABSOLUTE_MAX_ENTRIES),
+        default=BUNDLE_DEFAULT_MAX_ENTRIES,
+    )
+    p_verify_bundle.add_argument(
+        "--max-expanded-bytes",
+        type=bounded_cli_integer(
+            "max_expanded_bytes", BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES
+        ),
+        default=BUNDLE_DEFAULT_MAX_EXPANDED_BYTES,
+    )
+    p_verify_bundle.add_argument(
+        "--max-member-bytes",
+        type=bounded_cli_integer(
+            "max_member_bytes", BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES
+        ),
+    )
+    p_verify_bundle.add_argument(
+        "--max-compression-ratio",
+        type=bounded_cli_integer(
+            "max_compression_ratio", BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO
+        ),
+        default=BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+    )
+    p_verify_bundle.add_argument(
+        "--max-central-directory-bytes",
+        type=bounded_cli_integer(
+            "max_central_directory_bytes",
+            BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
+        default=BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+    )
+    p_verify_bundle.add_argument(
+        "--timeout-seconds",
+        type=bounded_cli_integer(
+            "timeout_seconds", BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS
+        ),
+        default=BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    )
 
     p_audit_secrets = sub.add_parser("audit-secrets", help="Scan an Epic Continuum root for obvious secret patterns")
     p_audit_secrets.add_argument("--root", required=True)
@@ -1801,7 +1858,16 @@ def _main(argv: list[str] | None = None) -> int:
         return 0 if result.get("ok") else 1
 
     if args.command == "verify-bundle":
-        result = verify_root_bundle(Path(args.path))
+        result = verify_root_bundle(
+            Path(args.path),
+            verify_embedded_root=not args.envelope_only,
+            max_entries=args.max_entries,
+            max_expanded_bytes=args.max_expanded_bytes,
+            max_member_bytes=args.max_member_bytes,
+            max_compression_ratio=args.max_compression_ratio,
+            max_central_directory_bytes=args.max_central_directory_bytes,
+            timeout_seconds=args.timeout_seconds,
+        )
         emit(result)
         return 0 if result.get("ok") else 1
 
@@ -2355,12 +2421,17 @@ def _main(argv: list[str] | None = None) -> int:
                 max_tokens=args.max_tokens,
                 set_default_model=args.set_default_model,
             )
+            install_ok = result.get("ok") is not False
             operation.cursor(
                 {
-                    "phase": "hermes_adapter_installed",
-                    "plugin_name": result["plugin_name"],
-                    "plugin_target": result["plugin_target"],
-                    "dry_run": result["dry_run"],
+                    "phase": (
+                        "hermes_adapter_installed"
+                        if install_ok
+                        else "hermes_adapter_install_failed"
+                    ),
+                    "plugin_name": result.get("plugin_name"),
+                    "plugin_target": result.get("plugin_target"),
+                    "dry_run": result.get("dry_run", args.dry_run),
                 }
             )
             return result
@@ -2382,6 +2453,15 @@ def _main(argv: list[str] | None = None) -> int:
                 snapshot_policy="none",
                 snapshot_reason="Hermes adapter install is copy/config outside the Continuum catalog",
                 result_touched_paths=lambda _result: [],
+                result_failure=lambda result: (
+                    {
+                        "code": "hermes_adapter_install_failed",
+                        "message": "The Hermes adapter backend reported one or more failed commands.",
+                        "command_failure_count": int(result.get("command_failure_count") or 0),
+                    }
+                    if isinstance(result, dict) and result.get("ok") is False
+                    else None
+                ),
                 action=action,
             )
         )

@@ -12,6 +12,7 @@ from typing import Any
 
 from continuum.core.config import capture_policy, should_capture
 from continuum.core.permissions import secure_write_text
+from continuum.core.safety import redact_text_secrets
 from continuum.core.store import (
     compile_context,
     connect_existing,
@@ -29,6 +30,34 @@ PLUGIN_NAME = "epic_continuum"
 DEFAULT_TOKEN_BUDGET = 1800
 DEFAULT_CONTEXT_HEADER = "Epic Continuum Looking Glass"
 REDACTED_SECRET = "[REDACTED]"
+MAX_ADAPTER_LOG_PHASE_BYTES = 256
+MAX_ADAPTER_LOG_ERROR_BYTES = 4096
+MAX_ADAPTER_LOG_TRACEBACK_BYTES = 16384
+MAX_ADAPTER_LOG_REDACTION_LOOKAHEAD_BYTES = 256
+ADAPTER_LOG_TRUNCATION_NOTICE = "...[truncated]"
+_OPEN_LOG_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:"
+    r"\bsk-[A-Za-z0-9_-]*"
+    r"|\bgh[pousr]_[A-Za-z0-9_]*"
+    r"|\bglpat-[A-Za-z0-9_-]*"
+    r"|\bhf_[A-Za-z0-9]*"
+    r"|\bxox[baprs]-[A-Za-z0-9-]*"
+    r"|\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]*"
+    r"|\bAIza[0-9A-Za-z_-]*"
+    r"|\bAKIA[0-9A-Z]*"
+    r"|\bBearer\s+[A-Za-z0-9._~+/=-]*"
+    r")\Z"
+)
+_LOG_ASSIGNMENT_START_RE = re.compile(
+    r"(?i)(?P<key_quote>['\"]?)(?P<key>[A-Za-z_][A-Za-z0-9_.-]{1,119})"
+    r"(?P=key_quote)\s*[:=]\s*(?P<quote>['\"]?)"
+)
+_SENSITIVE_LOG_KEY_RE = re.compile(
+    r"(?i)(?:^|_)"
+    r"(?:api_?key|apikey|access_key|auth_key|authorization|bearer|cookie|"
+    r"id_token|jwt|jwt_token|password|passwd|pwd|private_key|refresh_token|"
+    r"secret|session_token|signing_key|token|webhook_secret)$"
+)
 _CONFIG_PATH: Path | None = None
 _MODEL_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _WINDOWS_RESERVED_STEMS = {
@@ -338,18 +367,177 @@ def _log_warning(config: dict[str, Any], phase: str, message: str, detail: dict[
         return
 
 
-def _log_error(config: dict[str, Any], phase: str, exc: BaseException) -> None:
-    root = Path(config.get("continuum_root") or default_continuum_root())
-    log_path = Path(config.get("log_path") or root / "run" / "integrations" / "hermes_adapter.log")
+def _utf8_prefix(value: str, *, max_bytes: int) -> tuple[str, int, bool]:
+    characters: list[str] = []
+    used_bytes = 0
+    for character in value:
+        encoded = character.encode("utf-8", errors="replace")
+        if used_bytes + len(encoded) > max_bytes:
+            return "".join(characters), used_bytes, True
+        characters.append(character)
+        used_bytes += len(encoded)
+    return "".join(characters), used_bytes, False
+
+
+def _truncate_log_text(
+    value: str,
+    *,
+    max_bytes: int,
+    force_notice: bool = False,
+) -> str:
+    prefix, _used_bytes, truncated = _utf8_prefix(value, max_bytes=max_bytes)
+    if not truncated and not force_notice:
+        return prefix
+    notice_bytes = len(ADAPTER_LOG_TRUNCATION_NOTICE.encode("utf-8"))
+    prefix, _used_bytes, _truncated = _utf8_prefix(
+        value,
+        max_bytes=max(0, max_bytes - notice_bytes),
+    )
+    return prefix + ADAPTER_LOG_TRUNCATION_NOTICE
+
+
+def _bounded_log_secret_spans(
+    text: str,
+    *,
+    source_truncated: bool,
+) -> list[tuple[int, int]]:
+    """Locate sensitive spans without materializing content beyond the window."""
+
+    redactions: list[tuple[int, int]] = []
+    if source_truncated:
+        open_credential = _OPEN_LOG_CREDENTIAL_RE.search(text)
+        if open_credential is not None:
+            redactions.append((open_credential.start(), len(text)))
+    search_from = 0
+    while assignment := _LOG_ASSIGNMENT_START_RE.search(text, search_from):
+        search_from = assignment.start() + 1
+        normalized_key = _normalize_log_assignment_key(assignment.group("key"))
+        if _SENSITIVE_LOG_KEY_RE.search(normalized_key) is None:
+            continue
+        quote = assignment.group("quote")
+        value_start = assignment.end("quote") if quote else assignment.end()
+        if not quote:
+            line_end_candidates = [
+                position
+                for position in (
+                    text.find("\r", value_start),
+                    text.find("\n", value_start),
+                )
+                if position >= 0
+            ]
+            value_end = min(line_end_candidates, default=len(text))
+            redactions.append((assignment.start("key_quote"), value_end))
+            search_from = max(value_end, search_from)
+            continue
+        closing = _find_log_quote_close(text, start=value_start, quote=quote)
+        if closing is None:
+            redactions.append((assignment.start("key_quote"), len(text)))
+            break
+        redactions.append((assignment.start("key_quote"), closing + 1))
+        search_from = closing + 1
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(redactions):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _normalize_log_assignment_key(value: str) -> str:
+    with_acronym_boundaries = re.sub(
+        r"(?<=[A-Z])(?=[A-Z][a-z])",
+        "_",
+        value,
+    )
+    with_word_boundaries = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        "_",
+        with_acronym_boundaries,
+    )
+    return re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        with_word_boundaries.casefold(),
+    ).strip("_")
+
+
+def _redact_bounded_log_window(text: str, *, source_truncated: bool) -> str:
+    spans = _bounded_log_secret_spans(
+        text,
+        source_truncated=source_truncated,
+    )
+    if not spans:
+        return redact_text_secrets(text)
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(redact_text_secrets(text[cursor:start]))
+        parts.append(REDACTED_SECRET)
+        cursor = end
+    parts.append(redact_text_secrets(text[cursor:]))
+    return "".join(parts)
+
+
+def _find_log_quote_close(text: str, *, start: int, quote: str) -> int | None:
+    index = start
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if character != quote:
+            index += 1
+            continue
+        if quote == "'" and index + 1 < len(text) and text[index + 1] == quote:
+            index += 2
+            continue
+        return index
+    return None
+
+
+def _bounded_log_text(value: Any, *, max_bytes: int) -> str:
+    raw = str(value)
+    window, window_bytes, window_truncated = _utf8_prefix(
+        raw,
+        max_bytes=max_bytes + MAX_ADAPTER_LOG_REDACTION_LOOKAHEAD_BYTES,
+    )
+    redacted = _redact_bounded_log_window(
+        window,
+        source_truncated=window_truncated,
+    )
+    return _truncate_log_text(
+        redacted,
+        max_bytes=max_bytes,
+        force_notice=window_truncated or window_bytes > max_bytes,
+    )
+
+
+def _log_error(config: dict[str, Any] | None, phase: str, exc: BaseException) -> None:
     try:
+        selected = config if isinstance(config, dict) else {}
+        root = Path(selected.get("continuum_root") or default_continuum_root())
+        log_path = Path(
+            selected.get("log_path")
+            or root / "run" / "integrations" / "hermes_adapter.log"
+        )
         payload = {
             "created_at": utc_now(),
-            "phase": phase,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(limit=8),
+            "phase": _bounded_log_text(
+                phase,
+                max_bytes=MAX_ADAPTER_LOG_PHASE_BYTES,
+            ),
+            "error": _bounded_log_text(
+                f"{type(exc).__name__}: {exc}",
+                max_bytes=MAX_ADAPTER_LOG_ERROR_BYTES,
+            ),
+            "traceback": _bounded_log_text(
+                traceback.format_exc(limit=8),
+                max_bytes=MAX_ADAPTER_LOG_TRACEBACK_BYTES,
+            ),
         }
         append_adapter_log(log_path, payload)
-    except (OSError, ValueError):
+    except Exception:
         return
 
 
@@ -379,13 +567,13 @@ def format_context_packet(context: dict[str, Any], *, header: str = DEFAULT_CONT
 
 
 def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-    config = load_adapter_config()
-    root = Path(config["continuum_root"])
-    used_fallback_session = not _has_session_identifier(kwargs)
-    session_id = _session_id(kwargs)
-    user_message = _user_text(kwargs)
-
+    config: dict[str, Any] = {}
     try:
+        config = load_adapter_config()
+        root = Path(config["continuum_root"])
+        used_fallback_session = not _has_session_identifier(kwargs)
+        session_id = _session_id(kwargs)
+        user_message = _user_text(kwargs)
         if used_fallback_session and user_message:
             _log_warning(
                 config,
@@ -420,16 +608,19 @@ def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
 
 
 def post_llm_call(**kwargs: Any) -> None:
-    config = load_adapter_config()
-    root = Path(config["continuum_root"])
-    if not config.get("record_assistant_turns", True) or not should_capture(root, "assistant_turn"):
-        return None
-    response = _assistant_text(kwargs)
-    if not response:
-        return None
-    used_fallback_session = not _has_session_identifier(kwargs)
-    session_id = _session_id(kwargs)
+    config: dict[str, Any] = {}
     try:
+        config = load_adapter_config()
+        root = Path(config["continuum_root"])
+        if not config.get("record_assistant_turns", True) or not should_capture(
+            root, "assistant_turn"
+        ):
+            return None
+        response = _assistant_text(kwargs)
+        if not response:
+            return None
+        used_fallback_session = not _has_session_identifier(kwargs)
+        session_id = _session_id(kwargs)
         if used_fallback_session:
             _log_warning(
                 config,
@@ -453,50 +644,61 @@ def post_llm_call(**kwargs: Any) -> None:
 
 
 def tool_call(**kwargs: Any) -> None:
-    config = load_adapter_config()
-    root = Path(config["continuum_root"])
-    explicit = _explicit_capture(kwargs)
-    if not should_capture(root, "tool_call", explicit=explicit):
-        return None
-    record_tool_event(
-        root,
-        session_id=_session_id(kwargs),
-        tool_name=_tool_name(kwargs),
-        payload=_tool_payload(kwargs, result=False),
-        source="hermes",
-        result=False,
-        metadata=_metadata(kwargs),
-        explicit=explicit,
-    )
-    _maybe_roll_session(root, _session_id(kwargs))
+    config: dict[str, Any] = {}
+    try:
+        config = load_adapter_config()
+        root = Path(config["continuum_root"])
+        explicit = _explicit_capture(kwargs)
+        if not should_capture(root, "tool_call", explicit=explicit):
+            return None
+        session_id = _session_id(kwargs)
+        record_tool_event(
+            root,
+            session_id=session_id,
+            tool_name=_tool_name(kwargs),
+            payload=_tool_payload(kwargs, result=False),
+            source="hermes",
+            result=False,
+            metadata=_metadata(kwargs),
+            explicit=explicit,
+        )
+        _maybe_roll_session(root, session_id)
+    except Exception as exc:
+        _log_error(config, "tool_call", exc)
     return None
 
 
 def tool_result(**kwargs: Any) -> None:
-    config = load_adapter_config()
-    root = Path(config["continuum_root"])
-    explicit = _explicit_capture(kwargs)
-    if not should_capture(root, "tool_result", explicit=explicit):
-        return None
-    record_tool_event(
-        root,
-        session_id=_session_id(kwargs),
-        tool_name=_tool_name(kwargs),
-        payload=_tool_payload(kwargs, result=True),
-        source="hermes",
-        result=True,
-        metadata=_metadata(kwargs),
-        explicit=explicit,
-    )
-    _maybe_roll_session(root, _session_id(kwargs))
+    config: dict[str, Any] = {}
+    try:
+        config = load_adapter_config()
+        root = Path(config["continuum_root"])
+        explicit = _explicit_capture(kwargs)
+        if not should_capture(root, "tool_result", explicit=explicit):
+            return None
+        session_id = _session_id(kwargs)
+        record_tool_event(
+            root,
+            session_id=session_id,
+            tool_name=_tool_name(kwargs),
+            payload=_tool_payload(kwargs, result=True),
+            source="hermes",
+            result=True,
+            metadata=_metadata(kwargs),
+            explicit=explicit,
+        )
+        _maybe_roll_session(root, session_id)
+    except Exception as exc:
+        _log_error(config, "tool_result", exc)
     return None
 
 
 def lifecycle_event(event_name: str, **kwargs: Any) -> None:
-    config = load_adapter_config()
-    root = Path(config["continuum_root"])
-    session_id = _session_id(kwargs)
+    config: dict[str, Any] = {}
     try:
+        config = load_adapter_config()
+        root = Path(config["continuum_root"])
+        session_id = _session_id(kwargs)
         if event_name in {"session_start"}:
             _maybe_snapshot(root, reason=f"hermes:{event_name}:{session_id}", when="start")
         metadata = _metadata(kwargs)
@@ -658,6 +860,17 @@ def _run_command(
     }
 
 
+def _requested_command_failed(result: dict[str, Any], *, dry_run: bool) -> bool:
+    if dry_run:
+        return False
+    if "returncode" in result:
+        return int(result.get("returncode") or 0) != 0
+    return bool(
+        result.get("skipped")
+        and result.get("reason") == "hermes executable not found"
+    )
+
+
 def _find_hermes_exe(hermes_home: Path) -> Path | None:
     candidates = [
         hermes_home / "hermes-agent" / "venv" / "Scripts" / "hermes.exe",
@@ -757,17 +970,31 @@ def install_hermes_adapter(
             secure_write_text(profile_path, profile_snippet, encoding="utf-8")
 
     commands: list[dict[str, Any]] = []
+    command_failed = False
+    commands_aborted_after_failure = False
     exe = Path(hermes_exe) if hermes_exe else _find_hermes_exe(home)
     if enable and exe:
-        commands.append(
-            _run_command(
-                [str(exe), "plugins", "enable", PLUGIN_NAME],
-                dry_run=dry_run,
-                display_command=["hermes", "plugins", "enable", PLUGIN_NAME],
-            )
+        enable_result = _run_command(
+            [str(exe), "plugins", "enable", PLUGIN_NAME],
+            dry_run=dry_run,
+            display_command=["hermes", "plugins", "enable", PLUGIN_NAME],
+        )
+        commands.append(enable_result)
+        command_failed = _requested_command_failed(
+            enable_result,
+            dry_run=dry_run,
         )
     elif enable:
-        commands.append({"command": ["hermes", "plugins", "enable", PLUGIN_NAME], "skipped": True, "reason": "hermes executable not found"})
+        enable_result = {
+            "command": ["hermes", "plugins", "enable", PLUGIN_NAME],
+            "skipped": True,
+            "reason": "hermes executable not found",
+        }
+        commands.append(enable_result)
+        command_failed = _requested_command_failed(
+            enable_result,
+            dry_run=dry_run,
+        )
 
     if set_default_model:
         if not model_name or not base_url:
@@ -788,6 +1015,9 @@ def install_hermes_adapter(
             command = ["config", "set", "model.max_tokens", str(int(max_tokens))]
             config_commands.append((command, command))
         for command, display_command in config_commands:
+            if command_failed:
+                commands_aborted_after_failure = True
+                break
             if command[:3] == ["config", "set", "model.api_key"] and secret_api_key:
                 commands.append(
                     {
@@ -799,16 +1029,30 @@ def install_hermes_adapter(
                 )
                 continue
             if exe:
-                commands.append(
-                    _run_command(
-                        [str(exe), *command],
-                        dry_run=dry_run,
-                        display_command=["hermes", *display_command],
-                        sensitive_values=[api_key],
-                    )
+                command_result = _run_command(
+                    [str(exe), *command],
+                    dry_run=dry_run,
+                    display_command=["hermes", *display_command],
+                    sensitive_values=[api_key],
                 )
+                commands.append(command_result)
             else:
-                commands.append({"command": ["hermes", *display_command], "skipped": True, "reason": "hermes executable not found"})
+                command_result = {
+                    "command": ["hermes", *display_command],
+                    "skipped": True,
+                    "reason": "hermes executable not found",
+                }
+                commands.append(command_result)
+            command_failed = _requested_command_failed(
+                command_result,
+                dry_run=dry_run,
+            )
+
+    failed_commands = [
+        command
+        for command in commands
+        if _requested_command_failed(command, dry_run=dry_run)
+    ]
 
     hermes_home_ref = _path_reference(root, home)
     plugin_source_ref = _path_reference(root, plugin_source)
@@ -816,7 +1060,7 @@ def install_hermes_adapter(
     local_config_ref = _path_reference(root, local_config_path)
     continuum_src_ref = _path_reference(root, src)
     return {
-        "ok": True,
+        "ok": not failed_commands,
         "dry_run": dry_run,
         "plugin_name": PLUGIN_NAME,
         "hermes_home": hermes_home_ref["uri"],
@@ -833,6 +1077,9 @@ def install_hermes_adapter(
         "token_budget": int(token_budget),
         "enabled_requested": enable,
         "commands": commands,
+        "command_failure_count": len(failed_commands),
+        "failed_commands": [command.get("command") for command in failed_commands],
+        "commands_aborted_after_failure": commands_aborted_after_failure,
         "api_key_source": api_key_source if secret_api_key else "none_or_nonsecret",
         "api_key_applied_to_default_model": not (set_default_model and secret_api_key),
         "model_profile_snippet": profile_snippet_for_return,

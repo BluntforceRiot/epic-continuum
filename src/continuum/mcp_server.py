@@ -5,13 +5,25 @@ import math
 import os
 import re
 import sys
-import traceback
 from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import Any, Callable, overload
 
 from . import __version__
-from .core.bundle import pack_root, verify_root_bundle
+from .core.bundle import (
+    BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+    BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO,
+    BUNDLE_ABSOLUTE_MAX_ENTRIES,
+    BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+    BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+    BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+    BUNDLE_DEFAULT_MAX_ENTRIES,
+    BUNDLE_DEFAULT_MAX_EXPANDED_BYTES,
+    BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS,
+    pack_root,
+    verify_root_bundle,
+)
 from .core.config import config_path, default_config, load_config, optimize_config, write_default_config
 from .core.evals import run_memory_quality_evals
 from .core.hardware import PROFILES
@@ -24,7 +36,11 @@ from .core.project_state import (
     PROJECT_STATE_RESERVED_METADATA_KEYS,
     validate_project_state_input,
 )
-from .core.safety import redact_text_secrets, scan_text_for_secrets
+from .core.safety import (
+    redact_error_message_paths,
+    redact_text_secrets,
+    scan_text_for_secrets,
+)
 from .core.operations import (
     OperationGuard,
     doctor,
@@ -133,8 +149,33 @@ MAX_MCP_REQUEST_BYTES = 256 * 1024
 MAX_MCP_JSON_DEPTH = 64
 MAX_PROJECT_STATE_REPAIR_LIMIT = 1000
 MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION = "result_unavailable_after_completed_action"
+_MCP_DIAGNOSTIC_MAX_BYTES = 256
 _runtime_int_digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
 MAX_MCP_JSON_INTEGER_DIGITS = _runtime_int_digit_limit or 4300
+
+
+def _mcp_diagnostic_token(value: object, *, limit: int = 64) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:limit]
+    return token or "unknown"
+
+
+def _emit_mcp_diagnostic(event: str, exc: BaseException | None = None) -> None:
+    """Write one bounded, content-free MCP diagnostic on a best-effort basis."""
+
+    event_token = _mcp_diagnostic_token(event)
+    error_token = _mcp_diagnostic_token(type(exc).__name__) if exc is not None else "none"
+    message = (
+        f"Epic Continuum MCP diagnostic: event={event_token}; "
+        f"error={error_token}; details redacted"
+    )
+    payload = message.encode("ascii", errors="replace")[:_MCP_DIAGNOSTIC_MAX_BYTES]
+    try:
+        sys.stderr.write(payload.decode("ascii") + "\n")
+        sys.stderr.flush()
+    except Exception:
+        # Diagnostics never change the outcome of a completed operation or the
+        # MCP protocol recovery path.
+        pass
 
 
 class _NonIntegralJsonFloat(float):
@@ -416,7 +457,7 @@ def _completed_action_result_unavailable(exc: BaseException) -> JSON:
         "retry_advice": "do_not_retry_automatically",
         "warning": {
             "code": MCP_RESULT_UNAVAILABLE_AFTER_COMPLETED_ACTION,
-            "error_type": type(exc).__name__,
+            "error_type": _mcp_diagnostic_token(type(exc).__name__),
             "message": (
                 "The operation completed, but its result could not be represented as JSON. "
                 "Inspect the operation receipt instead of retrying automatically."
@@ -486,12 +527,7 @@ def guarded_tool(
             # The action has already returned and may have committed durable work.
             # Preserve that completed outcome and give callers an explicit receipt
             # instead of reporting a retryable tool failure after the fact.
-            try:
-                traceback.print_exc(file=sys.stderr)
-            except Exception:
-                # Diagnostics are best effort at this post-commit boundary. A
-                # broken stderr must not turn completed work into a failed receipt.
-                pass
+            _emit_mcp_diagnostic("completed_action_result_unavailable", exc)
             normalized_result = _completed_action_result_unavailable(exc)
         receipt_result = (
             normalized_result
@@ -1335,6 +1371,28 @@ def tool_verify_bundle(args: JSON) -> Any:
     return verify_root_bundle(
         bundle_path,
         verify_embedded_root=optional_bool(args, "verify_embedded_root", True),
+        max_entries=optional_int(
+            args, "max_entries", BUNDLE_DEFAULT_MAX_ENTRIES
+        ),
+        max_expanded_bytes=optional_int(
+            args, "max_expanded_bytes", BUNDLE_DEFAULT_MAX_EXPANDED_BYTES
+        ),
+        max_member_bytes=optional_int(args, "max_member_bytes", None),
+        max_compression_ratio=optional_int(
+            args,
+            "max_compression_ratio",
+            BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+        ),
+        max_central_directory_bytes=optional_int(
+            args,
+            "max_central_directory_bytes",
+            BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
+        timeout_seconds=optional_int(
+            args,
+            "timeout_seconds",
+            BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -2282,6 +2340,36 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
             "properties": {
                 "path": {"type": "string", "minLength": 1},
                 "verify_embedded_root": {"type": "boolean"},
+                "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_ABSOLUTE_MAX_ENTRIES,
+                },
+                "max_expanded_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+                },
+                "max_member_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+                },
+                "max_compression_ratio": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO,
+                },
+                "max_central_directory_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS,
+                },
             },
             "additionalProperties": False,
         },
@@ -3020,10 +3108,13 @@ def dispatch(request: JSON, session_state: _McpSessionState) -> JSON | None:
             return rpc_result(request_id, tool_result(handler(arguments)))
         except Exception as exc:
             if not isinstance(exc, ValueError):
-                traceback.print_exc(file=sys.stderr)
+                _emit_mcp_diagnostic("tool_handler_failed", exc)
             return rpc_result(
                 request_id,
-                tool_result({"error": str(exc), "tool": name}, is_error=True),
+                tool_result(
+                    {"error": redact_error_message_paths(str(exc)), "tool": name},
+                    is_error=True,
+                ),
             )
 
     return rpc_error(request_id, -32601, f"method not found: {method}")
@@ -3149,8 +3240,8 @@ def _write_response(response: JSON) -> None:
             separators=(",", ":"),
             allow_nan=False,
         )
-    except (TypeError, ValueError, RecursionError):
-        traceback.print_exc(file=sys.stderr)
+    except (TypeError, ValueError, RecursionError) as exc:
+        _emit_mcp_diagnostic("response_encoding_failed", exc)
         response_id = response.get("id", _UNKNOWN_REQUEST_ID)
         if response_id is not _UNKNOWN_REQUEST_ID and not _valid_request_id(response_id):
             response_id = _UNKNOWN_REQUEST_ID
@@ -3191,8 +3282,8 @@ def serve() -> int:
             else:
                 try:
                     response = dispatch(request, session_state)
-                except Exception:
-                    traceback.print_exc(file=sys.stderr)
+                except Exception as exc:
+                    _emit_mcp_diagnostic("dispatch_failed", exc)
                     if "id" not in request:
                         response = None
                     else:

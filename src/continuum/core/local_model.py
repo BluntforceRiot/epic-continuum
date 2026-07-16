@@ -56,6 +56,17 @@ class LocalModelError(RuntimeError):
     pass
 
 
+def _best_effort_close(resource: Any | None) -> None:
+    """Close an HTTP resource without replacing the primary request outcome."""
+
+    if resource is None:
+        return
+    try:
+        resource.close()
+    except Exception:
+        return
+
+
 def _remaining_deadline_seconds(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -588,15 +599,14 @@ def _http_json(
         ) as exc:  # Preserve unexpected implementation errors in the calling thread.
             outcome.append(exc)
         finally:
-            if response is not None:
-                response.close()
-            connection.close()
+            _best_effort_close(response)
+            _best_effort_close(connection)
 
     try:
         _local_stage_runner().run(request_deadline, request_once)
     except LocalModelError:
         cancelled.set()
-        connection.close()
+        _best_effort_close(connection)
         raise
     _remaining_deadline_seconds(request_deadline)
     if not outcome:

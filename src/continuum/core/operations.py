@@ -6,7 +6,6 @@ import errno
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import threading
@@ -15,7 +14,7 @@ import traceback
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from .config import CATALOG_PROOF_MODES, config_path, load_config, write_default_config
 from .permissions import (
@@ -68,6 +67,7 @@ _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _OPERATION_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
 _OPERATION_LOCKS_GUARD = threading.Lock()
 _OPERATION_LOCK_STATE = threading.local()
+PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID = "proof_artifact_mutations"
 _WINDOWS_RESERVED_OPERATION_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{index}" for index in range(1, 10)),
@@ -1615,13 +1615,19 @@ def create_proof_pack(
     catalog_proof_mode: str | None = None,
 ) -> dict[str, Any]:
     with operation_lock(root, operation_id):
-        return _create_proof_pack_unlocked(
-            root,
-            operation_id,
-            touched_paths=touched_paths,
-            extra=extra,
-            catalog_proof_mode=catalog_proof_mode,
-        )
+        def create() -> dict[str, Any]:
+            return _create_proof_pack_unlocked(
+                root,
+                operation_id,
+                touched_paths=touched_paths,
+                extra=extra,
+                catalog_proof_mode=catalog_proof_mode,
+            )
+
+        if operation_id == PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID:
+            return create()
+        with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+            return create()
 
 
 def _proof_pack_hash(payload: dict[str, Any]) -> str:
@@ -2654,6 +2660,68 @@ def recover_stale_operations(
     }
 
 
+def _truncate_json_string(value: str, *, serialized_limit: int) -> str:
+    if len(json.dumps(value, ensure_ascii=True)) <= serialized_limit:
+        return value
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(json.dumps(value[:middle], ensure_ascii=True)) <= serialized_limit:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low]
+
+
+def _bounded_operation_failure_error(
+    error: dict[str, Any],
+    *,
+    limit: int = 4000,
+) -> dict[str, Any]:
+    if not isinstance(error, dict) or not error:
+        raise ValueError("failed operation result requires a non-empty structured error")
+    encoded = json.dumps(error, ensure_ascii=True, sort_keys=True, default=str)
+    normalized = json.loads(encoded)
+    if len(encoded) <= limit:
+        return normalized
+    failure_type = _truncate_json_string(
+        str(normalized.get("type") or "OperationResultFailure"),
+        serialized_limit=200,
+    )
+    message = str(
+        normalized.get("message")
+        or normalized.get("error")
+        or "operation returned a failed result"
+    )
+    bounded: dict[str, Any] = {
+        "type": failure_type,
+        "message": "",
+        "truncated": True,
+        "original_size_chars": len(encoded),
+        "original_sha256": content_hash(encoded),
+    }
+    for key in ("code", "stage", "component"):
+        value = normalized.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            bounded[key] = (
+                _truncate_json_string(value, serialized_limit=200)
+                if isinstance(value, str)
+                else value
+            )
+    low = 0
+    high = len(message)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = {**bounded, "message": message[:middle]}
+        if len(json.dumps(candidate, ensure_ascii=True, sort_keys=True)) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    bounded["message"] = message[:low]
+    return bounded
+
+
 class OperationGuard:
     def __init__(
         self,
@@ -2775,6 +2843,44 @@ class OperationGuard:
         if self.finished:
             return self.final_receipt or read_operation(self.root, self.operation_id)
         self.final_receipt = finish_operation(self.root, self.operation_id, status="succeeded", result=result)
+        if self.proof:
+            proof_paths = [*self.touched_paths, *(touched_paths or [])]
+            try:
+                create_proof_pack(
+                    self.root,
+                    self.operation_id,
+                    touched_paths=proof_paths,
+                    extra=proof_extra,
+                    catalog_proof_mode=self.catalog_proof_mode,
+                )
+            except Exception as proof_exc:
+                try:
+                    _record_proof_pack_failure(self.root, self.operation_id, proof_exc)
+                except Exception:
+                    pass
+            self.final_receipt = read_operation(self.root, self.operation_id)
+        self.finished = True
+        return self.final_receipt
+
+    def fail_result(
+        self,
+        result: dict[str, Any] | None,
+        *,
+        error: dict[str, Any],
+        touched_paths: list[Path | str] | None = None,
+        proof_extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Finish a guarded false result without converting it into success."""
+        if self.finished:
+            return self.final_receipt or read_operation(self.root, self.operation_id)
+        bounded_error = _bounded_operation_failure_error(error)
+        self.final_receipt = finish_operation(
+            self.root,
+            self.operation_id,
+            status="failed",
+            result=result,
+            error=bounded_error,
+        )
         if self.proof:
             proof_paths = [*self.touched_paths, *(touched_paths or [])]
             try:
@@ -3392,16 +3498,624 @@ def _blocked_restore_drill_result(
     return result
 
 
-def _cleanup_restore_drill_root(root: Path, drill_root: Path) -> None:
-    parent = (root / "run" / "restore_drills").resolve(strict=False)
-    candidate = drill_root.resolve(strict=False)
-    if candidate.parent != parent or not candidate.name.startswith("restore_"):
+RestoreDrillRootIdentity = tuple[int, int, int]
+
+
+class _RestoreCleanupCapabilityUnavailable(OSError):
+    """The reserved root lacks the primitives needed for identity-bound cleanup."""
+
+
+class _RestoreDrillRootReservation:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        identity: RestoreDrillRootIdentity,
+        native: Any | None = None,
+        parent_handle: int = 0,
+        root_handle: int = 0,
+        directory_fd: int = -1,
+    ) -> None:
+        self.path = path
+        self.identity = identity
+        self.native = native
+        self.parent_handle = parent_handle
+        self.root_handle = root_handle
+        self.directory_fd = directory_fd
+
+
+def _restore_drill_root_identity(metadata: os.stat_result) -> RestoreDrillRootIdentity:
+    return (int(metadata.st_dev), int(metadata.st_ino), stat.S_IFMT(metadata.st_mode))
+
+
+def _strict_path_absent(path: Path) -> bool:
+    """Return true only when ``lstat`` proves that the pathname is absent."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _bounded_exception_note(exc: BaseException, *, limit: int = 400) -> str:
+    text = " ".join(str(exc).split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return f"{type(exc).__name__}: {text}"
+
+
+def _note_secondary_failure(
+    primary: BaseException,
+    *,
+    action: str,
+    secondary: BaseException,
+) -> None:
+    primary.add_note(f"{action} also failed: {_bounded_exception_note(secondary)}")
+
+
+def _close_native_after_error(
+    native: Any,
+    handle: int,
+    primary: BaseException,
+    *,
+    action: str,
+) -> None:
+    try:
+        native.close(handle)
+    except BaseException as secondary:
+        _note_secondary_failure(primary, action=action, secondary=secondary)
+
+
+def _close_fd_after_error(
+    fd: int,
+    primary: BaseException,
+    *,
+    action: str,
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as secondary:
+        _note_secondary_failure(primary, action=action, secondary=secondary)
+
+
+def _close_restore_drill_reservation(reservation: _RestoreDrillRootReservation) -> None:
+    errors: list[BaseException] = []
+    if reservation.directory_fd >= 0:
+        try:
+            os.close(reservation.directory_fd)
+        except BaseException as exc:
+            errors.append(exc)
+        reservation.directory_fd = -1
+    if reservation.native is not None:
+        for attribute in ("root_handle", "parent_handle"):
+            handle = int(getattr(reservation, attribute))
+            if not handle:
+                continue
+            try:
+                reservation.native.close(handle)
+            except BaseException as exc:
+                errors.append(exc)
+            setattr(reservation, attribute, 0)
+    if errors:
+        for secondary in errors[1:]:
+            _note_secondary_failure(
+                errors[0],
+                action="Closing another restore-drill reservation resource",
+                secondary=secondary,
+            )
+        raise errors[0]
+
+
+def _reserve_restore_drill_root(root: Path, drill_root: Path) -> _RestoreDrillRootReservation:
+    parent = root / "run" / "restore_drills"
+    _ensure_restore_output_safe(root, parent)
+    secure_mkdir(parent)
+    _ensure_restore_output_safe(root, drill_root)
+    if os.name == "nt":
+        from .review_bridge import _windows_native_confinement
+
+        native = _windows_native_confinement()
+        parent_handle = native.open_anchor(str(parent))
+        root_handle = 0
+        try:
+            root_handle = native.open_relative(
+                parent_handle,
+                drill_root.name,
+                directory=True,
+                disposition=native._FILE_CREATE,
+                desired_access=(
+                    native._DELETE
+                    | native._SYNCHRONIZE
+                    | native._FILE_READ_ATTRIBUTES
+                    | native._FILE_LIST_DIRECTORY
+                    | native._FILE_TRAVERSE
+                ),
+                share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+            )
+            metadata = native.fstat(root_handle)
+            path_metadata = os.lstat(drill_root)
+            identity = _restore_drill_root_identity(metadata)
+            if identity != _restore_drill_root_identity(path_metadata):
+                raise ValueError(
+                    f"restore-drill reservation path does not match its native handle: {drill_root}"
+                )
+            return _RestoreDrillRootReservation(
+                path=drill_root,
+                identity=identity,
+                native=native,
+                parent_handle=parent_handle,
+                root_handle=root_handle,
+            )
+        except FileExistsError as exc:
+            collision = FileExistsError(f"restore-drill root already exists: {drill_root}")
+            if root_handle:
+                _close_native_after_error(
+                    native,
+                    root_handle,
+                    collision,
+                    action="Closing the colliding restore-drill root handle",
+                )
+            _close_native_after_error(
+                native,
+                parent_handle,
+                collision,
+                action="Closing the restore-drill parent handle",
+            )
+            raise collision from exc
+        except BaseException as original:
+            if root_handle:
+                _close_native_after_error(
+                    native,
+                    root_handle,
+                    original,
+                    action="Closing the failed restore-drill root handle",
+                )
+            _close_native_after_error(
+                native,
+                parent_handle,
+                original,
+                action="Closing the restore-drill parent handle",
+            )
+            raise
+
+    try:
+        os.mkdir(drill_root, 0o700)
+    except FileExistsError as exc:
+        raise FileExistsError(f"restore-drill root already exists: {drill_root}") from exc
+    directory_fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(drill_root, flags)
+        metadata = os.fstat(directory_fd)
+        path_metadata = os.lstat(drill_root)
+        reason = _link_like_reason(drill_root)
+        identity = _restore_drill_root_identity(metadata)
+        if (
+            reason is not None
+            or not stat.S_ISDIR(metadata.st_mode)
+            or identity != _restore_drill_root_identity(path_metadata)
+        ):
+            raise ValueError(f"restore-drill reservation is not a physical directory: {drill_root}")
+        reservation = _RestoreDrillRootReservation(
+            path=drill_root,
+            identity=identity,
+            directory_fd=directory_fd,
+        )
+        directory_fd = -1
+        return reservation
+    except BaseException as original:
+        if directory_fd >= 0:
+            _close_fd_after_error(
+                directory_fd,
+                original,
+                action="Closing the failed restore-drill directory descriptor",
+            )
+        original.add_note(
+            "The failed POSIX restore-drill reservation was retained because "
+            "identity-bound root removal was unavailable."
+        )
+        raise
+
+
+def _delete_windows_restore_tree(
+    reservation: _RestoreDrillRootReservation,
+    path: Path,
+    handle: int,
+) -> None:
+    native = reservation.native
+    if native is None:
+        raise OSError("Windows identity-bound restore cleanup is unavailable")
+    for entry in list(os.scandir(path)):
+        child_path = path / entry.name
+        path_metadata = os.lstat(child_path)
+        reason = _link_like_reason(child_path)
+        if reason is not None:
+            raise ValueError(f"refusing {reason} restore-drill cleanup child: {child_path}")
+        is_directory = stat.S_ISDIR(path_metadata.st_mode)
+        if not is_directory and not stat.S_ISREG(path_metadata.st_mode):
+            raise ValueError(f"refusing non-regular restore-drill cleanup child: {child_path}")
+        desired_access = native._DELETE | native._SYNCHRONIZE | native._FILE_READ_ATTRIBUTES
+        if is_directory:
+            desired_access |= native._FILE_LIST_DIRECTORY | native._FILE_TRAVERSE
+        child_handle = native.open_relative(
+            handle,
+            entry.name,
+            directory=is_directory,
+            desired_access=desired_access,
+            share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+        )
+        try:
+            handle_metadata = native.fstat(child_handle)
+            if _restore_drill_root_identity(handle_metadata) != _restore_drill_root_identity(
+                os.lstat(child_path)
+            ):
+                raise ValueError(
+                    f"restore-drill cleanup child path changed after native open: {child_path}"
+                )
+            if is_directory:
+                _delete_windows_restore_tree(reservation, child_path, child_handle)
+            native.mark_delete(child_handle)
+        except BaseException as original:
+            _close_native_after_error(
+                native,
+                child_handle,
+                original,
+                action=f"Closing restore-drill cleanup handle for {entry.name}",
+            )
+            raise
+        else:
+            native.close(child_handle)
+        if not _strict_path_absent(child_path):
+            raise OSError(f"restore-drill cleanup child was repopulated: {child_path}")
+
+
+def _require_posix_restore_inspection_capability() -> None:
+    required_dir_fd = (os.open, os.stat)
+    if (
+        not getattr(os, "O_DIRECTORY", 0)
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or not getattr(os, "O_NONBLOCK", 0)
+        or os.listdir not in os.supports_fd
+        or any(function not in os.supports_dir_fd for function in required_dir_fd)
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        raise _RestoreCleanupCapabilityUnavailable(
+            "descriptor-relative restore-drill inspection is unavailable on this platform"
+        )
+
+
+def _validate_restore_cleanup_component(name: str) -> None:
+    if (
+        name in {"", ".", ".."}
+        or "\x00" in name
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise ValueError(f"refusing unsafe restore-drill cleanup component: {name!r}")
+
+
+def _retained_restore_file_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        *_restore_drill_root_identity(metadata),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(getattr(metadata, "st_nlink", 0)),
+    )
+
+
+def _inspect_posix_retained_restore_tree(directory_fd: int) -> tuple[int, int]:
+    """Verify a pinned POSIX drill tree without modifying any payload bytes."""
+    retained_file_count = 0
+    retained_bytes = 0
+    for name in sorted(os.listdir(directory_fd)):
+        _validate_restore_cleanup_component(name)
+        path_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        is_directory = stat.S_ISDIR(path_metadata.st_mode)
+        if not is_directory and not stat.S_ISREG(path_metadata.st_mode):
+            raise ValueError(
+                f"refusing non-regular retained restore-drill child: {name}"
+            )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if is_directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        child_fd = os.open(name, flags, dir_fd=directory_fd)
+        try:
+            handle_metadata = os.fstat(child_fd)
+            current_metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _restore_drill_root_identity(handle_metadata)
+                != _restore_drill_root_identity(path_metadata)
+                or _restore_drill_root_identity(current_metadata)
+                != _restore_drill_root_identity(handle_metadata)
+            ):
+                raise ValueError(
+                    f"retained restore-drill child changed after descriptor open: {name}"
+                )
+            if is_directory:
+                child_file_count, child_bytes = _inspect_posix_retained_restore_tree(child_fd)
+                retained_file_count += child_file_count
+                retained_bytes += child_bytes
+            else:
+                expected_file_identity = _retained_restore_file_identity(path_metadata)
+                if (
+                    expected_file_identity[-1] != 1
+                    or _retained_restore_file_identity(handle_metadata)
+                    != expected_file_identity
+                    or _retained_restore_file_identity(current_metadata)
+                    != expected_file_identity
+                ):
+                    raise ValueError(
+                        f"refusing changed or multiply linked retained restore-drill file: {name}"
+                    )
+            final_handle_metadata = os.fstat(child_fd)
+            final_path_metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _restore_drill_root_identity(final_handle_metadata)
+                != _restore_drill_root_identity(handle_metadata)
+                or _restore_drill_root_identity(final_path_metadata)
+                != _restore_drill_root_identity(handle_metadata)
+            ):
+                raise ValueError(
+                    f"retained restore-drill child changed during inspection: {name}"
+                )
+            if not is_directory and (
+                _retained_restore_file_identity(final_handle_metadata)
+                != expected_file_identity
+                or _retained_restore_file_identity(final_path_metadata)
+                != expected_file_identity
+            ):
+                raise ValueError(
+                    f"retained restore-drill file changed or became multiply linked: {name}"
+                )
+            if not is_directory:
+                retained_file_count += 1
+                retained_bytes += int(final_handle_metadata.st_size)
+        except BaseException as original:
+            _close_fd_after_error(
+                child_fd,
+                original,
+                action=f"Closing retained restore-drill inspection descriptor for {name}",
+            )
+            raise
+        else:
+            os.close(child_fd)
+    return retained_file_count, retained_bytes
+
+
+def _cleanup_result(
+    *,
+    ok: bool,
+    status: str,
+    root_retained: bool,
+    path_state: str,
+    error: str | None = None,
+    retained_file_count: int | None = None,
+    retained_bytes: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "status": status,
+        "root_retained": root_retained,
+        "path_state": path_state,
+    }
+    if error is not None:
+        result["error"] = error
+    if retained_file_count is not None:
+        result["retained_file_count"] = retained_file_count
+    if retained_bytes is not None:
+        result["retained_bytes"] = retained_bytes
+    return result
+
+
+def _cleanup_restore_drill_root_impl(
+    root: Path,
+    drill_root: Path,
+    *,
+    reservation: _RestoreDrillRootReservation,
+) -> dict[str, Any]:
+    parent = Path(os.path.abspath(root / "run" / "restore_drills"))
+    candidate = Path(os.path.abspath(drill_root))
+    reserved_candidate = Path(os.path.abspath(reservation.path))
+    if (
+        candidate.parent != parent
+        or not candidate.name.startswith("restore_")
+        or reserved_candidate != candidate
+    ):
         raise ValueError(f"refusing unsafe restore-drill cleanup target: {drill_root}")
-    reason = _link_like_reason(candidate)
-    if reason is not None:
-        raise ValueError(f"refusing {reason} restore-drill cleanup target: {drill_root}")
-    if candidate.exists():
-        shutil.rmtree(candidate)
+
+    if reservation.native is not None and reservation.root_handle:
+        _ensure_restore_output_safe(root, candidate)
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError as exc:
+            raise OSError(
+                f"reserved restore-drill pathname moved or disappeared: {drill_root}"
+            ) from exc
+        reason = _link_like_reason(candidate)
+        if reason is not None:
+            raise ValueError(f"refusing {reason} restore-drill cleanup target: {drill_root}")
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or _restore_drill_root_identity(metadata) != reservation.identity
+        ):
+            raise ValueError(f"refusing replaced restore-drill cleanup target: {drill_root}")
+        handle_metadata = reservation.native.fstat(reservation.root_handle)
+        if _restore_drill_root_identity(handle_metadata) != reservation.identity:
+            raise ValueError(f"refusing changed restore-drill reservation handle: {drill_root}")
+        _delete_windows_restore_tree(reservation, candidate, reservation.root_handle)
+        reservation.native.mark_delete(reservation.root_handle)
+        reservation.native.close(reservation.root_handle)
+        reservation.root_handle = 0
+        if not _strict_path_absent(candidate):
+            raise OSError(f"restore-drill cleanup target was repopulated: {drill_root}")
+        return _cleanup_result(
+            ok=True,
+            status="cleaned",
+            root_retained=False,
+            path_state="absent",
+        )
+
+    if reservation.directory_fd >= 0:
+        _require_posix_restore_inspection_capability()
+        handle_metadata = os.fstat(reservation.directory_fd)
+        if (
+            not stat.S_ISDIR(handle_metadata.st_mode)
+            or _restore_drill_root_identity(handle_metadata) != reservation.identity
+        ):
+            raise ValueError(f"refusing changed restore-drill reservation descriptor: {drill_root}")
+        retained_file_count, retained_bytes = _inspect_posix_retained_restore_tree(
+            reservation.directory_fd
+        )
+        final_metadata = os.fstat(reservation.directory_fd)
+        if _restore_drill_root_identity(final_metadata) != reservation.identity:
+            raise ValueError(f"restore-drill reservation identity changed: {drill_root}")
+        try:
+            path_metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            linked = int(getattr(final_metadata, "st_nlink", 1)) > 0
+            return _cleanup_result(
+                ok=False,
+                status=("inspected_root_moved" if linked else "inspected_root_unlinked"),
+                root_retained=linked,
+                path_state=("moved_or_identity_unavailable" if linked else "unlinked"),
+                error=(
+                    "the reserved restore-drill root was inspected without content mutation "
+                    "through its pinned descriptor, "
+                    "but its original pathname is absent"
+                ),
+                retained_file_count=retained_file_count,
+                retained_bytes=retained_bytes,
+            )
+        reason = _link_like_reason(candidate)
+        if reason is not None:
+            return _cleanup_result(
+                ok=False,
+                status="inspected_root_moved_or_replaced",
+                root_retained=True,
+                path_state=reason,
+                error=f"the original restore-drill pathname is now {reason}",
+                retained_file_count=retained_file_count,
+                retained_bytes=retained_bytes,
+            )
+        if (
+            not stat.S_ISDIR(path_metadata.st_mode)
+            or _restore_drill_root_identity(path_metadata) != reservation.identity
+        ):
+            return _cleanup_result(
+                ok=False,
+                status="inspected_root_moved_or_replaced",
+                root_retained=True,
+                path_state="replaced",
+                error="the original restore-drill pathname no longer names the reserved root",
+                retained_file_count=retained_file_count,
+                retained_bytes=retained_bytes,
+            )
+        return _cleanup_result(
+            ok=True,
+            status="inspected_root_retained",
+            root_retained=True,
+            path_state="bound_inspected_tree_retained",
+            retained_file_count=retained_file_count,
+            retained_bytes=retained_bytes,
+        )
+
+    raise _RestoreCleanupCapabilityUnavailable(
+        f"identity-bound restore-drill cleanup is unavailable; retained {drill_root}"
+    )
+
+
+def _cleanup_restore_drill_root(
+    root: Path,
+    drill_root: Path,
+    *,
+    reservation: _RestoreDrillRootReservation,
+) -> dict[str, Any]:
+    try:
+        return _cleanup_restore_drill_root_impl(
+            root,
+            drill_root,
+            reservation=reservation,
+        )
+    except _RestoreCleanupCapabilityUnavailable as exc:
+        return _cleanup_result(
+            ok=False,
+            status="identity_capability_unavailable",
+            root_retained=True,
+            path_state="retained_or_unknown",
+            error=_bounded_exception_note(exc),
+        )
+    except Exception as exc:
+        return _cleanup_result(
+            ok=False,
+            status="cleanup_failed_or_incomplete",
+            root_retained=True,
+            path_state="retained_or_unknown",
+            error=_bounded_exception_note(exc),
+        )
+
+
+def _verify_restore_cleanup_postcondition(
+    drill_root: Path,
+    *,
+    reservation: _RestoreDrillRootReservation,
+    cleanup: dict[str, Any],
+) -> None:
+    status = str(cleanup.get("status") or "")
+    if status == "cleaned":
+        if not _strict_path_absent(drill_root):
+            raise OSError(f"cleaned restore-drill pathname was repopulated: {drill_root}")
+        return
+    if status != "inspected_root_retained":
+        raise OSError(f"restore-drill cleanup has no successful postcondition: {status}")
+    before = os.lstat(drill_root)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or _restore_drill_root_identity(before) != reservation.identity
+    ):
+        raise OSError(f"inspected restore-drill root identity changed: {drill_root}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    directory_fd = os.open(drill_root, flags)
+    try:
+        handle_metadata = os.fstat(directory_fd)
+        if _restore_drill_root_identity(handle_metadata) != reservation.identity:
+            raise OSError(f"inspected restore-drill descriptor identity changed: {drill_root}")
+        retained_file_count, retained_bytes = _inspect_posix_retained_restore_tree(directory_fd)
+        if retained_file_count != int(cleanup.get("retained_file_count", -1)):
+            raise OSError("inspected restore-drill retained file count changed")
+        if retained_bytes != int(cleanup.get("retained_bytes", -1)):
+            raise OSError("inspected restore-drill retained byte count changed")
+    except BaseException as original:
+        _close_fd_after_error(
+            directory_fd,
+            original,
+            action="Closing final inspected restore-drill descriptor",
+        )
+        raise
+    else:
+        os.close(directory_fd)
+    after = os.lstat(drill_root)
+    if _restore_drill_root_identity(after) != reservation.identity:
+        raise OSError(f"inspected restore-drill root changed during final verification: {drill_root}")
 
 
 def verify_root(
@@ -3588,7 +4302,7 @@ def verify_root(
     }
 
 
-def restore_drill(
+def _restore_drill_impl(
     root: Path,
     *,
     snapshot_uri: str | None = None,
@@ -3596,6 +4310,7 @@ def restore_drill(
     verify_recent_proof_packs: int = 1,
     allowed_roots: list[Path] | None = None,
     retain_drill_root: bool = True,
+    _on_drill_root_created: Callable[[Path, _RestoreDrillRootReservation], None] | None = None,
 ) -> dict[str, Any]:
     created_seed_snapshot: dict[str, Any] | None = None
     output_audit = _audit_restore_drill_output_paths(root)
@@ -3723,6 +4438,9 @@ def restore_drill(
 
     drill_id = unique_id("restore")
     drill_root = root / "run" / "restore_drills" / drill_id
+    drill_root_reservation = _reserve_restore_drill_root(root, drill_root)
+    if _on_drill_root_created is not None:
+        _on_drill_root_created(drill_root, drill_root_reservation)
     restored_db = drill_root / "catalog" / "catalog.sqlite3"
     _restore_copy_file(root, selected_snapshot, restored_db)
     secure_sqlite_files(restored_db)
@@ -3908,25 +4626,181 @@ def restore_drill(
         "audit": audit_result,
         "semantic_integrity": restored_semantic_integrity,
         "drill_root_retained": bool(retain_drill_root),
+        "drill_root_cleanup_status": (
+            "retained_by_request" if retain_drill_root else "pending_cleanup"
+        ),
     }
+    cleanup: dict[str, Any] | None = None
+    cleanup_check: dict[str, Any] | None = None
     if not retain_drill_root:
-        try:
-            _cleanup_restore_drill_root(root, drill_root)
-            cleanup_check = {"name": "drill_root_cleanup", "ok": True, "path": str(drill_root)}
-        except Exception as exc:
-            result["drill_root_retained"] = True
-            cleanup_check = {
-                "name": "drill_root_cleanup",
-                "ok": False,
-                "path": str(drill_root),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+        cleanup = _cleanup_restore_drill_root(
+            root,
+            drill_root,
+            reservation=drill_root_reservation,
+        )
+        result["drill_root_retained"] = bool(cleanup["root_retained"])
+        result["drill_root_cleanup_status"] = cleanup["status"]
+        result["drill_root_cleanup_path_state"] = cleanup["path_state"]
+        if cleanup.get("retained_file_count") is not None:
+            result["drill_root_retained_file_count"] = int(cleanup["retained_file_count"])
+        if cleanup.get("retained_bytes") is not None:
+            result["drill_root_retained_bytes"] = int(cleanup["retained_bytes"])
+        cleanup_check = {
+            "name": "drill_root_cleanup",
+            "ok": bool(cleanup["ok"]),
+            "path": str(drill_root),
+            "status": cleanup["status"],
+            "path_state": cleanup["path_state"],
+        }
+        if cleanup.get("error") is not None:
+            cleanup_check["error"] = cleanup["error"]
+        if cleanup.get("retained_file_count") is not None:
+            cleanup_check["retained_file_count"] = int(cleanup["retained_file_count"])
+        if cleanup.get("retained_bytes") is not None:
+            cleanup_check["retained_bytes"] = int(cleanup["retained_bytes"])
         checks.append(cleanup_check)
-        result["checks"] = checks
-        result["ok"] = all(check["ok"] for check in checks)
+
+    cleanup_needs_postcondition = bool(cleanup is not None and cleanup.get("ok"))
+    cleanup_postcondition = dict(cleanup) if cleanup_needs_postcondition and cleanup is not None else None
+    close_error_text: str | None = None
+    try:
+        _close_restore_drill_reservation(drill_root_reservation)
+    except Exception as close_error:
+        close_error_text = _bounded_exception_note(close_error)
+        reservation_close_check = {
+            "name": "drill_root_reservation_closed",
+            "ok": False,
+            "error": close_error_text,
+        }
+    else:
+        reservation_close_check = {
+            "name": "drill_root_reservation_closed",
+            "ok": True,
+        }
+    checks.append(reservation_close_check)
+
+    if cleanup_needs_postcondition and close_error_text is not None:
+        assert cleanup is not None and cleanup_check is not None
+        cleanup["ok"] = False
+        cleanup["status"] = "cleanup_failed_or_incomplete"
+        cleanup["error"] = f"restore-drill reservation close failed: {close_error_text}"
+        result["drill_root_cleanup_status"] = cleanup["status"]
+        cleanup_check.update(
+            ok=False,
+            status=cleanup["status"],
+            error=cleanup["error"],
+        )
+
+    if cleanup_needs_postcondition:
+        assert cleanup is not None and cleanup_postcondition is not None
+        cleanup_state = cleanup
+        try:
+            _verify_restore_cleanup_postcondition(
+                drill_root,
+                reservation=drill_root_reservation,
+                cleanup=cleanup_postcondition,
+            )
+        except Exception as exc:
+            postcondition_error = _bounded_exception_note(exc)
+            prior_error = cleanup_state.get("error")
+            combined_error = (
+                f"{prior_error}; final cleanup postcondition failed: {postcondition_error}"
+                if prior_error
+                else postcondition_error
+            )
+            cleanup_state["ok"] = False
+            cleanup_state["status"] = "cleanup_failed_or_incomplete"
+            cleanup_state["root_retained"] = True
+            cleanup_state["path_state"] = "retained_or_unknown"
+            cleanup_state["error"] = combined_error
+            result["drill_root_retained"] = True
+            result["drill_root_cleanup_status"] = cleanup_state["status"]
+            result["drill_root_cleanup_path_state"] = cleanup_state["path_state"]
+            assert cleanup_check is not None
+            cleanup_check.update(
+                ok=False,
+                status=cleanup_state["status"],
+                path_state=cleanup_state["path_state"],
+                error=combined_error,
+            )
+
+    result["checks"] = checks
+    result["ok"] = all(check["ok"] for check in checks)
     out_path = root / "exports" / "restore_drills" / f"{drill_id}.json"
     result["receipt_uri"] = str(out_path)
     stored_result = _root_relative_payload(root, result)
     stored_result["receipt_uri"] = _stored_root_uri(root, out_path)
     atomic_write_json(out_path, stored_result)
+    return result
+
+
+def restore_drill(
+    root: Path,
+    *,
+    snapshot_uri: str | None = None,
+    drill_name: str = "epic-continuum-restore-drill",
+    verify_recent_proof_packs: int = 1,
+    allowed_roots: list[Path] | None = None,
+    retain_drill_root: bool = True,
+) -> dict[str, Any]:
+    """Run a restore drill and clean exceptional disposable roots."""
+    created_drill_root: Path | None = None
+    created_drill_root_reservation: _RestoreDrillRootReservation | None = None
+
+    def remember_drill_root(path: Path, reservation: _RestoreDrillRootReservation) -> None:
+        nonlocal created_drill_root, created_drill_root_reservation
+        created_drill_root = path
+        created_drill_root_reservation = reservation
+
+    try:
+        result = _restore_drill_impl(
+            root,
+            snapshot_uri=snapshot_uri,
+            drill_name=drill_name,
+            verify_recent_proof_packs=verify_recent_proof_packs,
+            allowed_roots=allowed_roots,
+            retain_drill_root=retain_drill_root,
+            _on_drill_root_created=remember_drill_root,
+        )
+    except BaseException as original:
+        if (
+            not retain_drill_root
+            and created_drill_root is not None
+            and created_drill_root_reservation is not None
+        ):
+            try:
+                cleanup = _cleanup_restore_drill_root(
+                    root,
+                    created_drill_root,
+                    reservation=created_drill_root_reservation,
+                )
+            except BaseException as cleanup_error:
+                original.add_note(
+                    "Disposable restore-drill cleanup also failed: "
+                    + _bounded_exception_note(cleanup_error)
+                )
+            else:
+                if not cleanup.get("ok"):
+                    original.add_note(
+                        "Disposable restore-drill cleanup was incomplete: "
+                        f"status={cleanup.get('status')}; "
+                        f"{cleanup.get('error') or 'no final postcondition'}"
+                    )
+                elif cleanup.get("root_retained"):
+                    original.add_note(
+                        "Disposable restore-drill root was inspected and retained without "
+                        f"content mutation: status={cleanup.get('status')}; "
+                        f"path={created_drill_root}"
+                    )
+        if created_drill_root_reservation is not None:
+            try:
+                _close_restore_drill_reservation(created_drill_root_reservation)
+            except BaseException as close_error:
+                original.add_note(
+                    "Restore-drill reservation close also failed: "
+                    + _bounded_exception_note(close_error)
+                )
+        raise
+    if created_drill_root_reservation is not None:
+        _close_restore_drill_reservation(created_drill_root_reservation)
     return result

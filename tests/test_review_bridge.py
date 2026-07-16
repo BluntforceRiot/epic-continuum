@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import patch
 
 from continuum.core.review_bridge import (
@@ -4176,6 +4177,548 @@ class ReviewBridgeTest(unittest.TestCase):
                 exclusive=True,
             )
             self.assertEqual(target.read_text(encoding="utf-8"), "complete-payload")
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle-relative proof")
+    def test_windows_confined_sinks_pin_ancestors_and_leaf_handles(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Native handles\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Exercise Windows handle-relative storage.",
+                transport="manual",
+            )
+            job_dir = Path(job["job_dir"])
+            target = job_dir / "receipts" / "pinned.txt"
+            review_bridge_module._confined_write_text(
+                root,
+                job["job_id"],
+                target,
+                "original",
+                exclusive=True,
+            )
+            api = review_bridge_module._windows_native_confinement()
+
+            real_open_relative = api.open_relative
+            ancestor_moved = False
+            moved_job_dir = job_dir.with_name(f"{job_dir.name}-substituted")
+
+            def attempt_ancestor_substitution(
+                parent_handle: int,
+                name: str,
+                **kwargs: object,
+            ) -> int:
+                nonlocal ancestor_moved
+                handle = real_open_relative(parent_handle, name, **kwargs)
+                if name == job["job_id"] and not ancestor_moved:
+                    os.replace(job_dir, moved_job_dir)
+                    job_dir.mkdir()
+                    substitute_receipts = job_dir / "receipts"
+                    substitute_receipts.mkdir()
+                    (substitute_receipts / target.name).write_text(
+                        "substituted",
+                        encoding="utf-8",
+                    )
+                    ancestor_moved = True
+                return handle
+
+            try:
+                with patch.object(
+                    api,
+                    "open_relative",
+                    side_effect=attempt_ancestor_substitution,
+                ):
+                    self.assertEqual(
+                        review_bridge_module._confined_read_bytes(
+                            root,
+                            job["job_id"],
+                            target,
+                        ),
+                        b"original",
+                    )
+                self.assertTrue(ancestor_moved)
+                self.assertEqual(target.read_text(encoding="utf-8"), "substituted")
+                self.assertEqual(
+                    (moved_job_dir / "receipts" / target.name).read_text(
+                        encoding="utf-8"
+                    ),
+                    "original",
+                )
+            finally:
+                if ancestor_moved:
+                    shutil.rmtree(job_dir)
+                    os.replace(moved_job_dir, job_dir)
+
+            leaf_attempts: list[OSError] = []
+            replacement = base / "replacement.txt"
+            replacement.write_text("substituted", encoding="utf-8")
+
+            def attempt_leaf_substitution(
+                parent_handle: int,
+                name: str,
+                **kwargs: object,
+            ) -> int:
+                handle = real_open_relative(parent_handle, name, **kwargs)
+                if name == target.name and not leaf_attempts:
+                    try:
+                        os.replace(replacement, target)
+                    except OSError as exc:
+                        leaf_attempts.append(exc)
+                    else:
+                        self.fail("an opened review job leaf was replaceable")
+                return handle
+
+            with patch.object(
+                api,
+                "open_relative",
+                side_effect=attempt_leaf_substitution,
+            ):
+                self.assertEqual(
+                    review_bridge_module._confined_file_sha256(
+                        root,
+                        job["job_id"],
+                        target,
+                    ),
+                    hashlib.sha256(b"original").hexdigest(),
+                )
+            self.assertEqual(len(leaf_attempts), 1)
+            self.assertEqual(
+                review_bridge_module._confined_file_size(
+                    root,
+                    job["job_id"],
+                    target,
+                ),
+                len(b"original"),
+            )
+            self.assertEqual(target.read_bytes(), b"original")
+
+            parent_moved = False
+            parent_blocked: list[OSError] = []
+            real_rename_relative = api.rename_relative
+
+            def attempt_parent_substitution(
+                handle: int,
+                parent_handle: int,
+                name: str,
+                **kwargs: object,
+            ) -> None:
+                nonlocal parent_moved
+                try:
+                    os.replace(job_dir, moved_job_dir)
+                except OSError as exc:
+                    parent_blocked.append(exc)
+                else:
+                    job_dir.mkdir()
+                    substitute_receipts = job_dir / "receipts"
+                    substitute_receipts.mkdir()
+                    (substitute_receipts / target.name).write_text(
+                        "substituted-write-target",
+                        encoding="utf-8",
+                    )
+                    parent_moved = True
+                real_rename_relative(handle, parent_handle, name, **kwargs)
+
+            try:
+                with patch.object(
+                    api,
+                    "rename_relative",
+                    side_effect=attempt_parent_substitution,
+                ):
+                    review_bridge_module._confined_write_text(
+                        root,
+                        job["job_id"],
+                        target,
+                        "updated",
+                    )
+                self.assertTrue(parent_moved or len(parent_blocked) == 1)
+                if parent_moved:
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        "substituted-write-target",
+                    )
+                    self.assertEqual(
+                        (moved_job_dir / "receipts" / target.name).read_text(
+                            encoding="utf-8"
+                        ),
+                        "updated",
+                    )
+                else:
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        "updated",
+                    )
+            finally:
+                if parent_moved:
+                    shutil.rmtree(job_dir)
+                    os.replace(moved_job_dir, job_dir)
+
+            delete_attempts: list[OSError] = []
+            replacement.write_text("replacement", encoding="utf-8")
+
+            def attempt_delete_leaf_substitution(
+                parent_handle: int,
+                name: str,
+                **kwargs: object,
+            ) -> int:
+                handle = real_open_relative(parent_handle, name, **kwargs)
+                if name == target.name and not delete_attempts:
+                    try:
+                        os.replace(replacement, target)
+                    except OSError as exc:
+                        delete_attempts.append(exc)
+                    else:
+                        self.fail("a delete target was replaceable after its exact open")
+                return handle
+
+            with patch.object(
+                api,
+                "open_relative",
+                side_effect=attempt_delete_leaf_substitution,
+            ):
+                review_bridge_module._confined_unlink(
+                    root,
+                    job["job_id"],
+                    target,
+                )
+            self.assertEqual(len(delete_attempts), 1)
+            self.assertFalse(target.exists())
+            self.assertTrue(replacement.exists())
+
+            short_target = job_dir / "receipts" / "x"
+            review_bridge_module._confined_write_text(
+                root,
+                job["job_id"],
+                short_target,
+                "short-name-native-rename",
+                exclusive=True,
+            )
+            self.assertEqual(
+                short_target.read_text(encoding="utf-8"),
+                "short-name-native-rename",
+            )
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "already exists",
+            ):
+                review_bridge_module._confined_write_text(
+                    root,
+                    job["job_id"],
+                    short_target,
+                    "must-not-replace",
+                    exclusive=True,
+                )
+            self.assertEqual(
+                short_target.read_text(encoding="utf-8"),
+                "short-name-native-rename",
+            )
+
+            missing_directory = job_dir / review_bridge_module.REVIEW_FINDINGS_DIR
+            missing_directory.rmdir()
+            self.assertEqual(
+                review_bridge_module._ensure_confined_subdirectory(
+                    root,
+                    job["job_id"],
+                    review_bridge_module.REVIEW_FINDINGS_DIR,
+                ),
+                missing_directory,
+            )
+            self.assertTrue(missing_directory.is_dir())
+
+            partial_target = job_dir / "receipts" / "partial.txt"
+            real_write_all = api.write_all
+
+            def partial_then_fail(handle: int, data: bytes) -> None:
+                real_write_all(handle, data[:3])
+                raise OSError("synthetic Windows mid-write failure")
+
+            with patch.object(
+                api,
+                "write_all",
+                side_effect=partial_then_fail,
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "could not be published safely",
+            ):
+                review_bridge_module._confined_write_text(
+                    root,
+                    job["job_id"],
+                    partial_target,
+                    "complete-payload",
+                    exclusive=True,
+                )
+            self.assertFalse(partial_target.exists())
+            self.assertEqual(
+                list(partial_target.parent.glob(".partial.txt.*.tmp")),
+                [],
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle-relative proof")
+    def test_windows_confined_sinks_keep_validation_handles_through_use(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# One context\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Keep validation handles through every sink.",
+                transport="manual",
+            )
+            job_dir = Path(job["job_dir"])
+            receipts = job_dir / review_bridge_module.REVIEW_RECEIPTS_DIR
+            target = receipts / "single-context.txt"
+            review_bridge_module._confined_write_text(
+                root,
+                job["job_id"],
+                target,
+                "original",
+                exclusive=True,
+            )
+            real_storage_context = (
+                review_bridge_module._open_windows_review_job_storage
+            )
+
+            def run_after_validation_substitution(
+                label: str,
+                operation: Callable[[], object],
+                *,
+                validated_directory: Path = receipts,
+            ) -> object:
+                moved = validated_directory.with_name(
+                    f"{validated_directory.name}-{label}-original"
+                )
+                namespace_moved = False
+                substitute_value = f"substituted-{label}"
+
+                @contextmanager
+                def inject_after_validation(
+                    active_root: Path,
+                    active_job_id: str,
+                    *,
+                    target_parts: tuple[str, ...] = (),
+                ):
+                    with real_storage_context(
+                        active_root,
+                        active_job_id,
+                        target_parts=target_parts,
+                    ) as opened:
+                        nonlocal namespace_moved
+                        os.replace(validated_directory, moved)
+                        validated_directory.mkdir()
+                        (validated_directory / "namespace-substitute.txt").write_text(
+                            substitute_value,
+                            encoding="utf-8",
+                        )
+                        if validated_directory == receipts:
+                            (validated_directory / target.name).write_text(
+                                substitute_value,
+                                encoding="utf-8",
+                            )
+                        namespace_moved = True
+                        yield opened
+
+                try:
+                    with patch.object(
+                        review_bridge_module,
+                        "_open_windows_review_job_storage",
+                        inject_after_validation,
+                    ):
+                        result = operation()
+                    self.assertTrue(namespace_moved, label)
+                    self.assertEqual(
+                        (validated_directory / "namespace-substitute.txt").read_text(
+                            encoding="utf-8"
+                        ),
+                        substitute_value,
+                    )
+                    if validated_directory == receipts:
+                        self.assertEqual(
+                            (validated_directory / target.name).read_text(
+                                encoding="utf-8"
+                            ),
+                            substitute_value,
+                        )
+                        moved_target = moved / target.name
+                        if label == "write":
+                            self.assertEqual(
+                                moved_target.read_text(encoding="utf-8"),
+                                "updated",
+                            )
+                        elif label == "unlink":
+                            self.assertFalse(moved_target.exists())
+                        else:
+                            self.assertEqual(
+                                moved_target.read_text(encoding="utf-8"),
+                                "original",
+                            )
+                    return result
+                finally:
+                    if namespace_moved:
+                        shutil.rmtree(validated_directory)
+                        os.replace(moved, validated_directory)
+
+            self.assertEqual(
+                run_after_validation_substitution(
+                    "read",
+                    lambda: review_bridge_module._confined_read_bytes(
+                        root,
+                        job["job_id"],
+                        target,
+                    ),
+                ),
+                b"original",
+            )
+            self.assertEqual(
+                run_after_validation_substitution(
+                    "hash",
+                    lambda: review_bridge_module._confined_file_sha256(
+                        root,
+                        job["job_id"],
+                        target,
+                    ),
+                ),
+                hashlib.sha256(b"original").hexdigest(),
+            )
+            self.assertEqual(
+                run_after_validation_substitution(
+                    "size",
+                    lambda: review_bridge_module._confined_file_size(
+                        root,
+                        job["job_id"],
+                        target,
+                    ),
+                ),
+                len(b"original"),
+            )
+            run_after_validation_substitution(
+                "write",
+                lambda: review_bridge_module._confined_write_text(
+                    root,
+                    job["job_id"],
+                    target,
+                    "updated",
+                ),
+            )
+            self.assertEqual(target.read_text(encoding="utf-8"), "updated")
+            run_after_validation_substitution(
+                "mkdir",
+                lambda: review_bridge_module._ensure_confined_subdirectory(
+                    root,
+                    job["job_id"],
+                    review_bridge_module.REVIEW_FINDINGS_DIR,
+                ),
+                validated_directory=(
+                    job_dir / review_bridge_module.REVIEW_FINDINGS_DIR
+                ),
+            )
+            run_after_validation_substitution(
+                "unlink",
+                lambda: review_bridge_module._confined_unlink(
+                    root,
+                    job["job_id"],
+                    target,
+                ),
+            )
+            self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle-relative proof")
+    def test_windows_native_component_length_cannot_wrap_unicode_string(self) -> None:
+        validator = review_bridge_module._WindowsNativeConfinement._validate_component
+        self.assertEqual(validator("a" * 255), "a" * 255)
+        self.assertEqual(validator("\U0001f642" * 127), "\U0001f642" * 127)
+        for component in ("a" * 256, "\U0001f642" * 128, "\ud800"):
+            with self.subTest(utf16_bytes=len(component.encode("utf-16-le", "surrogatepass"))):
+                with self.assertRaisesRegex(
+                    review_bridge_module.ReviewBridgeError,
+                    "UTF-16",
+                ):
+                    validator(component)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            with review_bridge_module._open_windows_plain_directory(
+                Path(tmp)
+            ) as (api, parent_handle), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "UTF-16 limit",
+            ):
+                api.open_relative(
+                    parent_handle,
+                    "x" * 256,
+                    directory=False,
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle-relative proof")
+    def test_windows_native_confinement_rejects_reparse_and_has_no_path_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Native only\n", encoding="utf-8")
+            job = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Reject Windows reparse substitution.",
+                transport="manual",
+            )
+            job_dir = Path(job["job_dir"])
+            status_path = Path(job["status_uri"])
+
+            with patch.object(
+                review_bridge_module,
+                "_WINDOWS_NATIVE_CONFINEMENT",
+                None,
+            ), patch.object(
+                review_bridge_module,
+                "_WindowsNativeConfinement",
+                side_effect=OSError("native layer unavailable"),
+            ), self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "native handle-relative confinement is unavailable",
+            ):
+                review_bridge_module._confined_read_bytes(
+                    root,
+                    job["job_id"],
+                    status_path,
+                )
+
+            responses = job_dir / review_bridge_module.REVIEW_RESULT_DIR
+            responses.rmdir()
+            outside = base / "outside-responses"
+            make_link_like_directory(self, responses, outside)
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "changed|safely|link-like|reparse",
+            ):
+                review_bridge_module._confined_write_text(
+                    root,
+                    job["job_id"],
+                    responses / "response-001.raw.txt",
+                    "must not escape",
+                    exclusive=True,
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
+            linked_subject = base / "linked-subject"
+            real_subject = base / "real-subject"
+            real_subject.mkdir()
+            (real_subject / "payload.txt").write_text("outside", encoding="utf-8")
+            make_link_like_directory(self, linked_subject, real_subject)
+            with self.assertRaisesRegex(
+                review_bridge_module.ReviewBridgeError,
+                "changed|safely|reparse",
+            ):
+                with review_bridge_module._open_confined_regular_file(
+                    base,
+                    Path("linked-subject/payload.txt"),
+                ):
+                    self.fail("reparse-backed subject file was opened")
 
     def test_already_bound_upgrade_requires_immutable_receipt_artifact_rows(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

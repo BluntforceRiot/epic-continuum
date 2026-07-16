@@ -235,6 +235,314 @@ def redact_text_secrets(text: str) -> str:
     return "\n".join(redacted_lines)
 
 
+_ERROR_ABSOLUTE_PATH_START_RE = re.compile(
+    r"(?i)(?<![A-Z0-9._-])(?:"
+    r"\\\\[?.]\\(?:UNC\\)?"
+    r"|\\\\"
+    r"|\\(?:Device\\|SystemRoot\\|\?\?\\|DosDevices\\)"
+    r"|(?P<windows_rooted>\\(?=[^\\/\r\n]+[\\/][^\\/\r\n]))"
+    r"|[A-Z]:[\\/]"
+    r"|(?P<posix_root>/)"
+    r")"
+)
+_COMPACT_DIAGNOSTIC_FIELD_RE_FRAGMENT = r"\s*[A-Z_][A-Z0-9_.-]*\s*="
+_ERROR_AUTHORITY_URI_RE = re.compile(
+    r"(?i)\b(?:https?|wss?|ftp)://"
+    r"(?:\[(?:[0-9A-F:.]+(?:%25(?:[A-Z0-9._~-]|%[0-9A-F]{2})+)?"
+    r"|v[0-9A-F]+\.[A-Z0-9._~!$&'()*+,;=:-]+)\]"
+    r"|[A-Z0-9](?:[A-Z0-9._~-]*[A-Z0-9])?)"
+    r"(?::[0-9]{1,5})?"
+    r"(?:[/?#](?:[^\s\"<>\\';,|]"
+    rf"|'(?![\s]|$|[;,|]{_COMPACT_DIAGNOSTIC_FIELD_RE_FRAGMENT})"
+    rf"|[;,|](?!{_COMPACT_DIAGNOSTIC_FIELD_RE_FRAGMENT}))*)?"
+)
+
+
+_WINDOWS_ESCAPE_COMPONENT_RE = re.compile(
+    r"(?i)^(?:[0-9abdefgknpqrstuvwxyz](?:[+*?]|\{[0-9]+(?:,[0-9]*)?\})?"
+    r"|[+.^$(){}\[\]|-])$"
+)
+_WINDOWS_COMPONENT_INVALID_CHARACTERS = frozenset('<>:"|?*')
+_POSIX_PATH_COMPONENT_START_EXCLUSIONS = frozenset(
+    [chr(0), *"/\\\\\"'`=+*%<>|&;,:)]}"]
+)
+
+
+def _is_absolute_path_token_boundary(text: str, start: int) -> bool:
+    if start <= 0:
+        return True
+    previous = text[start - 1]
+    return previous.isspace() or previous in "\"'([{=:;,>"
+
+
+def _looks_like_explicit_windows_rooted_path(text: str, start: int) -> bool:
+    """Discriminate a multi-component rooted path from regex/escape prose."""
+
+    separators = [
+        position
+        for position in (text.find("\\", start + 1), text.find("/", start + 1))
+        if position >= 0
+    ]
+    first_separator = min(separators, default=-1)
+    if first_separator < 0:
+        return False
+    later_separators = [
+        position
+        for position in (
+            text.find("\\", first_separator + 1),
+            text.find("/", first_separator + 1),
+        )
+        if position >= 0
+    ]
+    second_separator = min(later_separators, default=-1)
+    line_end = len(text)
+    for delimiter in ("\r", "\n", '"', "'"):
+        position = text.find(delimiter, first_separator + 1)
+        if position >= 0:
+            line_end = min(line_end, position)
+    second_end = min(second_separator if second_separator >= 0 else line_end, line_end)
+    raw_components = (
+        text[start + 1 : first_separator],
+        text[first_separator + 1 : second_end],
+    )
+    components: list[str] = []
+    for raw_component in raw_components:
+        # A component ending in a space or period is not a normal Win32 path
+        # component and commonly indicates prose between two escape tokens.
+        if raw_component != raw_component.rstrip(" ."):
+            return False
+        component = raw_component.strip()
+        if (
+            not component
+            or any(ord(character) < 32 for character in component)
+            or any(character in _WINDOWS_COMPONENT_INVALID_CHARACTERS for character in component)
+        ):
+            return False
+        components.append(component)
+
+    # ``\d\s`` and similar pairs are diagnostic escape notation.  A real path
+    # with one-character leading components is ambiguous and is deliberately
+    # left unchanged; namespace-qualified forms remain unambiguous.
+    if all(_WINDOWS_ESCAPE_COMPONENT_RE.fullmatch(component) for component in components):
+        return False
+    return True
+
+
+def _looks_like_explicit_posix_absolute_path(
+    text: str,
+    start: int,
+    *,
+    allow_ambiguous_component_start: bool,
+) -> bool:
+    """Require a credible component after a diagnostic POSIX root slash."""
+
+    component_start = start
+    while component_start < len(text) and text[component_start] == "/":
+        component_start += 1
+    if component_start >= len(text):
+        return False
+    first_component_character = text[component_start]
+    if (
+        not first_component_character.isspace()
+        and first_component_character not in _POSIX_PATH_COMPONENT_START_EXCLUSIONS
+    ):
+        return True
+    if (
+        first_component_character == "%"
+        and component_start + 2 < len(text)
+        and all(
+            character in "0123456789abcdefABCDEF"
+            for character in text[component_start + 1 : component_start + 3]
+        )
+    ):
+        return True
+    follows_file_uri_scheme = text[max(0, start - 5) : start].casefold() == "file:"
+    if not allow_ambiguous_component_start or (start != 0 and not follows_file_uri_scheme):
+        return False
+
+    # Inside a quoted diagnostic, a second separator makes an otherwise
+    # punctuation- or whitespace-led first component structurally path-like.
+    # This covers valid POSIX names such as ``/+private/secret`` and
+    # ``/ Private Folder/secret`` without promoting standalone operators.
+    next_separator = text.find("/", component_start + 1)
+    if next_separator < 0:
+        return False
+    first_component = text[component_start:next_separator]
+    return bool(first_component.strip()) and not any(
+        character in {"\x00", "\r", "\n"} for character in first_component
+    )
+
+
+def _error_uri_spans(text: str) -> list[tuple[int, int]]:
+    """Return authority-qualified public URI spans that are not local paths."""
+    return [match.span() for match in _ERROR_AUTHORITY_URI_RE.finditer(text)]
+
+
+def _first_unprotected_absolute_path(
+    text: str,
+    *,
+    allow_ambiguous_posix_components: bool = False,
+) -> int | None:
+    uri_spans = _error_uri_spans(text)
+    uri_index = 0
+    for match in _ERROR_ABSOLUTE_PATH_START_RE.finditer(text):
+        position = match.start()
+        if not _is_absolute_path_token_boundary(text, position):
+            continue
+        while uri_index < len(uri_spans) and uri_spans[uri_index][1] <= position:
+            uri_index += 1
+        if (
+            uri_index < len(uri_spans)
+            and uri_spans[uri_index][0] <= position < uri_spans[uri_index][1]
+        ):
+            continue
+        if match.lastgroup == "windows_rooted" and not _looks_like_explicit_windows_rooted_path(
+            text,
+            position,
+        ):
+            continue
+        if match.lastgroup == "posix_root" and not _looks_like_explicit_posix_absolute_path(
+            text,
+            position,
+            allow_ambiguous_component_start=allow_ambiguous_posix_components,
+        ):
+            continue
+        return position
+    return None
+
+
+def _redacted_error_path_token(value: str, *, precise: bool) -> str:
+    if not precise:
+        return "<redacted-path>"
+    name = re.split(r"[\\/]", value)[-1]
+    if not name:
+        return "<redacted-path>"
+    safe_name = redact_text_secrets(name)
+    if (
+        not safe_name
+        or any(separator in safe_name for separator in ("/", "\\"))
+        or any(character in safe_name for character in ("\r", "\n", "'", '"', "<", ">"))
+    ):
+        return "<redacted-path>"
+    return f"<redacted-path:{safe_name}>"
+
+
+def _find_closing_error_quote(
+    text: str,
+    opening: int,
+    *,
+    protected_spans: list[tuple[int, int]],
+) -> tuple[int | None, bool]:
+    """Find an unescaped matching quote in linear time."""
+    quote = text[opening]
+    backslash_run = 0
+    saw_escaped_delimiter = False
+    span_index = 0
+    for index in range(opening + 1, len(text)):
+        while span_index < len(protected_spans) and protected_spans[span_index][1] <= index:
+            span_index += 1
+        if (
+            span_index < len(protected_spans)
+            and protected_spans[span_index][0] <= index < protected_spans[span_index][1]
+        ):
+            backslash_run = 0
+            continue
+        character = text[index]
+        if character == "\\":
+            backslash_run += 1
+            continue
+        if character == quote:
+            if backslash_run % 2:
+                saw_escaped_delimiter = True
+            else:
+                return index, saw_escaped_delimiter
+        backslash_run = 0
+    return None, saw_escaped_delimiter
+
+
+def _redact_quoted_error_paths(line: str) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    index = 0
+    uri_spans = _error_uri_spans(line)
+    uri_index = 0
+    while index < len(line):
+        while uri_index < len(uri_spans) and uri_spans[uri_index][1] <= index:
+            uri_index += 1
+        if (
+            uri_index < len(uri_spans)
+            and uri_spans[uri_index][0] <= index < uri_spans[uri_index][1]
+        ):
+            index = uri_spans[uri_index][1]
+            continue
+        if line[index] not in {"'", '"'}:
+            index += 1
+            continue
+        closing, escaped_delimiter = _find_closing_error_quote(
+            line,
+            index,
+            protected_spans=uri_spans,
+        )
+        if closing is None:
+            candidate = line[index + 1 :]
+            path_start = _first_unprotected_absolute_path(
+                candidate,
+                allow_ambiguous_posix_components=True,
+            )
+            if path_start is not None:
+                pieces.append(line[cursor : index + 1 + path_start])
+                pieces.append("<redacted-path>")
+                return "".join(pieces)
+            break
+        candidate = line[index + 1 : closing]
+        path_start = _first_unprotected_absolute_path(
+            candidate,
+            allow_ambiguous_posix_components=True,
+        )
+        if path_start is not None:
+            pieces.append(line[cursor : index + 1])
+            pieces.append(
+                _redacted_error_path_token(
+                    candidate,
+                    precise=path_start == 0 and not escaped_delimiter,
+                )
+            )
+            pieces.append(line[closing])
+            cursor = closing + 1
+        index = closing + 1
+    pieces.append(line[cursor:])
+    return "".join(pieces)
+
+
+def redact_error_message_paths(message: str) -> str:
+    """Redact local absolute paths in an error without corrupting public URIs.
+
+    Quoted spans use escape-aware delimiters. An unquoted path containing
+    whitespace has no trustworthy end boundary, so its line tail is removed
+    conservatively. Runtime is linear in the rendered error size.
+    """
+    secret_redacted = redact_text_secrets(str(message))
+    output: list[str] = []
+    for raw_line in secret_redacted.split("\n"):
+        line = _redact_quoted_error_paths(raw_line)
+        path_start = _first_unprotected_absolute_path(line)
+        if path_start is None:
+            output.append(line)
+            continue
+        candidate = line[path_start:]
+        if any(character.isspace() for character in candidate):
+            output.append(line[:path_start] + "<redacted-path>")
+            continue
+        path_text = candidate.rstrip(".,;:)")
+        suffix = candidate[len(path_text) :]
+        output.append(
+            line[:path_start]
+            + _redacted_error_path_token(path_text, precise=True)
+            + suffix
+        )
+    return "\n".join(output)
+
+
 SENSITIVE_METADATA_KEYS = {
     "api_key",
     "apikey",
@@ -298,7 +606,10 @@ EMBEDDED_ASSIGNMENT_RE = re.compile(
 
 
 def _normal_sensitive_key_parts(key: Any) -> tuple[str, list[str]]:
-    lowered = str(key).strip().casefold()
+    separated = str(key).strip()
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", separated)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+    lowered = separated.casefold()
     normalized = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
     return normalized, [part for part in normalized.split("_") if part]
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from continuum.core.safety import (
+    redact_error_message_paths,
     redact_text_secrets,
     redact_value_secrets,
     scan_text_for_entropy_secrets,
@@ -12,6 +13,127 @@ from continuum.core.safety import (
 
 
 class EpicContinuumSafetyTest(unittest.TestCase):
+    def test_standalone_slashes_and_operators_are_not_paths(self) -> None:
+        for message in (
+            "expected / or \\ separator",
+            "ratio must be numerator / denominator",
+            "ratio numerator / denominator",
+            "division assignment uses /= here",
+            "glob operator /* is unsupported",
+            'formula "numerator / denominator / result"',
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(redact_error_message_paths(message), message)
+
+    def test_credible_posix_paths_are_still_redacted(self) -> None:
+        cases = (
+            ("failed /private/secret.txt", "failed <redacted-path:secret.txt>"),
+            ("failed /x/secret.txt", "failed <redacted-path:secret.txt>"),
+            ("failed /0/secret.txt", "failed <redacted-path:secret.txt>"),
+            (
+                "failed '/private folder/secret.txt'; retry",
+                "failed '<redacted-path:secret.txt>'; retry",
+            ),
+            ('failed "/+private/secret.txt"', 'failed "<redacted-path:secret.txt>"'),
+            (
+                'failed "/ Private Folder/secret.txt"',
+                'failed "<redacted-path:secret.txt>"',
+            ),
+            ("failed ///private/secret.txt", "failed <redacted-path:secret.txt>"),
+            ("path:/home/Jane Doe/Private Data", "path:<redacted-path>"),
+            ("failed file:///Private Folder/secret.txt", "failed file:<redacted-path>"),
+            ("failed file:///%20Private/secret.txt", "failed file:<redacted-path:secret.txt>"),
+            ("failed file:////private/secret.txt", "failed file:<redacted-path:secret.txt>"),
+            (
+                'failed "file://// Private Folder/secret.txt"',
+                'failed "<redacted-path>"',
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(redact_error_message_paths(message), expected)
+
+    def test_uri_protection_stops_before_generic_local_path_fields(self) -> None:
+        cases = (
+            (
+                "endpoint=https://example.com/status,file=/private/secret.txt",
+                "endpoint=https://example.com/status,file=<redacted-path:secret.txt>",
+            ),
+            (
+                "endpoint=https://example.com/status;cwd=/private/secret.txt",
+                "endpoint=https://example.com/status;cwd=<redacted-path:secret.txt>",
+            ),
+            (
+                "endpoint=https://example.com/status|source=C:/Private/secret.txt",
+                "endpoint=https://example.com/status|source=<redacted-path:secret.txt>",
+            ),
+            (
+                "endpoint=https://example.com/status,file='/private/secret.txt'",
+                "endpoint=https://example.com/status,file='<redacted-path:secret.txt>'",
+            ),
+            (
+                "endpoint=https://example.com/status,artifact=file:///%20Private/secret.txt",
+                "endpoint=https://example.com/status,artifact=file:<redacted-path:secret.txt>",
+            ),
+            (
+                "endpoint='https://[v1.a'b]/status',file=/private/secret.txt",
+                "endpoint='https://[v1.a'b]/status',file=<redacted-path:secret.txt>",
+            ),
+            (
+                "endpoint=https://example.com/status,file='/ Private Folder/secret.txt'",
+                "endpoint=https://example.com/status,file='<redacted-path:secret.txt>'",
+            ),
+            (
+                "endpoint=https://example.com/status;cwd='/+private/secret.txt'",
+                "endpoint=https://example.com/status;cwd='<redacted-path:secret.txt>'",
+            ),
+            (
+                "endpoint='https://[v1.a'b]:8443/status',path=\"/ Private Folder/secret.txt\"",
+                "endpoint='https://[v1.a'b]:8443/status',path=\"<redacted-path:secret.txt>\"",
+            ),
+            (
+                "endpoint=https://example.com/status,path=relative/file;"
+                "cwd='/ Private Folder/secret.txt'",
+                "endpoint=https://example.com/status,path=relative/file;"
+                "cwd='<redacted-path:secret.txt>'",
+            ),
+            (
+                "endpoint='https://example.com/status',path=relative/file;"
+                "cwd='/ Private Folder/secret.txt'; retry",
+                "endpoint='https://example.com/status',path=relative/file;"
+                "cwd='<redacted-path:secret.txt>'; retry",
+            ),
+            (
+                "endpoint='https://[v1.a'b]:8443/status',path=relative/file;"
+                "cwd='/ Private Folder/secret.txt'; retry",
+                "endpoint='https://[v1.a'b]:8443/status',path=relative/file;"
+                "cwd='<redacted-path:secret.txt>'; retry",
+            ),
+            (
+                "endpoint=https://example.com/status,path='relative/file';"
+                "cwd='/ Private Folder/secret.txt'; retry",
+                "endpoint=https://example.com/status,path='relative/file';"
+                "cwd='<redacted-path:secret.txt>'; retry",
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(redact_error_message_paths(message), expected)
+
+        for uri in (
+            "https://example.com/a,b/c",
+            "https://example.com/status?file=/download",
+            "https://[v1.a'b]/status",
+        ):
+            with self.subTest(uri=uri):
+                self.assertEqual(redact_error_message_paths(uri), uri)
+
+        relative_only = (
+            "endpoint='https://example.com/status',path=relative/file;"
+            "mode='still/relative'; retry"
+        )
+        self.assertEqual(redact_error_message_paths(relative_only), relative_only)
+
     def test_known_secret_patterns_are_detected_and_redacted(self) -> None:
         samples = {
             "private_key": "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
@@ -59,6 +181,23 @@ class EpicContinuumSafetyTest(unittest.TestCase):
         self.assertTrue(any(finding["type"] == "sensitive_metadata_key" for finding in findings), findings)
         self.assertEqual(redacted["auth"]["api_key"], "[REDACTED]")
         self.assertEqual(redacted["safe"]["token_budget"], 900)
+
+    def test_camelcase_sensitive_metadata_keys_are_split_before_casefold(self) -> None:
+        payload = {
+            "clientSecret": "one",
+            "accessToken": "two",
+            "privateKey": "three",
+            "clientIDToken": "four",
+        }
+
+        findings = scan_value_for_secrets(payload, scope="unit")
+        redacted = redact_value_secrets(payload)
+
+        sensitive_key_findings = [
+            finding for finding in findings if finding["type"] == "sensitive_metadata_key"
+        ]
+        self.assertEqual(len(sensitive_key_findings), 4, findings)
+        self.assertEqual(redacted, {key: "[REDACTED]" for key in payload})
 
     def test_entropy_scanner_detects_only_high_entropy_long_tokens(self) -> None:
         token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"

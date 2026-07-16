@@ -8,13 +8,19 @@ import shutil
 import sqlite3
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
+import time
 import unicodedata
 import zipfile
 import zlib
 from collections import Counter
+from contextlib import nullcontext
+from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, TypeVar
 
 from .config import load_config
 from .operations import _verify_artifact_ledger, _verify_recent_proof_packs, verify_root
@@ -38,6 +44,231 @@ BUNDLE_ROOT_NAME = "epic-continuum-root"
 BUNDLE_MANIFEST_NAME = "bundle.manifest.json"
 SUPPORTED_BUNDLE_PROFILES = {"portable", "shareable"}
 SUPPORTED_SYMLINK_POLICIES = {"fail", "skip"}
+
+# Bundle verification is intentionally stricter than the ZIP format's technical
+# maxima.  Continuum's default root-size budget is 50 GB; 64 GiB leaves useful
+# headroom without turning a verification request into an unbounded extraction.
+# Operators can raise the byte limits deliberately, but never beyond the
+# historical 1 TiB hard ceiling.
+BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES = 1024**4
+BUNDLE_DEFAULT_MAX_EXPANDED_BYTES = 64 * 1024**3
+BUNDLE_DEFAULT_MAX_ENTRIES = 100_000
+BUNDLE_ABSOLUTE_MAX_ENTRIES = 1_000_000
+BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES = 256 * 1024**2
+BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES = 4 * 1024**3
+BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO = 1_000
+BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO = 1_000_000
+BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS = 3_600
+BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS = 86_400
+BUNDLE_SEMANTIC_TEMP_RESERVE_BYTES = 1024**3
+_BUNDLE_IO_CHUNK_BYTES = 1024 * 1024
+_BUNDLE_RESERVE_CHECK_BYTES = 64 * 1024**2
+_BUNDLE_SEMANTIC_RESULT_MAX_BYTES = 1024 * 1024
+_BUNDLE_MANIFEST_MAX_BYTES = 16 * 1024**2
+_PORTABLE_METADATA_MAX_FILE_BYTES = 20 * 1024**2
+_PORTABLE_METADATA_MAX_STREAM_BYTES = 512 * 1024**2
+_PORTABLE_METADATA_MAX_STREAM_RECORDS = 1_000_000
+_PORTABLE_METADATA_MAX_ERRORS = 100
+_SQLITE_METADATA_MAX_VALUE_BYTES = 20 * 1024**2
+_SQLITE_METADATA_MAX_ROW_BYTES = 2 * _SQLITE_METADATA_MAX_VALUE_BYTES + 1024**2
+_SQLITE_METADATA_MAX_TABLES = 10_000
+_SQLITE_METADATA_MAX_SCHEMA_NAME_BYTES = 1024
+_SQLITE_METADATA_MAX_SCHEMA_COLUMNS = 512
+_SQLITE_METADATA_MAX_SCAN_GROUPS = 1024
+_SQLITE_METADATA_MAX_VALUES_SCANNED = 5_000_000
+_SQLITE_METADATA_MAX_ERRORS = 100
+_BUNDLE_MAX_RETAINED_ERRORS = 100
+_BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT = 20
+
+
+class _BundleLimitError(RuntimeError):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+class _BoundedBundleErrors(list[dict[str, Any]]):
+    """Retain first diagnostics plus one counter-bearing truncation marker."""
+
+    def __init__(self, maximum: int = _BUNDLE_MAX_RETAINED_ERRORS) -> None:
+        if maximum < 2:
+            raise ValueError("maximum retained bundle errors must be at least 2")
+        super().__init__()
+        self.maximum = maximum
+        self.total_count = 0
+        self.omitted_count = 0
+
+    @property
+    def truncated(self) -> bool:
+        return self.omitted_count > 0
+
+    @property
+    def retained_original_count(self) -> int:
+        return len(self) - (1 if self.truncated else 0)
+
+    def _record_unavailable(self, count: int) -> None:
+        if count <= 0:
+            return
+        had_marker = self.truncated
+        self.total_count += count
+        self.omitted_count += count
+        if not had_marker:
+            super().append(
+                {
+                    "error": "bundle_error_limit_reached",
+                    "maximum_retained_errors": self.maximum,
+                    "omitted_error_count": self.omitted_count,
+                }
+            )
+            return
+        self[-1]["omitted_error_count"] = self.omitted_count
+
+    def append(self, error: dict[str, Any]) -> None:
+        if self.retained_original_count < self.maximum - 1:
+            self.total_count += 1
+            if self.truncated:
+                super().insert(len(self) - 1, error)
+            else:
+                super().append(error)
+            return
+        self._record_unavailable(1)
+
+    def extend(self, errors: Iterable[dict[str, Any]]) -> None:
+        if errors is self:
+            raise ValueError("cannot extend bounded bundle errors with itself")
+        if isinstance(errors, _BoundedBundleErrors):
+            retained = errors[:-1] if errors.truncated else errors[:]
+            for error in retained:
+                self.append(error)
+            self._record_unavailable(errors.total_count - len(retained))
+            return
+        for error in errors:
+            self.append(error)
+
+
+class _PortableMetadataTooLarge(ValueError):
+    pass
+
+
+class _PortableMetadataStreamLimit(_PortableMetadataTooLarge):
+    def __init__(self, code: str, detail: str, *, maximum: int) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.maximum = maximum
+
+
+@dataclass
+class _PortableMetadataLineBudget:
+    max_bytes: int
+    max_records: int
+    bytes_scanned: int = 0
+    records_scanned: int = 0
+
+    def consume(self, payload_bytes: int) -> None:
+        if self.records_scanned >= self.max_records:
+            raise _PortableMetadataStreamLimit(
+                "metadata_stream_record_limit_reached",
+                f"metadata stream exceeds {self.max_records} records",
+                maximum=self.max_records,
+            )
+        next_bytes = self.bytes_scanned + max(0, int(payload_bytes))
+        if next_bytes > self.max_bytes:
+            raise _PortableMetadataStreamLimit(
+                "metadata_stream_byte_limit_reached",
+                f"metadata stream exceeds {self.max_bytes} scanned bytes",
+                maximum=self.max_bytes,
+            )
+        self.records_scanned += 1
+        self.bytes_scanned = next_bytes
+
+
+@dataclass
+class _BundleVerificationBudget:
+    """One monotonic deadline and byte-work account for a verification pass."""
+
+    deadline: float
+    max_work_bytes: int
+    work_bytes: int = 0
+
+    def check_deadline(self, phase: str) -> None:
+        if time.monotonic() > self.deadline:
+            raise _BundleLimitError(
+                "bundle_verification_timeout",
+                f"bundle verification exceeded its deadline while {phase}",
+            )
+
+    def consume(self, count: int, phase: str) -> None:
+        self.check_deadline(phase)
+        next_total = self.work_bytes + max(0, int(count))
+        if next_total > self.max_work_bytes:
+            raise _BundleLimitError(
+                "bundle_verification_work_limit_exceeded",
+                f"bundle verification exceeded its byte-work budget while {phase}",
+            )
+        self.work_bytes = next_total
+
+
+@dataclass
+class _BundleVerifierResources:
+    raw_archive: Any | None = None
+    archive: zipfile.ZipFile | None = None
+
+    def close(self) -> None:
+        """Best-effort close without masking the verifier's primary outcome."""
+        for handle in (self.archive, self.raw_archive):
+            if handle is None:
+                continue
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _open_bundle_read_handle(path: Path) -> Any:
+    """Open a bundle read-only and deny later write/delete opens on Windows."""
+    if os.name != "nt":
+        return path.open("rb")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.path.abspath(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001,  # FILE_SHARE_READ: deny new write/delete handles
+        None,
+        3,  # OPEN_EXISTING
+        0x08000080,  # FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = msvcrt.open_osfhandle(int(handle), flags)
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(descriptor, "rb", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
 
 # These are process/build leftovers outside the immutable ``archive`` evidence
 # namespace. Generic names such as ``build`` or ``*.egg-info`` may legitimately
@@ -286,6 +517,9 @@ _EMBEDDED_QUOTED_PATH_RE = re.compile(
 _EMBEDDED_WINDOWS_PATH_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?P<path>[A-Z]:[\\\\/][^\s\"\'<>|\r\n]+)"
 )
+_PORTABLE_METADATA_MAX_FINDING_FIELD_BYTES = 1024
+_PORTABLE_METADATA_MAX_PATH_FIELD_BYTES = 2048
+_PORTABLE_METADATA_MAX_REFERENCE_BYTES = 512
 
 
 def _normalized_key_text(value: str) -> str:
@@ -344,19 +578,64 @@ def _looks_nonportable_local_path(value: str) -> bool:
     return Path(text).is_absolute() or bool(_WINDOWS_ABSOLUTE_RE.match(text))
 
 
-def _embedded_nonportable_paths(value: str) -> list[str]:
-    """Extract clear local filesystem references embedded in diagnostic text."""
+def _bounded_portable_text(value: object, *, maximum_bytes: int) -> str:
+    text = redact_text_secrets(str(value))
+    encoded = text.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return text
+    digest = hashlib.sha256(encoded).hexdigest()
+    marker = f"...<truncated sha256={digest} bytes={len(encoded)}>"
+    marker_bytes = marker.encode("ascii")
+    prefix_budget = max(0, maximum_bytes - len(marker_bytes))
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
+def _bounded_metadata_path(value: object) -> str:
+    return _bounded_portable_text(
+        value,
+        maximum_bytes=_PORTABLE_METADATA_MAX_PATH_FIELD_BYTES,
+    )
+
+
+def _bounded_portable_finding(finding: dict[str, Any]) -> dict[str, Any]:
+    bounded: dict[str, Any] = {}
+    for key, value in finding.items():
+        if not isinstance(value, str) or key == "value_hash":
+            bounded[key] = value
+            continue
+        maximum = (
+            _PORTABLE_METADATA_MAX_PATH_FIELD_BYTES
+            if key == "metadata_path"
+            else _PORTABLE_METADATA_MAX_FINDING_FIELD_BYTES
+        )
+        bounded[key] = _bounded_portable_text(value, maximum_bytes=maximum)
+    return bounded
+
+
+def _embedded_nonportable_paths(
+    value: str,
+    *,
+    max_paths: int,
+) -> tuple[list[str], bool]:
+    """Extract embedded local paths without expanding beyond ``max_paths``."""
+
     found: list[str] = []
+    seen: set[str] = set()
     for pattern in (
         _EMBEDDED_TRACEBACK_PATH_RE,
         _EMBEDDED_QUOTED_PATH_RE,
         _EMBEDDED_WINDOWS_PATH_RE,
     ):
         for match in pattern.finditer(value):
+            if len(found) >= max_paths:
+                return found, True
             candidate = match.group("path").strip().rstrip(".,;:)")
-            if candidate and _looks_nonportable_local_path(candidate) and candidate not in found:
+            candidate_hash = content_hash(candidate)
+            if candidate and _looks_nonportable_local_path(candidate) and candidate_hash not in seen:
                 found.append(candidate)
-    return found
+                seen.add(candidate_hash)
+    return found, False
 
 
 def _external_path_reference(value: str) -> str:
@@ -370,7 +649,10 @@ def _external_path_reference(value: str) -> str:
     else:
         name = PurePosixPath(text.replace("\\", "/")).name
     safe_name = redact_text_secrets(name or "path") or "path"
-    return f"external:{safe_name}"
+    return _bounded_portable_text(
+        f"external:{safe_name}",
+        maximum_bytes=_PORTABLE_METADATA_MAX_REFERENCE_BYTES,
+    )
 
 
 def _portable_metadata_findings(
@@ -379,71 +661,168 @@ def _portable_metadata_findings(
     path: str = "$",
     key_hint: str | None = None,
     scan_embedded_paths: bool = False,
-) -> list[dict[str, Any]]:
+    max_findings: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Walk structured metadata without expanding beyond ``max_findings``."""
+
     findings: list[dict[str, Any]] = []
-    if isinstance(value, dict):
-        for key, nested in value.items():
+    if max_findings <= 0:
+        return findings, True
+    stack: list[tuple[str, Any, str, str | None]] = [
+        ("visit", value, _bounded_metadata_path(path), key_hint)
+    ]
+    while stack:
+        if len(findings) >= max_findings:
+            return findings, True
+        kind, current, current_path, current_hint = stack.pop()
+        if kind == "dict_iter":
+            try:
+                key, nested = next(current)
+            except StopIteration:
+                continue
+            stack.append(("dict_iter", current, current_path, current_hint))
             key_text = str(key)
-            key_is_path = isinstance(key, str) and _looks_nonportable_local_path(key_text)
-            if key_is_path:
+            if isinstance(key, str) and _looks_nonportable_local_path(key_text):
                 findings.append(
+                    _bounded_portable_finding(
+                        {
+                            "metadata_path": f"{current_path}.[path_key]",
+                            "value": _external_path_reference(key_text),
+                            "value_hash": content_hash(key_text),
+                        }
+                    )
+                )
+                nested_path = _bounded_metadata_path(f"{current_path}.[path_key]")
+            else:
+                safe_key_text = _bounded_portable_text(
+                    key_text,
+                    maximum_bytes=_PORTABLE_METADATA_MAX_FINDING_FIELD_BYTES,
+                )
+                nested_path = _bounded_metadata_path(f"{current_path}.{safe_key_text}")
+            stack.append(("visit", nested, nested_path, key_text))
+            continue
+        if kind == "list_iter":
+            try:
+                index, nested = next(current)
+            except StopIteration:
+                continue
+            stack.append(("list_iter", current, current_path, current_hint))
+            stack.append(
+                (
+                    "visit",
+                    nested,
+                    _bounded_metadata_path(f"{current_path}[{index}]"),
+                    current_hint,
+                )
+            )
+            continue
+        if isinstance(current, dict):
+            stack.append(("dict_iter", iter(current.items()), current_path, current_hint))
+            continue
+        if isinstance(current, list):
+            stack.append(("list_iter", iter(enumerate(current)), current_path, current_hint))
+            continue
+        if not isinstance(current, str):
+            continue
+        seen_hashes: set[str] = set()
+        if (
+            current_hint
+            and _is_path_like_key(current_hint)
+            and _looks_nonportable_local_path(current)
+        ):
+            direct_hash = content_hash(current)
+            findings.append(
+                _bounded_portable_finding(
                     {
-                        "metadata_path": f"{path}.[path_key]",
-                        "value": _external_path_reference(key_text),
-                        "value_hash": content_hash(key_text),
+                        "metadata_path": current_path,
+                        "value": _external_path_reference(current),
+                        "value_hash": direct_hash,
                     }
                 )
-                nested_path = f"{path}.[path_key]"
-            else:
-                safe_key_text = redact_text_secrets(key_text)
-                nested_path = f"{path}.{safe_key_text}"
-            findings.extend(
-                _portable_metadata_findings(
-                    nested,
-                    path=nested_path,
-                    key_hint=key_text,
-                    scan_embedded_paths=scan_embedded_paths,
-                )
             )
-    elif isinstance(value, list):
-        for index, nested in enumerate(value):
-            findings.extend(
-                _portable_metadata_findings(
-                    nested,
-                    path=f"{path}[{index}]",
-                    key_hint=key_hint,
-                    scan_embedded_paths=scan_embedded_paths,
-                )
+            seen_hashes.add(direct_hash)
+        if scan_embedded_paths and len(findings) < max_findings:
+            embedded_paths, embedded_truncated = _embedded_nonportable_paths(
+                current,
+                max_paths=max_findings - len(findings),
             )
-    elif isinstance(value, str):
-        if key_hint and _is_path_like_key(key_hint) and _looks_nonportable_local_path(value):
-            findings.append(
-                {
-                    "metadata_path": path,
-                    "value": _external_path_reference(value),
-                    "value_hash": content_hash(value),
-                }
-            )
-        if scan_embedded_paths:
-            seen_hashes = {str(item.get("value_hash")) for item in findings}
-            for embedded in _embedded_nonportable_paths(value):
+            for embedded in embedded_paths:
                 embedded_hash = content_hash(embedded)
                 if embedded_hash in seen_hashes:
                     continue
                 findings.append(
-                    {
-                        "metadata_path": path,
-                        "value": _external_path_reference(embedded),
-                        "value_hash": embedded_hash,
-                        "embedded": True,
-                    }
+                    _bounded_portable_finding(
+                        {
+                            "metadata_path": current_path,
+                            "value": _external_path_reference(embedded),
+                            "value_hash": embedded_hash,
+                            "embedded": True,
+                        }
+                    )
                 )
                 seen_hashes.add(embedded_hash)
-    return findings
+            if embedded_truncated:
+                return findings, True
+    return findings, False
 
 
 def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def _append_bounded_audit_error(
+    errors: list[dict[str, Any]],
+    error: dict[str, Any],
+    *,
+    maximum: int,
+    source: str,
+) -> bool:
+    """Append one error or a single terminal truncation marker."""
+
+    if maximum <= 0 or len(errors) >= maximum:
+        return False
+    if len(errors) < maximum - 1:
+        errors.append(
+            {
+                key: (
+                    _bounded_portable_text(
+                        value,
+                        maximum_bytes=(
+                            _PORTABLE_METADATA_MAX_PATH_FIELD_BYTES
+                            if key in {"detail", "file", "metadata_path"}
+                            else _PORTABLE_METADATA_MAX_FINDING_FIELD_BYTES
+                        ),
+                    )
+                    if isinstance(value, str)
+                    else value
+                )
+                for key, value in error.items()
+            }
+        )
+        return True
+    errors.append(
+        {
+            "source": source,
+            "error": "audit_error_limit_reached",
+            "maximum_errors": maximum,
+        }
+    )
+    return False
+
+
+def _sqlite_rows_for_columns(
+    conn: Any,
+    table: str,
+    columns: list[str],
+) -> Any:
+    selected = ", ".join(_quote_identifier(column) for column in columns)
+    table_name = _quote_identifier(table)
+    try:
+        return conn.execute(
+            f"SELECT rowid AS __continuum_rowid__, {selected} FROM {table_name}"
+        )
+    except sqlite3.OperationalError:
+        return conn.execute(f"SELECT {selected} FROM {table_name}")
 
 
 def _sqlite_database_paths(root: Path) -> list[Path]:
@@ -490,61 +869,199 @@ def _audit_sqlite_portable_metadata(
     errors: list[dict[str, Any]] = []
     databases_scanned = 0
 
-    for database in _sqlite_database_paths(root):
-        if len(findings) >= max_findings:
+    databases = _sqlite_database_paths(root)
+    for database_index, database in enumerate(databases):
+        if len(findings) >= max_findings or len(errors) >= _SQLITE_METADATA_MAX_ERRORS:
+            break
+        if values_scanned >= _SQLITE_METADATA_MAX_VALUES_SCANNED:
+            if not any(
+                item.get("error") == "sqlite_value_scan_limit_reached"
+                for item in errors
+            ):
+                _append_bounded_audit_error(
+                    errors,
+                    {
+                        "source": "sqlite",
+                        "error": "sqlite_value_scan_limit_reached",
+                        "maximum_values": _SQLITE_METADATA_MAX_VALUES_SCANNED,
+                        "pending_databases": len(databases) - database_index,
+                    },
+                    maximum=_SQLITE_METADATA_MAX_ERRORS,
+                    source="sqlite",
+                )
             break
         rel_raw = database.relative_to(root)
         rel = str(_safe_rel_text(rel_raw)["path"])
         try:
             conn = sqlite3.connect(sqlite_readonly_uri(database), uri=True, timeout=2)
-            conn.row_factory = sqlite3.Row
         except sqlite3.Error as exc:
-            errors.append(
+            _append_bounded_audit_error(
+                errors,
                 {
                     "source": "sqlite",
                     "file": rel,
                     "error": "sqlite_open_failed",
                     "detail": redact_text_secrets(str(exc)),
-                }
+                },
+                maximum=_SQLITE_METADATA_MAX_ERRORS,
+                source="sqlite",
             )
+            continue
+
+        set_limit = getattr(conn, "setlimit", None)
+        get_limit = getattr(conn, "getlimit", None)
+        length_category = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+        if (
+            not callable(set_limit)
+            or not callable(get_limit)
+            or not isinstance(length_category, int)
+        ):
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "sqlite",
+                    "file": rel,
+                    "error": "sqlite_length_limit_unavailable",
+                },
+                maximum=_SQLITE_METADATA_MAX_ERRORS,
+                source="sqlite",
+            )
+            conn.close()
+            continue
+        try:
+            set_limit(length_category, _SQLITE_METADATA_MAX_ROW_BYTES)
+            observed_limit = int(get_limit(length_category))
+            if observed_limit > _SQLITE_METADATA_MAX_ROW_BYTES:
+                raise ValueError("SQLite length limit was not lowered")
+            conn.row_factory = sqlite3.Row
+        except Exception as exc:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "sqlite",
+                    "file": rel,
+                    "error": "sqlite_length_limit_failed",
+                    "detail": redact_text_secrets(str(exc)),
+                },
+                maximum=_SQLITE_METADATA_MAX_ERRORS,
+                source="sqlite",
+            )
+            conn.close()
             continue
 
         databases_scanned += 1
         try:
             try:
-                tables = [
-                    str(row[0])
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                oversized_name = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                    "AND length(CAST(name AS BLOB)) > ? LIMIT 1",
+                    (_SQLITE_METADATA_MAX_SCHEMA_NAME_BYTES,),
+                ).fetchone()
+                if oversized_name is not None:
+                    _append_bounded_audit_error(
+                        errors,
+                        {
+                            "source": "sqlite",
+                            "file": rel,
+                            "error": "sqlite_schema_name_too_large",
+                            "maximum_bytes": _SQLITE_METADATA_MAX_SCHEMA_NAME_BYTES,
+                        },
+                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                        source="sqlite",
                     )
-                ]
+                    continue
+                table_rows = list(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name LIMIT ?",
+                        (_SQLITE_METADATA_MAX_TABLES + 1,),
+                    )
+                )
+                if len(table_rows) > _SQLITE_METADATA_MAX_TABLES:
+                    _append_bounded_audit_error(
+                        errors,
+                        {
+                            "source": "sqlite",
+                            "file": rel,
+                            "error": "sqlite_table_count_too_large",
+                            "maximum_tables": _SQLITE_METADATA_MAX_TABLES,
+                        },
+                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                        source="sqlite",
+                    )
+                    continue
+                tables = [str(row[0]) for row in table_rows]
             except sqlite3.Error as exc:
-                errors.append(
+                _append_bounded_audit_error(
+                    errors,
                     {
                         "source": "sqlite",
                         "file": rel,
                         "error": "sqlite_schema_list_failed",
                         "detail": redact_text_secrets(str(exc)),
-                    }
+                    },
+                    maximum=_SQLITE_METADATA_MAX_ERRORS,
+                    source="sqlite",
                 )
                 continue
 
-            for table in tables:
-                if len(findings) >= max_findings:
+            for table_index, table in enumerate(tables):
+                if len(findings) >= max_findings or len(errors) >= _SQLITE_METADATA_MAX_ERRORS:
                     break
-                safe_table = redact_text_secrets(table)
+                if values_scanned >= _SQLITE_METADATA_MAX_VALUES_SCANNED:
+                    if not any(
+                        item.get("error") == "sqlite_value_scan_limit_reached"
+                        for item in errors
+                    ):
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "error": "sqlite_value_scan_limit_reached",
+                                "maximum_values": _SQLITE_METADATA_MAX_VALUES_SCANNED,
+                                "pending_tables": len(tables) - table_index,
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                    break
+                safe_table = _bounded_portable_text(
+                    table,
+                    maximum_bytes=_PORTABLE_METADATA_MAX_FINDING_FIELD_BYTES,
+                )
                 try:
-                    schema_rows = list(conn.execute(f"PRAGMA table_info({_quote_identifier(table)})"))
+                    schema_cursor = conn.execute(f"PRAGMA table_info({_quote_identifier(table)})")
+                    schema_rows = schema_cursor.fetchmany(_SQLITE_METADATA_MAX_SCHEMA_COLUMNS + 1)
                 except sqlite3.Error as exc:
-                    errors.append(
+                    _append_bounded_audit_error(
+                        errors,
                         {
                             "source": "sqlite",
                             "file": rel,
                             "sqlite_table": safe_table,
                             "error": "sqlite_schema_read_failed",
                             "detail": redact_text_secrets(str(exc)),
-                        }
+                        },
+                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                        source="sqlite",
+                    )
+                    continue
+
+                if len(schema_rows) > _SQLITE_METADATA_MAX_SCHEMA_COLUMNS:
+                    _append_bounded_audit_error(
+                        errors,
+                        {
+                            "source": "sqlite",
+                            "file": rel,
+                            "sqlite_table": safe_table,
+                            "error": "sqlite_schema_column_count_too_large",
+                            "maximum_columns": _SQLITE_METADATA_MAX_SCHEMA_COLUMNS,
+                        },
+                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                        source="sqlite",
                     )
                     continue
 
@@ -574,145 +1091,347 @@ def _audit_sqlite_portable_metadata(
                 if not selected:
                     continue
 
-                select_columns = ", ".join(_quote_identifier(column) for column in selected)
-                try:
-                    rows = conn.execute(
-                        f"SELECT rowid AS __continuum_rowid__, {select_columns} "
-                        f"FROM {_quote_identifier(table)}"
+                single_scan_columns = list(dict.fromkeys([*direct_columns, *json_columns]))
+                key_value_pairs = [
+                    (key_column, value_column)
+                    for key_column in key_columns
+                    for value_column in value_columns
+                ]
+                if (
+                    len(single_scan_columns) + len(key_value_pairs)
+                    > _SQLITE_METADATA_MAX_SCAN_GROUPS
+                ):
+                    _append_bounded_audit_error(
+                        errors,
+                        {
+                            "source": "sqlite",
+                            "file": rel,
+                            "sqlite_table": safe_table,
+                            "error": "sqlite_scan_group_count_too_large",
+                            "maximum_scan_groups": _SQLITE_METADATA_MAX_SCAN_GROUPS,
+                        },
+                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                        source="sqlite",
                     )
-                except sqlite3.Error:
+                    continue
+
+                oversized_value = False
+                for column in selected:
+                    quoted_column = _quote_identifier(column)
+                    oversized_condition = (
+                        f"typeof({quoted_column}) IN ('text', 'blob') "
+                        f"AND length(CAST({quoted_column} AS BLOB)) > ?"
+                    )
                     try:
-                        rows = conn.execute(
-                            f"SELECT {select_columns} FROM {_quote_identifier(table)}"
-                        )
-                    except sqlite3.Error as exc:
-                        errors.append(
+                        try:
+                            oversized_row = conn.execute(
+                                f"SELECT rowid FROM {_quote_identifier(table)} "
+                                f"WHERE {oversized_condition} LIMIT 1",
+                                (_SQLITE_METADATA_MAX_VALUE_BYTES,),
+                            ).fetchone()
+                        except sqlite3.DataError:
+                            raise
+                        except sqlite3.Error:
+                            oversized_row = conn.execute(
+                                f"SELECT 1 FROM {_quote_identifier(table)} "
+                                f"WHERE {oversized_condition} LIMIT 1",
+                                (_SQLITE_METADATA_MAX_VALUE_BYTES,),
+                            ).fetchone()
+                    except sqlite3.DataError as exc:
+                        _append_bounded_audit_error(
+                            errors,
                             {
                                 "source": "sqlite",
                                 "file": rel,
                                 "sqlite_table": safe_table,
-                                "error": "sqlite_query_failed",
+                                "sqlite_column": redact_text_secrets(column),
+                                "error": "sqlite_value_too_large",
+                                "maximum_bytes": _SQLITE_METADATA_MAX_VALUE_BYTES,
                                 "detail": redact_text_secrets(str(exc)),
-                            }
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
                         )
-                        continue
+                        oversized_value = True
+                        break
+                    except sqlite3.Error as exc:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "sqlite_column": redact_text_secrets(column),
+                                "error": "sqlite_value_size_probe_failed",
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                        oversized_value = True
+                        break
+                    if oversized_row is not None:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "sqlite_column": redact_text_secrets(column),
+                                "sqlite_rowid": oversized_row[0],
+                                "error": "sqlite_value_too_large",
+                                "maximum_bytes": _SQLITE_METADATA_MAX_VALUE_BYTES,
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                        oversized_value = True
+                        break
+                if oversized_value:
+                    continue
 
-                try:
-                    for row_number, row in enumerate(rows, start=1):
-                        if len(findings) >= max_findings:
-                            break
-                        row_keys = set(row.keys())
-                        row_id = (
-                            row["__continuum_rowid__"]
-                            if "__continuum_rowid__" in row_keys
-                            else row_number
-                        )
-                        texts: dict[str, str] = {}
-                        for column in selected:
+                direct_set = set(direct_columns)
+                json_set = set(json_columns)
+                scan_stopped = False
+                for column in single_scan_columns:
+                    if len(findings) >= max_findings:
+                        break
+                    try:
+                        rows = _sqlite_rows_for_columns(conn, table, [column])
+                        for row_number, row in enumerate(rows, start=1):
+                            if len(findings) >= max_findings:
+                                break
                             value = row[column]
                             if value is None:
                                 continue
+                            if values_scanned >= _SQLITE_METADATA_MAX_VALUES_SCANNED:
+                                _append_bounded_audit_error(
+                                    errors,
+                                    {
+                                        "source": "sqlite",
+                                        "file": rel,
+                                        "error": "sqlite_value_scan_limit_reached",
+                                        "maximum_values": _SQLITE_METADATA_MAX_VALUES_SCANNED,
+                                    },
+                                    maximum=_SQLITE_METADATA_MAX_ERRORS,
+                                    source="sqlite",
+                                )
+                                scan_stopped = True
+                                break
                             values_scanned += 1
-                            texts[column] = (
+                            row_keys = set(row.keys())
+                            row_id = (
+                                row["__continuum_rowid__"]
+                                if "__continuum_rowid__" in row_keys
+                                else row_number
+                            )
+                            text_value = (
                                 value.decode("utf-8", errors="replace")
                                 if isinstance(value, bytes)
                                 else str(value)
                             )
-
-                        for column in direct_columns:
-                            text_value = texts.get(column)
-                            if text_value is None or not _looks_nonportable_local_path(text_value):
+                            if column in direct_set and _looks_nonportable_local_path(text_value):
+                                findings.append(
+                                    _bounded_portable_finding(
+                                        {
+                                            "source": "sqlite",
+                                            "file": rel,
+                                            "sqlite_table": safe_table,
+                                            "sqlite_column": column,
+                                            "sqlite_rowid": row_id,
+                                            "metadata_path": f"$.{safe_table}[{row_id}].{column}",
+                                            "value": _external_path_reference(text_value),
+                                            "value_hash": content_hash(text_value),
+                                        }
+                                    )
+                                )
+                            if column not in json_set or len(findings) >= max_findings:
                                 continue
-                            findings.append(
-                                {
-                                    "source": "sqlite",
-                                    "file": rel,
-                                    "sqlite_table": safe_table,
-                                    "sqlite_column": redact_text_secrets(column),
-                                    "sqlite_rowid": row_id,
-                                    "metadata_path": (
-                                        f"$.{safe_table}[{row_id}].{redact_text_secrets(column)}"
-                                    ),
-                                    "value": _external_path_reference(text_value),
-                                    "value_hash": content_hash(text_value),
-                                }
-                            )
-                            if len(findings) >= max_findings:
-                                break
-                        if len(findings) >= max_findings:
-                            break
-
-                        for column in json_columns:
-                            text_value = texts.get(column, "").strip()
-                            if not text_value or text_value[0] not in "[{":
+                            json_text = text_value.strip()
+                            if not json_text or json_text[0] not in "[{":
                                 continue
                             try:
-                                parsed = _strict_json_loads(text_value)
+                                parsed = _strict_json_loads(json_text)
                             except ValueError as exc:
-                                errors.append(
+                                if not _append_bounded_audit_error(
+                                    errors,
                                     {
                                         "source": "sqlite_json",
                                         "file": rel,
                                         "sqlite_table": safe_table,
-                                        "sqlite_column": redact_text_secrets(column),
+                                        "sqlite_column": column,
                                         "sqlite_rowid": row_id,
                                         "error": "sqlite_json_decode_failed",
                                         "detail": redact_text_secrets(str(exc)),
-                                    }
-                                )
+                                    },
+                                    maximum=_SQLITE_METADATA_MAX_ERRORS,
+                                    source="sqlite",
+                                ):
+                                    scan_stopped = True
+                                    break
                                 continue
                             remaining = max_findings - len(findings)
-                            for item in _portable_metadata_findings(parsed)[:remaining]:
+                            nested_findings, nested_truncated = _portable_metadata_findings(
+                                parsed,
+                                max_findings=remaining,
+                            )
+                            for item in nested_findings:
                                 item.update(
                                     {
                                         "source": "sqlite_json",
                                         "file": rel,
                                         "sqlite_table": safe_table,
-                                        "sqlite_column": redact_text_secrets(column),
+                                        "sqlite_column": column,
                                         "sqlite_rowid": row_id,
                                     }
                                 )
-                                findings.append(item)
-                        if len(findings) >= max_findings:
-                            break
-
-                        for key_column in key_columns:
-                            key_text = texts.get(key_column)
-                            if not key_text or not _is_path_like_key(key_text):
-                                continue
-                            for value_column in value_columns:
-                                value_text = texts.get(value_column)
-                                if value_text is None or not _looks_nonportable_local_path(value_text):
-                                    continue
-                                findings.append(
+                                findings.append(_bounded_portable_finding(item))
+                            if nested_truncated:
+                                _append_bounded_audit_error(
+                                    errors,
                                     {
-                                        "source": "sqlite_key_value",
+                                        "source": "sqlite_json",
                                         "file": rel,
                                         "sqlite_table": safe_table,
-                                        "sqlite_key_column": redact_text_secrets(key_column),
-                                        "sqlite_value_column": redact_text_secrets(value_column),
-                                        "sqlite_rowid": row_id,
-                                        "metadata_path": (
-                                            f"$.{safe_table}[{row_id}].{redact_text_secrets(key_text)}"
-                                        ),
-                                        "value": _external_path_reference(value_text),
-                                        "value_hash": content_hash(value_text),
-                                    }
+                                        "error": "metadata_finding_limit_reached",
+                                        "maximum_findings": max_findings,
+                                    },
+                                    maximum=_SQLITE_METADATA_MAX_ERRORS,
+                                    source="sqlite",
+                                )
+                                scan_stopped = True
+                                break
+                    except sqlite3.DataError as exc:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "sqlite_column": column,
+                                "error": "sqlite_value_too_large",
+                                "maximum_bytes": _SQLITE_METADATA_MAX_VALUE_BYTES,
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                    except sqlite3.Error as exc:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "sqlite_column": column,
+                                "error": "sqlite_iteration_failed",
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                    if scan_stopped or len(errors) >= _SQLITE_METADATA_MAX_ERRORS:
+                        break
+                if scan_stopped or len(findings) >= max_findings:
+                    continue
+
+                for key_column, value_column in key_value_pairs:
+                    if len(findings) >= max_findings:
+                        break
+                    try:
+                        rows = _sqlite_rows_for_columns(
+                            conn,
+                            table,
+                            [key_column, value_column],
+                        )
+                        for row_number, row in enumerate(rows, start=1):
+                            row_keys = set(row.keys())
+                            row_id = (
+                                row["__continuum_rowid__"]
+                                if "__continuum_rowid__" in row_keys
+                                else row_number
+                            )
+                            texts: dict[str, str] = {}
+                            for column in (key_column, value_column):
+                                value = row[column]
+                                if value is None:
+                                    continue
+                                if values_scanned >= _SQLITE_METADATA_MAX_VALUES_SCANNED:
+                                    _append_bounded_audit_error(
+                                        errors,
+                                        {
+                                            "source": "sqlite",
+                                            "file": rel,
+                                            "error": "sqlite_value_scan_limit_reached",
+                                            "maximum_values": _SQLITE_METADATA_MAX_VALUES_SCANNED,
+                                        },
+                                        maximum=_SQLITE_METADATA_MAX_ERRORS,
+                                        source="sqlite",
+                                    )
+                                    scan_stopped = True
+                                    break
+                                values_scanned += 1
+                                texts[column] = (
+                                    value.decode("utf-8", errors="replace")
+                                    if isinstance(value, bytes)
+                                    else str(value)
+                                )
+                            if scan_stopped:
+                                break
+                            key_text = texts.get(key_column)
+                            value_text = texts.get(value_column)
+                            if (
+                                key_text
+                                and value_text is not None
+                                and _is_path_like_key(key_text)
+                                and _looks_nonportable_local_path(value_text)
+                            ):
+                                findings.append(
+                                    _bounded_portable_finding(
+                                        {
+                                            "source": "sqlite_key_value",
+                                            "file": rel,
+                                            "sqlite_table": safe_table,
+                                            "sqlite_key_column": key_column,
+                                            "sqlite_value_column": value_column,
+                                            "sqlite_rowid": row_id,
+                                            "metadata_path": f"$.{safe_table}[{row_id}].{key_text}",
+                                            "value": _external_path_reference(value_text),
+                                            "value_hash": content_hash(value_text),
+                                        }
+                                    )
                                 )
                                 if len(findings) >= max_findings:
                                     break
-                            if len(findings) >= max_findings:
-                                break
-                except sqlite3.Error as exc:
-                    errors.append(
-                        {
-                            "source": "sqlite",
-                            "file": rel,
-                            "sqlite_table": safe_table,
-                            "error": "sqlite_iteration_failed",
-                            "detail": redact_text_secrets(str(exc)),
-                        }
-                    )
+                    except sqlite3.DataError as exc:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "error": "sqlite_value_too_large",
+                                "maximum_bytes": _SQLITE_METADATA_MAX_VALUE_BYTES,
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                    except sqlite3.Error as exc:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "sqlite",
+                                "file": rel,
+                                "sqlite_table": safe_table,
+                                "error": "sqlite_iteration_failed",
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_SQLITE_METADATA_MAX_ERRORS,
+                            source="sqlite",
+                        )
+                    if scan_stopped or len(errors) >= _SQLITE_METADATA_MAX_ERRORS:
+                        break
         finally:
             conn.close()
 
@@ -739,10 +1458,44 @@ def _yaml_scalar_text(raw: str) -> str:
     return text
 
 
+def _read_portable_metadata_text(path: Path) -> str:
+    """Read one metadata file without allowing whole-file memory growth."""
+    with path.open("rb") as handle:
+        payload = handle.read(_PORTABLE_METADATA_MAX_FILE_BYTES + 1)
+    if len(payload) > _PORTABLE_METADATA_MAX_FILE_BYTES:
+        raise _PortableMetadataTooLarge(
+            f"metadata file exceeds {_PORTABLE_METADATA_MAX_FILE_BYTES} bytes"
+        )
+    return payload.decode("utf-8")
+
+
+def _iter_portable_metadata_lines(
+    path: Path,
+    *,
+    budget: _PortableMetadataLineBudget,
+) -> Iterable[tuple[int, str]]:
+    """Stream UTF-8 metadata while bounding every individual record."""
+    with path.open("rb") as handle:
+        line_number = 0
+        while True:
+            payload = handle.readline(_PORTABLE_METADATA_MAX_FILE_BYTES + 1)
+            if not payload:
+                return
+            line_number += 1
+            if len(payload) > _PORTABLE_METADATA_MAX_FILE_BYTES:
+                raise _PortableMetadataTooLarge(
+                    "metadata line exceeds "
+                    f"{_PORTABLE_METADATA_MAX_FILE_BYTES} bytes"
+                )
+            budget.consume(len(payload))
+            yield line_number, payload.decode("utf-8").rstrip("\r\n")
+
+
 def _audit_yaml_portable_metadata(
     root: Path,
     *,
     max_findings: int,
+    line_budget: _PortableMetadataLineBudget,
 ) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
     """Inspect generated card YAML path fields without adding a YAML dependency."""
     findings: list[dict[str, Any]] = []
@@ -761,35 +1514,71 @@ def _audit_yaml_portable_metadata(
             continue
         rel = file_path.relative_to(root).as_posix()
         try:
-            text = file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            errors.append({"source": "yaml", "file": rel, "error": "yaml_read_failed", "detail": str(exc)})
+            files_scanned += 1
+            for line_number, line in _iter_portable_metadata_lines(
+                file_path,
+                budget=line_budget,
+            ):
+                if len(findings) >= max_findings:
+                    break
+                match = _YAML_KEY_VALUE_RE.match(line)
+                if not match:
+                    continue
+                raw_key = match.group("key")
+                try:
+                    key = str(json.loads(raw_key)) if raw_key.startswith('"') else raw_key
+                except json.JSONDecodeError:
+                    key = raw_key.strip('"')
+                raw_value = match.group("value") or ""
+                value = _yaml_scalar_text(raw_value)
+                if _is_path_like_key(key) and _looks_nonportable_local_path(value):
+                    findings.append(
+                        _bounded_portable_finding(
+                            {
+                            "source": "yaml",
+                            "file": rel,
+                            "line": line_number,
+                            "metadata_path": f"$.{key}",
+                            "value": _external_path_reference(value),
+                            "value_hash": content_hash(value),
+                            }
+                        )
+                    )
+        except _PortableMetadataStreamLimit as exc:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "yaml",
+                    "file": rel,
+                    "error": exc.code,
+                    "maximum": exc.maximum,
+                    "detail": str(exc),
+                },
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="yaml",
+            )
+            break
+        except _PortableMetadataTooLarge as exc:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "yaml",
+                    "file": rel,
+                    "error": "yaml_too_large",
+                    "detail": str(exc),
+                },
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="yaml",
+            )
             continue
-        files_scanned += 1
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if len(findings) >= max_findings:
-                break
-            match = _YAML_KEY_VALUE_RE.match(line)
-            if not match:
-                continue
-            raw_key = match.group("key")
-            try:
-                key = str(json.loads(raw_key)) if raw_key.startswith('"') else raw_key
-            except json.JSONDecodeError:
-                key = raw_key.strip('"')
-            raw_value = match.group("value") or ""
-            value = _yaml_scalar_text(raw_value)
-            if _is_path_like_key(key) and _looks_nonportable_local_path(value):
-                findings.append(
-                    {
-                        "source": "yaml",
-                        "file": rel,
-                        "line": line_number,
-                        "metadata_path": f"$.{key}",
-                        "value": _external_path_reference(value),
-                        "value_hash": content_hash(value),
-                    }
-                )
+        except (OSError, UnicodeDecodeError) as exc:
+            _append_bounded_audit_error(
+                errors,
+                {"source": "yaml", "file": rel, "error": "yaml_read_failed", "detail": str(exc)},
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="yaml",
+            )
+            continue
     return findings, files_scanned, errors
 
 
@@ -799,8 +1588,12 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
     errors: list[dict[str, Any]] = []
     json_files_scanned = 0
     max_findings = max(1, int(max_findings))
+    line_budget = _PortableMetadataLineBudget(
+        max_bytes=_PORTABLE_METADATA_MAX_STREAM_BYTES,
+        max_records=_PORTABLE_METADATA_MAX_STREAM_RECORDS,
+    )
     for file_path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if len(findings) >= max_findings:
+        if len(findings) >= max_findings or len(errors) >= _PORTABLE_METADATA_MAX_ERRORS:
             break
         if _is_link_like(file_path) or not file_path.is_file():
             continue
@@ -810,57 +1603,156 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
         if not _is_metadata_file(rel):
             continue
         json_files_scanned += 1
-        try:
-            text = file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            errors.append({"source": "json", "file": rel.as_posix(), "error": "metadata_read_failed", "detail": str(exc)})
-            continue
-        values: list[tuple[int | None, Any]] = []
         line_oriented = rel.suffix.casefold() in {".jsonl", ".log"}
         if line_oriented:
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if not line.strip():
-                    continue
-                try:
-                    parsed = _strict_json_loads(line)
-                except ValueError as exc:
-                    errors.append(
-                        {
-                            "source": "jsonl",
-                            "file": rel.as_posix(),
-                            "line": line_number,
-                            "error": "metadata_decode_failed",
-                            "detail": redact_text_secrets(str(exc)),
-                        }
-                    )
-                    continue
-                values.append((line_number, parsed))
-        else:
             try:
-                values.append((None, _strict_json_loads(text)))
-            except ValueError as exc:
-                errors.append(
+                streamed_values = _iter_portable_metadata_lines(file_path, budget=line_budget)
+                for line_number, line in streamed_values:
+                    if len(findings) >= max_findings:
+                        break
+                    if not line.strip():
+                        continue
+                    try:
+                        parsed = _strict_json_loads(line)
+                    except ValueError as exc:
+                        if not _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "jsonl",
+                                "file": rel.as_posix(),
+                                "line": line_number,
+                                "error": "metadata_decode_failed",
+                                "detail": redact_text_secrets(str(exc)),
+                            },
+                            maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                            source="jsonl",
+                        ):
+                            break
+                        continue
+                    remaining = max_findings - len(findings)
+                    record_findings, record_truncated = _portable_metadata_findings(
+                        parsed,
+                        scan_embedded_paths=rel.suffix.casefold() == ".log",
+                        max_findings=remaining,
+                    )
+                    for item in record_findings:
+                        item["source"] = "jsonl"
+                        item["file"] = rel.as_posix()
+                        item["line"] = line_number
+                        findings.append(_bounded_portable_finding(item))
+                    if record_truncated:
+                        _append_bounded_audit_error(
+                            errors,
+                            {
+                                "source": "jsonl",
+                                "file": rel.as_posix(),
+                                "line": line_number,
+                                "error": "metadata_finding_limit_reached",
+                                "maximum_findings": max_findings,
+                            },
+                            maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                            source="jsonl",
+                        )
+                        break
+            except _PortableMetadataStreamLimit as exc:
+                _append_bounded_audit_error(
+                    errors,
                     {
-                        "source": "json",
+                        "source": "jsonl",
                         "file": rel.as_posix(),
-                        "error": "metadata_decode_failed",
-                        "detail": redact_text_secrets(str(exc)),
-                    }
+                        "error": exc.code,
+                        "maximum": exc.maximum,
+                        "detail": str(exc),
+                    },
+                    maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                    source="jsonl",
                 )
-                continue
-        for value_line_number, parsed in values:
-            remaining = max_findings - len(findings)
-            if remaining <= 0:
-                break
-            for item in _portable_metadata_findings(
-                parsed,
-                scan_embedded_paths=rel.suffix.casefold() == ".log",
-            )[:remaining]:
-                item["source"] = "jsonl" if value_line_number is not None else "json"
-                item["file"] = rel.as_posix()
-                if value_line_number is not None:
-                    item["line"] = value_line_number
-                findings.append(item)
+            except _PortableMetadataTooLarge as exc:
+                _append_bounded_audit_error(
+                    errors,
+                    {
+                        "source": "jsonl",
+                        "file": rel.as_posix(),
+                        "error": "metadata_line_too_large",
+                        "detail": str(exc),
+                    },
+                    maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                    source="jsonl",
+                )
+            except (OSError, UnicodeDecodeError) as exc:
+                _append_bounded_audit_error(
+                    errors,
+                    {
+                        "source": "jsonl",
+                        "file": rel.as_posix(),
+                        "error": "metadata_read_failed",
+                        "detail": str(exc),
+                    },
+                    maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                    source="jsonl",
+                )
+            continue
+
+        try:
+            text = _read_portable_metadata_text(file_path)
+        except _PortableMetadataTooLarge as exc:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "json",
+                    "file": rel.as_posix(),
+                    "error": "metadata_too_large",
+                    "detail": str(exc),
+                },
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="json",
+            )
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            _append_bounded_audit_error(
+                errors,
+                {"source": "json", "file": rel.as_posix(), "error": "metadata_read_failed", "detail": str(exc)},
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="json",
+            )
+            continue
+        try:
+            parsed = _strict_json_loads(text)
+        except ValueError as exc:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "json",
+                    "file": rel.as_posix(),
+                    "error": "metadata_decode_failed",
+                    "detail": redact_text_secrets(str(exc)),
+                },
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="json",
+            )
+            continue
+        remaining = max_findings - len(findings)
+        record_findings, record_truncated = _portable_metadata_findings(
+            parsed,
+            max_findings=remaining,
+        )
+        for item in record_findings:
+            item["source"] = "json"
+            item["file"] = rel.as_posix()
+            findings.append(_bounded_portable_finding(item))
+        if record_truncated:
+            _append_bounded_audit_error(
+                errors,
+                {
+                    "source": "json",
+                    "file": rel.as_posix(),
+                    "error": "metadata_finding_limit_reached",
+                    "maximum_findings": max_findings,
+                },
+                maximum=_PORTABLE_METADATA_MAX_ERRORS,
+                source="json",
+            )
+            break
 
     remaining = max_findings - len(findings)
     sqlite_findings, sqlite_values_scanned, sqlite_errors, sqlite_databases_scanned = _audit_sqlite_portable_metadata(
@@ -874,6 +1766,7 @@ def audit_portable_metadata(root: Path, *, max_findings: int = 200) -> dict[str,
     yaml_findings, yaml_files_scanned, yaml_errors = _audit_yaml_portable_metadata(
         root,
         max_findings=max(0, remaining),
+        line_budget=line_budget,
     )
     findings.extend(yaml_findings)
     errors.extend(yaml_errors)
@@ -996,12 +1889,23 @@ def _file_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
                 "mode": stat.S_IMODE(path.stat().st_mode),
             }
         )
-    unsafe = [entry["path"] for entry in entries if not _zip_member_is_safe(str(entry["path"]))]
+    unsafe = _bounded_diagnostic_sample(
+        (
+            str(entry["path"])
+            for entry in entries
+            if not _zip_member_is_safe(str(entry["path"]))
+        ),
+        maximum=5,
+    )
     if unsafe:
-        raise ValueError(f"root contains bundle-incompatible path(s): {unsafe[:5]}")
-    collisions = _portable_name_collisions(str(entry["path"]) for entry in entries)
+        raise ValueError(f"root contains bundle-incompatible path(s): {unsafe}")
+    collisions = _portable_name_collisions(
+        (str(entry["path"]) for entry in entries),
+        maximum=5,
+        members_per_collision=5,
+    )
     if collisions:
-        raise ValueError(f"root contains case/Unicode-colliding path(s): {collisions[:5]}")
+        raise ValueError(f"root contains case/Unicode-colliding path(s): {collisions}")
     return entries, total_bytes
 
 
@@ -1039,12 +1943,90 @@ def _zip_member_is_safe(name: str) -> bool:
     return True
 
 
-def _portable_name_collisions(names: Iterable[str]) -> list[list[str]]:
-    groups: dict[str, list[str]] = {}
+_DiagnosticItem = TypeVar("_DiagnosticItem")
+
+
+def _bounded_diagnostic_sample(
+    values: Iterable[_DiagnosticItem],
+    *,
+    maximum: int = _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT,
+) -> list[_DiagnosticItem]:
+    """Retain at most ``maximum`` already-matched diagnostic values."""
+
+    if maximum < 1:
+        raise ValueError("diagnostic sample maximum must be positive")
+    sample: list[_DiagnosticItem] = []
+    for value in values:
+        sample.append(value)
+        if len(sample) == maximum:
+            break
+    return sample
+
+
+def _bounded_absent_text_sample(
+    candidates: Iterable[str],
+    present: set[str],
+    *,
+    maximum: int = _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT,
+) -> list[str]:
+    """Sample unique candidates absent from ``present`` without a full difference."""
+
+    if maximum < 1:
+        raise ValueError("diagnostic sample maximum must be positive")
+    sample: list[str] = []
+    sampled: set[str] = set()
+    for candidate in candidates:
+        if candidate in present or candidate in sampled:
+            continue
+        sampled.add(candidate)
+        sample.append(candidate)
+        if len(sample) == maximum:
+            break
+    return sample
+
+
+def _is_nondecreasing_text(values: Iterable[str]) -> bool:
+    iterator = iter(values)
+    try:
+        previous = next(iterator)
+    except StopIteration:
+        return True
+    for value in iterator:
+        if previous > value:
+            return False
+        previous = value
+    return True
+
+
+def _portable_name_collisions(
+    names: Iterable[str],
+    *,
+    maximum: int = _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT,
+    members_per_collision: int = _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT,
+) -> list[list[str]]:
+    """Return bounded collision groups while preserving exact collision detection."""
+
+    if maximum < 1 or members_per_collision < 2:
+        raise ValueError("collision sample limits are invalid")
+    first_by_key: dict[str, str] = {}
+    sampled_by_key: dict[str, list[str]] = {}
+    samples: list[list[str]] = []
     for name in names:
         key = unicodedata.normalize("NFC", name).casefold()
-        groups.setdefault(key, []).append(name)
-    return [sorted(values) for values in groups.values() if len(values) > 1]
+        if key not in first_by_key:
+            first_by_key[key] = name
+            continue
+        group = sampled_by_key.get(key)
+        if group is None:
+            group = [first_by_key[key], name]
+            sampled_by_key[key] = group
+            samples.append(group)
+            if len(samples) == maximum:
+                return [sorted(values) for values in samples]
+            continue
+        if len(group) < members_per_collision:
+            group.append(name)
+    return [sorted(values) for values in samples]
 
 
 def _zip_member_type(info: zipfile.ZipInfo) -> str:
@@ -1065,14 +2047,20 @@ def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _manifest_structure_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    errors: list[dict[str, Any]] = []
+def _manifest_structure_errors(
+    manifest: dict[str, Any],
+    *,
+    _errors: _BoundedBundleErrors | None = None,
+) -> list[dict[str, Any]]:
+    errors = _errors if _errors is not None else _BoundedBundleErrors()
     allowed_keys = {
         "schema", "bundle_id", "created_at", "profile", "symlink_policy",
         "redaction_profile", "root_identity_hash", "file_count", "total_size_bytes",
         "files", "copy", "preflight", "alias_key_policy", "manifest_hash",
     }
-    unexpected = sorted(set(manifest) - allowed_keys)
+    unexpected = _bounded_diagnostic_sample(
+        (key for key in manifest if key not in allowed_keys)
+    )
     if unexpected:
         errors.append({"error": "manifest_unexpected_fields", "fields": unexpected})
     required_strings = ("bundle_id", "created_at", "manifest_hash")
@@ -1102,26 +2090,45 @@ def _manifest_structure_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]
     files = manifest.get("files")
     if not isinstance(files, list):
         return errors
-    ordered_paths = [
-        str(entry.get("path"))
-        for entry in files
-        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
-    ]
-    if ordered_paths != sorted(ordered_paths):
+    previous_path: str | None = None
+    file_order_noncanonical = False
+    alias_key_paths: list[str] = []
+    shareable = manifest.get("profile") == "shareable"
+    for entry in files:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        path = str(entry["path"])
+        if previous_path is not None and previous_path > path:
+            file_order_noncanonical = True
+        previous_path = path
+        if (
+            shareable
+            and len(alias_key_paths) < _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT
+            and (
+                path == "catalog/partition_alias.key"
+                or (
+                    path.startswith("snapshots/continuum_partition_alias_")
+                    and path.endswith(".key")
+                )
+            )
+        ):
+            alias_key_paths.append(path)
+    if file_order_noncanonical:
         errors.append({"error": "manifest_file_order_noncanonical"})
-    if manifest.get("profile") == "shareable":
-        alias_key_paths = [
-            path for path in ordered_paths
-            if path == "catalog/partition_alias.key"
-            or (path.startswith("snapshots/continuum_partition_alias_") and path.endswith(".key"))
-        ]
-        if alias_key_paths:
-            errors.append({"error": "manifest_shareable_alias_key_included", "paths": alias_key_paths[:20]})
+    if alias_key_paths:
+        errors.append(
+            {
+                "error": "manifest_shareable_alias_key_included",
+                "paths": alias_key_paths,
+            }
+        )
     allowed_entry_keys = {"path", "sha256", "size_bytes", "mode"}
     for index, entry in enumerate(files):
         if not isinstance(entry, dict):
             continue
-        unexpected_entry = sorted(set(entry) - allowed_entry_keys)
+        unexpected_entry = _bounded_diagnostic_sample(
+            (key for key in entry if key not in allowed_entry_keys)
+        )
         if unexpected_entry:
             errors.append({"error": "manifest_file_entry_unexpected_fields", "index": index, "fields": unexpected_entry})
         if not isinstance(entry.get("path"), str) or not entry.get("path"):
@@ -1136,9 +2143,13 @@ def _manifest_structure_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]
     return errors
 
 
-def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _manifest_semantic_errors(
+    manifest: dict[str, Any],
+    *,
+    _errors: _BoundedBundleErrors | None = None,
+) -> list[dict[str, Any]]:
     """Validate claims that distinguish a policy-checked handoff from a hash list."""
-    errors: list[dict[str, Any]] = []
+    errors = _errors if _errors is not None else _BoundedBundleErrors()
     profile = manifest.get("profile")
     symlink_policy = manifest.get("symlink_policy")
     redaction_profile = manifest.get("redaction_profile")
@@ -1166,7 +2177,9 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             "copied_files", "copied_bytes", "skipped_count", "skipped",
             "symlink_count", "symlinks",
         }
-        unexpected = sorted(set(copy_payload) - allowed_copy_keys)
+        unexpected = _bounded_diagnostic_sample(
+            (key for key in copy_payload if key not in allowed_copy_keys)
+        )
         if unexpected:
             errors.append({"error": "manifest_copy_unexpected_fields", "fields": unexpected})
         for key in ("copied_files", "copied_bytes", "skipped_count", "symlink_count"):
@@ -1191,26 +2204,43 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             if copy_payload.get("copied_bytes") != manifest.get("total_size_bytes"):
                 errors.append({"error": "manifest_copy_size_mismatch"})
         valid_skip_reasons = {"transient_excluded", "symlink_skipped", "unsupported_file_type", "shareable_alias_key_omitted"}
-        invalid_skipped = [
-            index for index, item in enumerate(skipped)
-            if not isinstance(item, dict)
-            or not isinstance(item.get("reason"), str)
-            or item.get("reason") not in valid_skip_reasons
-        ]
+        invalid_skipped = _bounded_diagnostic_sample(
+            (
+                index
+                for index, item in enumerate(skipped)
+                if not isinstance(item, dict)
+                or not isinstance(item.get("reason"), str)
+                or item.get("reason") not in valid_skip_reasons
+            )
+        )
         if invalid_skipped:
-            errors.append({"error": "manifest_copy_skip_entry_invalid", "indexes": invalid_skipped[:20]})
+            errors.append(
+                {
+                    "error": "manifest_copy_skip_entry_invalid",
+                    "indexes": invalid_skipped,
+                }
+            )
         symlink_count = copy_payload.get("symlink_count")
         if symlink_policy == "fail" and (symlinks or (symlink_count is not None and symlink_count != 0)):
             errors.append({"error": "manifest_fail_policy_contains_symlinks"})
         if profile == "shareable":
-            prohibited = [
-                index for index, item in enumerate(skipped)
-                if isinstance(item, dict)
-                and isinstance(item.get("reason"), str)
-                and item.get("reason") in {"symlink_skipped", "unsupported_file_type"}
-            ]
+            prohibited = _bounded_diagnostic_sample(
+                (
+                    index
+                    for index, item in enumerate(skipped)
+                    if isinstance(item, dict)
+                    and isinstance(item.get("reason"), str)
+                    and item.get("reason")
+                    in {"symlink_skipped", "unsupported_file_type"}
+                )
+            )
             if prohibited:
-                errors.append({"error": "manifest_shareable_omitted_evidence", "indexes": prohibited[:20]})
+                errors.append(
+                    {
+                        "error": "manifest_shareable_omitted_evidence",
+                        "indexes": prohibited,
+                    }
+                )
 
     preflight = manifest.get("preflight")
     if isinstance(preflight, dict):
@@ -1223,7 +2253,9 @@ def _manifest_semantic_errors(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             "alias_key_included", "alias_key_policy", "alias_key_files_omitted",
             "snapshot_manifests_rewritten_for_shareable",
         }
-        unexpected = sorted(set(preflight) - allowed_preflight_keys)
+        unexpected = _bounded_diagnostic_sample(
+            (key for key in preflight if key not in allowed_preflight_keys)
+        )
         if unexpected:
             errors.append({"error": "manifest_preflight_unexpected_fields", "fields": unexpected})
         healthy_bool_fields = (
@@ -1324,6 +2356,7 @@ def _read_zip_member_exact(
     info: zipfile.ZipInfo,
     *,
     collect: bool = False,
+    budget: _BundleVerificationBudget | None = None,
 ) -> tuple[bytes | None, str | None, int, str | None]:
     """Read a member and require DEFLATE EOF at the declared byte boundary.
 
@@ -1357,6 +2390,8 @@ def _read_zip_member_exact(
             return
         if output_size + len(output) > declared_output_size:
             raise _OutputSizeExceeded
+        if budget is not None:
+            budget.consume(len(output), f"hashing ZIP member {info.filename}")
         digest.update(output)
         crc = zlib.crc32(output, crc)
         output_size += len(output)
@@ -1367,6 +2402,8 @@ def _read_zip_member_exact(
     try:
         if info.compress_type == zipfile.ZIP_STORED:
             while remaining:
+                if budget is not None:
+                    budget.check_deadline(f"reading ZIP member {info.filename}")
                 chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     return None, None, output_size, "compressed_data_truncated"
@@ -1375,6 +2412,8 @@ def _read_zip_member_exact(
         elif info.compress_type == zipfile.ZIP_DEFLATED:
             inflater = zlib.decompressobj(-15)
             while remaining:
+                if budget is not None:
+                    budget.check_deadline(f"reading ZIP member {info.filename}")
                 chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     return None, None, output_size, "compressed_data_truncated"
@@ -1521,6 +2560,222 @@ def _find_eocd(data: bytes) -> tuple[int, tuple[int, ...]] | None:
         cursor = offset
 
 
+@dataclass(frozen=True)
+class _BundleZipPreflight:
+    file_size: int
+    declared_entry_count: int
+    observed_entry_count: int
+    central_directory_size: int
+    central_directory_offset: int
+
+    @property
+    def entry_count(self) -> int:
+        return self.observed_entry_count
+
+
+def _validated_bundle_limit(name: str, value: Any, *, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < 1 or value > maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+def _deflate_compressed_size_bound(expanded_bytes: int, entry_count: int) -> int:
+    """Conservative sum of zlib ``compressBound`` over canonical members."""
+    expanded = max(0, int(expanded_bytes))
+    entries = max(0, int(entry_count))
+    return (
+        expanded
+        + (expanded >> 12)
+        + (expanded >> 14)
+        + (expanded >> 25)
+        + 13 * entries
+    )
+
+
+def _read_bundle_zip_preflight(
+    path: Path,
+    *,
+    budget: _BundleVerificationBudget | None = None,
+    raw_handle: Any | None = None,
+    max_entries: int | None = None,
+    max_central_directory_bytes: int | None = None,
+) -> _BundleZipPreflight:
+    """Walk bounded EOCD and central records before ``ZipFile`` allocates them."""
+    file_size = (
+        os.fstat(raw_handle.fileno()).st_size
+        if raw_handle is not None
+        else path.stat().st_size
+    )
+    if file_size < 22:
+        raise ValueError("ZIP end-of-central-directory record is missing")
+    handle_context = nullcontext(raw_handle) if raw_handle is not None else path.open("rb")
+    with handle_context as handle:
+        if budget is not None:
+            budget.check_deadline("preflighting the ZIP end record")
+        tail_size = min(file_size, 22 + _ZIP_UINT16_MAX + 4096)
+        tail = _read_exact_at(handle, file_size - tail_size, tail_size)
+        located = _find_eocd(tail)
+        if located is None:
+            raise ValueError("ZIP end-of-central-directory record is missing")
+        relative_eocd, eocd = located
+        eocd_offset = file_size - tail_size + relative_eocd
+        (
+            _signature,
+            _disk_number,
+            _central_disk,
+            _entries_on_disk,
+            declared_entries,
+            central_size,
+            central_offset,
+            _comment_length,
+        ) = eocd
+        legacy_central_size = int(central_size)
+        legacy_central_offset = int(central_offset)
+        if _disk_number != 0 or _central_disk != 0 or _entries_on_disk != declared_entries:
+            raise ValueError("multi-disk ZIP metadata is not supported")
+
+        locator_offset = eocd_offset - 20
+        locator = _read_exact_at(handle, locator_offset, 20) if locator_offset >= 0 else b""
+        central_boundary = eocd_offset
+        has_zip64_locator = (
+            len(locator) == 20
+            and struct.unpack_from("<I", locator)[0] == _ZIP64_LOCATOR_SIGNATURE
+        )
+        if has_zip64_locator:
+            _locator_signature, zip64_disk, zip64_offset, zip64_disks = struct.unpack(
+                "<IIQI", locator
+            )
+            if zip64_disk != 0 or zip64_disks != 1:
+                raise ValueError("multi-disk ZIP64 metadata is not supported")
+            zip64_header = _read_exact_at(handle, int(zip64_offset), 56)
+            if struct.unpack_from("<I", zip64_header)[0] != _ZIP64_EOCD_SIGNATURE:
+                raise ValueError("ZIP64 end-of-central-directory record is missing")
+            record_size = struct.unpack_from("<Q", zip64_header, 4)[0]
+            if record_size != 44 or int(zip64_offset) + 56 != locator_offset:
+                raise ValueError("ZIP64 end record is not the fixed adjacent canonical record")
+            (
+                made,
+                needed,
+                disk_number,
+                directory_disk,
+                entries_on_disk,
+                total_entries,
+                central_size,
+                central_offset,
+            ) = struct.unpack_from("<HHIIQQQQ", zip64_header, 12)
+            if made != 45 or needed != 45:
+                raise ValueError("ZIP64 version metadata is not canonical")
+            if (
+                disk_number != 0
+                or directory_disk != 0
+                or entries_on_disk != total_entries
+            ):
+                raise ValueError("multi-disk or inconsistent ZIP64 entry metadata")
+            if not (
+                int(total_entries) > zipfile.ZIP_FILECOUNT_LIMIT
+                or int(central_size) > zipfile.ZIP64_LIMIT
+                or int(central_offset) > zipfile.ZIP64_LIMIT
+            ):
+                raise _BundleLimitError(
+                    "zip64_not_required",
+                    "ZIP64 end records are present below every writer threshold",
+                )
+            expected_legacy_entries = min(int(total_entries), _ZIP_UINT16_MAX)
+            expected_legacy_size = min(int(central_size), _ZIP_UINT32_MAX)
+            expected_legacy_offset = min(int(central_offset), _ZIP_UINT32_MAX)
+            if (
+                _entries_on_disk != expected_legacy_entries
+                or declared_entries != expected_legacy_entries
+                or legacy_central_size != expected_legacy_size
+                or legacy_central_offset != expected_legacy_offset
+            ):
+                raise ValueError("ZIP64 legacy end-record fields are inconsistent")
+            declared_entries = int(total_entries)
+            central_boundary = int(zip64_offset)
+        elif (
+            legacy_central_size > zipfile.ZIP64_LIMIT
+            or legacy_central_offset > zipfile.ZIP64_LIMIT
+        ):
+            raise _BundleLimitError(
+                "zip64_required",
+                "ZIP central size or offset exceeds the writer threshold without ZIP64 end records",
+            )
+
+        central_size = int(central_size)
+        central_offset = int(central_offset)
+        central_end = central_offset + central_size
+        if central_offset >= 0 and central_size >= 0 and central_end < central_boundary:
+            raise _BundleLimitError(
+                "zip_local_member_gap_or_preamble",
+                "ZIP local/central regions leave an unbound prefix or gap",
+            )
+        if (
+            central_offset < 0
+            or central_size < 0
+            or central_end != central_boundary
+            or central_boundary > file_size
+        ):
+            raise ValueError("ZIP central directory geometry is invalid")
+        if (
+            max_central_directory_bytes is not None
+            and central_size > max_central_directory_bytes
+        ):
+            raise _BundleLimitError(
+                "bundle_central_directory_too_large",
+                "ZIP central directory exceeds the configured byte limit",
+            )
+
+        cursor = central_offset
+        observed_entries = 0
+        while cursor < central_end:
+            if budget is not None:
+                budget.check_deadline("counting ZIP central-directory records")
+            if max_entries is not None and observed_entries >= max_entries:
+                raise _BundleLimitError(
+                    "bundle_entry_count_too_large",
+                    "ZIP central directory exceeds the configured entry limit",
+                )
+            header = _read_exact_at(handle, cursor, 46)
+            if struct.unpack_from("<I", header)[0] != _ZIP_CENTRAL_SIGNATURE:
+                raise ValueError("ZIP central directory contains a non-record gap")
+            name_length, extra_length, comment_length = struct.unpack_from(
+                "<HHH", header, 28
+            )
+            record_size = 46 + name_length + extra_length + comment_length
+            if record_size < 46 or cursor + record_size > central_end:
+                raise ValueError("ZIP central-directory record exceeds its boundary")
+            cursor += record_size
+            observed_entries += 1
+        if cursor != central_end:
+            raise ValueError("ZIP central directory is not exactly contiguous")
+        if observed_entries != int(declared_entries):
+            raise ValueError(
+                "ZIP declared entry count does not match observed central records"
+            )
+    return _BundleZipPreflight(
+        file_size=int(file_size),
+        declared_entry_count=int(declared_entries),
+        observed_entry_count=observed_entries,
+        central_directory_size=int(central_size),
+        central_directory_offset=int(central_offset),
+    )
+
+
+def _bounded_bundle_sha256(handle: Any, budget: _BundleVerificationBudget) -> str:
+    digest = hashlib.sha256()
+    handle.seek(0)
+    while True:
+        budget.check_deadline("hashing the ZIP envelope")
+        chunk = handle.read(_BUNDLE_IO_CHUNK_BYTES)
+        if not chunk:
+            break
+        budget.consume(len(chunk), "hashing the ZIP envelope")
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _read_exact_at(handle: Any, offset: int, size: int) -> bytes:
     handle.seek(offset)
     data = handle.read(size)
@@ -1529,7 +2784,14 @@ def _read_exact_at(handle: Any, offset: int, size: int) -> bytes:
     return data
 
 
-def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[str, Any]]:
+def _zip_envelope_errors(
+    path: Path,
+    infos: list[zipfile.ZipInfo],
+    *,
+    budget: _BundleVerificationBudget | None = None,
+    raw_handle: Any | None = None,
+    _errors: _BoundedBundleErrors | None = None,
+) -> list[dict[str, Any]]:
     """Reject bytes and metadata that are not bound by the bundle manifest.
 
     The normal ``zipfile`` API exposes logical members but intentionally tolerates
@@ -1539,22 +2801,33 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
     structurally required Zip64 size fields emitted by the packer.  It uses
     bounded random-access reads rather than loading the entire archive into RAM.
     """
-    errors: list[dict[str, Any]] = []
+    errors = _errors if _errors is not None else _BoundedBundleErrors()
+    if budget is not None:
+        budget.check_deadline("validating the ZIP envelope")
     try:
-        file_size = path.stat().st_size
-        handle = path.open("rb")
+        file_size = (
+            os.fstat(raw_handle.fileno()).st_size
+            if raw_handle is not None
+            else path.stat().st_size
+        )
+        handle_context = (
+            nullcontext(raw_handle) if raw_handle is not None else path.open("rb")
+        )
     except OSError as exc:
-        return [{"error": "zip_envelope_read_failed", "detail": str(exc)}]
+        errors.append({"error": "zip_envelope_read_failed", "detail": str(exc)})
+        return errors
 
-    with handle:
+    with handle_context as handle:
         tail_size = min(file_size, 22 + _ZIP_UINT16_MAX + 4096)
         try:
             tail = _read_exact_at(handle, file_size - tail_size, tail_size)
         except (OSError, EOFError) as exc:
-            return [{"error": "zip_envelope_read_failed", "detail": str(exc)}]
+            errors.append({"error": "zip_envelope_read_failed", "detail": str(exc)})
+            return errors
         located = _find_eocd(tail)
         if located is None:
-            return [{"error": "zip_eocd_missing"}]
+            errors.append({"error": "zip_eocd_missing"})
+            return errors
         relative_eocd, eocd = located
         eocd_offset = file_size - tail_size + relative_eocd
         (
@@ -1685,6 +2958,8 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
         central_index = 0
         central_zip64_by_offset: dict[int, bool] = {}
         while cursor < min(central_end, file_size):
+            if budget is not None:
+                budget.check_deadline("validating the ZIP central directory")
             try:
                 header = _read_exact_at(handle, cursor, 46)
             except (OSError, EOFError):
@@ -1838,6 +3113,8 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
         ordered_infos = sorted(infos, key=lambda item: item.header_offset)
         expected_local_offset = 0
         for info in ordered_infos:
+            if budget is not None:
+                budget.check_deadline("validating ZIP local records")
             offset = int(info.header_offset)
             if offset != expected_local_offset:
                 errors.append(
@@ -1944,10 +3221,36 @@ def _zip_envelope_errors(path: Path, infos: list[zipfile.ZipInfo]) -> list[dict[
 
 
 
+def _require_semantic_temp_reserve(
+    temp_parent: Path,
+    phase: str,
+    *,
+    additional_bytes: int = 0,
+) -> None:
+    try:
+        free_bytes = int(shutil.disk_usage(temp_parent).free)
+    except OSError as exc:
+        raise _BundleLimitError(
+            "semantic_temp_space_probe_failed",
+            f"temporary free-space probe failed while {phase}: {type(exc).__name__}",
+        ) from exc
+    required_bytes = BUNDLE_SEMANTIC_TEMP_RESERVE_BYTES + max(
+        0, int(additional_bytes)
+    )
+    if free_bytes < required_bytes:
+        raise _BundleLimitError(
+            "semantic_temp_reserve_eroded",
+            f"temporary free space fell below the reserve while {phase}",
+        )
+
+
 def _extract_manifested_root(
     archive: zipfile.ZipFile,
     manifest: dict[str, Any],
     destination: Path,
+    *,
+    budget: _BundleVerificationBudget,
+    temp_parent: Path,
 ) -> None:
     """Extract only already-validated manifest members into a fresh root.
 
@@ -1959,6 +3262,7 @@ def _extract_manifested_root(
     file_entries = manifest.get("files")
     if not isinstance(file_entries, list):
         raise ValueError("manifest files are unavailable for semantic verification")
+    bytes_since_reserve_check = 0
     for entry in file_entries:
         if not isinstance(entry, dict):
             raise ValueError("manifest file entry is not an object")
@@ -1968,10 +3272,37 @@ def _extract_manifested_root(
         member = f"{BUNDLE_ROOT_NAME}/{rel}"
         target = destination.joinpath(*PurePosixPath(rel).parts)
         secure_mkdir(target.parent)
-        with archive.open(member, "r") as source, target.open("xb") as output:
-            shutil.copyfileobj(source, output, length=1024 * 1024)
         expected_size = entry.get("size_bytes")
-        if not isinstance(expected_size, int) or target.stat().st_size != expected_size:
+        if not isinstance(expected_size, int):
+            raise ValueError(f"semantic extraction size is invalid: {rel}")
+        written = 0
+        _require_semantic_temp_reserve(temp_parent, f"starting extraction of {member}")
+        with archive.open(member, "r") as source, target.open("xb") as output:
+            while True:
+                budget.check_deadline(f"extracting ZIP member {member}")
+                chunk = source.read(_BUNDLE_IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > expected_size:
+                    raise ValueError(f"semantic extraction size exceeded: {rel}")
+                budget.consume(len(chunk), f"extracting ZIP member {member}")
+                _require_semantic_temp_reserve(
+                    temp_parent,
+                    f"writing ZIP member {member}",
+                    additional_bytes=len(chunk),
+                )
+                output.write(chunk)
+                bytes_since_reserve_check += len(chunk)
+                if bytes_since_reserve_check >= _BUNDLE_RESERVE_CHECK_BYTES:
+                    output.flush()
+                    _require_semantic_temp_reserve(
+                        temp_parent, f"extracting ZIP member {member}"
+                    )
+                    bytes_since_reserve_check = 0
+            output.flush()
+        _require_semantic_temp_reserve(temp_parent, f"finishing extraction of {member}")
+        if written != expected_size or target.stat().st_size != expected_size:
             raise ValueError(f"semantic extraction size mismatch: {rel}")
         mode = entry.get("mode")
         if isinstance(mode, int):
@@ -1983,33 +3314,13 @@ def _extract_manifested_root(
                 pass
 
 
-def _embedded_root_semantic_errors(
-    archive: zipfile.ZipFile,
+def _audit_extracted_root(
+    embedded_root: Path,
     manifest: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Independently verify the Continuum root carried by a valid ZIP envelope.
-
-    Manifest hashes prove byte consistency, not that the catalog opens, proof
-    packs remain meaningful, or a claimed shareable root is actually free of
-    secrets and machine-local paths. Reconstructing the root in a temporary
-    directory closes that trust gap without touching the caller's filesystem.
-    """
+    """Run semantic checks in the disposable worker process."""
     errors: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="continuum-bundle-verify-") as tmp:
-        embedded_root = Path(tmp) / BUNDLE_ROOT_NAME
-        try:
-            _extract_manifested_root(archive, manifest, embedded_root)
-        except (
-            OSError, ValueError, RuntimeError, KeyError, zipfile.BadZipFile,
-            NotImplementedError, zlib.error,
-        ) as exc:
-            return [
-                {
-                    "error": "embedded_root_extraction_failed",
-                    "detail": redact_text_secrets(str(exc)),
-                }
-            ]
-
+    try:
         # Portability is checked first so later verifiers never follow an
         # absolute URI or config path outside the temporary extraction root.
         try:
@@ -2073,15 +3384,17 @@ def _embedded_root_semantic_errors(
                 }
             ]
         if not root_verification.get("ok"):
-            failed_checks = [
-                str(item.get("name"))
-                for item in root_verification.get("checks") or []
-                if not item.get("ok")
-            ]
+            failed_checks = _bounded_diagnostic_sample(
+                (
+                    str(item.get("name"))
+                    for item in root_verification.get("checks") or []
+                    if not item.get("ok")
+                )
+            )
             errors.append(
                 {
                     "error": "embedded_root_verification_unhealthy",
-                    "failed_checks": failed_checks[:20],
+                    "failed_checks": failed_checks,
                 }
             )
 
@@ -2155,46 +3468,522 @@ def _embedded_root_semantic_errors(
                             "actual": actual,
                         }
                     )
+    except Exception as exc:
+        return errors + [
+            {
+                "error": "embedded_root_audit_failed",
+                "detail": redact_text_secrets(str(exc)),
+            }
+        ]
     return errors
 
-def verify_root_bundle(
+
+def _semantic_worker_cli(
+    embedded_root_text: str,
+    manifest_path_text: str,
+    result_path_text: str,
+) -> int:
+    """Private subprocess entrypoint for hard-bounded semantic verification."""
+    try:
+        with Path(manifest_path_text).open("rb") as manifest_file:
+            manifest_bytes = manifest_file.read(_BUNDLE_MANIFEST_MAX_BYTES + 1)
+        if len(manifest_bytes) > _BUNDLE_MANIFEST_MAX_BYTES:
+            raise ValueError("semantic worker manifest exceeds its byte limit")
+        manifest = _strict_json_loads(manifest_bytes.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("semantic worker manifest must be an object")
+        errors = _audit_extracted_root(Path(embedded_root_text), manifest)
+    except Exception as exc:
+        errors = [
+            {
+                "error": "embedded_root_audit_worker_failed",
+                "detail": redact_text_secrets(f"{type(exc).__name__}: {exc}"),
+            }
+        ]
+    payload = json.dumps(
+        errors,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > _BUNDLE_SEMANTIC_RESULT_MAX_BYTES:
+        payload = b'[{"error":"embedded_root_audit_result_too_large"}]'
+    try:
+        result_path = Path(result_path_text)
+        _require_semantic_temp_reserve(
+            result_path.parent,
+            "writing embedded-root semantic result",
+            additional_bytes=len(payload),
+        )
+        with result_path.open("xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, _BundleLimitError):
+        return 1
+    return 0
+
+
+def _stop_semantic_worker(process: subprocess.Popen[bytes]) -> None:
+    """Reap one semantic child; never return while it remains live."""
+    if process.poll() is not None:
+        process.wait(timeout=0)
+        return
+    try:
+        process.terminate()
+    except OSError:
+        if process.poll() is None:
+            raise
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        if process.poll() is None:
+            raise
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("semantic verification child could not be reaped") from exc
+
+
+def _run_extracted_root_audit(
+    embedded_root: Path,
+    manifest: dict[str, Any],
+    *,
+    budget: _BundleVerificationBudget,
+    temp_parent: Path,
+    worker_command: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    control_dir = embedded_root.parent
+    manifest_path = control_dir / "semantic-worker-manifest.json"
+    result_path = control_dir / "semantic-worker-result.json"
+    manifest_payload = json.dumps(
+        manifest,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(manifest_payload) > _BUNDLE_MANIFEST_MAX_BYTES:
+        return [{"error": "embedded_root_audit_worker_manifest_too_large"}]
+    try:
+        budget.check_deadline("preparing embedded-root semantic worker")
+        manifest_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+        _require_semantic_temp_reserve(
+            temp_parent,
+            "writing embedded-root semantic controls",
+            additional_bytes=(
+                len(manifest_payload) + _BUNDLE_SEMANTIC_RESULT_MAX_BYTES
+            ),
+        )
+        with manifest_path.open("xb") as manifest_file:
+            manifest_file.write(manifest_payload)
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        _require_semantic_temp_reserve(
+            temp_parent,
+            "starting embedded-root semantic worker",
+            additional_bytes=_BUNDLE_SEMANTIC_RESULT_MAX_BYTES,
+        )
+    except _BundleLimitError:
+        raise
+    except OSError as exc:
+        return [
+            {
+                "error": "embedded_root_audit_worker_setup_failed",
+                "detail": redact_text_secrets(str(exc)),
+            }
+        ]
+    source_root = str(Path(__file__).resolve().parents[2])
+    if worker_command is None:
+        worker_code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); "
+            "from continuum.core.bundle import _semantic_worker_cli; "
+            "raise SystemExit(_semantic_worker_cli(sys.argv[2], sys.argv[3], sys.argv[4]))"
+        )
+        worker_command = [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            worker_code,
+            source_root,
+            str(embedded_root),
+            str(manifest_path),
+            str(result_path),
+        ]
+    worker_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("PYTHON")
+    }
+    try:
+        process = subprocess.Popen(
+            worker_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env=worker_env,
+            cwd=source_root,
+        )
+    except OSError as exc:
+        return [
+            {
+                "error": "embedded_root_audit_worker_start_failed",
+                "detail": redact_text_secrets(str(exc)),
+            }
+        ]
+    try:
+        while process.poll() is None:
+            budget.check_deadline("running embedded-root semantic checks")
+            _require_semantic_temp_reserve(
+                temp_parent, "running embedded-root semantic checks"
+            )
+            remaining = budget.deadline - time.monotonic()
+            if remaining <= 0:
+                raise _BundleLimitError(
+                    "bundle_verification_timeout",
+                    "bundle verification exceeded its semantic-audit deadline",
+                )
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException as exc:
+        try:
+            _stop_semantic_worker(process)
+        except Exception as cleanup_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"semantic worker cleanup failed: {cleanup_exc}")
+        raise
+    _stop_semantic_worker(process)
+    _require_semantic_temp_reserve(temp_parent, "finishing embedded-root semantic checks")
+    if process.returncode != 0:
+        return [{"error": "embedded_root_audit_worker_failed"}]
+    try:
+        with result_path.open("rb") as result_file:
+            result_bytes = result_file.read(_BUNDLE_SEMANTIC_RESULT_MAX_BYTES + 1)
+    except OSError as exc:
+        return [
+            {
+                "error": "embedded_root_audit_result_missing",
+                "detail": redact_text_secrets(str(exc)),
+            }
+        ]
+    if len(result_bytes) > _BUNDLE_SEMANTIC_RESULT_MAX_BYTES:
+        return [{"error": "embedded_root_audit_result_too_large"}]
+    try:
+        result = _strict_json_loads(result_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        return [
+            {
+                "error": "embedded_root_audit_result_invalid",
+                "detail": redact_text_secrets(str(exc)),
+            }
+        ]
+    if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+        return [{"error": "embedded_root_audit_result_invalid"}]
+    return result
+
+
+def _embedded_root_semantic_errors(
+    archive: zipfile.ZipFile,
+    manifest: dict[str, Any],
+    *,
+    budget: _BundleVerificationBudget,
+    temp_parent: Path,
+) -> list[dict[str, Any]]:
+    """Extract in-process, then hard-bound every semantic check in one child."""
+    budget.check_deadline("starting embedded-root verification")
+    with tempfile.TemporaryDirectory(
+        prefix="continuum-bundle-verify-",
+        dir=temp_parent,
+    ) as tmp:
+        embedded_root = Path(tmp) / BUNDLE_ROOT_NAME
+        try:
+            _extract_manifested_root(
+                archive,
+                manifest,
+                embedded_root,
+                budget=budget,
+                temp_parent=temp_parent,
+            )
+        except _BundleLimitError:
+            raise
+        except (
+            OSError,
+            ValueError,
+            RuntimeError,
+            KeyError,
+            zipfile.BadZipFile,
+            NotImplementedError,
+            zlib.error,
+        ) as exc:
+            return [
+                {
+                    "error": "embedded_root_extraction_failed",
+                    "detail": redact_text_secrets(str(exc)),
+                }
+            ]
+        _require_semantic_temp_reserve(temp_parent, "starting semantic audit")
+        errors = _run_extracted_root_audit(
+            embedded_root,
+            manifest,
+            budget=budget,
+            temp_parent=temp_parent,
+        )
+    budget.check_deadline("finishing embedded-root verification")
+    return errors
+
+
+def _verify_root_bundle_impl(
     bundle_path: Path,
     *,
+    _resources: _BundleVerifierResources,
     verify_embedded_root: bool = True,
+    max_entries: int = BUNDLE_DEFAULT_MAX_ENTRIES,
+    max_expanded_bytes: int = BUNDLE_DEFAULT_MAX_EXPANDED_BYTES,
+    max_member_bytes: int | None = None,
+    max_compression_ratio: int = BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+    max_central_directory_bytes: int = BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+    timeout_seconds: int = BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Verify the ZIP envelope and, by default, the embedded Continuum root."""
+    """Verify one bounded ZIP envelope and, by default, its embedded root."""
     path = Path(bundle_path)
-    errors: list[dict[str, Any]] = []
+    max_entries = _validated_bundle_limit(
+        "max_entries", max_entries, maximum=BUNDLE_ABSOLUTE_MAX_ENTRIES
+    )
+    max_expanded_bytes = _validated_bundle_limit(
+        "max_expanded_bytes",
+        max_expanded_bytes,
+        maximum=BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+    )
+    effective_max_member_bytes = _validated_bundle_limit(
+        "max_member_bytes",
+        max_expanded_bytes if max_member_bytes is None else max_member_bytes,
+        maximum=BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+    )
+    max_compression_ratio = _validated_bundle_limit(
+        "max_compression_ratio",
+        max_compression_ratio,
+        maximum=BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO,
+    )
+    max_central_directory_bytes = _validated_bundle_limit(
+        "max_central_directory_bytes",
+        max_central_directory_bytes,
+        maximum=BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+    )
+    timeout_seconds = _validated_bundle_limit(
+        "timeout_seconds",
+        timeout_seconds,
+        maximum=BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS,
+    )
+    limits = {
+        "max_entries": max_entries,
+        "max_expanded_bytes": max_expanded_bytes,
+        "max_member_bytes": effective_max_member_bytes,
+        "max_compression_ratio": max_compression_ratio,
+        "max_central_directory_bytes": max_central_directory_bytes,
+        "timeout_seconds": timeout_seconds,
+        "semantic_temp_reserve_bytes": BUNDLE_SEMANTIC_TEMP_RESERVE_BYTES,
+    }
+    errors = _BoundedBundleErrors()
     manifest: dict[str, Any] | None = None
-    if not path.exists():
-        return {
+    bundle_sha256: str | None = None
+    bundle_size_bytes: int | None = None
+    archive: zipfile.ZipFile | None = None
+    raw_archive: Any | None = None
+    initial_handle_stat: os.stat_result | None = None
+    identity_checked = False
+    content_checked = False
+    budget: _BundleVerificationBudget | None = None
+
+    def result() -> dict[str, Any]:
+        nonlocal content_checked, identity_checked
+        if (
+            not content_checked
+            and bundle_sha256 is not None
+            and budget is not None
+            and raw_archive is not None
+            and not raw_archive.closed
+        ):
+            content_checked = True
+            try:
+                current_sha256 = _bounded_bundle_sha256(raw_archive, budget)
+                if current_sha256 != bundle_sha256:
+                    errors.append({"error": "bundle_file_identity_changed"})
+            except _BundleLimitError as exc:
+                errors.append({"error": exc.code, "detail": exc.detail})
+            except OSError as exc:
+                errors.append(
+                    {
+                        "error": "bundle_file_content_check_failed",
+                        "detail": redact_text_secrets(str(exc)),
+                    }
+                )
+        if (
+            not identity_checked
+            and raw_archive is not None
+            and not raw_archive.closed
+            and initial_handle_stat is not None
+        ):
+            identity_checked = True
+            try:
+                final_handle_stat = os.fstat(raw_archive.fileno())
+                current_path_stat = path.stat(follow_symlinks=False)
+                stable_handle = (
+                    os.path.samestat(initial_handle_stat, final_handle_stat)
+                    and initial_handle_stat.st_size == final_handle_stat.st_size
+                    and initial_handle_stat.st_mtime_ns == final_handle_stat.st_mtime_ns
+                    and initial_handle_stat.st_ctime_ns == final_handle_stat.st_ctime_ns
+                )
+                stable_path = (
+                    stat.S_ISREG(current_path_stat.st_mode)
+                    and not _is_link_like(path)
+                    and os.path.samestat(final_handle_stat, current_path_stat)
+                )
+                if not stable_handle or not stable_path:
+                    errors.append({"error": "bundle_file_identity_changed"})
+            except OSError as exc:
+                errors.append(
+                    {
+                        "error": "bundle_file_identity_check_failed",
+                        "detail": redact_text_secrets(str(exc)),
+                    }
+                )
+        output = {
             "schema": "epic_continuum.root_bundle_verification.v1",
-            "ok": False,
+            "ok": not errors,
             "bundle_uri": str(path),
-            "error_count": 1,
-            "errors": [{"error": "bundle_missing"}],
+            "bundle_sha256": bundle_sha256,
+            "bundle_size_bytes": bundle_size_bytes,
+            "bundle_id": manifest.get("bundle_id") if isinstance(manifest, dict) else None,
+            "profile": manifest.get("profile") if isinstance(manifest, dict) else None,
+            "file_count": manifest.get("file_count") if isinstance(manifest, dict) else None,
+            "verify_embedded_root": bool(verify_embedded_root),
+            "verification_limits": limits,
+            "error_count": errors.total_count,
+            "errors": redact_value_secrets(errors),
         }
-    try:
-        is_zip = zipfile.is_zipfile(path)
-    except (OSError, ValueError, RuntimeError, UnicodeError, OverflowError, struct.error) as exc:
-        return {
-            "schema": "epic_continuum.root_bundle_verification.v1",
-            "ok": False,
-            "bundle_uri": str(path),
-            "error_count": 1,
-            "errors": [{"error": "bundle_probe_failed", "detail": redact_text_secrets(str(exc))}],
-        }
-    if not is_zip:
-        return {
-            "schema": "epic_continuum.root_bundle_verification.v1",
-            "ok": False,
-            "bundle_uri": str(path),
-            "error_count": 1,
-            "errors": [{"error": "not_a_zip_archive"}],
-        }
+        return output
 
     try:
-        archive = zipfile.ZipFile(path, "r")
+        initial_path_stat = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        errors.append({"error": "bundle_missing"})
+        return result()
+    except OSError as exc:
+        errors.append({"error": "bundle_stat_failed", "detail": redact_text_secrets(str(exc))})
+        return result()
+    if not stat.S_ISREG(initial_path_stat.st_mode) or _is_link_like(path):
+        errors.append({"error": "bundle_not_regular_file"})
+        return result()
+    try:
+        raw_archive = _open_bundle_read_handle(path)
+        _resources.raw_archive = raw_archive
+        initial_handle_stat = os.fstat(raw_archive.fileno())
+    except OSError as exc:
+        errors.append({"error": "bundle_raw_open_failed", "detail": redact_text_secrets(str(exc))})
+        return result()
+    if (
+        not stat.S_ISREG(initial_handle_stat.st_mode)
+        or not os.path.samestat(initial_path_stat, initial_handle_stat)
+    ):
+        errors.append({"error": "bundle_file_identity_changed"})
+        return result()
+    bundle_size_bytes = int(initial_handle_stat.st_size)
+
+    budget = _BundleVerificationBudget(
+        deadline=time.monotonic() + timeout_seconds,
+        max_work_bytes=(
+            bundle_size_bytes * 2
+            + max_expanded_bytes * (2 if verify_embedded_root else 1)
+            + _BUNDLE_IO_CHUNK_BYTES
+        ),
+    )
+    try:
+        budget.check_deadline("probing the ZIP archive")
+        is_zip = zipfile.is_zipfile(raw_archive)
+    except _BundleLimitError as exc:
+        errors.append({"error": exc.code, "detail": exc.detail})
+        return result()
+    except (OSError, ValueError, RuntimeError, UnicodeError, OverflowError, struct.error) as exc:
+        errors.append({"error": "bundle_probe_failed", "detail": redact_text_secrets(str(exc))})
+        return result()
+    if not is_zip:
+        errors.append({"error": "not_a_zip_archive"})
+        return result()
+
+    try:
+        preflight = _read_bundle_zip_preflight(
+            path,
+            budget=budget,
+            raw_handle=raw_archive,
+            max_entries=max_entries,
+            max_central_directory_bytes=max_central_directory_bytes,
+        )
+    except _BundleLimitError as exc:
+        errors.append({"error": exc.code, "detail": exc.detail})
+        return result()
+    except (OSError, EOFError, ValueError, OverflowError, struct.error) as exc:
+        errors.append(
+            {"error": "zip_preflight_failed", "detail": redact_text_secrets(str(exc))}
+        )
+        return result()
+
+    if preflight.entry_count > max_entries:
+        errors.append(
+            {
+                "error": "bundle_entry_count_too_large",
+                "count": preflight.entry_count,
+                "maximum": max_entries,
+            }
+        )
+    if preflight.central_directory_size > max_central_directory_bytes:
+        errors.append(
+            {
+                "error": "bundle_central_directory_too_large",
+                "size_bytes": preflight.central_directory_size,
+                "maximum": max_central_directory_bytes,
+            }
+        )
+    # A canonical archive duplicates central-directory names in local headers.
+    # This derived physical bound prevents a huge invalid/trailing file from
+    # reaching the whole-file hash even when its declared expanded size is tiny.
+    max_archive_bytes = (
+        _deflate_compressed_size_bound(max_expanded_bytes, max_entries)
+        + 2 * max_central_directory_bytes
+        + max_entries * 128
+        + _BUNDLE_IO_CHUNK_BYTES
+    )
+    if preflight.file_size > max_archive_bytes:
+        errors.append(
+            {
+                "error": "bundle_archive_size_too_large",
+                "size_bytes": preflight.file_size,
+                "maximum": max_archive_bytes,
+            }
+        )
+    if errors:
+        return result()
+
+    try:
+        bundle_sha256 = _bounded_bundle_sha256(raw_archive, budget)
+    except _BundleLimitError as exc:
+        errors.append({"error": exc.code, "detail": exc.detail})
+        return result()
+    except OSError as exc:
+        errors.append({"error": "bundle_hash_failed", "detail": redact_text_secrets(str(exc))})
+        return result()
+
+    try:
+        archive = zipfile.ZipFile(raw_archive, "r")
+        _resources.archive = archive
     except (
         OSError,
         ValueError,
@@ -2205,30 +3994,23 @@ def verify_root_bundle(
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
     ) as exc:
-        return {
-            "schema": "epic_continuum.root_bundle_verification.v1",
-            "ok": False,
-            "bundle_uri": str(path),
-            "error_count": 1,
-            "errors": [{"error": "bundle_open_failed", "detail": redact_text_secrets(str(exc))}],
-        }
+        errors.append({"error": "bundle_open_failed", "detail": redact_text_secrets(str(exc))})
+        return result()
 
-    try:
-        raw_archive = path.open("rb")
-    except OSError as exc:
-        archive.close()
-        return {
-            "schema": "epic_continuum.root_bundle_verification.v1",
-            "ok": False,
-            "bundle_uri": str(path),
-            "error_count": 1,
-            "errors": [{"error": "bundle_raw_open_failed", "detail": redact_text_secrets(str(exc))}],
-        }
-
-    with archive, raw_archive:
-        infos = archive.infolist()
+    with archive:
         try:
-            errors.extend(_zip_envelope_errors(path, infos))
+            budget.check_deadline("reading ZIP metadata")
+            infos = archive.infolist()
+            _zip_envelope_errors(
+                path,
+                infos,
+                budget=budget,
+                raw_handle=raw_archive,
+                _errors=errors,
+            )
+        except _BundleLimitError as exc:
+            errors.append({"error": exc.code, "detail": exc.detail})
+            return result()
         except (OSError, EOFError, ValueError, OverflowError, struct.error) as exc:
             errors.append(
                 {
@@ -2236,41 +4018,141 @@ def verify_root_bundle(
                     "detail": redact_text_secrets(str(exc)),
                 }
             )
-        names = [item.filename for item in infos]
-        if names != sorted(names):
+            return result()
+        if len(infos) != preflight.entry_count:
+            errors.append(
+                {
+                    "error": "zip_preflight_entry_count_mismatch",
+                    "preflight": preflight.entry_count,
+                    "actual": len(infos),
+                }
+            )
+        if not _is_nondecreasing_text(info.filename for info in infos):
             errors.append({"error": "zip_member_order_noncanonical"})
-        name_counts = Counter(names)
-        duplicate_names = sorted(name for name, count in name_counts.items() if count > 1)
+        name_counts = Counter(info.filename for info in infos)
+        duplicate_names = _bounded_diagnostic_sample(
+            (name for name, count in name_counts.items() if count > 1)
+        )
         if duplicate_names:
-            errors.append({"error": "duplicate_member_names", "members": duplicate_names[:20]})
-        unsafe_names = [name for name in names if not _zip_member_is_safe(name)]
+            errors.append(
+                {"error": "duplicate_member_names", "members": duplicate_names}
+            )
+        unsafe_names = _bounded_diagnostic_sample(
+            (
+                info.filename
+                for info in infos
+                if not _zip_member_is_safe(info.filename)
+            )
+        )
         if unsafe_names:
-            errors.append({"error": "unsafe_member_names", "members": unsafe_names[:20]})
-        portable_collisions = _portable_name_collisions(names)
+            errors.append({"error": "unsafe_member_names", "members": unsafe_names})
+        portable_collisions = _portable_name_collisions(
+            info.filename for info in infos
+        )
         if portable_collisions:
-            errors.append({"error": "portable_member_name_collisions", "collisions": portable_collisions[:20]})
+            errors.append(
+                {
+                    "error": "portable_member_name_collisions",
+                    "collisions": portable_collisions,
+                }
+            )
 
-        directory_members = [info.filename for info in infos if info.is_dir()]
+        directory_members = _bounded_diagnostic_sample(
+            (info.filename for info in infos if info.is_dir())
+        )
         if directory_members:
-            errors.append({"error": "directory_members_not_allowed", "members": directory_members[:20]})
-        encrypted_members = [info.filename for info in infos if info.flag_bits & 0x1]
+            errors.append(
+                {"error": "directory_members_not_allowed", "members": directory_members}
+            )
+        encrypted_members = _bounded_diagnostic_sample(
+            (info.filename for info in infos if info.flag_bits & 0x1)
+        )
         if encrypted_members:
-            errors.append({"error": "encrypted_members_not_allowed", "members": encrypted_members[:20]})
-        non_unix_members = [info.filename for info in infos if info.create_system != 3]
+            errors.append(
+                {"error": "encrypted_members_not_allowed", "members": encrypted_members}
+            )
+        non_unix_members = _bounded_diagnostic_sample(
+            (info.filename for info in infos if info.create_system != 3)
+        )
         if non_unix_members:
-            errors.append({"error": "zip_member_platform_invalid", "members": non_unix_members[:20]})
-        non_regular = [
-            {"member": info.filename, "kind": _zip_member_type(info)}
-            for info in infos
-            if _zip_member_type(info) not in {"regular_or_unspecified", "directory"}
-        ]
+            errors.append(
+                {"error": "zip_member_platform_invalid", "members": non_unix_members}
+            )
+        non_regular = _bounded_diagnostic_sample(
+            (
+                {"member": info.filename, "kind": kind}
+                for info in infos
+                if (kind := _zip_member_type(info))
+                not in {"regular_or_unspecified", "directory"}
+            )
+        )
         if non_regular:
-            errors.append({"error": "non_regular_bundle_members", "members": non_regular[:20]})
+            errors.append({"error": "non_regular_bundle_members", "members": non_regular})
 
         declared_expanded_size = sum(max(0, int(info.file_size)) for info in infos)
-        expanded_size_allowed = declared_expanded_size <= 1024**4
-        if not expanded_size_allowed:
-            errors.append({"error": "bundle_expanded_size_too_large", "size_bytes": declared_expanded_size})
+        declared_compressed_size = sum(max(0, int(info.compress_size)) for info in infos)
+        if declared_expanded_size > max_expanded_bytes:
+            errors.append(
+                {
+                    "error": "bundle_expanded_size_too_large",
+                    "size_bytes": declared_expanded_size,
+                    "maximum": max_expanded_bytes,
+                }
+            )
+        oversized_members: list[dict[str, Any]] = []
+        for info in infos:
+            if int(info.file_size) <= effective_max_member_bytes:
+                continue
+            oversized_members.append(
+                {"member": info.filename, "size_bytes": int(info.file_size)}
+            )
+            if len(oversized_members) == 20:
+                break
+        if oversized_members:
+            errors.append(
+                {
+                    "error": "bundle_member_too_large",
+                    "maximum": effective_max_member_bytes,
+                    "members": oversized_members,
+                }
+            )
+        excessive_ratio_members: list[dict[str, Any]] = []
+        for info in infos:
+            if int(info.file_size) <= max_compression_ratio * max(
+                1, int(info.compress_size)
+            ):
+                continue
+            excessive_ratio_members.append(
+                {
+                    "member": info.filename,
+                    "expanded_bytes": int(info.file_size),
+                    "compressed_bytes": int(info.compress_size),
+                }
+            )
+            if len(excessive_ratio_members) == 20:
+                break
+        if excessive_ratio_members:
+            errors.append(
+                {
+                    "error": "bundle_compression_ratio_too_large",
+                    "maximum": max_compression_ratio,
+                    "members": excessive_ratio_members,
+                }
+            )
+        if declared_expanded_size > max_compression_ratio * max(1, declared_compressed_size):
+            errors.append(
+                {
+                    "error": "bundle_total_compression_ratio_too_large",
+                    "maximum": max_compression_ratio,
+                    "expanded_bytes": declared_expanded_size,
+                    "compressed_bytes": declared_compressed_size,
+                }
+            )
+
+        # Do not decode a manifest or inflate a single member after any cheap
+        # envelope/resource rejection.
+        if errors:
+            return result()
 
         manifest_member = f"{BUNDLE_ROOT_NAME}/{BUNDLE_MANIFEST_NAME}"
         if name_counts.get(manifest_member, 0) != 1:
@@ -2293,12 +4175,17 @@ def verify_root_bundle(
                             "actual": manifest_mode,
                         }
                     )
-            if info.file_size > 16 * 1024 * 1024:
+            if info.file_size > _BUNDLE_MANIFEST_MAX_BYTES:
                 errors.append({"error": "manifest_too_large", "size_bytes": info.file_size})
             else:
                 try:
                     manifest_bytes, _manifest_hash_value, _manifest_size, stream_error = (
-                        _read_zip_member_exact(raw_archive, info, collect=True)
+                        _read_zip_member_exact(
+                            raw_archive,
+                            info,
+                            collect=True,
+                            budget=budget,
+                        )
                     )
                     if stream_error:
                         errors.append(
@@ -2310,11 +4197,34 @@ def verify_root_bundle(
                         )
                     elif manifest_bytes is not None:
                         manifest = _strict_json_loads(manifest_bytes.decode("utf-8"))
-                        canonical_manifest_bytes = (
-                            json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-                        ).encode("utf-8")
-                        if manifest_bytes != canonical_manifest_bytes:
-                            errors.append({"error": "manifest_serialization_noncanonical"})
+                        decoded_files = (
+                            manifest.get("files") if isinstance(manifest, dict) else None
+                        )
+                        if isinstance(decoded_files, list) and len(decoded_files) > max_entries:
+                            errors.append(
+                                {
+                                    "error": "manifest_file_count_too_large",
+                                    "count": len(decoded_files),
+                                    "maximum": max_entries,
+                                }
+                            )
+                            # Drop the hostile object before canonicalization,
+                            # secret scanning, portability walking, or hashing.
+                            manifest = None
+                        else:
+                            canonical_manifest_bytes = (
+                                json.dumps(
+                                    manifest,
+                                    ensure_ascii=True,
+                                    indent=2,
+                                    sort_keys=True,
+                                )
+                                + "\n"
+                            ).encode("utf-8")
+                            if manifest_bytes != canonical_manifest_bytes:
+                                errors.append({"error": "manifest_serialization_noncanonical"})
+                except _BundleLimitError as exc:
+                    errors.append({"error": exc.code, "detail": exc.detail})
                 except (
                     UnicodeDecodeError, ValueError, RuntimeError, OSError, EOFError,
                     zipfile.BadZipFile, NotImplementedError, zlib.error,
@@ -2327,8 +4237,8 @@ def verify_root_bundle(
                     )
 
         if isinstance(manifest, dict):
-            errors.extend(_manifest_structure_errors(manifest))
-            errors.extend(_manifest_semantic_errors(manifest))
+            _manifest_structure_errors(manifest, _errors=errors)
+            _manifest_semantic_errors(manifest, _errors=errors)
             manifest_secret_findings = scan_value_for_secrets(
                 manifest, scope="bundle_manifest", max_findings=20
             )
@@ -2347,13 +4257,17 @@ def verify_root_bundle(
                         ],
                     }
                 )
-            manifest_portability_findings = _portable_metadata_findings(manifest)
+            (
+                manifest_portability_findings,
+                manifest_portability_truncated,
+            ) = _portable_metadata_findings(manifest, max_findings=20)
             if manifest_portability_findings:
                 errors.append(
                     {
                         "error": "manifest_nonportable_metadata",
                         "finding_count": len(manifest_portability_findings),
-                        "findings": manifest_portability_findings[:20],
+                        "findings": manifest_portability_findings,
+                        "truncated": manifest_portability_truncated,
                     }
                 )
             if manifest.get("schema") != BUNDLE_MANIFEST_SCHEMA:
@@ -2378,13 +4292,19 @@ def verify_root_bundle(
             if not isinstance(file_entries, list):
                 errors.append({"error": "manifest_files_not_list"})
                 file_entries = []
-            if len(file_entries) > 1_000_000:
-                errors.append({"error": "manifest_file_count_too_large", "count": len(file_entries)})
+            if len(file_entries) > max_entries:
+                errors.append(
+                    {
+                        "error": "manifest_file_count_too_large",
+                        "count": len(file_entries),
+                        "maximum": max_entries,
+                    }
+                )
                 file_entries = []
 
             listed_paths: list[str] = []
             computed_total = 0
-            for index, entry in enumerate(file_entries):
+            for index, entry in enumerate(file_entries if not errors else []):
                 if not isinstance(entry, dict):
                     errors.append({"error": "manifest_file_entry_not_object", "index": index})
                     continue
@@ -2404,12 +4324,16 @@ def verify_root_bundle(
                     )
                     continue
                 info = archive.getinfo(member)
-                if not expanded_size_allowed:
-                    continue
                 try:
                     _member_data, actual_hash, actual_size, stream_error = _read_zip_member_exact(
-                        raw_archive, info, collect=False
+                        raw_archive,
+                        info,
+                        collect=False,
+                        budget=budget,
                     )
+                except _BundleLimitError as exc:
+                    errors.append({"error": exc.code, "detail": exc.detail})
+                    return result()
                 except OSError as exc:
                     errors.append(
                         {
@@ -2460,12 +4384,21 @@ def verify_root_bundle(
                         )
 
             listed_counts = Counter(listed_paths)
-            duplicate_listed = sorted(item for item, count in listed_counts.items() if count > 1)
+            duplicate_listed = _bounded_diagnostic_sample(
+                (item for item, count in listed_counts.items() if count > 1)
+            )
             if duplicate_listed:
-                errors.append({"error": "duplicate_manifest_paths", "paths": duplicate_listed[:20]})
+                errors.append(
+                    {"error": "duplicate_manifest_paths", "paths": duplicate_listed}
+                )
             listed_collisions = _portable_name_collisions(listed_paths)
             if listed_collisions:
-                errors.append({"error": "portable_manifest_path_collisions", "collisions": listed_collisions[:20]})
+                errors.append(
+                    {
+                        "error": "portable_manifest_path_collisions",
+                        "collisions": listed_collisions,
+                    }
+                )
             required_paths = {"catalog/catalog.sqlite3", "config/continuum.config.json"}
             missing_required = sorted(required_paths - set(listed_paths))
             if missing_required:
@@ -2473,12 +4406,21 @@ def verify_root_bundle(
             expected_members = {f"{BUNDLE_ROOT_NAME}/{rel}" for rel in listed_paths}
             expected_members.add(manifest_member)
             actual_file_members = {info.filename for info in infos if not info.is_dir()}
-            unexpected = sorted(actual_file_members - expected_members)
-            missing = sorted(expected_members - actual_file_members)
+            unexpected = _bounded_absent_text_sample(
+                (info.filename for info in infos if not info.is_dir()),
+                expected_members,
+            )
+            missing = _bounded_absent_text_sample(
+                chain(
+                    (manifest_member,),
+                    (f"{BUNDLE_ROOT_NAME}/{rel}" for rel in listed_paths),
+                ),
+                actual_file_members,
+            )
             if unexpected:
-                errors.append({"error": "unlisted_bundle_members", "members": unexpected[:20]})
+                errors.append({"error": "unlisted_bundle_members", "members": unexpected})
             if missing:
-                errors.append({"error": "missing_bundle_members", "members": missing[:20]})
+                errors.append({"error": "missing_bundle_members", "members": missing})
             if manifest.get("file_count") != len(file_entries):
                 errors.append(
                     {
@@ -2499,24 +4441,156 @@ def verify_root_bundle(
             errors.append({"error": "manifest_not_object"})
 
         if isinstance(manifest, dict) and not errors and verify_embedded_root:
-            errors.extend(_embedded_root_semantic_errors(archive, manifest))
+            temp_parent = Path(tempfile.gettempdir())
+            semantic_control_bytes = len(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            semantic_output_bytes = _BUNDLE_SEMANTIC_RESULT_MAX_BYTES
+            required_temp_bytes = (
+                computed_total
+                + BUNDLE_SEMANTIC_TEMP_RESERVE_BYTES
+                + semantic_control_bytes
+                + semantic_output_bytes
+            )
+            try:
+                budget.check_deadline("checking semantic-verification free space")
+                free_temp_bytes = int(shutil.disk_usage(temp_parent).free)
+            except _BundleLimitError as exc:
+                errors.append({"error": exc.code, "detail": exc.detail})
+            except OSError as exc:
+                errors.append(
+                    {
+                        "error": "semantic_temp_space_probe_failed",
+                        "detail": redact_text_secrets(str(exc)),
+                    }
+                )
+            else:
+                if free_temp_bytes < required_temp_bytes:
+                    errors.append(
+                        {
+                            "error": "semantic_temp_space_insufficient",
+                            "free_bytes": free_temp_bytes,
+                            "required_bytes": required_temp_bytes,
+                            "payload_bytes": computed_total,
+                            "reserve_bytes": BUNDLE_SEMANTIC_TEMP_RESERVE_BYTES,
+                            "control_bytes": semantic_control_bytes,
+                            "result_bytes": semantic_output_bytes,
+                        }
+                    )
+            if not errors:
+                try:
+                    errors.extend(
+                        _embedded_root_semantic_errors(
+                            archive,
+                            manifest,
+                            budget=budget,
+                            temp_parent=temp_parent,
+                        )
+                    )
+                except _BundleLimitError as exc:
+                    errors.append({"error": exc.code, "detail": exc.detail})
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "error": "embedded_root_semantic_verification_failed",
+                            "detail": redact_text_secrets(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+                    )
 
-    return {
-        "schema": "epic_continuum.root_bundle_verification.v1",
-        "ok": not errors,
-        "bundle_uri": str(path),
-        "bundle_sha256": file_sha256(path),
-        "bundle_size_bytes": path.stat().st_size,
-        "bundle_id": manifest.get("bundle_id") if isinstance(manifest, dict) else None,
-        "profile": manifest.get("profile") if isinstance(manifest, dict) else None,
-        "file_count": manifest.get("file_count") if isinstance(manifest, dict) else None,
-        "error_count": len(errors),
-        "errors": redact_value_secrets(errors[:100]),
-    }
+    return result()
+
+
+def verify_root_bundle(
+    bundle_path: Path,
+    *,
+    verify_embedded_root: bool = True,
+    max_entries: int = BUNDLE_DEFAULT_MAX_ENTRIES,
+    max_expanded_bytes: int = BUNDLE_DEFAULT_MAX_EXPANDED_BYTES,
+    max_member_bytes: int | None = None,
+    max_compression_ratio: int = BUNDLE_DEFAULT_MAX_COMPRESSION_RATIO,
+    max_central_directory_bytes: int = BUNDLE_DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
+    timeout_seconds: int = BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Verify a bundle while guaranteeing every owned descriptor is closed."""
+    resources = _BundleVerifierResources()
+    try:
+        return _verify_root_bundle_impl(
+            bundle_path,
+            _resources=resources,
+            verify_embedded_root=verify_embedded_root,
+            max_entries=max_entries,
+            max_expanded_bytes=max_expanded_bytes,
+            max_member_bytes=max_member_bytes,
+            max_compression_ratio=max_compression_ratio,
+            max_central_directory_bytes=max_central_directory_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        resources.close()
 
 def _verification_failure_message(result: dict[str, Any]) -> str:
-    failed = [str(item.get("name")) for item in result.get("checks") or [] if not item.get("ok")]
+    failed = _bounded_diagnostic_sample(
+        (
+            str(item.get("name"))
+            for item in result.get("checks") or []
+            if not item.get("ok")
+        )
+    )
     return ", ".join(failed) or str(result.get("reason") or "verification_failed")
+
+
+def _trusted_bundle_verification_limits(path: Path) -> dict[str, int]:
+    """Derive exact public verifier ceilings for a packer-created archive."""
+    preflight = _read_bundle_zip_preflight(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        infos = archive.infolist()
+    expanded = sum(max(0, int(info.file_size)) for info in infos)
+    compressed = sum(max(0, int(info.compress_size)) for info in infos)
+    member_size = max((max(0, int(info.file_size)) for info in infos), default=0)
+    maximum_ratio = max(
+        (
+            (max(0, int(info.file_size)) + max(1, int(info.compress_size)) - 1)
+            // max(1, int(info.compress_size))
+            for info in infos
+        ),
+        default=1,
+    )
+    maximum_ratio = max(
+        maximum_ratio,
+        (expanded + max(1, compressed) - 1) // max(1, compressed),
+    )
+    derived = {
+        "max_entries": max(1, len(infos)),
+        "max_expanded_bytes": max(1, expanded),
+        "max_member_bytes": max(1, member_size),
+        "max_compression_ratio": max(1, maximum_ratio),
+        "max_central_directory_bytes": max(1, preflight.central_directory_size),
+        "timeout_seconds": BUNDLE_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    }
+    absolute_limits = {
+        "max_entries": BUNDLE_ABSOLUTE_MAX_ENTRIES,
+        "max_expanded_bytes": BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+        "max_member_bytes": BUNDLE_ABSOLUTE_MAX_EXPANDED_BYTES,
+        "max_compression_ratio": BUNDLE_ABSOLUTE_MAX_COMPRESSION_RATIO,
+        "max_central_directory_bytes": BUNDLE_ABSOLUTE_MAX_CENTRAL_DIRECTORY_BYTES,
+        "timeout_seconds": BUNDLE_MAX_VERIFY_TIMEOUT_SECONDS,
+    }
+    exceeded = [
+        name for name, value in derived.items() if value > absolute_limits[name]
+    ]
+    if exceeded:
+        raise ValueError(
+            "new bundle exceeds absolute verification limit(s): "
+            + ", ".join(sorted(exceeded))
+        )
+    return derived
 
 
 def _path_lexists(path: Path) -> bool:
@@ -2775,13 +4849,15 @@ def pack_root(
         alias_key_stage_policy: dict[str, Any] = {"removed_alias_key_files": 0, "rewritten_snapshot_manifests": 0}
         if profile == "shareable":
             alias_key_stage_policy = _strip_shareable_alias_keys(stage_root, copy_result)
-        unsupported = [
-            item for item in copy_result["skipped"]
+        unsupported_count = sum(
+            1
+            for item in copy_result["skipped"]
             if item.get("reason") == "unsupported_file_type"
-        ]
-        if profile == "shareable" and unsupported:
+        )
+        if profile == "shareable" and unsupported_count:
             raise ValueError(
-                f"shareable bundle refused because the root contains {len(unsupported)} unsupported file type(s)"
+                "shareable bundle refused because the root contains "
+                f"{unsupported_count} unsupported file type(s)"
             )
 
         staged_proof_count = _proof_pack_count(stage_root)
@@ -2887,7 +4963,16 @@ def pack_root(
                         mode_override=0o644 if path == manifest_path else None,
                     )
 
-            bundle_verification = verify_root_bundle(temp_zip, verify_embedded_root=False)
+            # The packer has just measured and written this immutable temporary
+            # archive.  Derive tight limits from those trusted bytes so a root
+            # above the public 64 GiB default can still self-check deliberately,
+            # while every absolute verifier ceiling remains in force.
+            trusted_verification_limits = _trusted_bundle_verification_limits(temp_zip)
+            bundle_verification = verify_root_bundle(
+                temp_zip,
+                verify_embedded_root=False,
+                **trusted_verification_limits,
+            )
             if not bundle_verification.get("ok"):
                 raise ValueError(f"new bundle failed self-verification: {bundle_verification.get('errors')}")
 
@@ -2925,11 +5010,17 @@ def pack_root(
                 # Re-verify the published archive envelope and member binding
                 # without extracting and re-auditing the same root a third time.
                 final_verification = verify_root_bundle(
-                    out_path, verify_embedded_root=False
+                    out_path,
+                    verify_embedded_root=False,
+                    **trusted_verification_limits,
                 )
                 if not final_verification.get("ok"):
                     raise ValueError(f"final bundle verification failed: {final_verification.get('errors')}")
-                bundle_sha256 = file_sha256(out_path)
+                bundle_sha256 = final_verification.get("bundle_sha256")
+                if not isinstance(bundle_sha256, str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", bundle_sha256
+                ):
+                    raise ValueError("final bundle verification did not return a valid SHA-256")
                 atomic_write_text_file(sha_path, f"{bundle_sha256}  {out_path.name}\n")
             except Exception:
                 if publication_started:

@@ -240,6 +240,20 @@ class _BlockingConnection:
         self.closed.set()
 
 
+class _CloseFailingResponse(_BlockingResponse):
+    def close(self) -> None:
+        raise OSError("response close failed")
+
+
+class _CloseFailingConnection(_BlockingConnection):
+    def getresponse(self) -> _BlockingResponse:
+        return _CloseFailingResponse(self, self.stage)
+
+    def close(self) -> None:
+        self.closed.set()
+        raise OSError("connection close failed")
+
+
 class LocalModelTests(unittest.TestCase):
     def setUp(self) -> None:
         with local_model._CIRCUIT_LOCK:
@@ -1205,6 +1219,41 @@ class LocalModelTests(unittest.TestCase):
                     1.5,
                     f"{stage} exceeded the wall-clock deadline: {elapsed:.3f}s",
                 )
+
+    def test_http_cleanup_failures_preserve_success_and_deadline_outcomes(self) -> None:
+        successful = _CloseFailingConnection("response-close")
+        with mock.patch(
+            "continuum.core.local_model.http.client.HTTPConnection",
+            return_value=successful,
+        ):
+            self.assertEqual(
+                local_model._http_json(
+                    method="GET",
+                    url="http://127.0.0.1:8080/v1/health",
+                    timeout_seconds=1,
+                ),
+                {},
+            )
+        self.assertTrue(successful.closed.is_set())
+
+        blocked = _CloseFailingConnection("request")
+        try:
+            with mock.patch(
+                "continuum.core.local_model.http.client.HTTPConnection",
+                return_value=blocked,
+            ):
+                with self.assertRaisesRegex(
+                    local_model.LocalModelError,
+                    "total deadline",
+                ):
+                    local_model._http_json(
+                        method="GET",
+                        url="http://127.0.0.1:8080/v1/health",
+                        timeout_seconds=0.05,
+                    )
+        finally:
+            self.assertTrue(local_model._local_stage_runner().wait_idle(2))
+        self.assertTrue(blocked.closed.is_set())
 
     def test_blocked_http_requests_use_one_runner_without_thread_growth(self) -> None:
         release = threading.Event()

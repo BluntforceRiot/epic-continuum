@@ -248,6 +248,37 @@ audit, secret audit, stale-operation dry-run, and an optional restore drill.
 Use `--no-restore-drill` for fast checks that avoid disposable restore-drill
 artifacts.
 
+Restore-drill receipts expose an explicit `drill_root_cleanup_status`:
+
+- `cleaned` means the reserved Windows root was removed through its pinned
+  native handle and its final pathname was proven absent.
+- `inspected_root_retained` means POSIX cleanup deliberately performed no
+  delete, truncate, or other payload mutation. The retained tree was inspected
+  through read-only pinned descriptors and found to contain only stable physical
+  directories and stable, single-link regular files. Payload bytes remain in
+  place. This is an accepted non-destructive disposition for strict
+  `verify-root`, not a claim that disk space was reclaimed.
+- `retained_by_request` means the caller requested the complete drill tree.
+- `identity_capability_unavailable` means no pinned inspection primitive was
+  available, so Continuum conservatively reports the tree retained.
+- `cleanup_failed_or_incomplete` means cleanup capability existed but an
+  inspection, descriptor close, or final-postcondition check failed.
+
+If a POSIX reserved root is renamed while its descriptor remains open,
+Continuum still performs a read-only inspection of the pinned tree but reports
+`inspected_root_moved`, `inspected_root_unlinked`, or
+`inspected_root_moved_or_replaced`; it never calls a missing original pathname
+`cleaned`. Successful postconditions are checked again before the receipt is
+written.
+
+On POSIX, `retain_drill_root=false` therefore retains a complete restored tree.
+Repeated drills can consume substantial disk space under `run/restore_drills`.
+Receipts expose the exact retained path plus `drill_root_retained_file_count`
+and `drill_root_retained_bytes` so operators can review and remove old
+disposable roots through their normal maintenance process. Version 0.3.0 does
+not impose an automatic POSIX retained-root count or byte cap and does not
+remove those bytes without an identity-bound deletion primitive.
+
 ## Catalog Proof Mode
 
 `epic_continuity.catalog_proof_mode` controls how operation proof packs represent
@@ -291,6 +322,35 @@ drive-relative, or root-relative paths.
 continuum pack-root --root <root> --profile shareable --out continuum-root.zip
 continuum verify-bundle --path continuum-root.zip
 ```
+
+Bundle verification applies host-resource ceilings before materializing the ZIP
+central directory or inflating members. Defaults are 100,000 entries, 64 GiB of
+expanded bytes, 256 MiB of central-directory bytes, a 1,000:1 compression ratio,
+and a one-hour monotonic verification deadline. The raw preflight walks and
+counts central records (including strict adjacent Zip64 end records) before
+`ZipFile` can materialize them, and one pinned regular-file handle is used for
+the preflight, archive hash, envelope parser, and member reads. Semantic
+verification also requires temporary free space for the manifest-declared root
+plus a 1 GiB reserve and bounded control/result overhead; the reserve is
+rechecked during extraction and while the semantic audit runs. Semantic audits execute in a separately reaped process, so
+the deadline can terminate a stalled catalog or evidence check rather than
+waiting for a cooperative return. Worker output is capped at 1 MiB. Use
+`--max-entries`, `--max-expanded-bytes`, `--max-member-bytes`,
+`--max-compression-ratio`, `--max-central-directory-bytes`, and
+`--timeout-seconds` only for a trusted larger archive; expanded/member overrides
+remain capped at the absolute 1 TiB boundary. `--envelope-only` skips temporary
+reconstruction and therefore the free-space preflight, while retaining every ZIP,
+manifest, hash, and resource limit. The MCP `continuum_verify_bundle` tool exposes
+the same controls as JSON properties.
+
+Portable-metadata verification reads regular JSON with a 20 MiB whole-file
+ceiling. JSONL, integration logs, and card YAML stream record by record, so an
+ordinary file may exceed 20 MiB while each record remains bounded; the audit also
+caps total streamed bytes, record count, detailed errors, findings, and derived
+finding-field sizes. SQLite metadata applies its connection length ceiling before
+the first query, caps schema and scan work, checks individual text/blob values at
+20 MiB, and reads path columns singly or key/value pairs so two valid cells do not
+fail merely because their aggregate row is larger than one cell.
 
 `secret_audit_max_file_bytes` is a safety boundary during export. Files larger
 than that limit are reported as an incomplete audit, and strict verification or

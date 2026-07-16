@@ -56,6 +56,25 @@ The default state-witness mode prevents proof storage from growing by one full
 catalog copy for every mutation. Full integrity and restore claims still belong
 to `verify-root`, explicit snapshots, restore drills, and verified root bundles.
 
+### POSIX restore-drill retention
+
+Disposable restore-drill cleanup is platform-specific. Windows can delete the
+reserved tree through pinned native handles. POSIX does not provide the same
+portable identity-bound recursive deletion operation, and a link-count check
+cannot safely authorize a later truncate because a hardlink can appear between
+those operations. Continuum therefore opens POSIX drill-tree entries read-only,
+recursively checks physical type, descriptor/path identity, stable metadata,
+and single-link regular files, and retains every payload byte unchanged.
+
+The receipt status `inspected_root_retained` is a successful non-destructive
+postcondition, so strict `verify-root` can pass while also reporting
+`drill_root_retained: true`, the retained file count, and retained byte count.
+It is not a storage-cleanup claim. Repeated POSIX drills retain full copies
+under `run/restore_drills`; v0.3.0 has no automatic retained-root count or byte
+cap. Operators should use the receipt paths and metrics in their normal
+disk-retention maintenance. Any inspection, identity, hardlink, or
+final-postcondition failure remains non-successful.
+
 ### External archive for legacy catalog proofs
 
 Older roots can contain many full `catalog.snapshot.sqlite3` proof inputs. The
@@ -63,6 +82,46 @@ legacy-proof archive workflow can move eligible, immutable copies to an external
 content-addressed archive without invalidating their proof packs. It writes a
 root-bound locator at `config/proof-archive.json` and a hash-chained relocation
 ledger before removing each verified source copy.
+
+Source removal is fail-closed. On Windows, Continuum deletes only through the
+same native handle whose bytes and identity were verified, and that handle does
+not share write access between the final hash and deletion disposition.
+The containing directory is then opened with native write access and flushed
+with `FlushFileBuffers`; an open, flush, or handle-close failure is surfaced as
+an incomplete durability result rather than being treated as best effort.
+Platforms without an equivalent identity-bound delete operation retain the
+original source and return `ok: false`; the archive object and relocation record
+remain available, but the source is not reported as removed.
+
+If a verified archive copy fails, that copy or integrity error remains the
+primary exception. Descriptor-close and temporary-file cleanup failures are
+attempted independently and recorded as bounded exception notes rather than
+replacing the failure that caused the copy to stop.
+
+Archive results separate exact disposition from later housekeeping.
+`source_removed: true` and `source_disposition_status: removed_exact_handle`
+remain truthful if the verified object was deleted but quarantine-directory
+cleanup or a durability flush later fails. In that case
+`quarantine_cleanup_status` or `source_durability_status` reports the incomplete
+step and the aggregate result remains false. Path inspection counts as absence
+only when `lstat` returns `FileNotFoundError`; permission and other inspection
+errors are reported rather than converted into success.
+
+Every disposition path verifies the content-addressed destination immediately
+before it can report success. This includes an already-absent source and a retry
+that reuses an existing relocation record. A missing or modified destination
+therefore makes both the item and aggregate archive result false, even when the
+source pathname is already absent.
+
+Every later plan and apply pass also inventories leftover
+`.catalog.snapshot.sqlite3.archive-quarantine-*` entries. A surviving quarantine
+appears under `retained_quarantines`, contributes to
+`retained_quarantine_count`, and produces a non-successful
+`retained_quarantine` result instead of an empty success. The relocation ledger
+can confirm URI and content identity, but older records do not identify the
+exact object moved into quarantine. A retry therefore reports and preserves the
+quarantine even when every retained file has matching bytes; it does not delete
+by pathname or content match alone.
 
 Verification still evaluates the original root-relative proof URI first. If and
 only if that exact legacy catalog proof is absent, the verifier may follow the

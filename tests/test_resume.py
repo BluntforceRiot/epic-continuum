@@ -2490,21 +2490,31 @@ class ResumeLatestTests(unittest.TestCase):
     def test_resume_preserves_the_callers_visibility_capability_scope_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
-            session_state = record_project_state(
-                root,
-                session_id="matrix-session",
-                agent_id="codex-sol",
-                project_id="matrix-project",
-                objective="SESSION-SCOPED-AUTHORIZED-CHECKPOINT",
-                metadata={"visibility_scope": "session"},
-            )
-            project_state = record_project_state(
-                root,
-                session_id="matrix-session",
-                agent_id="codex-sol",
-                project_id="matrix-project",
-                objective="NEWER-PROJECT-SCOPED-CHECKPOINT",
-            )
+            with patch.object(
+                store_module,
+                "utc_now",
+                return_value="2026-01-01T00:00:00+00:00",
+            ):
+                session_state = record_project_state(
+                    root,
+                    session_id="matrix-session",
+                    agent_id="codex-sol",
+                    project_id="matrix-project",
+                    objective="SESSION-SCOPED-AUTHORIZED-CHECKPOINT",
+                    metadata={"visibility_scope": "session"},
+                )
+            with patch.object(
+                store_module,
+                "utc_now",
+                return_value="2026-01-01T00:01:00+00:00",
+            ):
+                project_state = record_project_state(
+                    root,
+                    session_id="matrix-session",
+                    agent_id="codex-sol",
+                    project_id="matrix-project",
+                    objective="NEWER-PROJECT-SCOPED-CHECKPOINT",
+                )
             append_scroll_event(
                 root,
                 session_id="matrix-session",

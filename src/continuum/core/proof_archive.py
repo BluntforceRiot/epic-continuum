@@ -1450,7 +1450,7 @@ def _open_windows_deletable_file(path: Path) -> tuple[int, int]:
     import msvcrt
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -1484,14 +1484,14 @@ def _open_windows_deletable_file(path: Path) -> tuple[int, int]:
     if handle_value in {0, invalid_handle}:
         raise RelocatedArtifactIntegrityError(
             f"unable to open quarantined proof artifact for identity-bound deletion: {path}"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     try:
-        fd = msvcrt.open_osfhandle(handle_value, flags)
+        fd = msvcrt.open_osfhandle(handle_value, flags)  # type: ignore[attr-defined]
     except BaseException as original:
         try:
             if not kernel32.CloseHandle(handle):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
         except BaseException as secondary:
             _note_cleanup_failure(
                 original,
@@ -1509,7 +1509,7 @@ def _set_windows_delete_disposition(handle: int) -> None:
     class FileDispositionInfo(ctypes.Structure):
         _fields_ = [("delete_file", wintypes.BOOLEAN)]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.SetFileInformationByHandle.argtypes = [
         wintypes.HANDLE,
         ctypes.c_int,
@@ -1526,7 +1526,7 @@ def _set_windows_delete_disposition(handle: int) -> None:
     ):
         raise RelocatedArtifactIntegrityError(
             "unable to mark quarantined proof artifact for identity-bound deletion"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
 def _open_windows_directory_flush_handle(directory: Path) -> tuple[Any, int]:
@@ -1534,7 +1534,7 @@ def _open_windows_directory_flush_handle(directory: Path) -> tuple[Any, int]:
     from ctypes import wintypes
 
     _assert_no_link_components(directory)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -1567,7 +1567,7 @@ def _open_windows_directory_flush_handle(directory: Path) -> tuple[Any, int]:
     if handle_value in {0, invalid_handle}:
         raise RelocatedArtifactIntegrityError(
             f"unable to open proof source parent for a strict durability flush: {directory}"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     return kernel32, handle_value
 
 
@@ -1578,7 +1578,7 @@ def _flush_windows_directory_handle(kernel32: Any, handle: int, directory: Path)
     if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle)):
         raise RelocatedArtifactIntegrityError(
             f"unable to durably flush proof source parent directory: {directory}"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
 def _close_windows_directory_flush_handle(kernel32: Any, handle: int) -> None:
@@ -1588,7 +1588,7 @@ def _close_windows_directory_flush_handle(kernel32: Any, handle: int) -> None:
     if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
         raise RelocatedArtifactIntegrityError(
             "unable to close proof source parent durability handle"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
 def _flush_windows_directory_strict(directory: Path) -> None:

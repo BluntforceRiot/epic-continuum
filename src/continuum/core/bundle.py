@@ -234,7 +234,7 @@ def _open_bundle_read_handle(path: Path) -> Any:
     import msvcrt
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR,
@@ -257,10 +257,10 @@ def _open_bundle_read_handle(path: Path) -> Any:
     )
     invalid_handle = ctypes.c_void_p(-1).value
     if handle == invalid_handle:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     try:
-        descriptor = msvcrt.open_osfhandle(int(handle), flags)
+        descriptor = msvcrt.open_osfhandle(int(handle), flags)  # type: ignore[attr-defined]
     except Exception:
         kernel32.CloseHandle(handle)
         raise

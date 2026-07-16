@@ -1929,7 +1929,7 @@ class _WindowsNativeConfinement:
             raise ReviewBridgeError("Windows native duplication returned no file handle")
         descriptor = -1
         try:
-            descriptor = self.msvcrt.open_osfhandle(
+            descriptor = self.msvcrt.open_osfhandle(  # type: ignore[attr-defined]
                 duplicate_value,
                 os.O_RDONLY | getattr(os, "O_BINARY", 0),
             )
@@ -1977,7 +1977,7 @@ class _WindowsNativeConfinement:
         if not duplicate_value:
             raise ReviewBridgeError("Windows native duplication returned no file handle")
         try:
-            descriptor = self.msvcrt.open_osfhandle(
+            descriptor = self.msvcrt.open_osfhandle(  # type: ignore[attr-defined]
                 duplicate_value,
                 os.O_RDONLY | getattr(os, "O_BINARY", 0),
             )

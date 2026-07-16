@@ -514,7 +514,10 @@ class ReviewBridgeTest(unittest.TestCase):
                 Path(path).as_posix(),
                 {"/private", "/private/tmp", "/private/var"},
             )
-            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755)
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_reparse_tag=0,
+            )
 
         with (
             patch.object(review_bridge_module.sys, "platform", "darwin"),
@@ -576,7 +579,8 @@ class ReviewBridgeTest(unittest.TestCase):
                         stat.S_IFLNK | 0o777
                         if Path(path).as_posix() == "/var"
                         else stat.S_IFDIR | 0o755
-                    )
+                    ),
+                    st_reparse_tag=0,
                 ),
             ),
         ):
@@ -614,7 +618,8 @@ class ReviewBridgeTest(unittest.TestCase):
                         stat.S_IFLNK | 0o777
                         if Path(path).as_posix() == "/private/var"
                         else stat.S_IFDIR | 0o755
-                    )
+                    ),
+                    st_reparse_tag=0,
                 ),
             ),
         ):

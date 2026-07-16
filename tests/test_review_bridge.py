@@ -629,7 +629,7 @@ class ReviewBridgeTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            physical = Path(tmp).absolute()
+            physical = Path(tmp).resolve(strict=True)
             lexical = Path("/var/folders/review-case")
 
             def normalize(path: Path) -> Path:
@@ -10025,7 +10025,13 @@ class ReviewBridgeTest(unittest.TestCase):
             ) -> object:
                 nonlocal swapped
                 active_path = Path(path)
-                if active_path == tmp_root and not swapped:
+                if (
+                    review_bridge_module._normalize_review_platform_path(
+                        active_path
+                    )
+                    == review_bridge_module._normalize_review_platform_path(tmp_root)
+                    and not swapped
+                ):
                     tmp_root.rename(saved_tmp)
                     replacement_tmp.rename(tmp_root)
                     swapped = True
@@ -14632,7 +14638,15 @@ class ReviewBridgeTest(unittest.TestCase):
                 **kwargs: object,
             ) -> object:
                 nonlocal injected
-                if not injected and source_root == object_store:
+                if (
+                    not injected
+                    and review_bridge_module._normalize_review_platform_path(
+                        source_root
+                    )
+                    == review_bridge_module._normalize_review_platform_path(
+                        object_store
+                    )
+                ):
                     injected = True
                     alternates.parent.mkdir(parents=True, exist_ok=True)
                     alternates.write_text(
@@ -14748,7 +14762,10 @@ class ReviewBridgeTest(unittest.TestCase):
                     )
                     if (
                         not mutated
-                        and source_root == git_dir
+                        and review_bridge_module._normalize_review_platform_path(
+                            source_root
+                        )
+                        == review_bridge_module._normalize_review_platform_path(git_dir)
                         and relative.as_posix() == metadata_name
                     ):
                         (git_dir / metadata_name).write_bytes(replacement)

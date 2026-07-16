@@ -1645,7 +1645,7 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertIn("exports/review_bridge/jobs", result["copied_durable_paths"])
             restored_artifact = (
                 Path(result["drill_root"])
-                / review_artifact.relative_to(root)
+                / root_uri(root, review_artifact)
             )
             self.assertEqual(restored_artifact.read_bytes(), payload)
             self.assertTrue(result["artifact_ledger"]["ok"], result["artifact_ledger"])

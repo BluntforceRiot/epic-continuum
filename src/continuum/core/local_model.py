@@ -1463,6 +1463,8 @@ def assist_resume(
         )
         _remaining_deadline_seconds(operation_deadline)
         if not health.get("ready"):
+            if health.get("reason") == TOTAL_DEADLINE_ERROR:
+                raise LocalModelError(TOTAL_DEADLINE_ERROR)
             if health.get("reason") not in {
                 "insufficient_resource_headroom",
                 "probe_not_requested",

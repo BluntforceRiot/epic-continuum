@@ -1208,6 +1208,8 @@ class LocalModelTests(unittest.TestCase):
 
     def test_blocked_http_requests_use_one_runner_without_thread_growth(self) -> None:
         release = threading.Event()
+        stage_runner = local_model._local_stage_runner()
+        self.assertTrue(stage_runner.wait_idle(2))
 
         class IgnoringCloseConnection:
             sock = None
@@ -1249,7 +1251,7 @@ class LocalModelTests(unittest.TestCase):
                     elapsed_times.append(time.monotonic() - started)
         finally:
             release.set()
-            self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            self.assertTrue(stage_runner.wait_idle(2))
 
         http_threads_after = sum(
             thread.name == "continuum-local-http" and thread.is_alive()
@@ -1307,6 +1309,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
+            stage_runner = local_model._local_stage_runner()
+            self.assertTrue(stage_runner.wait_idle(2))
             release = threading.Event()
             stage_threads_before = [
                 thread
@@ -1333,7 +1337,7 @@ class LocalModelTests(unittest.TestCase):
                     elapsed = time.monotonic() - started
             finally:
                 release.set()
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+                self.assertTrue(stage_runner.wait_idle(2))
 
             stage_threads_after = [
                 thread
@@ -1355,8 +1359,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
-            if local_model._LOCAL_STAGE_RUNNER is not None:
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            stage_runner = local_model._local_stage_runner()
+            self.assertTrue(stage_runner.wait_idle(2))
             original_configuration = local_model._configuration
             preprocessing_started = threading.Event()
             release = threading.Event()
@@ -1391,7 +1395,7 @@ class LocalModelTests(unittest.TestCase):
                     elapsed = time.monotonic() - started
             finally:
                 release.set()
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+                self.assertTrue(stage_runner.wait_idle(2))
 
             self.assertEqual(configuration.call_count, 1)
             self.assertTrue(preprocessing_started.is_set())
@@ -1408,6 +1412,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
+            stage_runner = local_model._local_stage_runner()
+            self.assertTrue(stage_runner.wait_idle(2))
             releases = [threading.Event() for _ in range(3)]
             resource_calls = 0
             stage_threads_before = [
@@ -1442,11 +1448,11 @@ class LocalModelTests(unittest.TestCase):
                         )
                         elapsed_times.append(time.monotonic() - started)
                         release.set()
-                        self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+                        self.assertTrue(stage_runner.wait_idle(2))
             finally:
                 for release in releases:
                     release.set()
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+                self.assertTrue(stage_runner.wait_idle(2))
 
             stage_threads_after = [
                 thread
@@ -1470,8 +1476,8 @@ class LocalModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
             configure_yarn(root, enabled=True, timeout_seconds=1)
-            if local_model._LOCAL_STAGE_RUNNER is not None:
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+            stage_runner = local_model._local_stage_runner()
+            self.assertTrue(stage_runner.wait_idle(2))
             original_configuration = local_model._configuration
             release = threading.Event()
             resource_started = threading.Event()
@@ -1518,7 +1524,7 @@ class LocalModelTests(unittest.TestCase):
                     self.assertEqual(configuration.call_count, 1)
             finally:
                 release.set()
-                self.assertTrue(local_model._LOCAL_STAGE_RUNNER.wait_idle(2))
+                self.assertTrue(stage_runner.wait_idle(2))
 
             stage_threads_after = [
                 thread
@@ -1538,6 +1544,31 @@ class LocalModelTests(unittest.TestCase):
                     1.5,
                     f"blocked runner call exceeded its deadline: {elapsed:.3f}s",
                 )
+
+    def test_health_deadline_result_uses_stable_request_failure_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            configure_yarn(root, enabled=True, timeout_seconds=5)
+            with mock.patch(
+                "continuum.core.local_model._local_model_health",
+                return_value={
+                    "ok": False,
+                    "ready": False,
+                    "reason": local_model.TOTAL_DEADLINE_ERROR,
+                    "error_type": local_model.LocalModelError.__name__,
+                },
+            ):
+                result = assist_resume(
+                    root,
+                    context_text="health deadline classification evidence",
+                    session_id="s",
+                    project_id="p",
+                )
+
+            self.assertFalse(result["used"], result)
+            self.assertEqual(result["reason"], "model_request_failed")
+            self.assertEqual(result["detail"], local_model.TOTAL_DEADLINE_ERROR)
+            self.assertEqual(result["error_type"], "LocalModelError")
 
     def test_unknown_evidence_citation_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):

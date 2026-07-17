@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .permissions import secure_write_text
+from .permissions import secure_write_text, secure_write_text_exclusive
 
 
 def yaml_scalar(value: Any) -> str:
@@ -174,9 +174,17 @@ def load_atomic_yaml(text: str) -> Any:
     return result
 
 
-def write_atomic_yaml(path: Path, payload: dict[str, Any]) -> None:
+def write_atomic_yaml(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    exclusive: bool = False,
+) -> None:
     text = dump_yaml(payload).rstrip() + "\n"
-    secure_write_text(path, text)
+    if exclusive:
+        secure_write_text_exclusive(path, text)
+    else:
+        secure_write_text(path, text)
 
 
 def atomic_memory_card(

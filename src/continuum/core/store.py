@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import ctypes
 import hashlib
 import hmac
 import json
@@ -9,9 +10,10 @@ import random
 import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -19,7 +21,16 @@ from urllib.parse import urlencode
 
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
 from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
-from .permissions import secure_copy_file, secure_copytree, secure_mkdir, secure_sqlite_files, secure_write_text
+from .permissions import (
+    fsync_parent,
+    secure_copy_file,
+    secure_copytree,
+    secure_mkdir,
+    secure_sqlite_files,
+    secure_write_text,
+    secure_write_text_exclusive,
+    replace_file_noclobber,
+)
 from .project_state import (
     MAX_PROJECT_STATE_NOTES_BYTES,
     MAX_PROJECT_STATE_TITLE_BYTES,
@@ -717,77 +728,235 @@ def snapshot_review_bridge_jobs_path(snapshot_path: Path) -> Path:
     return snapshot_path.parent / f"continuum_review_bridge_jobs_{snapshot_id}"
 
 
+def snapshot_card_sidecar_receipts_path(snapshot_path: Path) -> Path:
+    snapshot_id = snapshot_id_from_catalog_path(snapshot_path) or snapshot_path.stem
+    return snapshot_path.parent / f"continuum_card_sidecar_receipts_{snapshot_id}"
+
+
 def snapshot_alias_key_path(snapshot_path: Path) -> Path:
     snapshot_id = snapshot_id_from_catalog_path(snapshot_path) or snapshot_path.stem
     return snapshot_path.parent / f"continuum_partition_alias_{snapshot_id}.key"
 
 
 def _file_manifest(path: Path, *, root: Path | None = None) -> dict[str, Any]:
+    _entry_identity, fingerprint, sha256 = _stable_regular_file_hash_evidence(path)
     return {
         "uri": continuum_uri(root, path) if root is not None else path.name,
-        "sha256": file_sha256(path),
-        "size_bytes": path.stat().st_size,
+        "sha256": sha256,
+        "size_bytes": fingerprint[0],
     }
+
+
+SnapshotDirectoryEvidence = tuple[
+    tuple[int, int, int, int],
+    dict[str, tuple[str, tuple[int, int]]],
+]
+
+
+def _snapshot_directory_evidence(
+    directory: Path,
+    *,
+    label: str,
+) -> SnapshotDirectoryEvidence:
+    reason = _snapshot_link_like_reason(directory)
+    if reason:
+        raise ValueError(
+            f"snapshot paired tree contains a link-like {label} path: "
+            f"{directory} ({reason})"
+        )
+    metadata = os.lstat(directory)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"snapshot paired tree is not a directory: {directory}")
+    entries: dict[str, tuple[str, tuple[int, int]]] = {}
+    try:
+        with os.scandir(directory) as scanned:
+            children = sorted(scanned, key=lambda entry: entry.name)
+        for entry in children:
+            path = Path(entry.path)
+            reason = _snapshot_link_like_reason(path)
+            if reason:
+                raise ValueError(
+                    f"snapshot paired tree contains a link-like {label} path: "
+                    f"{path} ({reason})"
+                )
+            child_metadata = os.lstat(path)
+            if entry.is_dir(follow_symlinks=False):
+                kind = "directory"
+            elif entry.is_file(follow_symlinks=False):
+                kind = "file"
+            else:
+                raise ValueError(
+                    f"snapshot paired tree contains an unsupported {label} entry: {path}"
+                )
+            entries[entry.name] = (
+                kind,
+                (int(child_metadata.st_dev), int(child_metadata.st_ino)),
+            )
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(
+            f"snapshot paired tree could not be inspected: {directory}: {exc}"
+        ) from exc
+    return (
+        (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mtime_ns),
+            int(metadata.st_ctime_ns),
+        ),
+        entries,
+    )
+
+
+def _assert_snapshot_inventory_current(
+    *,
+    directories: dict[Path, SnapshotDirectoryEvidence],
+    files: list[tuple[Path, StableRegularFileEvidence, int]],
+    label: str,
+) -> None:
+    for path, expected in directories.items():
+        if _snapshot_directory_evidence(path, label=label) != expected:
+            raise ValueError(
+                f"snapshot paired tree changed during inventory: {path}"
+            )
+    for path, evidence, fd in files:
+        if not _held_regular_file_evidence_is_current(path, evidence, fd):
+            raise ValueError(f"file evidence source changed while hashing: {path}")
 
 
 def _sidecar_hashes(sidecars: Path | None) -> dict[str, dict[str, Any]]:
-    if sidecars is None or not sidecars.exists():
+    if sidecars is None:
         return {}
+    root_reason = _snapshot_link_like_reason(sidecars)
+    if root_reason:
+        raise ValueError(
+            f"snapshot Card sidecar tree is link-like or unavailable: "
+            f"{sidecars} ({root_reason})"
+        )
+    if not sidecars.is_dir():
+        raise ValueError(f"snapshot Card sidecar tree is not a directory: {sidecars}")
     output: dict[str, dict[str, Any]] = {}
-    for path in sorted(sidecars.glob("*.yaml")):
-        output[path.relative_to(sidecars).as_posix()] = _file_manifest(path)
+    portable_names: dict[str, str] = {}
+    directories = {
+        sidecars: _snapshot_directory_evidence(
+            sidecars,
+            label="Card sidecar",
+        )
+    }
+    held_files: list[tuple[Path, StableRegularFileEvidence, int]] = []
+    succeeded = False
+    try:
+        for name, (kind, entry_identity) in directories[sidecars][1].items():
+            path = sidecars / name
+            if kind != "file":
+                raise ValueError(
+                    f"snapshot Card sidecar tree contains an unsupported entry: {path}"
+                )
+            folded_name = path.name.casefold()
+            prior_name = portable_names.get(folded_name)
+            if prior_name is not None and prior_name != path.name:
+                raise ValueError(
+                    "snapshot Card sidecar tree contains a portable filename collision: "
+                    f"{prior_name!r} and {path.name!r}"
+                )
+            portable_names[folded_name] = path.name
+            evidence, fd, _captured = _open_stable_regular_file_hash_evidence(path)
+            if evidence[0][1] != entry_identity:
+                os.close(fd)
+                raise ValueError(f"snapshot Card sidecar entry changed before hashing: {path}")
+            held_files.append((path, evidence, fd))
+            output[path.name] = {
+                "uri": path.name,
+                "sha256": evidence[2],
+                "size_bytes": evidence[1][0],
+            }
+        _assert_snapshot_inventory_current(
+            directories=directories,
+            files=held_files,
+            label="Card sidecar",
+        )
+        succeeded = True
+    finally:
+        for _path, _evidence, fd in held_files:
+            os.close(fd)
+    if succeeded:
+        _assert_snapshot_inventory_current(
+            directories=directories,
+            files=[],
+            label="Card sidecar",
+        )
+        for path, evidence, _fd in held_files:
+            if not _stable_regular_file_evidence_is_current(path, evidence):
+                raise ValueError(f"file evidence source changed while hashing: {path}")
     return output
 
 
-def _snapshot_tree_inventory(tree: Path) -> dict[str, Any]:
+def _snapshot_tree_inventory(
+    tree: Path,
+    *,
+    label: str = "Review Relay jobs",
+) -> dict[str, Any]:
     if not tree.exists() or not tree.is_dir():
         raise ValueError(f"snapshot paired tree is missing or is not a directory: {tree}")
-    _raise_if_snapshot_source_has_link_like_path(tree, label="Review Relay jobs")
-    directories: list[str] = []
+    _raise_if_snapshot_source_has_link_like_path(tree, label=label)
+    directory_names: list[str] = []
     files: dict[str, dict[str, Any]] = {}
+    directory_evidence: dict[Path, SnapshotDirectoryEvidence] = {}
+    held_files: list[tuple[Path, StableRegularFileEvidence, int]] = []
     stack = [tree]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                children = sorted(entries, key=lambda entry: entry.name)
-            for entry in children:
-                path = Path(entry.path)
+    succeeded = False
+    try:
+        while stack:
+            current = stack.pop()
+            current_evidence = _snapshot_directory_evidence(current, label=label)
+            directory_evidence[current] = current_evidence
+            for name, (kind, entry_identity) in current_evidence[1].items():
+                path = current / name
                 relative = path.relative_to(tree).as_posix()
-                reason = _snapshot_link_like_reason(path)
-                if reason:
-                    raise ValueError(
-                        "snapshot paired tree contains a link-like Review Relay jobs path: "
-                        f"{path} ({reason})"
-                    )
-                if entry.is_dir(follow_symlinks=False):
-                    directories.append(relative)
+                if kind == "directory":
+                    directory_names.append(relative)
                     stack.append(path)
-                elif entry.is_file(follow_symlinks=False):
-                    files[relative] = {
-                        "sha256": file_sha256(path),
-                        "size_bytes": path.stat(follow_symlinks=False).st_size,
-                    }
                 else:
-                    raise ValueError(
-                        f"snapshot paired tree contains an unsupported Review Relay jobs entry: {path}"
-                    )
-        except ValueError:
-            raise
-        except OSError as exc:
-            raise ValueError(
-                f"snapshot paired tree could not be inspected: {current}: {exc}"
-            ) from exc
-    directories.sort()
+                    evidence, fd, _captured = _open_stable_regular_file_hash_evidence(path)
+                    if evidence[0][1] != entry_identity:
+                        os.close(fd)
+                        raise ValueError(
+                            f"snapshot paired tree entry changed before hashing: {path}"
+                        )
+                    held_files.append((path, evidence, fd))
+                    files[relative] = {
+                        "sha256": evidence[2],
+                        "size_bytes": evidence[1][0],
+                    }
+        _assert_snapshot_inventory_current(
+            directories=directory_evidence,
+            files=held_files,
+            label=label,
+        )
+        succeeded = True
+    finally:
+        for _path, _evidence, fd in held_files:
+            os.close(fd)
+    if succeeded:
+        _assert_snapshot_inventory_current(
+            directories=directory_evidence,
+            files=[],
+            label=label,
+        )
+        for path, evidence, _fd in held_files:
+            if not _stable_regular_file_evidence_is_current(path, evidence):
+                raise ValueError(f"file evidence source changed while hashing: {path}")
+    directory_names.sort()
     files = {name: files[name] for name in sorted(files)}
     digest_payload = {
-        "directories": directories,
+        "directories": directory_names,
         "files": files,
     }
     return {
-        "directory_count": len(directories),
+        "directory_count": len(directory_names),
         "file_count": len(files),
-        "directories": directories,
+        "directories": directory_names,
         "files": files,
         "tree_sha256": content_hash(
             json.dumps(
@@ -814,6 +983,23 @@ def _review_bridge_jobs_snapshot_manifest(
     }
 
 
+def _card_sidecar_receipts_snapshot_manifest(
+    root: Path,
+    *,
+    receipts_path: Path,
+    source_path: Path,
+) -> dict[str, Any]:
+    return {
+        "schema": "epic_continuum.snapshot_card_sidecar_receipts.v1",
+        "uri": continuum_uri(root, receipts_path),
+        "source_uri": continuum_uri(root, source_path),
+        **_snapshot_tree_inventory(
+            receipts_path,
+            label="Card sidecar history receipts",
+        ),
+    }
+
+
 def build_snapshot_manifest(
     root: Path,
     *,
@@ -821,11 +1007,21 @@ def build_snapshot_manifest(
     card_sidecars_path: Path | None,
     alias_key_path: Path | None,
     card_sidecars_source_path: Path | None = None,
+    card_sidecars_write_enabled: bool | None = None,
+    card_sidecar_receipts_path: Path | None = None,
+    card_sidecar_receipts_source_path: Path | None = None,
     review_bridge_jobs_path: Path | None = None,
     review_bridge_jobs_source_path: Path | None = None,
     semantic_integrity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if card_sidecars_write_enabled is None:
+        card_sidecars_write_enabled = bool(
+            load_config(root)
+            .get("atomic_memory", {})
+            .get("write_card_sidecars", True)
+        )
     alias_key = _file_manifest(alias_key_path, root=root) if alias_key_path and alias_key_path.exists() else None
+    card_sidecar_inventory = _sidecar_hashes(card_sidecars_path)
     manifest = {
         "schema": "epic_continuum.snapshot_manifest.v2",
         "created_at": utc_now(),
@@ -837,8 +1033,9 @@ def build_snapshot_manifest(
         "counts": catalog_counts_from_db_file(snapshot_path),
         "card_sidecars_uri": continuum_uri(root, card_sidecars_path) if card_sidecars_path and card_sidecars_path.exists() else None,
         "card_sidecars_source_uri": continuum_uri(root, card_sidecars_source_path) if card_sidecars_source_path else "catalog/cards",
-        "card_sidecar_count": len(_sidecar_hashes(card_sidecars_path)),
-        "card_sidecars": _sidecar_hashes(card_sidecars_path),
+        "card_sidecars_write_enabled": card_sidecars_write_enabled,
+        "card_sidecar_count": len(card_sidecar_inventory),
+        "card_sidecars": card_sidecar_inventory,
         "partition_alias_key": alias_key,
         "partition_alias_key_fingerprint": alias_key["sha256"] if alias_key else None,
         "semantic_integrity": semantic_integrity or {"ok": False, "error": "semantic_integrity_missing"},
@@ -850,6 +1047,17 @@ def build_snapshot_manifest(
             jobs_path=review_bridge_jobs_path,
             source_path=review_bridge_jobs_source_path,
         )
+    if (
+        card_sidecar_receipts_path is not None
+        and card_sidecar_receipts_source_path is not None
+    ):
+        manifest["card_sidecar_receipts"] = (
+            _card_sidecar_receipts_snapshot_manifest(
+                root,
+                receipts_path=card_sidecar_receipts_path,
+                source_path=card_sidecar_receipts_source_path,
+            )
+        )
     return manifest
 
 
@@ -860,6 +1068,9 @@ def write_snapshot_manifest(
     card_sidecars_path: Path | None,
     alias_key_path: Path | None,
     card_sidecars_source_path: Path | None = None,
+    card_sidecars_write_enabled: bool | None = None,
+    card_sidecar_receipts_path: Path | None = None,
+    card_sidecar_receipts_source_path: Path | None = None,
     review_bridge_jobs_path: Path | None = None,
     review_bridge_jobs_source_path: Path | None = None,
     semantic_integrity: dict[str, Any] | None = None,
@@ -871,6 +1082,9 @@ def write_snapshot_manifest(
         card_sidecars_path=card_sidecars_path,
         alias_key_path=alias_key_path,
         card_sidecars_source_path=card_sidecars_source_path,
+        card_sidecars_write_enabled=card_sidecars_write_enabled,
+        card_sidecar_receipts_path=card_sidecar_receipts_path,
+        card_sidecar_receipts_source_path=card_sidecar_receipts_source_path,
         review_bridge_jobs_path=review_bridge_jobs_path,
         review_bridge_jobs_source_path=review_bridge_jobs_source_path,
         semantic_integrity=semantic_integrity,
@@ -1025,6 +1239,89 @@ def _snapshot_review_bridge_jobs_errors(
     ]
 
 
+def _snapshot_card_sidecar_receipts_errors(
+    snapshot_path: Path,
+    manifest: dict[str, Any],
+    *,
+    root: Path | None,
+) -> list[dict[str, Any]]:
+    if "card_sidecar_receipts" not in manifest:
+        pair_path = snapshot_card_sidecar_receipts_path(snapshot_path)
+        if pair_path.exists() or pair_path.is_symlink():
+            return [
+                {
+                    "error": "card_sidecar_receipts_tree_mismatch",
+                    "detail": "undeclared snapshot Card sidecar receipt tree is present",
+                }
+            ]
+        return []
+    expected = manifest.get("card_sidecar_receipts")
+    if not isinstance(expected, dict):
+        return [
+            {
+                "error": "card_sidecar_receipts_tree_mismatch",
+                "detail": "snapshot Card sidecar receipt binding is not an object",
+            }
+        ]
+    pair_path = snapshot_card_sidecar_receipts_path(snapshot_path)
+    expected_uri = (
+        continuum_uri(root, pair_path)
+        if root is not None
+        else f"{snapshot_path.parent.name}/{pair_path.name}"
+    )
+    metadata_mismatches: list[str] = []
+    if (
+        expected.get("schema")
+        != "epic_continuum.snapshot_card_sidecar_receipts.v1"
+    ):
+        metadata_mismatches.append("schema")
+    if expected.get("uri") != expected_uri:
+        metadata_mismatches.append("uri")
+    if expected.get("source_uri") != "exports/card_sidecar_recovery_receipts":
+        metadata_mismatches.append("source_uri")
+    try:
+        actual_inventory = _snapshot_tree_inventory(
+            pair_path,
+            label="Card sidecar history receipts",
+        )
+    except Exception as exc:
+        return [
+            {
+                "error": "card_sidecar_receipts_tree_mismatch",
+                "detail": str(exc),
+                "mismatched_fields": sorted(
+                    set(metadata_mismatches + ["tree"])
+                ),
+            }
+        ]
+    inventory_fields = (
+        "directory_count",
+        "file_count",
+        "directories",
+        "files",
+        "tree_sha256",
+    )
+    metadata_mismatches.extend(
+        field
+        for field in inventory_fields
+        if expected.get(field) != actual_inventory[field]
+    )
+    if not metadata_mismatches:
+        return []
+    return [
+        {
+            "error": "card_sidecar_receipts_tree_mismatch",
+            "mismatched_fields": sorted(set(metadata_mismatches)),
+            "expected_directory_count": expected.get("directory_count"),
+            "actual_directory_count": actual_inventory["directory_count"],
+            "expected_file_count": expected.get("file_count"),
+            "actual_file_count": actual_inventory["file_count"],
+            "expected_tree_sha256": expected.get("tree_sha256"),
+            "actual_tree_sha256": actual_inventory["tree_sha256"],
+        }
+    ]
+
+
 def verify_snapshot_manifest_for_root(
     snapshot_path: Path,
     *,
@@ -1043,6 +1340,16 @@ def verify_snapshot_manifest_for_root(
             "manifest": None,
         }
     expected_snapshot_hash = str(manifest.get("snapshot", {}).get("sha256") or manifest.get("snapshot_hash") or "")
+    if (
+        "card_sidecars_write_enabled" in manifest
+        and not isinstance(manifest.get("card_sidecars_write_enabled"), bool)
+    ):
+        errors.append(
+            {
+                "error": "snapshot_card_sidecar_write_policy_malformed",
+                "detail": "card_sidecars_write_enabled must be true or false",
+            }
+        )
     if not snapshot_path.exists():
         errors.append({"error": "snapshot_missing", "path": str(snapshot_path)})
     elif expected_snapshot_hash != file_sha256(snapshot_path):
@@ -1075,11 +1382,60 @@ def verify_snapshot_manifest_for_root(
     sidecars_path = snapshot_sidecars_path(snapshot_path)
     raw_expected_sidecars = manifest.get("card_sidecars")
     expected_sidecars: dict[str, Any] = raw_expected_sidecars if isinstance(raw_expected_sidecars, dict) else {}
-    actual_sidecars = _sidecar_hashes(sidecars_path)
-    if actual_sidecars != expected_sidecars:
-        errors.append({"error": "snapshot_sidecars_mismatch", "expected_count": len(expected_sidecars), "actual_count": len(actual_sidecars)})
+    raw_expected_sidecar_count = manifest.get("card_sidecar_count")
+    expected_sidecar_count_valid = (
+        isinstance(raw_expected_sidecar_count, int)
+        and not isinstance(raw_expected_sidecar_count, bool)
+        and raw_expected_sidecar_count >= 0
+        and raw_expected_sidecar_count == len(expected_sidecars)
+    )
+    if not expected_sidecar_count_valid:
+        errors.append(
+            {
+                "error": "snapshot_sidecars_mismatch",
+                "detail": "card_sidecar_count does not match the bound sidecar inventory",
+                "expected_count": raw_expected_sidecar_count,
+                "inventory_count": len(expected_sidecars),
+            }
+        )
+    sidecars_declared = manifest.get("card_sidecars_uri") is not None
+    try:
+        if sidecars_declared and sidecars_path is None:
+            raise ValueError("declared snapshot Card sidecar tree is missing")
+        if not sidecars_declared and sidecars_path is not None:
+            raise ValueError("undeclared snapshot Card sidecar tree is present")
+        actual_sidecars = _sidecar_hashes(sidecars_path)
+    except (OSError, ValueError) as exc:
+        errors.append(
+            {
+                "error": "snapshot_sidecars_mismatch",
+                "expected_count": len(expected_sidecars),
+                "actual_count": None,
+                "detail": str(exc),
+            }
+        )
+    else:
+        if (
+            actual_sidecars != expected_sidecars
+            or not expected_sidecar_count_valid
+            or raw_expected_sidecar_count != len(actual_sidecars)
+        ):
+            errors.append(
+                {
+                    "error": "snapshot_sidecars_mismatch",
+                    "expected_count": len(expected_sidecars),
+                    "actual_count": len(actual_sidecars),
+                }
+            )
     errors.extend(
         _snapshot_review_bridge_jobs_errors(
+            snapshot_path,
+            manifest,
+            root=root,
+        )
+    )
+    errors.extend(
+        _snapshot_card_sidecar_receipts_errors(
             snapshot_path,
             manifest,
             root=root,
@@ -1518,6 +1874,30 @@ def _canonical_scroll_metadata(
         canonical["project_id"] = str(canonical["project_id"])
     else:
         canonical.pop("project_id", None)
+    return canonical
+
+
+def _canonical_card_metadata(
+    metadata: dict[str, Any],
+    *,
+    session_id: str | None,
+    visibility_scope: str | None,
+    project_id: str | None,
+) -> dict[str, Any]:
+    """Mirror authoritative Card partition columns into persisted metadata."""
+    canonical = dict(metadata)
+    if session_id:
+        canonical["session_id"] = session_id
+    else:
+        canonical.pop("session_id", None)
+    if project_id:
+        canonical["project_id"] = project_id
+    else:
+        canonical.pop("project_id", None)
+    canonical["visibility_scope"] = normalize_visibility_scope(
+        str(visibility_scope or canonical.get("visibility_scope") or "global"),
+        field="card visibility_scope",
+    )
     return canonical
 
 
@@ -2099,18 +2479,11 @@ def _backfill_partition_aliases(root: Path, conn: sqlite3.Connection) -> int:
         ).fetchall()
         for row in rows:
             metadata = json_loads(row["metadata_json"], {})
-            canonical = dict(metadata)
-            if row["session_id"]:
-                canonical["session_id"] = row["session_id"]
-            else:
-                canonical.pop("session_id", None)
-            if row["project_id"]:
-                canonical["project_id"] = row["project_id"]
-            else:
-                canonical.pop("project_id", None)
-            canonical["visibility_scope"] = normalize_visibility_scope(
-                str(row["visibility_scope"] or canonical.get("visibility_scope") or "global"),
-                field="card visibility_scope",
+            canonical = _canonical_card_metadata(
+                metadata,
+                session_id=str(row["session_id"]) if row["session_id"] else None,
+                project_id=str(row["project_id"]) if row["project_id"] else None,
+                visibility_scope=str(row["visibility_scope"]) if row["visibility_scope"] else None,
             )
             if canonical != metadata:
                 conn.execute("UPDATE cards SET metadata_json = ? WHERE id = ?", (json_dumps(canonical), row["id"]))
@@ -2268,17 +2641,2176 @@ def _status_config(root: Path, *, create: bool) -> dict[str, Any]:
     return default_config()
 
 
-def card_sidecar_path(root: Path, card_id: str) -> Path | None:
-    config = load_config(root)
-    atomic_config = config.get("atomic_memory", {})
-    if not atomic_config.get("write_card_sidecars", True):
-        return None
+_PORTABLE_CARD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_PORTABLE_WINDOWS_DEVICE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def _is_canonical_card_id(card_id: str) -> bool:
+    return bool(
+        _PORTABLE_CARD_ID_RE.fullmatch(card_id)
+        and not card_id.endswith(".")
+        and card_id.split(".", 1)[0].upper()
+        not in _PORTABLE_WINDOWS_DEVICE_NAMES
+    )
+
+
+def _require_canonical_card_id(card_id: str) -> str:
+    if not _is_canonical_card_id(card_id):
+        raise ValueError("invalid Card id: expected one portable path component")
+    return card_id
+
+
+def _configured_card_sidecar_dir(
+    root: Path,
+    *,
+    atomic_config: dict[str, Any] | None = None,
+) -> Path:
+    if atomic_config is None:
+        atomic_config = load_config(root).get("atomic_memory", {})
     sidecar_dir = resolve_root_config_path(
         root,
         atomic_config.get("card_sidecar_dir", "catalog/cards"),
         field="atomic_memory.card_sidecar_dir",
     )
-    return sidecar_dir / f"{card_id}.yaml"
+    return sidecar_dir
+
+
+def _configured_card_sidecar_path(
+    root: Path,
+    card_id: str,
+    *,
+    atomic_config: dict[str, Any] | None = None,
+) -> Path:
+    _require_canonical_card_id(card_id)
+    return _configured_card_sidecar_dir(
+        root,
+        atomic_config=atomic_config,
+    ) / f"{card_id}.yaml"
+
+
+def card_sidecar_path(root: Path, card_id: str) -> Path | None:
+    atomic_config = load_config(root).get("atomic_memory", {})
+    if not atomic_config.get("write_card_sidecars", True):
+        return None
+    return _configured_card_sidecar_path(
+        root,
+        card_id,
+        atomic_config=atomic_config,
+    )
+
+
+def current_card_sidecar_path(
+    root: Path,
+    conn: sqlite3.Connection,
+    card_id: str,
+) -> Path | None:
+    # The write toggle controls new materialization, not whether an already
+    # recorded sidecar remains readable durable state.
+    default_path = _configured_card_sidecar_path(root, card_id)
+    row = conn.execute(
+        "SELECT location_uri FROM cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if row is not None and row["location_uri"]:
+        candidate = resolve_stored_uri(root, str(row["location_uri"]))
+        managed_candidate = _resolved_managed_card_sidecar_path(
+            default_path,
+            candidate,
+            card_id=card_id,
+        )
+        if managed_candidate is not None:
+            return managed_candidate
+        return None
+    return _resolved_managed_card_sidecar_path(
+        default_path,
+        default_path,
+        card_id=card_id,
+    )
+
+
+def _card_sidecar_payload_for_row(row: sqlite3.Row) -> dict[str, Any]:
+    return atomic_memory_card(
+        card_id=row["id"],
+        card_type=row["card_type"],
+        title=row["title"],
+        summary=row["summary"],
+        status=row["status"],
+        source_refs=json_loads(row["source_refs_json"], []),
+        entities=json_loads(row["entities_json"], []),
+        topics=json_loads(row["topics_json"], []),
+        decisions=json_loads(row["decisions_json"], []),
+        open_tasks=json_loads(row["open_tasks_json"], []),
+        salience=float(row["salience"] or 0.0),
+        confidence=float(row["confidence"] or 0.0),
+        metadata=json_loads(row["metadata_json"], {}),
+        visibility_scope=row["visibility_scope"],
+        session_id=row["session_id"],
+        project_id=row["project_id"],
+        placement_collection=row["placement_collection"],
+        shelf=row["shelf"],
+        storage_tier=row["storage_tier"],
+        recall_count=int(row["recall_count"] or 0),
+        last_recalled_at=row["last_recalled_at"],
+        conflict_group=row["conflict_group"],
+        supersedes_card_id=row["supersedes_card_id"],
+        superseded_by_card_id=row["superseded_by_card_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        summary_hash=content_hash(row["summary"]),
+    )
+
+
+def _card_sidecar_filename_state_hash(path: Path, card_id: str) -> str | None:
+    match = re.fullmatch(
+        rf"{re.escape(card_id)}\.live-(?P<state_hash>[0-9a-f]{{64}})\.yaml",
+        path.name,
+        flags=re.IGNORECASE,
+    )
+    return str(match.group("state_hash")).lower() if match is not None else None
+
+
+def _portable_unique_casefold_lookup(
+    values: Iterable[str],
+) -> tuple[dict[str, str], int]:
+    grouped: dict[str, set[str]] = {}
+    for value in values:
+        grouped.setdefault(value.casefold(), set()).add(value)
+    return (
+        {
+            folded: next(iter(originals))
+            for folded, originals in grouped.items()
+            if len(originals) == 1
+        },
+        sum(1 for originals in grouped.values() if len(originals) > 1),
+    )
+
+
+def _card_sidecar_matches_payload(path: Path, payload: dict[str, Any]) -> bool:
+    entry_identity = _sidecar_nofollow_path_identity(path)
+    if entry_identity is None:
+        return False
+    try:
+        loaded = load_atomic_yaml(path.read_text(encoding="utf-8"))
+        card_id = str(payload.get("card_id") or payload.get("id") or "")
+        filename_state_hash = _card_sidecar_filename_state_hash(path, card_id)
+        return (
+            _sidecar_nofollow_path_identity(path) == entry_identity
+            and
+            loaded == payload
+            and (
+                filename_state_hash is None
+                or filename_state_hash == str(payload.get("state_hash") or "").lower()
+            )
+        )
+    except (OSError, ValueError):
+        return False
+
+
+SidecarPathIdentity = tuple[frozenset[str], tuple[int, int] | None]
+ImmutableArtifactPathIndex = tuple[tuple[Path, SidecarPathIdentity], ...]
+CardIntentBatchIndex = tuple[
+    dict[str, sqlite3.Row],
+    frozenset[str],
+    dict[str, frozenset[str]],
+    dict[tuple[int, int], frozenset[str]],
+    dict[str, tuple[Path, SidecarPathIdentity]],
+]
+
+
+def _filesystem_path_identity(
+    path: Path,
+) -> tuple[frozenset[str], tuple[int, int] | None]:
+    keys: set[str] = set()
+    try:
+        resolved = path.resolve(strict=False)
+        keys.add(os.path.normcase(os.path.abspath(resolved)))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    file_identity: tuple[int, int] | None = None
+    try:
+        stat_result = path.stat()
+        file_identity = (int(stat_result.st_dev), int(stat_result.st_ino))
+    except OSError:
+        pass
+    return frozenset(keys), file_identity
+
+
+def _sidecar_nofollow_path_identity(
+    path: Path,
+    *,
+    allow_missing: bool = False,
+) -> SidecarPathIdentity | None:
+    """Return a leaf-lexical identity without following a link-like entry."""
+    try:
+        resolved_parent = path.parent.resolve(strict=False)
+        path_key = os.path.normcase(
+            os.path.abspath(resolved_parent / path.name)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return (frozenset({path_key}), None) if allow_missing else None
+    except OSError:
+        return None
+    is_junction = getattr(path, "is_junction", None)
+    try:
+        junction = bool(callable(is_junction) and is_junction())
+    except OSError:
+        return None
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    is_reparse = bool(
+        int(getattr(metadata, "st_file_attributes", 0)) & reparse_flag
+    )
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or junction
+        or is_reparse
+        or not stat.S_ISREG(metadata.st_mode)
+    ):
+        return None
+    return (
+        frozenset({path_key}),
+        (int(metadata.st_dev), int(metadata.st_ino)),
+    )
+
+
+StableRegularFileEvidence = tuple[
+    SidecarPathIdentity,
+    tuple[int, int, int],
+    str,
+]
+
+
+def _namespace_and_handle_fingerprints_match(
+    namespace_fingerprint: tuple[int, int, int],
+    handle_fingerprint: tuple[int, int, int],
+) -> bool:
+    """Compare metadata observed through a pathname and an open descriptor.
+
+    On Windows, ``stat(path)`` and ``fstat(fd)`` can expose different ctime
+    values for the same NTFS file even when the volume/file identity, size,
+    and mtime agree.  Namespace-to-namespace and handle-to-handle checks still
+    compare all three fields; only this cross-API comparison omits ctime.
+    """
+
+    if os.name == "nt":
+        return namespace_fingerprint[:2] == handle_fingerprint[:2]
+    return namespace_fingerprint == handle_fingerprint
+
+
+def _open_regular_file_evidence_fd(path: Path) -> int:
+    """Open a leaf without following it and, on Windows, fence writers.
+
+    The CRT's default sharing mode is not strong enough for evidence reads:
+    another handle can rewrite a same-size file and restore its mtime while it
+    is being hashed.  A Windows evidence handle therefore shares reads only,
+    denying writes and namespace deletion until the caller closes the fd.
+    """
+
+    if os.name != "nt":
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+        if nofollow:
+            flags |= nofollow
+        return os.open(path, flags)
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_sequential_scan = 0x08000000
+    handle = create_file(
+        str(path),
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_attribute_normal | file_flag_open_reparse_point | file_flag_sequential_scan,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        return msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            int(handle),
+            os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
+        )
+    except Exception:
+        close_handle(handle)
+        raise
+
+
+def _open_stable_regular_file_hash_evidence(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    capture_bytes: bool = False,
+) -> tuple[StableRegularFileEvidence, int, bytes | None]:
+    """Return hash evidence plus a still-open, identity-bound descriptor."""
+
+    identity = _sidecar_nofollow_path_identity(path)
+    if identity is None:
+        raise ValueError(f"file evidence source is not a stable regular file: {path}")
+    before = _regular_file_fingerprint(path)
+    if max_bytes is not None and before[0] > max_bytes:
+        raise ValueError(f"file evidence source exceeds its byte limit: {path}")
+    fd = _open_regular_file_evidence_fd(path)
+    digest = hashlib.sha256()
+    byte_count = 0
+    captured = bytearray() if capture_bytes else None
+    try:
+        opened_before = os.fstat(fd)
+        opened_identity = (
+            int(opened_before.st_dev),
+            int(opened_before.st_ino),
+        )
+        opened_fingerprint = (
+            int(opened_before.st_size),
+            int(opened_before.st_mtime_ns),
+            int(opened_before.st_ctime_ns),
+        )
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        opened_is_reparse = bool(
+            int(getattr(opened_before, "st_file_attributes", 0)) & reparse_flag
+        )
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or opened_is_reparse
+            or identity[1] is None
+            or opened_identity != identity[1]
+            or not _namespace_and_handle_fingerprints_match(before, opened_fingerprint)
+        ):
+            raise ValueError(f"file evidence source changed before open: {path}")
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if max_bytes is not None and byte_count > max_bytes:
+                raise ValueError(f"file evidence source exceeds its byte limit: {path}")
+            digest.update(chunk)
+            if captured is not None:
+                captured.extend(chunk)
+        opened_after = os.fstat(fd)
+        after_open_identity = (
+            int(opened_after.st_dev),
+            int(opened_after.st_ino),
+        )
+        after_open_fingerprint = (
+            int(opened_after.st_size),
+            int(opened_after.st_mtime_ns),
+            int(opened_after.st_ctime_ns),
+        )
+        if (
+            after_open_identity != opened_identity
+            or after_open_fingerprint != opened_fingerprint
+            or byte_count != opened_fingerprint[0]
+            or _sidecar_nofollow_path_identity(path) != identity
+            or _regular_file_fingerprint(path) != before
+        ):
+            raise ValueError(f"file evidence source changed while hashing: {path}")
+        evidence = (identity, before, digest.hexdigest())
+        return evidence, fd, bytes(captured) if captured is not None else None
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _held_regular_file_evidence_is_current(
+    path: Path,
+    evidence: StableRegularFileEvidence,
+    fd: int,
+) -> bool:
+    """Rehash a held descriptor and verify its final namespace binding."""
+
+    identity, fingerprint, expected_sha256 = evidence
+    try:
+        opened_before = os.fstat(fd)
+        opened_identity = (int(opened_before.st_dev), int(opened_before.st_ino))
+        opened_fingerprint = (
+            int(opened_before.st_size),
+            int(opened_before.st_mtime_ns),
+            int(opened_before.st_ctime_ns),
+        )
+        if (
+            identity[1] is None
+            or opened_identity != identity[1]
+            or not _namespace_and_handle_fingerprints_match(fingerprint, opened_fingerprint)
+        ):
+            return False
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            digest.update(chunk)
+        opened_after = os.fstat(fd)
+        after_fingerprint = (
+            int(opened_after.st_size),
+            int(opened_after.st_mtime_ns),
+            int(opened_after.st_ctime_ns),
+        )
+        return (
+            (int(opened_after.st_dev), int(opened_after.st_ino)) == opened_identity
+            and after_fingerprint == opened_fingerprint
+            and byte_count == fingerprint[0]
+            and digest.hexdigest() == expected_sha256
+            and _sidecar_nofollow_path_identity(path) == identity
+            and _regular_file_fingerprint(path) == fingerprint
+        )
+    except OSError:
+        return False
+
+
+def _regular_file_fingerprint(path: Path) -> tuple[int, int, int]:
+    metadata = os.lstat(path)
+    return (
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _stable_regular_file_hash_evidence(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> StableRegularFileEvidence:
+    evidence, fd, _captured = _open_stable_regular_file_hash_evidence(
+        path,
+        max_bytes=max_bytes,
+    )
+    try:
+        if not _held_regular_file_evidence_is_current(path, evidence, fd):
+            raise ValueError(f"file evidence source changed while hashing: {path}")
+    finally:
+        os.close(fd)
+    return evidence
+
+
+def _stable_regular_file_evidence_is_current(
+    path: Path,
+    evidence: StableRegularFileEvidence,
+) -> bool:
+    fd = -1
+    try:
+        current, fd, _captured = _open_stable_regular_file_hash_evidence(path)
+        return current == evidence and _held_regular_file_evidence_is_current(
+            path,
+            current,
+            fd,
+        )
+    except (OSError, ValueError):
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _immutable_artifact_path_index(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> ImmutableArtifactPathIndex:
+    entries: list[tuple[Path, SidecarPathIdentity]] = []
+    try:
+        rows = conn.execute(
+            "SELECT uri FROM artifacts WHERE immutable = 1"
+        ).fetchall()
+        card_ids = {
+            str(row["id"])
+            for row in conn.execute("SELECT id FROM cards").fetchall()
+        }
+    except sqlite3.OperationalError:
+        return ()
+    card_id_lookup, _card_id_collisions = _portable_unique_casefold_lookup(
+        card_ids
+    )
+    for row in rows:
+        artifact_path = resolve_stored_uri(root, str(row["uri"]))
+        indexed_paths: list[Path] = []
+        if not os.path.lexists(artifact_path) or not _card_sidecar_path_is_link_like(
+            artifact_path
+        ):
+            indexed_paths.append(artifact_path)
+        name_match = re.fullmatch(
+            r"(?P<card_id>.+?)(?:\.live(?:-[0-9a-f]{64})?)?\.yaml",
+            artifact_path.name,
+            flags=re.IGNORECASE,
+        )
+        if name_match is not None and indexed_paths:
+            card_id = card_id_lookup.get(
+                str(name_match.group("card_id")).casefold()
+            )
+            if card_id is not None:
+                managed_alias = _resolved_managed_card_sidecar_path(
+                    _configured_card_sidecar_path(root, card_id),
+                    artifact_path,
+                    card_id=card_id,
+                )
+                if managed_alias is not None and managed_alias != artifact_path:
+                    indexed_paths.append(managed_alias)
+        for indexed_path in indexed_paths:
+            identity = _sidecar_nofollow_path_identity(
+                indexed_path,
+                allow_missing=True,
+            )
+            if identity is not None:
+                entries.append((indexed_path, identity))
+    return tuple(entries)
+
+
+def _immutable_artifact_binds_path(
+    root: Path,
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    artifact_index: ImmutableArtifactPathIndex | None = None,
+) -> bool:
+    index = (
+        artifact_index
+        if artifact_index is not None
+        else _immutable_artifact_path_index(root, conn)
+    )
+    identity = _sidecar_nofollow_path_identity(path, allow_missing=True)
+    return bool(identity is not None and _path_identity_binds_index(identity, index))
+
+
+def _path_identity_binds_index(
+    identity: SidecarPathIdentity,
+    index: ImmutableArtifactPathIndex,
+) -> bool:
+    target_keys, target_file_identity = identity
+    for source_path, expected_source_identity in index:
+        if (
+            _sidecar_nofollow_path_identity(
+                source_path,
+                allow_missing=True,
+            )
+            != expected_source_identity
+        ):
+            continue
+        source_keys, source_file_identity = expected_source_identity
+        if target_keys.intersection(source_keys):
+            return True
+        if (
+            target_file_identity is not None
+            and source_file_identity is not None
+            and target_file_identity == source_file_identity
+        ):
+            return True
+    return False
+
+
+def _card_intent_batch_index(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> CardIntentBatchIndex:
+    rows = conn.execute("SELECT * FROM cards").fetchall()
+    rows_by_id = {str(row["id"]): row for row in rows}
+    card_ids_by_path_key: dict[str, set[str]] = {}
+    card_ids_by_file_id: dict[tuple[int, int], set[str]] = {}
+    references_by_card_id: dict[str, tuple[Path, SidecarPathIdentity]] = {}
+    for row in rows:
+        location_uri = str(row["location_uri"] or "")
+        if not location_uri:
+            continue
+        card_id = str(row["id"])
+        candidate = resolve_stored_uri(root, location_uri)
+        default_path = _configured_card_sidecar_path(root, card_id)
+        managed_candidate = _resolved_managed_card_sidecar_path(
+            default_path,
+            candidate,
+            card_id=card_id,
+        )
+        if managed_candidate is None:
+            continue
+        identity = _sidecar_nofollow_path_identity(managed_candidate)
+        if identity is None:
+            continue
+        references_by_card_id[card_id] = (managed_candidate, identity)
+        for path_key in identity[0]:
+            card_ids_by_path_key.setdefault(path_key, set()).add(card_id)
+        if identity[1] is not None:
+            card_ids_by_file_id.setdefault(identity[1], set()).add(card_id)
+    outbox_ids = frozenset(
+        str(row["card_id"])
+        for row in conn.execute("SELECT card_id FROM card_sidecar_outbox").fetchall()
+    )
+    return (
+        rows_by_id,
+        outbox_ids,
+        {key: frozenset(value) for key, value in card_ids_by_path_key.items()},
+        {key: frozenset(value) for key, value in card_ids_by_file_id.items()},
+        references_by_card_id,
+    )
+
+
+def _card_ids_for_path_identity(
+    batch_index: CardIntentBatchIndex,
+    identity: tuple[frozenset[str], tuple[int, int] | None],
+) -> list[str]:
+    (
+        _rows_by_id,
+        _outbox_ids,
+        by_path_key,
+        by_file_id,
+        references_by_card_id,
+    ) = batch_index
+    card_ids: set[str] = set()
+    for path_key in identity[0]:
+        card_ids.update(by_path_key.get(path_key, ()))
+    if identity[1] is not None:
+        card_ids.update(by_file_id.get(identity[1], ()))
+    return sorted(
+        card_id
+        for card_id in card_ids
+        if (
+            card_id in references_by_card_id
+            and _sidecar_nofollow_path_identity(
+                references_by_card_id[card_id][0]
+            )
+            == references_by_card_id[card_id][1]
+        )
+    )
+
+
+def _card_sidecar_parents_match(default_parent: Path, candidate_parent: Path) -> bool:
+    for parent in (default_parent, candidate_parent):
+        if not os.path.lexists(parent):
+            continue
+        if _card_sidecar_path_is_link_like(parent) or not parent.is_dir():
+            return False
+    return _paths_share_filesystem_identity(default_parent, candidate_parent)
+
+
+def _has_managed_card_sidecar_name(
+    default_path: Path,
+    candidate: Path,
+    *,
+    card_id: str,
+) -> bool:
+    if not _is_canonical_card_id(card_id):
+        return False
+    if not _card_sidecar_parents_match(default_path.parent, candidate.parent):
+        return False
+    candidate_name = candidate.name.casefold()
+    default_name = default_path.name.casefold()
+    valid_name = candidate_name == default_name or bool(
+        re.fullmatch(
+            rf"{re.escape(card_id)}\.live(?:-[0-9a-f]{{64}})?\.yaml",
+            candidate.name,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not valid_name:
+        return False
+    return True
+
+
+def _is_managed_card_sidecar_path(
+    default_path: Path,
+    candidate: Path,
+    *,
+    card_id: str,
+) -> bool:
+    if not _has_managed_card_sidecar_name(
+        default_path,
+        candidate,
+        card_id=card_id,
+    ):
+        return False
+    return not os.path.lexists(candidate) or not _card_sidecar_path_is_link_like(candidate)
+
+
+def _portable_casefold_file_alias(path: Path) -> Path | None:
+    """Resolve one basename-only portable case alias without folding its parent."""
+    try:
+        if not path.parent.is_dir():
+            return path
+        with os.scandir(path.parent) as entries:
+            matches = [
+                Path(entry.path)
+                for entry in entries
+                if entry.name.casefold() == path.name.casefold()
+            ]
+    except OSError:
+        return None
+    if not matches:
+        return path
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _resolved_managed_card_sidecar_path(
+    default_path: Path,
+    candidate: Path,
+    *,
+    card_id: str,
+) -> Path | None:
+    if not _is_managed_card_sidecar_path(
+        default_path,
+        candidate,
+        card_id=card_id,
+    ):
+        return None
+    resolved_candidate = _portable_casefold_file_alias(candidate)
+    if resolved_candidate is None or not _is_managed_card_sidecar_path(
+        default_path,
+        resolved_candidate,
+        card_id=card_id,
+    ):
+        return None
+    if os.path.lexists(resolved_candidate) and _card_sidecar_path_is_link_like(
+        resolved_candidate
+    ):
+        return None
+    return resolved_candidate
+
+
+def _ensure_content_addressed_sidecar_transition_receipt(
+    root: Path,
+    *,
+    current_path: Path,
+    card_id: str,
+) -> None:
+    filename_state_hash = _card_sidecar_filename_state_hash(
+        current_path,
+        card_id,
+    )
+    if filename_state_hash is None:
+        return
+    entry_identity = _sidecar_nofollow_path_identity(current_path)
+    if entry_identity is None:
+        raise ValueError("current content-addressed Card sidecar is unsafe")
+    history_index = _validated_card_sidecar_history_receipt_index(root)
+    receipt_binds = _history_receipt_binds_card_sidecar(
+        current_path,
+        card_id=card_id,
+        state_hash=filename_state_hash,
+        receipt_index=history_index,
+    )
+    target_uri = lexical_continuum_uri(root, current_path)
+    exact_uri_binds = (
+        target_uri,
+        card_id,
+        filename_state_hash,
+    ) in history_index[2]
+    if _sidecar_nofollow_path_identity(current_path) != entry_identity:
+        raise ValueError(
+            "current content-addressed Card sidecar changed during receipt binding"
+        )
+    if receipt_binds and exact_uri_binds:
+        return
+    held_fd = -1
+    try:
+        _payload, evidence, held_fd = _open_validated_card_sidecar_payload(
+            current_path,
+            card_id=card_id,
+            expected_state_hash=filename_state_hash,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError(
+            "cannot preserve current content-addressed Card sidecar transition"
+        ) from exc
+    try:
+        if evidence[0] != entry_identity:
+            raise ValueError(
+                "current content-addressed Card sidecar changed during transition read"
+            )
+        intent_id, intent_path = _write_card_sidecar_write_intent(
+            root,
+            card_id=card_id,
+            target_uri=target_uri,
+            expected_state_hash=filename_state_hash,
+            mode="history_transition",
+        )
+        intent_entry_identity = _plain_card_sidecar_state_path_identity(
+            intent_path,
+            directory=False,
+        )
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        if not isinstance(intent, dict) or intent.get("intent_id") != intent_id:
+            raise ValueError("Card sidecar history transition intent is malformed")
+        _finish_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+            status="transition_prepared",
+            observed_path=current_path,
+            observed_evidence=evidence,
+            observed_fd=held_fd,
+        )
+    finally:
+        os.close(held_fd)
+
+
+def _card_sidecar_write_target_selection(
+    root: Path,
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: dict[str, Any],
+    *,
+    artifact_index: ImmutableArtifactPathIndex | None = None,
+) -> tuple[Path | None, bool]:
+    card_id = str(row["id"])
+    default_path = card_sidecar_path(root, card_id)
+    if default_path is None:
+        return None, False
+    current_path = default_path
+    repair_exact_managed_link = False
+    if row["location_uri"]:
+        candidate = resolve_stored_uri(root, str(row["location_uri"]))
+        managed_candidate = _resolved_managed_card_sidecar_path(
+            default_path,
+            candidate,
+            card_id=card_id,
+        )
+        if managed_candidate is None:
+            if (
+                not os.path.lexists(candidate)
+                or not _has_managed_card_sidecar_name(
+                    default_path,
+                    candidate,
+                    card_id=card_id,
+                )
+                or not _card_sidecar_path_is_link_like(candidate)
+            ):
+                raise ValueError(
+                    "recorded Card sidecar path is unmanaged or has a portable case collision"
+                )
+            # The durable write path owns quarantine/replacement of an exact
+            # managed-name link. Do not follow it or bless it as readable state.
+            managed_candidate = candidate
+            repair_exact_managed_link = True
+        current_path = managed_candidate
+    if repair_exact_managed_link:
+        current_filename_hash = _card_sidecar_filename_state_hash(
+            current_path,
+            card_id,
+        )
+        if current_filename_hash is None:
+            return current_path, False
+        raise ValueError(
+            "hash-named Card sidecar link requires explicit no-follow cleanup"
+        )
+    if _card_sidecar_matches_payload(current_path, payload):
+        return current_path, False
+    state_hash = str(payload.get("state_hash") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", state_hash):
+        raise ValueError("cannot version Card sidecar without a valid state hash")
+    if _card_sidecar_filename_state_hash(current_path, card_id) is not None:
+        _ensure_content_addressed_sidecar_transition_receipt(
+            root,
+            current_path=current_path,
+            card_id=card_id,
+        )
+        content_addressed_path = default_path.with_name(
+            f"{card_id}.live-{state_hash}.yaml"
+        )
+        if _card_sidecar_matches_payload(content_addressed_path, payload):
+            return content_addressed_path, False
+        if os.path.lexists(content_addressed_path):
+            raise ValueError(
+                "content-addressed Card sidecar version already binds different bytes"
+            )
+        return content_addressed_path, True
+    immutable_index = (
+        artifact_index
+        if artifact_index is not None
+        else _immutable_artifact_path_index(root, conn)
+    )
+    if not _immutable_artifact_binds_path(
+        root,
+        conn,
+        current_path,
+        artifact_index=immutable_index,
+    ):
+        return current_path, not os.path.lexists(current_path)
+
+    live_path = default_path.with_name(f"{card_id}.live.yaml")
+    if _card_sidecar_matches_payload(live_path, payload):
+        return live_path, False
+    if os.path.lexists(live_path) and _card_sidecar_path_is_link_like(live_path):
+        return live_path, False
+    if live_path == current_path or _immutable_artifact_binds_path(
+        root,
+        conn,
+        live_path,
+        artifact_index=immutable_index,
+    ):
+        live_path = default_path.with_name(f"{card_id}.live-{state_hash}.yaml")
+        if _card_sidecar_matches_payload(live_path, payload):
+            return live_path, False
+        if os.path.lexists(live_path):
+            raise ValueError(
+                "content-addressed Card sidecar version already binds different bytes"
+            )
+        return live_path, True
+    return live_path, not os.path.lexists(live_path)
+
+
+def _card_sidecar_write_target(
+    root: Path,
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: dict[str, Any],
+    *,
+    artifact_index: ImmutableArtifactPathIndex | None = None,
+) -> Path | None:
+    """Compatibility wrapper for callers that only need the selected path."""
+
+    path, _create_only = _card_sidecar_write_target_selection(
+        root,
+        conn,
+        row,
+        payload,
+        artifact_index=artifact_index,
+    )
+    return path
+
+
+CARD_SIDECAR_WRITE_INTENT_SCHEMA = "continuum.card_sidecar_write_intent.v2"
+CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA = "continuum.card_sidecar_recovery_receipt.v2"
+MAX_CARD_SIDECAR_WRITE_INTENTS = 10000
+MAX_CARD_SIDECAR_WRITE_INTENT_BYTES = 64 * 1024
+
+
+def _card_sidecar_write_intent_dir(root: Path) -> Path:
+    return root / "run" / "card_sidecar_write_intents"
+
+
+def _card_sidecar_recovery_receipt_dir(root: Path) -> Path:
+    return root / "exports" / "card_sidecar_recovery_receipts"
+
+
+def _bounded_card_sidecar_intent_paths(
+    intent_dir: Path,
+) -> tuple[list[Path], bool]:
+    """Collect no more than the active-intent cap plus one overflow sentinel."""
+    collected: list[Path] = []
+    with os.scandir(intent_dir) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            collected.append(Path(entry.path))
+            if len(collected) > MAX_CARD_SIDECAR_WRITE_INTENTS:
+                break
+    overflow = len(collected) > MAX_CARD_SIDECAR_WRITE_INTENTS
+    collected = collected[:MAX_CARD_SIDECAR_WRITE_INTENTS]
+    collected.sort(key=lambda path: path.name)
+    return collected, overflow
+
+
+CardSidecarStateDir = tuple[Path, tuple[int, int], str, Path]
+
+
+def _plain_card_sidecar_state_path_identity(
+    path: Path,
+    *,
+    directory: bool,
+) -> tuple[int, int]:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"Card sidecar state path is unavailable: {path}") from exc
+    is_junction = getattr(path, "is_junction", None)
+    try:
+        junction = bool(callable(is_junction) and is_junction())
+    except OSError as exc:
+        raise ValueError(f"Card sidecar state path junction check failed: {path}") from exc
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    is_reparse = bool(int(getattr(metadata, "st_file_attributes", 0)) & reparse_flag)
+    expected_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode) or junction or is_reparse or not expected_type:
+        expected_label = "directory" if directory else "regular file"
+        raise ValueError(
+            f"Card sidecar state path is link-like or not a plain {expected_label}: {path}"
+        )
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _validated_card_sidecar_state_dir(
+    root: Path,
+    *,
+    purpose: str,
+    create: bool,
+) -> CardSidecarStateDir | None:
+    components_by_purpose = {
+        "intent": ("run", "card_sidecar_write_intents"),
+        "receipt": ("exports", "card_sidecar_recovery_receipts"),
+    }
+    components = components_by_purpose.get(purpose)
+    if components is None:
+        raise ValueError("unsupported Card sidecar state directory purpose")
+    absolute_root = Path(os.path.abspath(root))
+    current = absolute_root
+    for component in (None, *components):
+        if component is not None:
+            current = current / component
+        if not os.path.lexists(current):
+            if not create:
+                return None
+            parent_identity = _plain_card_sidecar_state_path_identity(
+                current.parent,
+                directory=True,
+            )
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                pass
+            fsync_parent(current)
+            if _plain_card_sidecar_state_path_identity(
+                current.parent,
+                directory=True,
+            ) != parent_identity:
+                raise ValueError(
+                    f"Card sidecar state parent changed while creating {current}"
+                )
+        _plain_card_sidecar_state_path_identity(current, directory=True)
+    identity = _plain_card_sidecar_state_path_identity(current, directory=True)
+    return current, identity, purpose, absolute_root
+
+
+def _assert_card_sidecar_state_dir_unchanged(state: CardSidecarStateDir) -> None:
+    path, expected_identity, purpose, root = state
+    current = _validated_card_sidecar_state_dir(root, purpose=purpose, create=False)
+    if current is None or current[0] != path or current[1] != expected_identity:
+        raise ValueError(f"Card sidecar state directory changed during use: {path}")
+
+
+def _write_card_sidecar_write_intent(
+    root: Path,
+    *,
+    card_id: str,
+    target_uri: str,
+    expected_state_hash: str,
+    mode: str = "write",
+) -> tuple[str, Path]:
+    _require_canonical_card_id(card_id)
+    if mode not in {"write", "compensation_cleanup", "history_transition"}:
+        raise ValueError("unsupported Card sidecar write intent mode")
+    attempt_id = unique_id("card_sidecar_attempt")
+    intent_id = stable_id(
+        "card_sidecar_write_intent",
+        mode,
+        card_id,
+        target_uri,
+        expected_state_hash,
+        attempt_id,
+    )
+    intent_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="intent",
+        create=True,
+    )
+    if intent_state is None:
+        raise ValueError("Card sidecar write intent directory is unavailable")
+    intent_path = intent_state[0] / f"{intent_id}.json"
+    payload = {
+        "schema": CARD_SIDECAR_WRITE_INTENT_SCHEMA,
+        "intent_id": intent_id,
+        "card_id": card_id,
+        "target_uri": target_uri,
+        "expected_state_hash": expected_state_hash,
+        "mode": mode,
+        "attempt_id": attempt_id,
+        "created_at": utc_now(),
+    }
+    if os.path.lexists(intent_path):
+        _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+    secure_write_text(intent_path, json_dumps(payload) + "\n")
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+    return intent_id, intent_path
+
+
+def _card_sidecar_path_is_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        attrs = int(getattr(os.lstat(path), "st_file_attributes", 0))
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        return bool(reparse_flag and attrs & reparse_flag)
+    except OSError:
+        return True
+
+
+def _paths_share_filesystem_identity(left: Path, right: Path) -> bool:
+    left_keys, left_file_id = _filesystem_path_identity(left)
+    right_keys, right_file_id = _filesystem_path_identity(right)
+    if left_keys.intersection(right_keys):
+        return True
+    return (
+        left_file_id is not None
+        and right_file_id is not None
+        and left_file_id == right_file_id
+    )
+
+
+def _open_validated_card_sidecar_payload(
+    path: Path,
+    *,
+    card_id: str,
+    expected_state_hash: str | None = None,
+) -> tuple[dict[str, Any], StableRegularFileEvidence, int]:
+    evidence, fd, raw_bytes = _open_stable_regular_file_hash_evidence(
+        path,
+        max_bytes=MAX_VERIFIED_CARD_SIDECAR_BYTES,
+        capture_bytes=True,
+    )
+    try:
+        if raw_bytes is None:
+            raise ValueError("Card sidecar evidence bytes are unavailable")
+        payload = load_atomic_yaml(raw_bytes.decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "continuum.atomic_memory.v2"
+            or payload.get("id") != card_id
+            or payload.get("card_id") != card_id
+            or payload.get("state_hash") != _atomic_card_state_hash(payload)
+            or (
+                expected_state_hash is not None
+                and payload.get("state_hash") != expected_state_hash
+            )
+            or not _held_regular_file_evidence_is_current(path, evidence, fd)
+        ):
+            raise ValueError("Card sidecar recovery state mismatch")
+        return payload, evidence, fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+_CARD_SIDECAR_RECEIPT_STATUSES_BY_MODE = {
+    "write": frozenset(
+        {
+            "adopted",
+            "no_file_created",
+            "preserved_immutable",
+            "quarantined",
+            "superseded_by_newer_state",
+        }
+    ),
+    "compensation_cleanup": frozenset(
+        {
+            "no_file_created",
+            "preserved_immutable",
+            "quarantined",
+            "rollback_not_committed",
+        }
+    ),
+    "history_transition": frozenset({"transition_prepared"}),
+}
+
+
+def _open_valid_card_sidecar_recovery_receipt(
+    root: Path,
+    *,
+    intent: dict[str, Any],
+    receipt_path: Path,
+    expected_status: str | None = None,
+) -> tuple[dict[str, Any], StableRegularFileEvidence, int] | None:
+    if not os.path.lexists(receipt_path):
+        return None
+    evidence, fd, raw_bytes = _open_stable_regular_file_hash_evidence(
+        receipt_path,
+        max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+        capture_bytes=True,
+    )
+    try:
+        if raw_bytes is None:
+            raise ValueError("Card sidecar recovery receipt bytes are unavailable")
+        receipt = json.loads(raw_bytes.decode("utf-8"))
+        mode = str(intent.get("mode") or "write")
+        status = str(receipt.get("status") or "") if isinstance(receipt, dict) else ""
+        permitted_statuses = _CARD_SIDECAR_RECEIPT_STATUSES_BY_MODE.get(mode, frozenset())
+        target_path = resolve_stored_uri(root, str(intent["target_uri"]))
+        recovery_path = target_path.with_name(
+            f".{target_path.name}.{intent['intent_id']}.uncommitted"
+        )
+        recovery_fields_valid = (
+            (
+                status == "quarantined"
+                and receipt.get("recovery_uri") == continuum_uri(root, recovery_path)
+                and isinstance(receipt.get("recovery_size_bytes"), int)
+                and 0 <= int(receipt["recovery_size_bytes"]) <= MAX_VERIFIED_CARD_SIDECAR_BYTES
+                and isinstance(receipt.get("recovery_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", str(receipt["recovery_sha256"]))
+                is not None
+            )
+            or (
+                status != "quarantined"
+                and receipt.get("recovery_uri") is None
+                and receipt.get("recovery_size_bytes") is None
+                and receipt.get("recovery_sha256") is None
+            )
+        )
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("ok") is not True
+            or receipt.get("schema") != CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA
+            or receipt.get("intent_id") != intent.get("intent_id")
+            or receipt.get("card_id") != intent.get("card_id")
+            or receipt.get("target_uri") != intent.get("target_uri")
+            or receipt.get("expected_state_hash") != intent.get("expected_state_hash")
+            or receipt.get("mode") != mode
+            or receipt.get("attempt_id") != intent.get("attempt_id")
+            or status not in permitted_statuses
+            or (expected_status is not None and status != expected_status)
+            or not isinstance(receipt.get("resolved_at"), str)
+            or not recovery_fields_valid
+            or not _held_regular_file_evidence_is_current(receipt_path, evidence, fd)
+        ):
+            raise ValueError("existing Card sidecar recovery receipt conflicts")
+        return receipt, evidence, fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _finish_intent_from_committed_receipt(
+    root: Path,
+    *,
+    intent_path: Path,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+    expected_status: str | None = None,
+) -> dict[str, Any] | None:
+    receipt_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="receipt",
+        create=False,
+    )
+    if receipt_state is None:
+        return None
+    receipt_path = receipt_state[0] / f"{intent['intent_id']}.json"
+    opened = _open_valid_card_sidecar_recovery_receipt(
+        root,
+        intent=intent,
+        receipt_path=receipt_path,
+        expected_status=expected_status,
+    )
+    if opened is None:
+        return None
+    receipt, _receipt_evidence, receipt_fd = opened
+    try:
+        _assert_card_sidecar_state_dir_unchanged(receipt_state)
+        if (
+            _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+            != intent_entry_identity
+        ):
+            raise ValueError(
+                "Card sidecar write intent changed before committed receipt adoption"
+            )
+        intent_path.unlink()
+        fsync_parent(intent_path)
+        return {**receipt, "receipt_uri": continuum_uri(root, receipt_path)}
+    finally:
+        os.close(receipt_fd)
+
+
+def _finish_card_sidecar_write_intent(
+    root: Path,
+    *,
+    intent_path: Path,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+    status: str,
+    recovery_path: Path | None = None,
+    recovery_evidence: StableRegularFileEvidence | None = None,
+    recovery_fd: int | None = None,
+    observed_path: Path | None = None,
+    observed_evidence: StableRegularFileEvidence | None = None,
+    observed_fd: int | None = None,
+) -> dict[str, Any]:
+    mode = str(intent.get("mode") or "write")
+    if status not in _CARD_SIDECAR_RECEIPT_STATUSES_BY_MODE.get(mode, frozenset()):
+        raise ValueError("unsupported Card sidecar recovery receipt status")
+    if recovery_path is None:
+        if recovery_evidence is not None or recovery_fd is not None:
+            raise ValueError("Card sidecar recovery evidence has no recovery path")
+        recovery_sha256: str | None = None
+        recovery_size_bytes: int | None = None
+    else:
+        if recovery_evidence is None or recovery_fd is None:
+            raise ValueError("Card sidecar recovery evidence is unavailable")
+        if not _held_regular_file_evidence_is_current(
+            recovery_path,
+            recovery_evidence,
+            recovery_fd,
+        ):
+            raise ValueError("Card sidecar recovery changed before receipt publication")
+        recovery_size_bytes = recovery_evidence[1][0]
+        recovery_sha256 = recovery_evidence[2]
+    if observed_path is None and observed_evidence is None and observed_fd is None:
+        observed_path = recovery_path
+        observed_evidence = recovery_evidence
+        observed_fd = recovery_fd
+    elif observed_path is None or observed_evidence is None or observed_fd is None:
+        raise ValueError("Card sidecar observed-file evidence is incomplete")
+    if observed_path is not None and (
+        observed_evidence is None
+        or observed_fd is None
+        or not _held_regular_file_evidence_is_current(
+            observed_path,
+            observed_evidence,
+            observed_fd,
+        )
+    ):
+        raise ValueError("Card sidecar observed file changed before receipt publication")
+    receipt = {
+        "ok": True,
+        "schema": CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA,
+        "intent_id": str(intent["intent_id"]),
+        "card_id": str(intent["card_id"]),
+        "target_uri": str(intent["target_uri"]),
+        "expected_state_hash": str(intent["expected_state_hash"]),
+        "mode": mode,
+        "attempt_id": str(intent["attempt_id"]),
+        "status": status,
+        "resolved_at": utc_now(),
+        "recovery_uri": (
+            continuum_uri(root, recovery_path) if recovery_path is not None else None
+        ),
+        "recovery_sha256": recovery_sha256,
+        "recovery_size_bytes": recovery_size_bytes,
+    }
+    intent_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="intent",
+        create=False,
+    )
+    if intent_state is None or intent_path.parent != intent_state[0]:
+        raise ValueError("Card sidecar write intent directory is unavailable")
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    if (
+        _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+        != intent_entry_identity
+    ):
+        raise ValueError("Card sidecar write intent changed before receipt finalization")
+    receipt_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="receipt",
+        create=True,
+    )
+    if receipt_state is None:
+        raise ValueError("Card sidecar recovery receipt directory is unavailable")
+    receipt_path = receipt_state[0] / f"{intent['intent_id']}.json"
+    committed = _finish_intent_from_committed_receipt(
+        root,
+        intent_path=intent_path,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+        expected_status=status,
+    )
+    if committed is not None:
+        return committed
+    if recovery_path is not None and (
+        recovery_evidence is None
+        or recovery_fd is None
+        or not _held_regular_file_evidence_is_current(
+            recovery_path,
+            recovery_evidence,
+            recovery_fd,
+        )
+    ):
+        raise ValueError("Card sidecar recovery changed before receipt publication")
+    if observed_path is not None and (
+        observed_evidence is None
+        or observed_fd is None
+        or not _held_regular_file_evidence_is_current(
+            observed_path,
+            observed_evidence,
+            observed_fd,
+        )
+    ):
+        raise ValueError("Card sidecar observed file changed before receipt publication")
+    receipt_text = json_dumps(receipt) + "\n"
+    secure_write_text_exclusive(receipt_path, receipt_text)
+    _assert_card_sidecar_state_dir_unchanged(receipt_state)
+    committed = _finish_intent_from_committed_receipt(
+        root,
+        intent_path=intent_path,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+        expected_status=status,
+    )
+    if committed is None:
+        raise ValueError("Card sidecar recovery receipt publication was not durable")
+    return committed
+
+
+def _resolve_card_sidecar_write_intent(
+    root: Path,
+    conn: sqlite3.Connection,
+    intent_path: Path,
+    intent: dict[str, Any],
+    *,
+    intent_entry_identity: tuple[int, int],
+    artifact_index: ImmutableArtifactPathIndex,
+    batch_index: CardIntentBatchIndex,
+) -> dict[str, Any]:
+    card_id = str(intent.get("card_id") or "")
+    target_uri = str(intent.get("target_uri") or "")
+    expected_state_hash = str(intent.get("expected_state_hash") or "")
+    intent_id = str(intent.get("intent_id") or "")
+    mode = str(intent.get("mode") or "write")
+    attempt_id = str(intent.get("attempt_id") or "")
+    expected_intent_id = stable_id(
+        "card_sidecar_write_intent",
+        mode,
+        card_id,
+        target_uri,
+        expected_state_hash,
+        attempt_id,
+    )
+    if (
+        intent.get("schema") != CARD_SIDECAR_WRITE_INTENT_SCHEMA
+        or not _is_canonical_card_id(card_id)
+        or not target_uri
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_state_hash)
+        or intent_path.name != f"{intent_id}.json"
+        or mode not in {"write", "compensation_cleanup", "history_transition"}
+        or not re.fullmatch(
+            r"card_sidecar_attempt_\d{8}T\d{6}Z_[0-9a-f]{16}",
+            attempt_id,
+        )
+        or intent_id != expected_intent_id
+    ):
+        return {"ok": False, "status": "invalid_intent", "intent_uri": str(intent_path)}
+
+    target_path = resolve_stored_uri(root, target_uri)
+    default_path = _configured_card_sidecar_path(root, card_id)
+    managed_target_path = _resolved_managed_card_sidecar_path(
+        default_path,
+        target_path,
+        card_id=card_id,
+    )
+    if managed_target_path is None:
+        return {"ok": False, "status": "unmanaged_target", "intent_uri": str(intent_path)}
+    target_path = managed_target_path
+    recovery_path = target_path.with_name(
+        f".{target_path.name}.{intent_id}.uncommitted"
+    )
+
+    # Receipt publication is the durable commit point.  A crash can occur
+    # after the exclusive receipt write but before intent removal, so adopt a
+    # fully intent-bound receipt before re-inspecting mutable target/recovery
+    # paths.  Recovery divergence remains visible through the evidence audit.
+    committed = _finish_intent_from_committed_receipt(
+        root,
+        intent_path=intent_path,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+    )
+    if committed is not None:
+        return committed
+
+    recovery_exists = os.path.lexists(recovery_path)
+    if recovery_exists:
+        target_also_exists = os.path.lexists(target_path)
+        if mode == "history_transition":
+            return {
+                "ok": False,
+                "status": "unexpected_history_transition_recovery",
+                "intent_uri": str(intent_path),
+            }
+        if _card_sidecar_path_is_link_like(recovery_path) or not recovery_path.is_file():
+            return {
+                "ok": False,
+                "status": "link_or_non_file_recovery",
+                "intent_uri": str(intent_path),
+            }
+        recovery_fd = -1
+        try:
+            _recovery_payload, recovery_evidence, recovery_fd = (
+                _open_validated_card_sidecar_payload(
+                    recovery_path,
+                    card_id=card_id,
+                )
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "status": (
+                    "recovery_target_exists"
+                    if target_also_exists
+                    else "invalid_recovery"
+                ),
+                "intent_uri": str(intent_path),
+                "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            }
+        # A recovery file is the durable result of an earlier quarantine move.
+        # Receipt it before considering any target-side terminal branch; a
+        # target may have been recreated after the move and is separate state.
+        try:
+            return _finish_card_sidecar_write_intent(
+                root,
+                intent_path=intent_path,
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+                status="quarantined",
+                recovery_path=recovery_path,
+                recovery_evidence=recovery_evidence,
+                recovery_fd=recovery_fd,
+            )
+        finally:
+            os.close(recovery_fd)
+
+    if not os.path.lexists(target_path):
+        if mode == "history_transition":
+            return {
+                "ok": False,
+                "status": "history_transition_target_missing",
+                "intent_uri": str(intent_path),
+            }
+        return _finish_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+            status="no_file_created",
+        )
+    target_fd = -1
+    try:
+        payload, target_evidence, target_fd = _open_validated_card_sidecar_payload(
+            target_path,
+            card_id=card_id,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return {"ok": False, "status": "invalid_target", "intent_uri": str(intent_path)}
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+    target_identity = target_evidence[0]
+
+    (
+        rows_by_id,
+        outbox_ids,
+        _by_path_key,
+        _by_file_id,
+        _references_by_card_id,
+    ) = batch_index
+    card_row = rows_by_id.get(card_id)
+    if card_row is not None and card_row["location_uri"]:
+        card_reference = _references_by_card_id.get(card_id)
+        if (
+            card_reference is None
+            or _sidecar_nofollow_path_identity(card_reference[0])
+            != card_reference[1]
+        ):
+            return {
+                "ok": False,
+                "status": "card_reference_unstable",
+                "intent_uri": str(intent_path),
+            }
+    referenced_by = _card_ids_for_path_identity(batch_index, target_identity)
+
+    def finish_stable_target(
+        status: str,
+    ) -> dict[str, Any]:
+        held_fd = -1
+        try:
+            _current_payload, current_evidence, held_fd = (
+                _open_validated_card_sidecar_payload(
+                    target_path,
+                    card_id=card_id,
+                )
+            )
+        except (OSError, UnicodeError, ValueError):
+            return {
+                "ok": False,
+                "status": "target_changed_before_receipt",
+                "intent_uri": str(intent_path),
+            }
+        try:
+            if current_evidence != target_evidence:
+                return {
+                    "ok": False,
+                    "status": "target_changed_before_receipt",
+                    "intent_uri": str(intent_path),
+                }
+            return _finish_card_sidecar_write_intent(
+                root,
+                intent_path=intent_path,
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+                status=status,
+                observed_path=target_path,
+                observed_evidence=current_evidence,
+                observed_fd=held_fd,
+            )
+        finally:
+            os.close(held_fd)
+
+    observed_state_hash = str(payload.get("state_hash") or "")
+    if observed_state_hash != expected_state_hash:
+        if mode == "history_transition":
+            return {
+                "ok": False,
+                "status": "history_transition_target_mismatch",
+                "intent_uri": str(intent_path),
+            }
+        if len(referenced_by) == 1 and referenced_by[0] == card_id and card_row is not None:
+            current_payload = _card_sidecar_payload_for_row(card_row)
+            if current_payload.get("state_hash") == observed_state_hash:
+                return finish_stable_target(
+                    (
+                        "superseded_by_newer_state"
+                        if mode == "write"
+                        else "rollback_not_committed"
+                    )
+                )
+        return {"ok": False, "status": "target_state_mismatch", "intent_uri": str(intent_path)}
+    if mode == "history_transition":
+        if referenced_by == [card_id] and card_row is not None:
+            return finish_stable_target("transition_prepared")
+        return {
+            "ok": False,
+            "status": "history_transition_unreferenced",
+            "intent_uri": str(intent_path),
+        }
+    if referenced_by:
+        if mode == "compensation_cleanup":
+            if len(referenced_by) == 1 and referenced_by[0] == card_id and card_row is not None:
+                expected_payload = _card_sidecar_payload_for_row(card_row)
+                if expected_payload.get("state_hash") == expected_state_hash:
+                    return finish_stable_target("rollback_not_committed")
+            return {
+                "ok": True,
+                "status": "pending_compensation",
+                "intent_uri": continuum_uri(root, intent_path),
+                "referenced_by": sorted(referenced_by),
+            }
+        if len(referenced_by) == 1 and set(referenced_by) == {card_id} and card_row is not None:
+            expected_payload = _card_sidecar_payload_for_row(card_row)
+            if expected_payload.get("state_hash") == expected_state_hash:
+                return finish_stable_target("adopted")
+        return {
+            "ok": False,
+            "status": "referenced_target_mismatch",
+            "intent_uri": str(intent_path),
+            "referenced_by": sorted(referenced_by),
+        }
+
+    if _path_identity_binds_index(target_identity, artifact_index):
+        return finish_stable_target("preserved_immutable")
+
+    if mode == "write" and card_row is not None and card_id in outbox_ids:
+        expected_payload = _card_sidecar_payload_for_row(card_row)
+        if expected_payload.get("state_hash") == expected_state_hash:
+            return {
+                "ok": True,
+                "status": "pending_retry",
+                "intent_uri": continuum_uri(root, intent_path),
+            }
+
+    quarantine_check_fd = -1
+    try:
+        _quarantine_payload, quarantine_evidence, quarantine_check_fd = (
+            _open_validated_card_sidecar_payload(
+                target_path,
+                card_id=card_id,
+            )
+        )
+    except (OSError, UnicodeError, ValueError):
+        return {
+            "ok": False,
+            "status": "target_changed_before_quarantine",
+            "intent_uri": str(intent_path),
+        }
+    finally:
+        if quarantine_check_fd >= 0:
+            os.close(quarantine_check_fd)
+    if quarantine_evidence != target_evidence:
+        return {
+            "ok": False,
+            "status": "target_changed_before_quarantine",
+            "intent_uri": str(intent_path),
+        }
+    try:
+        replace_file_noclobber(target_path, recovery_path)
+        recovery_identity = _sidecar_nofollow_path_identity(recovery_path)
+        if (
+            recovery_identity is None
+            or target_identity[1] is None
+            or recovery_identity[1] != target_identity[1]
+            or os.path.lexists(target_path)
+        ):
+            raise OSError("Card sidecar quarantine identity changed during move")
+    except OSError as exc:
+        return {
+            "ok": False,
+            "status": "quarantine_failed",
+            "intent_uri": str(intent_path),
+            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+        }
+    recovery_fd = -1
+    try:
+        _recovery_payload, recovery_evidence, recovery_fd = (
+            _open_validated_card_sidecar_payload(
+                recovery_path,
+                card_id=card_id,
+            )
+        )
+        if (
+            recovery_evidence[0][1] != target_identity[1]
+            or recovery_evidence[1][0] != target_evidence[1][0]
+            or recovery_evidence[2] != target_evidence[2]
+        ):
+            raise ValueError("Card sidecar quarantine bytes changed during move")
+        return _finish_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+            status="quarantined",
+            recovery_path=recovery_path,
+            recovery_evidence=recovery_evidence,
+            recovery_fd=recovery_fd,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "status": "quarantine_recovery_validation_failed",
+            "intent_uri": str(intent_path),
+            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+        }
+    finally:
+        if recovery_fd >= 0:
+            os.close(recovery_fd)
+
+
+def reconcile_card_sidecar_write_intents(
+    root: Path,
+    *,
+    card_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    if not is_initialized(root):
+        return {"ok": True, "processed": 0, "pending": 0, "failures": [], "results": []}
+    try:
+        intent_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="intent",
+            create=False,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 0,
+            "failures": [{"intent_uri": str(_card_sidecar_write_intent_dir(root)), "error": str(exc)}],
+            "results": [],
+            "overflow": False,
+        }
+    if intent_state is None:
+        return {"ok": True, "processed": 0, "pending": 0, "failures": [], "results": []}
+    intent_dir = intent_state[0]
+    selected_card_ids = {str(card_id) for card_id in card_ids or () if card_id}
+    try:
+        intent_paths, overflow = _bounded_card_sidecar_intent_paths(intent_dir)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 0,
+            "failures": [{"intent_uri": str(intent_dir), "error": str(exc)}],
+            "results": [],
+            "overflow": False,
+        }
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    parsed_intents: list[tuple[Path, dict[str, Any], tuple[int, int]]] = []
+    for intent_path in intent_paths:
+        try:
+            intent_entry_identity = _plain_card_sidecar_state_path_identity(
+                intent_path,
+                directory=False,
+            )
+            if os.lstat(intent_path).st_size > MAX_CARD_SIDECAR_WRITE_INTENT_BYTES:
+                raise ValueError("Card sidecar write intent exceeds its byte limit")
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            if not isinstance(intent, dict):
+                raise ValueError("Card sidecar write intent must be an object")
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            if (
+                _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+                != intent_entry_identity
+            ):
+                raise ValueError("Card sidecar write intent changed during bounded read")
+        except (OSError, UnicodeError, ValueError) as exc:
+            failures.append(
+                {
+                    "intent_uri": continuum_uri(root, intent_path),
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            )
+            continue
+        if selected_card_ids and str(intent.get("card_id") or "") not in selected_card_ids:
+            continue
+        parsed_intents.append((intent_path, intent, intent_entry_identity))
+
+    conn = connect(root)
+    try:
+        if parsed_intents:
+            conn.execute("BEGIN IMMEDIATE")
+            artifact_index = _immutable_artifact_path_index(root, conn)
+            batch_index = _card_intent_batch_index(root, conn)
+        for intent_path, intent, intent_entry_identity in parsed_intents:
+            try:
+                result = _resolve_card_sidecar_write_intent(
+                    root,
+                    conn,
+                    intent_path,
+                    intent,
+                    intent_entry_identity=intent_entry_identity,
+                    artifact_index=artifact_index,
+                    batch_index=batch_index,
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "status": "reconciliation_exception",
+                    "intent_uri": continuum_uri(root, intent_path),
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            results.append(result)
+            if not result.get("ok"):
+                failures.append(result)
+        if conn.in_transaction:
+            conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    pending = sum(
+        1
+        for result in results
+        if result.get("status") in {"pending_retry", "pending_compensation"}
+    )
+    if overflow:
+        failures.append(
+            {
+                "intent_uri": continuum_uri(root, intent_dir),
+                "error": "Card sidecar write intent scan limit exceeded",
+            }
+        )
+    return {
+        "ok": not failures,
+        "processed": len(results),
+        "pending": pending,
+        "failures": failures,
+        "results": results,
+        "overflow": overflow,
+    }
+
+
+def register_card_sidecar_compensation_intents(
+    root: Path,
+    candidates: Iterable[dict[str, Any]],
+) -> list[dict[str, str]]:
+    registered: list[dict[str, str]] = []
+    for candidate in candidates:
+        card_id = str(candidate.get("card_id") or "")
+        target_uri = str(candidate.get("uri") or "")
+        expected_state_hash = str(candidate.get("state_hash") or "")
+        if (
+            not _is_canonical_card_id(card_id)
+            or not target_uri
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_state_hash)
+        ):
+            continue
+        intent_id, intent_path = _write_card_sidecar_write_intent(
+            root,
+            card_id=card_id,
+            target_uri=target_uri,
+            expected_state_hash=expected_state_hash,
+            mode="compensation_cleanup",
+        )
+        registered.append(
+            {
+                "intent_id": intent_id,
+                "intent_uri": continuum_uri(root, intent_path),
+                "card_id": card_id,
+                "target_uri": target_uri,
+            }
+        )
+    return registered
+
+
+def _stream_card_sidecar_recovery_receipt_paths(
+    directory: Path,
+    audit_result: dict[str, int],
+) -> Iterator[Path]:
+    """Yield terminal receipts without imposing the active-intent ceiling."""
+
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    yield Path(entry.path)
+    except OSError:
+        audit_result["unsafe_card_sidecar_recovery_paths"] += 1
+
+
+def _stream_bounded_card_sidecar_recovery_paths(
+    directory: Path,
+    audit_result: dict[str, int],
+) -> Iterator[Path]:
+    count = 0
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.startswith(".")
+                    and entry.name.endswith(".uncommitted")
+                ):
+                    continue
+                count += 1
+                if count > MAX_CARD_SIDECAR_WRITE_INTENTS:
+                    audit_result["card_sidecar_recovery_scan_overflow"] += 1
+                    break
+                yield Path(entry.path)
+    except OSError:
+        audit_result["unsafe_card_sidecar_recovery_paths"] += 1
+
+
+def _card_sidecar_recovery_evidence_audit(root: Path) -> dict[str, int]:
+    result = {
+        "unsafe_card_sidecar_recovery_paths": 0,
+        "malformed_card_sidecar_recovery_receipts": 0,
+        "missing_card_sidecar_recoveries": 0,
+        "mismatched_card_sidecar_recoveries": 0,
+        "unreceipted_card_sidecar_recoveries": 0,
+        "card_sidecar_recovery_scan_overflow": 0,
+    }
+    expected_recoveries: set[str] = set()
+    try:
+        receipt_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="receipt",
+            create=False,
+        )
+    except ValueError:
+        result["unsafe_card_sidecar_recovery_paths"] += 1
+        receipt_state = None
+    if receipt_state is not None:
+        receipt_paths = _stream_card_sidecar_recovery_receipt_paths(
+            receipt_state[0],
+            result,
+        )
+        for receipt_path in receipt_paths:
+            receipt_fd = -1
+            try:
+                _plain_card_sidecar_state_path_identity(receipt_path, directory=False)
+                receipt_evidence, receipt_fd, receipt_bytes = (
+                    _open_stable_regular_file_hash_evidence(
+                        receipt_path,
+                        max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                        capture_bytes=True,
+                    )
+                )
+                if receipt_bytes is None:
+                    raise ValueError("Card sidecar recovery receipt bytes are unavailable")
+                receipt = json.loads(receipt_bytes.decode("utf-8"))
+                if not isinstance(receipt, dict):
+                    raise ValueError("Card sidecar recovery receipt must be an object")
+                intent_id = str(receipt.get("intent_id") or "")
+                card_id = str(receipt.get("card_id") or "")
+                target_uri = str(receipt.get("target_uri") or "")
+                expected_state_hash = str(receipt.get("expected_state_hash") or "")
+                mode = str(receipt.get("mode") or "")
+                attempt_id = str(receipt.get("attempt_id") or "")
+                status = str(receipt.get("status") or "")
+                expected_intent_id = stable_id(
+                    "card_sidecar_write_intent",
+                    mode,
+                    card_id,
+                    target_uri,
+                    expected_state_hash,
+                    attempt_id,
+                )
+                target_path = resolve_stored_uri(root, target_uri)
+                default_path = _configured_card_sidecar_path(root, card_id)
+                if (
+                    receipt.get("schema") != CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA
+                    or receipt.get("ok") is not True
+                    or receipt_path.name != f"{intent_id}.json"
+                    or intent_id != expected_intent_id
+                    or mode
+                    not in {"write", "compensation_cleanup", "history_transition"}
+                    or not re.fullmatch(
+                        r"card_sidecar_attempt_\d{8}T\d{6}Z_[0-9a-f]{16}",
+                        attempt_id,
+                    )
+                    or status
+                    not in {
+                        "adopted",
+                        "no_file_created",
+                        "preserved_immutable",
+                        "quarantined",
+                        "rollback_not_committed",
+                        "superseded_by_newer_state",
+                        "transition_prepared",
+                    }
+                    or not card_id
+                    or not target_uri
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_state_hash)
+                    or not _is_managed_card_sidecar_path(
+                        default_path,
+                        target_path,
+                        card_id=card_id,
+                    )
+                    or (status == "rollback_not_committed" and mode != "compensation_cleanup")
+                    or (status == "superseded_by_newer_state" and mode != "write")
+                    or (status == "transition_prepared" and mode != "history_transition")
+                    or (mode == "history_transition" and status != "transition_prepared")
+                    or not _held_regular_file_evidence_is_current(
+                        receipt_path,
+                        receipt_evidence,
+                        receipt_fd,
+                    )
+                ):
+                    raise ValueError("Card sidecar recovery receipt identity mismatch")
+            except (OSError, UnicodeError, ValueError):
+                result["malformed_card_sidecar_recovery_receipts"] += 1
+                continue
+            finally:
+                if receipt_fd >= 0:
+                    os.close(receipt_fd)
+            recovery_uri = str(receipt.get("recovery_uri") or "")
+            if not recovery_uri:
+                if (
+                    status == "quarantined"
+                    or
+                    receipt.get("recovery_sha256") is not None
+                    or receipt.get("recovery_size_bytes") is not None
+                ):
+                    result["malformed_card_sidecar_recovery_receipts"] += 1
+                continue
+            if status != "quarantined":
+                result["malformed_card_sidecar_recovery_receipts"] += 1
+                continue
+            recovery_path = resolve_stored_uri(root, recovery_uri)
+            expected_name = f".{target_path.name}.{intent_id}.uncommitted"
+            if (
+                recovery_path.name != expected_name
+                or not _card_sidecar_parents_match(
+                    default_path.parent,
+                    recovery_path.parent,
+                )
+            ):
+                result["malformed_card_sidecar_recovery_receipts"] += 1
+                continue
+            recovery_key = os.path.normcase(os.path.abspath(recovery_path))
+            if (
+                recovery_key not in expected_recoveries
+                and len(expected_recoveries) >= MAX_CARD_SIDECAR_WRITE_INTENTS
+            ):
+                result["card_sidecar_recovery_scan_overflow"] += 1
+            else:
+                expected_recoveries.add(recovery_key)
+            if not os.path.lexists(recovery_path):
+                result["missing_card_sidecar_recoveries"] += 1
+                continue
+            try:
+                raw_expected_size = receipt.get("recovery_size_bytes")
+                if not isinstance(raw_expected_size, int) or isinstance(
+                    raw_expected_size,
+                    bool,
+                ):
+                    raise ValueError("Card sidecar recovery size is invalid")
+                expected_size = raw_expected_size
+                expected_hash = str(receipt.get("recovery_sha256") or "")
+                recovery_evidence, recovery_fd, recovery_bytes = (
+                    _open_stable_regular_file_hash_evidence(
+                        recovery_path,
+                        max_bytes=MAX_VERIFIED_CARD_SIDECAR_BYTES,
+                        capture_bytes=True,
+                    )
+                )
+                try:
+                    if recovery_bytes is None:
+                        raise ValueError("Card sidecar recovery bytes are unavailable")
+                    if (
+                        expected_size < 0
+                        or expected_size > MAX_VERIFIED_CARD_SIDECAR_BYTES
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+                        or recovery_evidence[1][0] != expected_size
+                        or recovery_evidence[2] != expected_hash
+                    ):
+                        raise ValueError("Card sidecar recovery hash or size mismatch")
+                    recovery_payload = load_atomic_yaml(recovery_bytes.decode("utf-8"))
+                    if (
+                        not _held_regular_file_evidence_is_current(
+                            recovery_path,
+                            recovery_evidence,
+                            recovery_fd,
+                        )
+                        or not isinstance(recovery_payload, dict)
+                        or recovery_payload.get("schema") != "continuum.atomic_memory.v2"
+                        or recovery_payload.get("id") != card_id
+                        or recovery_payload.get("card_id") != card_id
+                        or recovery_payload.get("state_hash")
+                        != _atomic_card_state_hash(recovery_payload)
+                    ):
+                        raise ValueError("Card sidecar recovery payload mismatch")
+                finally:
+                    os.close(recovery_fd)
+            except (OSError, TypeError, ValueError):
+                result["mismatched_card_sidecar_recoveries"] += 1
+
+    cards_dir = _configured_card_sidecar_dir(root)
+    if cards_dir.exists():
+        recovery_paths = _stream_bounded_card_sidecar_recovery_paths(
+            cards_dir,
+            result,
+        )
+        for recovery_path in recovery_paths:
+            recovery_key = os.path.normcase(os.path.abspath(recovery_path))
+            if recovery_key not in expected_recoveries:
+                result["unreceipted_card_sidecar_recoveries"] += 1
+    return result
 
 
 def write_card_sidecar_from_values(
@@ -2311,8 +4843,11 @@ def write_card_sidecar_from_values(
     created_at: str,
     updated_at: str,
     summary_hash: str,
+    sidecar_path: Path | None = None,
+    exclusive_create: bool = False,
 ) -> str | None:
-    sidecar_path = card_sidecar_path(root, card_id)
+    _require_canonical_card_id(card_id)
+    sidecar_path = sidecar_path or card_sidecar_path(root, card_id)
     if sidecar_path is None:
         return None
     write_atomic_yaml(
@@ -2346,15 +4881,84 @@ def write_card_sidecar_from_values(
             updated_at=updated_at,
             summary_hash=summary_hash,
         ),
+        exclusive=exclusive_create,
     )
     return continuum_uri(root, sidecar_path)
 
 
-def sync_card_sidecar(root: Path, conn: sqlite3.Connection, card_id: str) -> str | None:
+def sync_card_sidecar(
+    root: Path,
+    conn: sqlite3.Connection,
+    card_id: str,
+    *,
+    artifact_index: ImmutableArtifactPathIndex | None = None,
+    write_observation: dict[str, Any] | None = None,
+) -> str | None:
     row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
     if row is None:
         return None
-    location_uri = write_card_sidecar_from_values(
+    payload = _card_sidecar_payload_for_row(row)
+    sidecar_path, create_only = _card_sidecar_write_target_selection(
+        root,
+        conn,
+        row,
+        payload,
+        artifact_index=artifact_index,
+    )
+    if sidecar_path is not None and _card_sidecar_matches_payload(sidecar_path, payload):
+        location_uri = continuum_uri(root, sidecar_path)
+        if row["location_uri"] != location_uri:
+            conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (location_uri, card_id))
+        return location_uri
+    target_is_link_like = bool(
+        sidecar_path is not None
+        and os.path.lexists(sidecar_path)
+        and _card_sidecar_path_is_link_like(sidecar_path)
+    )
+    target_uri = (
+        lexical_continuum_uri(root, sidecar_path)
+        if sidecar_path is not None and target_is_link_like
+        else continuum_uri(root, sidecar_path)
+        if sidecar_path is not None
+        else ""
+    )
+    expected_state_hash = str(payload.get("state_hash") or "")
+    intent_id: str | None = None
+    intent_path: Path | None = None
+    if sidecar_path is not None and create_only and write_observation is None:
+        prebound_path = current_card_sidecar_path(root, conn, card_id)
+        if prebound_path is None or not _paths_share_filesystem_identity(
+            prebound_path,
+            sidecar_path,
+        ):
+            raise RuntimeError(
+                "new Card sidecar targets require sync_card_sidecars_after_commit "
+                "or a durable write observation"
+            )
+    if (
+        sidecar_path is not None
+        and create_only
+        and write_observation is not None
+    ):
+        intent_id, intent_path = _write_card_sidecar_write_intent(
+            root,
+            card_id=card_id,
+            target_uri=target_uri,
+            expected_state_hash=expected_state_hash,
+        )
+    if write_observation is not None and sidecar_path is not None:
+        write_observation.update(
+            {
+                "card_id": card_id,
+                "target_uri": target_uri,
+                "target_existed_before": not create_only,
+                "expected_state_hash": expected_state_hash,
+                "attempted_write": True,
+                "intent_id": intent_id,
+                "intent_uri": continuum_uri(root, intent_path) if intent_path else None,
+            }
+        )
+    written_location_uri = write_card_sidecar_from_values(
         root,
         card_id=row["id"],
         card_type=row["card_type"],
@@ -2383,10 +4987,14 @@ def sync_card_sidecar(root: Path, conn: sqlite3.Connection, card_id: str) -> str
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         summary_hash=content_hash(row["summary"]),
+        sidecar_path=sidecar_path,
+        exclusive_create=create_only,
     )
-    if location_uri and row["location_uri"] != location_uri:
-        conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (location_uri, card_id))
-    return location_uri
+    if write_observation is not None:
+        write_observation["write_completed"] = True
+    if written_location_uri and row["location_uri"] != written_location_uri:
+        conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (written_location_uri, card_id))
+    return written_location_uri
 
 
 def mark_card_sidecar_outbox(conn: sqlite3.Connection, card_ids: list[str], *, reason: str) -> int:
@@ -2537,8 +5145,10 @@ def init_db(root: Path) -> None:
         _INIT_DB_CACHE.add(cache_key)
     finally:
         conn.close()
-    if sync_migrated_sidecars:
+    intent_recovery = reconcile_card_sidecar_write_intents(root)
+    if sync_migrated_sidecars or intent_recovery.get("pending"):
         sync_pending_card_sidecars(root)
+        reconcile_card_sidecar_write_intents(root)
 
 
 def record_artifact(
@@ -3832,7 +6442,7 @@ def create_card(
     card_topics = topics or []
     card_decisions = decisions or []
     card_open_tasks = open_tasks or []
-    card_metadata = metadata or {}
+    card_metadata = dict(metadata or {})
     visibility_scope = normalize_visibility_scope(visibility_scope)
     if root is not None:
         session_id = canonical_partition_identifier(root, "session_id", session_id)
@@ -3852,8 +6462,12 @@ def create_card(
         card_metadata = enforce_value_secret_policy(root, card_metadata, scope="card metadata")
     if project_id and visibility_scope == "global":
         visibility_scope = "project"
-    if card_metadata.get("visibility_scope"):
-        card_metadata["visibility_scope"] = visibility_scope
+    card_metadata = _canonical_card_metadata(
+        card_metadata,
+        session_id=session_id,
+        project_id=project_id,
+        visibility_scope=visibility_scope,
+    )
     now = utc_now()
     summary_hash = content_hash(summary)
     card_id = stable_id(
@@ -3894,7 +6508,7 @@ def create_card(
             visibility_scope = excluded.visibility_scope,
             session_id = excluded.session_id,
             project_id = excluded.project_id,
-            location_uri = coalesce(excluded.location_uri, cards.location_uri),
+            location_uri = coalesce(cards.location_uri, excluded.location_uri),
             updated_at = excluded.updated_at
         """,
         (
@@ -3918,14 +6532,22 @@ def create_card(
             now,
         ),
     )
-    if root is not None and location_uri:
+    effective_location_uri = location_uri
+    if root is not None:
+        stored_location = conn.execute(
+            "SELECT location_uri FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        if stored_location is not None and stored_location["location_uri"]:
+            effective_location_uri = str(stored_location["location_uri"])
+    if root is not None and effective_location_uri:
         mark_card_sidecar_outbox(conn, [card_id], reason="card_created")
         audit_event(
             conn,
             action="card_sidecar_sync_scheduled",
             target_type="card",
             target_id=card_id,
-            payload={"location_uri": location_uri},
+            payload={"location_uri": effective_location_uri},
         )
     return card_id
 
@@ -3939,31 +6561,136 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
             "deferred": 0,
             "failed": 0,
             "failures": [],
+            "compensation_cas_complete": True,
+            "compensation_cas_rows": [],
         }
+
+    compensation_cas_by_card: dict[str, dict[str, Any]] = {}
+    compensation_cas_complete = True
+
+    def observe_compensation_cas_rows(
+        evidence_conn: sqlite3.Connection,
+        observed_card_ids: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        observed: dict[str, dict[str, Any]] = {}
+        for observed_card_id in dict.fromkeys(observed_card_ids):
+            row = evidence_conn.execute(
+                """
+                SELECT card.id AS card_id,
+                       card.location_uri,
+                       outbox.generation AS sidecar_generation
+                FROM cards AS card
+                LEFT JOIN card_sidecar_outbox AS outbox
+                  ON outbox.card_id = card.id
+                WHERE card.id = ?
+                """,
+                (observed_card_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            observed[observed_card_id] = {
+                "card_id": observed_card_id,
+                "location_uri": (
+                    str(row["location_uri"])
+                    if row["location_uri"] is not None
+                    else None
+                ),
+                "sidecar_generation": (
+                    str(row["sidecar_generation"])
+                    if row["sidecar_generation"] is not None
+                    else None
+                ),
+            }
+        return observed
+
+    def compensation_cas_rows() -> list[dict[str, Any]]:
+        return [
+            compensation_cas_by_card[card_id]
+            for card_id in unique_card_ids
+            if card_id in compensation_cas_by_card
+        ]
+
     conn = connect(root)
     synced = 0
     deferred = 0
     failures: list[dict[str, Any]] = []
+    generated_sidecar_candidates: list[dict[str, Any]] = []
+    intent_reconciliation_results: list[dict[str, Any]] = []
+    artifact_index: ImmutableArtifactPathIndex | None = None
+    artifact_index_data_version: int | None = None
     try:
         for card_id in unique_card_ids:
             observed_generation: str | None = None
+            observed_location_uri: str | None = None
+            observed_card_exists = False
+            write_observation: dict[str, Any] = {}
             try:
                 # Serialize the Card snapshot, atomic file replacement, and
                 # outbox acknowledgement. A process can die after replacing
                 # the file, so post-write revalidation alone cannot prevent an
                 # older writer from overtaking a newer completed sync.
                 conn.execute("BEGIN IMMEDIATE")
+                data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+                if artifact_index is None or artifact_index_data_version != data_version:
+                    artifact_index = _immutable_artifact_path_index(root, conn)
+                    artifact_index_data_version = data_version
                 outbox_row = conn.execute(
-                    "SELECT generation FROM card_sidecar_outbox WHERE card_id = ?",
+                    """
+                    SELECT card.location_uri,
+                           outbox.generation
+                    FROM cards AS card
+                    LEFT JOIN card_sidecar_outbox AS outbox
+                      ON outbox.card_id = card.id
+                    WHERE card.id = ?
+                    """,
                     (card_id,),
                 ).fetchone()
+                observed_card_exists = outbox_row is not None
                 observed_generation = (
                     str(outbox_row["generation"] or "")
-                    if outbox_row is not None
+                    if outbox_row is not None and outbox_row["generation"] is not None
                     else None
                 )
-                location_uri = sync_card_sidecar(root, conn, card_id)
-                acknowledged = outbox_row is None
+                observed_location_uri = (
+                    str(outbox_row["location_uri"])
+                    if outbox_row is not None
+                    and outbox_row["location_uri"] is not None
+                    else None
+                )
+                location_uri = sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    artifact_index=artifact_index,
+                    write_observation=write_observation,
+                )
+                card_row = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                disabled_without_promised_sidecar = bool(
+                    location_uri is None
+                    and card_row is not None
+                    and not card_row["location_uri"]
+                )
+                if location_uri is None and card_row is not None:
+                    if not disabled_without_promised_sidecar:
+                        raise RuntimeError(
+                            "Card sidecar materialization is disabled; retry remains pending"
+                        )
+                    audit_event(
+                        conn,
+                        action="card_sidecar_sync_skipped",
+                        target_type="card",
+                        target_id=card_id,
+                        payload={"reason": "sidecars_disabled_unmaterialized"},
+                    )
+                # A location-less Card selected by sync_pending_card_sidecars
+                # deliberately has no outbox row.  The LEFT JOIN still returns
+                # the Card, so use the observed generation rather than the
+                # joined row's presence to recognize that transaction-bound
+                # backfill case.
+                acknowledged = observed_card_exists and observed_generation is None
                 if observed_generation is not None:
                     acknowledged = (
                         conn.execute(
@@ -3976,13 +6703,14 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
                         == 1
                     )
                 if acknowledged:
-                    audit_event(
-                        conn,
-                        action="card_sidecar_synced",
-                        target_type="card",
-                        target_id=card_id,
-                        payload={"location_uri": location_uri},
-                    )
+                    if not disabled_without_promised_sidecar:
+                        audit_event(
+                            conn,
+                            action="card_sidecar_synced",
+                            target_type="card",
+                            target_id=card_id,
+                            payload={"location_uri": location_uri},
+                        )
                     synced += 1
                 else:
                     audit_event(
@@ -3993,24 +6721,132 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
                         payload={"location_uri": location_uri},
                     )
                     deferred += 1
+                pending_compensation_rows = observe_compensation_cas_rows(
+                    conn,
+                    [card_id],
+                )
                 conn.commit()
+                compensation_cas_by_card.update(pending_compensation_rows)
+                target_uri = str(write_observation.get("target_uri") or "")
+                if (
+                    target_uri
+                    and write_observation.get("attempted_write")
+                    and not write_observation.get("target_existed_before")
+                ):
+                    generated_sidecar_candidates.append(
+                        {
+                            "card_id": card_id,
+                            "uri": target_uri,
+                            "state_hash": str(
+                                write_observation.get("expected_state_hash") or ""
+                            ),
+                        }
+                    )
             except Exception as exc:
                 if conn.in_transaction:
                     conn.rollback()
+                target_uri = str(write_observation.get("target_uri") or "")
+                if (
+                    target_uri
+                    and write_observation.get("attempted_write")
+                    and not write_observation.get("target_existed_before")
+                ):
+                    target_path = resolve_stored_uri(root, target_uri)
+                    expected_state_hash = str(
+                        write_observation.get("expected_state_hash") or ""
+                    )
+                    try:
+                        payload = load_atomic_yaml(target_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        payload = None
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("card_id") == card_id
+                        and payload.get("id") == card_id
+                        and payload.get("state_hash") == expected_state_hash
+                        and payload.get("state_hash") == _atomic_card_state_hash(payload)
+                    ):
+                        generated_sidecar_candidates.append(
+                            {
+                                "card_id": card_id,
+                                "uri": target_uri,
+                                "state_hash": expected_state_hash,
+                            }
+                        )
                 error = str(exc)
                 failures.append({"card_id": card_id, "error": error})
                 conn.execute("BEGIN IMMEDIATE")
-                if observed_generation is not None:
-                    conn.execute(
-                        """
-                        UPDATE card_sidecar_outbox
-                        SET attempt_count = attempt_count + 1,
-                            last_error = ?,
-                            updated_at = ?
-                        WHERE card_id = ? AND generation = ?
-                        """,
-                        (error, utc_now(), card_id, observed_generation),
+                current_failure_row = conn.execute(
+                    """
+                    SELECT card.location_uri,
+                           outbox.generation
+                    FROM cards AS card
+                    LEFT JOIN card_sidecar_outbox AS outbox
+                      ON outbox.card_id = card.id
+                    WHERE card.id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+                current_failure_location = (
+                    str(current_failure_row["location_uri"])
+                    if current_failure_row is not None
+                    and current_failure_row["location_uri"] is not None
+                    else None
+                )
+                current_failure_generation = (
+                    str(current_failure_row["generation"])
+                    if current_failure_row is not None
+                    and current_failure_row["generation"] is not None
+                    else None
+                )
+                failure_state_is_bound = bool(
+                    observed_card_exists
+                    and current_failure_row is not None
+                    and current_failure_location == observed_location_uri
+                    and current_failure_generation == observed_generation
+                )
+                if failure_state_is_bound and observed_generation is not None:
+                    failure_state_is_bound = (
+                        conn.execute(
+                            """
+                            UPDATE card_sidecar_outbox
+                            SET attempt_count = attempt_count + 1,
+                                last_error = ?,
+                                updated_at = ?
+                            WHERE card_id = ? AND generation = ?
+                            """,
+                            (error, utc_now(), card_id, observed_generation),
+                        ).rowcount
+                        == 1
                     )
+                elif failure_state_is_bound:
+                    now = utc_now()
+                    failure_state_is_bound = (
+                        conn.execute(
+                            """
+                            INSERT INTO card_sidecar_outbox(
+                                card_id, reason, generation, created_at, updated_at
+                            )
+                            SELECT ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1
+                                FROM card_sidecar_outbox
+                                WHERE card_id = ?
+                            )
+                            """,
+                            (
+                                card_id,
+                                "sidecar_sync_failed",
+                                unique_id("sidecar_generation"),
+                                now,
+                                now,
+                                card_id,
+                            ),
+                        ).rowcount
+                        == 1
+                    )
+                if not failure_state_is_bound:
+                    compensation_cas_complete = False
                 audit_event(
                     conn,
                     action="card_sidecar_sync_failed",
@@ -4027,7 +6863,13 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
                     related_card_ids=[card_id],
                     dedupe_key=f"card:{card_id}",
                 )
+                pending_compensation_rows = (
+                    observe_compensation_cas_rows(conn, [card_id])
+                    if failure_state_is_bound
+                    else {}
+                )
                 conn.commit()
+                compensation_cas_by_card.update(pending_compensation_rows)
     except Exception as exc:
         if conn.in_transaction:
             conn.rollback()
@@ -4037,32 +6879,144 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
             "deferred": deferred,
             "failed": len(unique_card_ids) - synced,
             "failures": [*failures, {"card_id": None, "error": str(exc)}],
+            "generated_sidecar_candidates": generated_sidecar_candidates,
+            "intent_reconciliation_results": intent_reconciliation_results,
+            "compensation_cas_complete": False,
+            "compensation_cas_rows": compensation_cas_rows(),
         }
     finally:
         conn.close()
+    reconciliation = reconcile_card_sidecar_write_intents(
+        root,
+        card_ids=unique_card_ids,
+    )
+    reconciliation_results = list(reconciliation.get("results", []))
+    intent_reconciliation_results.extend(reconciliation_results)
+    for reconciliation_result in reconciliation_results:
+        if (
+            reconciliation_result.get("status") != "adopted"
+            or reconciliation_result.get("mode") != "write"
+        ):
+            continue
+        candidate = {
+            "card_id": str(reconciliation_result.get("card_id") or ""),
+            "uri": str(reconciliation_result.get("target_uri") or ""),
+            "state_hash": str(
+                reconciliation_result.get("expected_state_hash") or ""
+            ),
+        }
+        if (
+            candidate["card_id"] in unique_card_ids
+            and candidate["uri"]
+            and re.fullmatch(r"[0-9a-f]{64}", candidate["state_hash"])
+            and candidate not in generated_sidecar_candidates
+        ):
+            generated_sidecar_candidates.append(candidate)
+    reconciliation_clean = bool(reconciliation.get("ok")) and int(
+        reconciliation.get("pending", 0)
+    ) == 0
+    if not reconciliation_clean:
+        failures.append(
+            {
+                "card_id": None,
+                "error": "Card sidecar intent reconciliation did not complete cleanly",
+                "intent_reconciliation": reconciliation,
+            }
+        )
+        retry_conn = connect(root)
+        try:
+            retry_conn.execute("BEGIN IMMEDIATE")
+            mark_card_sidecar_outbox(
+                retry_conn,
+                unique_card_ids,
+                reason="intent_reconciliation_incomplete",
+            )
+            audit_event(
+                retry_conn,
+                action="card_sidecar_intent_reconciliation_incomplete",
+                target_type="cards",
+                target_id=None,
+                payload={
+                    "card_ids": unique_card_ids,
+                    "pending": int(reconciliation.get("pending", 0)),
+                    "failure_count": len(reconciliation.get("failures", [])),
+                },
+            )
+            pending_compensation_rows = observe_compensation_cas_rows(
+                retry_conn,
+                unique_card_ids,
+            )
+            retry_conn.commit()
+            compensation_cas_by_card.update(pending_compensation_rows)
+        except Exception as exc:
+            if retry_conn.in_transaction:
+                retry_conn.rollback()
+            failures.append(
+                {
+                    "card_id": None,
+                    "error": "Card sidecar reconciliation retry authority could not be recorded: "
+                    f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            )
+            compensation_cas_complete = False
+        finally:
+            retry_conn.close()
+    compensation_cas_complete = bool(
+        compensation_cas_complete
+        and len(compensation_cas_by_card) == len(unique_card_ids)
+    )
     return {
-        "ok": not failures,
+        "ok": not failures and reconciliation_clean,
         "synced": synced,
         "deferred": deferred,
-        "failed": len(failures),
+        "failed": len(unique_card_ids) if not reconciliation_clean else len(failures),
         "failures": failures,
+        "generated_sidecar_candidates": generated_sidecar_candidates,
+        "intent_reconciliation_results": intent_reconciliation_results,
+        "intent_reconciliation": reconciliation,
+        "compensation_cas_complete": compensation_cas_complete,
+        "compensation_cas_rows": compensation_cas_rows(),
     }
 
 
 def sync_pending_card_sidecars(root: Path, *, limit: int = 10000) -> dict[str, Any]:
     if not is_initialized(root):
         return {"ok": True, "synced": 0, "failed": 0, "failures": [], "pending": 0}
+    bounded_limit = max(1, int(limit))
+    writes_enabled = bool(
+        load_config(root)
+        .get("atomic_memory", {})
+        .get("write_card_sidecars", True)
+    )
     conn = connect(root)
     try:
-        rows = conn.execute(
+        rows = list(conn.execute(
             """
             SELECT card_id
             FROM card_sidecar_outbox
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (max(1, int(limit)),),
-        ).fetchall()
+            (bounded_limit,),
+        ).fetchall())
+        if writes_enabled and len(rows) < bounded_limit:
+            rows.extend(
+                conn.execute(
+                    """
+                    SELECT id AS card_id
+                    FROM cards
+                    WHERE location_uri IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM card_sidecar_outbox
+                          WHERE card_sidecar_outbox.card_id = cards.id
+                      )
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (bounded_limit - len(rows),),
+                ).fetchall()
+            )
     finally:
         conn.close()
     result = sync_card_sidecars_after_commit(root, [str(row["card_id"]) for row in rows])
@@ -5051,7 +8005,7 @@ def roll_scroll_segment(
             transaction_guard(conn)
         conn.commit()
         sync_card_sidecars_after_commit(root, [card_id])
-        sidecar_path = card_sidecar_path(root, card_id)
+        sidecar_path = current_card_sidecar_path(root, conn, card_id)
         return {
             **committed_result,
             "card_uri": str(sidecar_path) if sidecar_path and sidecar_path.exists() else None,
@@ -5269,7 +8223,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
         )
         conn.commit()
         sync_card_sidecars_after_commit(root, [card_id])
-        sidecar_path = card_sidecar_path(root, card_id)
+        sidecar_path = current_card_sidecar_path(root, conn, card_id)
         return {
             "book_id": book_id,
             "card_id": card_id,
@@ -12251,8 +15205,7 @@ def _project_state_durable_authority_signals(
     card_id = str(row["id"])
     material = conn.execute(
         """
-        SELECT metadata_json, source_refs_json, location_uri,
-               visibility_scope, project_id, session_id
+        SELECT *
         FROM cards WHERE id = ?
         """,
         (card_id,),
@@ -12553,25 +15506,80 @@ def _project_state_durable_authority_signals(
                 coordinate_bucket=retained_coordinate_sessions,
             )
 
-    sidecar_path = card_sidecar_path(root, card_id)
-    if sidecar_path is not None and sidecar_path.is_file():
+    sidecar_authority_uncertain = False
+    sidecar_path = current_card_sidecar_path(root, conn, card_id)
+    if material is not None and material["location_uri"] and sidecar_path is None:
+        sidecar_authority_uncertain = True
+    seen_sidecar_states: set[tuple[str, str]] = set()
+    sidecar_path_exists = sidecar_path is not None and os.path.lexists(sidecar_path)
+    if (
+        sidecar_path is not None
+        and sidecar_path_exists
+        and not _card_sidecar_path_is_link_like(sidecar_path)
+        and sidecar_path.is_file()
+    ):
         try:
             sidecar_payload = load_atomic_yaml(
                 sidecar_path.read_text(encoding="utf-8")
             )
-        except (OSError, ValueError):
+        except (OSError, UnicodeError, ValueError):
             sidecar_payload = None
         if (
             isinstance(sidecar_payload, dict)
+            and sidecar_payload.get("schema") == "continuum.atomic_memory.v2"
             and str(sidecar_payload.get("card_id") or "") == card_id
+            and str(sidecar_payload.get("id") or "") == card_id
+            and sidecar_payload.get("card_type") == "project_state"
             and sidecar_payload.get("state_hash")
             == _atomic_card_state_hash(sidecar_payload)
+            and material is not None
+            and sidecar_payload == _card_sidecar_payload_for_row(material)
         ):
+            seen_sidecar_states.add(
+                (continuum_uri(root, sidecar_path), str(sidecar_payload["state_hash"]))
+            )
             add_claim(
                 sidecar_payload,
                 claim_bucket=sidecar_claims,
                 coordinate_bucket=sidecar_coordinate_sessions,
             )
+        # A mutable current sidecar that is stale, malformed, or mirrors an
+        # already-invalid Card is not independent authority. Semantic audit
+        # still reports it; only a ledger-verified immutable copy below may
+        # preserve a divergent boundary claim.
+
+    cards_dir = _configured_card_sidecar_dir(root)
+    if proof_cache is not None:
+        immutable_cache = proof_cache.setdefault("immutable_card_sidecars", {})
+        cached = immutable_cache.get("verified")
+        if not isinstance(cached, tuple) or len(cached) != 2:
+            cached = _verified_immutable_card_sidecars(root, conn, cards_dir)
+            immutable_cache["verified"] = cached
+        verified_immutable, uncertain_immutable = cached
+    else:
+        verified_immutable, uncertain_immutable = _verified_immutable_card_sidecars(
+            root,
+            conn,
+            cards_dir,
+        )
+    if card_id in uncertain_immutable:
+        sidecar_authority_uncertain = True
+    for immutable_path, immutable_payload in verified_immutable.get(card_id, []):
+        if immutable_payload.get("card_type") != "project_state":
+            sidecar_authority_uncertain = True
+            continue
+        identity = (
+            continuum_uri(root, immutable_path),
+            str(immutable_payload.get("state_hash") or ""),
+        )
+        if identity in seen_sidecar_states:
+            continue
+        seen_sidecar_states.add(identity)
+        add_claim(
+            immutable_payload,
+            claim_bucket=sidecar_claims,
+            coordinate_bucket=sidecar_coordinate_sessions,
+        )
 
     return {
         "claims": claims,
@@ -12585,6 +15593,7 @@ def _project_state_durable_authority_signals(
         "mirror_coordinate_sessions": mirror_coordinate_sessions,
         "source_coordinate_sessions": source_coordinate_sessions,
         "sidecar_coordinate_sessions": sidecar_coordinate_sessions,
+        "sidecar_authority_uncertain": sidecar_authority_uncertain,
     }
 
 
@@ -12599,7 +15608,8 @@ def _project_state_effective_durable_authority_signals(
     metadata, placement jobs, receipts, and source references retain the
     independently recorded boundary; raw source coordinates remain a fallback
     when none of that material survives. A sidecar that differs from the Card
-    row is preserved evidence and remains an additional constraint.
+    row is an additional constraint only when the artifact ledger preserves
+    and verifies its exact bytes.
     """
 
     retained_claims = set(signals["retained_claims"])
@@ -12972,6 +15982,10 @@ def repair_invalid_project_state_checkpoints(
                     durable_signals,
                 )
             )
+            if durable_signals.get("sidecar_authority_uncertain"):
+                withheld_uncertain_candidate_count += 1
+                repair_authorization_cache[candidate_id] = False
+                return False
             durable_claims = set(effective_signals["claims"])
             coordinate_sessions = set(
                 effective_signals["coordinate_sessions"]
@@ -14254,6 +17268,9 @@ def _discover_resume_state(
             candidate_row,
             durable_signals,
         )
+        if durable_signals.get("sidecar_authority_uncertain"):
+            resume_authorization_cache[candidate_id] = False
+            return False
         durable_claims = set(effective_signals["claims"])
         # An oversized Card selected directly through the caller's visibility
         # capability must remain visible to the boundary report even when its
@@ -15955,42 +18972,405 @@ def audit(root: Path, *, create: bool = True) -> dict[str, Any]:
         conn.close()
 
 
-def _card_sidecar_payload_for_row(row: sqlite3.Row) -> dict[str, Any]:
-    return atomic_memory_card(
-        card_id=row["id"],
-        card_type=row["card_type"],
-        title=row["title"],
-        summary=row["summary"],
-        status=row["status"],
-        source_refs=json_loads(row["source_refs_json"], []),
-        entities=json_loads(row["entities_json"], []),
-        topics=json_loads(row["topics_json"], []),
-        decisions=json_loads(row["decisions_json"], []),
-        open_tasks=json_loads(row["open_tasks_json"], []),
-        salience=float(row["salience"] or 0.0),
-        confidence=float(row["confidence"] or 0.0),
-        metadata=json_loads(row["metadata_json"], {}),
-        visibility_scope=row["visibility_scope"],
-        session_id=row["session_id"],
-        project_id=row["project_id"],
-        placement_collection=row["placement_collection"],
-        shelf=row["shelf"],
-        storage_tier=row["storage_tier"],
-        recall_count=int(row["recall_count"] or 0),
-        last_recalled_at=row["last_recalled_at"],
-        conflict_group=row["conflict_group"],
-        supersedes_card_id=row["supersedes_card_id"],
-        superseded_by_card_id=row["superseded_by_card_id"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        summary_hash=content_hash(row["summary"]),
-    )
-
-
 def _atomic_card_state_hash(payload: dict[str, Any]) -> str:
     comparable = dict(payload)
     comparable.pop("state_hash", None)
     return content_hash(json_dumps(comparable))
+
+
+MAX_VERIFIED_CARD_SIDECAR_BYTES = 16 * 1024 * 1024
+
+
+def _verified_immutable_card_sidecars(
+    root: Path,
+    conn: sqlite3.Connection,
+    cards_dir: Path,
+) -> tuple[dict[str, list[tuple[Path, dict[str, Any]]]], set[str]]:
+    try:
+        rows = conn.execute(
+            "SELECT uri, sha256, size_bytes FROM artifacts WHERE immutable = 1"
+        ).fetchall()
+        card_rows = conn.execute("SELECT id FROM cards").fetchall()
+    except sqlite3.OperationalError:
+        return {}, set()
+    card_ids = {str(row["id"]) for row in card_rows}
+    card_id_lookup, _card_id_collisions = _portable_unique_casefold_lookup(
+        card_ids
+    )
+    candidates_by_path_key: dict[str, set[tuple[str, Path]]] = {}
+    candidates_by_file_id: dict[tuple[int, int], set[tuple[str, Path]]] = {}
+    candidate_identities: dict[tuple[str, Path], SidecarPathIdentity] = {}
+    verified: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    uncertain: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
+    try:
+        card_paths = list(cards_dir.iterdir()) if cards_dir.is_dir() else []
+    except OSError:
+        card_paths = []
+    for candidate in card_paths:
+        candidate_match = re.fullmatch(
+            r"(?P<card_id>.+?)(?:\.live(?:-[0-9a-f]{64})?)?\.yaml",
+            candidate.name,
+            flags=re.IGNORECASE,
+        )
+        if candidate_match is None:
+            continue
+        observed_candidate_id = str(candidate_match.group("card_id"))
+        candidate_card_id = card_id_lookup.get(observed_candidate_id.casefold())
+        if candidate_card_id is None:
+            continue
+        default_path = cards_dir / f"{candidate_card_id}.yaml"
+        if not _is_managed_card_sidecar_path(
+            default_path,
+            candidate,
+            card_id=candidate_card_id,
+        ):
+            continue
+        candidate_ref = (candidate_card_id, candidate)
+        candidate_identity = _sidecar_nofollow_path_identity(candidate)
+        if candidate_identity is None:
+            uncertain.add(candidate_card_id)
+            continue
+        candidate_identities[candidate_ref] = candidate_identity
+        path_keys, file_identity = candidate_identity
+        for path_key in path_keys:
+            candidates_by_path_key.setdefault(path_key, set()).add(candidate_ref)
+        if file_identity is not None:
+            candidates_by_file_id.setdefault(file_identity, set()).add(candidate_ref)
+    for row in rows:
+        uri_text = str(row["uri"])
+        artifact_path = resolve_stored_uri(root, uri_text)
+        artifact_source_path = artifact_path
+        candidate_refs: set[tuple[str, Path]] = set()
+        lexical_name = Path(uri_text).name
+        name_match = re.fullmatch(
+            r"(?P<card_id>.+?)(?:\.live(?:-[0-9a-f]{64})?)?\.yaml",
+            lexical_name,
+            flags=re.IGNORECASE,
+        )
+        if name_match is not None:
+            observed_card_id = str(name_match.group("card_id"))
+            direct_card_id = card_id_lookup.get(observed_card_id.casefold())
+            if direct_card_id is not None:
+                default_path = cards_dir / f"{direct_card_id}.yaml"
+                if _card_sidecar_parents_match(
+                    default_path.parent,
+                    artifact_path.parent,
+                ):
+                    managed_artifact_path = _resolved_managed_card_sidecar_path(
+                        default_path,
+                        artifact_path,
+                        card_id=direct_card_id,
+                    )
+                    if managed_artifact_path is not None:
+                        artifact_source_path = managed_artifact_path
+                        direct_candidate_ref = (
+                            direct_card_id,
+                            managed_artifact_path,
+                        )
+                        if direct_candidate_ref in candidate_identities:
+                            candidate_refs.add(direct_candidate_ref)
+                    else:
+                        uncertain.add(direct_card_id)
+
+        # An immutable artifact may be recorded through a regular hardlink
+        # alias whose basename is unrelated to the Card. Resolve that physical
+        # identity back to managed Card paths without treating symlink aliases
+        # as immutable authority.
+        artifact_identity = _sidecar_nofollow_path_identity(
+            artifact_source_path
+        )
+        if artifact_identity is not None:
+            artifact_path_keys, artifact_file_identity = artifact_identity
+            for path_key in artifact_path_keys:
+                candidate_refs.update(candidates_by_path_key.get(path_key, ()))
+            if artifact_file_identity is not None:
+                candidate_refs.update(
+                    candidates_by_file_id.get(artifact_file_identity, ())
+                )
+        else:
+            uncertain.update(card_id for card_id, _path in candidate_refs)
+            if os.path.lexists(artifact_source_path):
+                uncertain.update(card_ids)
+            continue
+
+        for card_id, path in sorted(
+            candidate_refs,
+            key=lambda item: (item[0], str(item[1])),
+        ):
+            candidate_identity = candidate_identities.get((card_id, path))
+            if (
+                candidate_identity is None
+                or _sidecar_nofollow_path_identity(path) != candidate_identity
+                or _sidecar_nofollow_path_identity(artifact_source_path)
+                != artifact_identity
+            ):
+                uncertain.add(card_id)
+                continue
+            try:
+                expected_size = int(row["size_bytes"])
+                if (
+                    expected_size < 0
+                    or expected_size > MAX_VERIFIED_CARD_SIDECAR_BYTES
+                    or os.lstat(path).st_size != expected_size
+                    or file_sha256(path) != str(row["sha256"])
+                ):
+                    raise ValueError("immutable Card sidecar artifact mismatch")
+                payload = load_atomic_yaml(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                uncertain.add(card_id)
+                continue
+            if (
+                _sidecar_nofollow_path_identity(path) != candidate_identity
+                or _sidecar_nofollow_path_identity(artifact_source_path)
+                != artifact_identity
+            ):
+                uncertain.add(card_id)
+                continue
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != "continuum.atomic_memory.v2"
+                or payload.get("id") != card_id
+                or payload.get("card_id") != card_id
+                or payload.get("state_hash") != _atomic_card_state_hash(payload)
+            ):
+                uncertain.add(card_id)
+                continue
+            state_hash = str(payload.get("state_hash") or "")
+            filename_state_hash = _card_sidecar_filename_state_hash(
+                path,
+                card_id,
+            )
+            if (
+                filename_state_hash is not None
+                and filename_state_hash != state_hash.lower()
+            ):
+                uncertain.add(card_id)
+                continue
+            identity = (
+                next(iter(candidate_identity[0]), str(path)),
+                str(row["sha256"]),
+                state_hash,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            verified.setdefault(card_id, []).append((path, payload))
+    return verified, uncertain
+
+
+CardSidecarHistoryReceiptIndex = tuple[
+    frozenset[tuple[str, str, str]],
+    frozenset[tuple[int, int, str, str]],
+    frozenset[tuple[str, str, str]],
+]
+
+
+def _validated_card_sidecar_history_receipt_index(
+    root: Path,
+) -> CardSidecarHistoryReceiptIndex:
+    path_bindings: set[tuple[str, str, str]] = set()
+    file_bindings: set[tuple[int, int, str, str]] = set()
+    lexical_bindings: set[tuple[str, str, str]] = set()
+    try:
+        receipt_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="receipt",
+            create=False,
+        )
+    except ValueError:
+        return frozenset(), frozenset(), frozenset()
+    if receipt_state is None:
+        return frozenset(), frozenset(), frozenset()
+    try:
+        with os.scandir(receipt_state[0]) as entries:
+            receipt_paths = (
+                Path(entry.path)
+                for entry in entries
+                if entry.name.endswith(".json")
+            )
+            for receipt_path in receipt_paths:
+                try:
+                    receipt_identity = _plain_card_sidecar_state_path_identity(
+                        receipt_path,
+                        directory=False,
+                    )
+                    if (
+                        os.lstat(receipt_path).st_size
+                        > MAX_CARD_SIDECAR_WRITE_INTENT_BYTES
+                    ):
+                        raise ValueError(
+                            "Card sidecar recovery receipt exceeds its byte limit"
+                        )
+                    receipt = json.loads(
+                        receipt_path.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(receipt, dict):
+                        raise ValueError(
+                            "Card sidecar recovery receipt must be an object"
+                        )
+                    intent_id = str(receipt.get("intent_id") or "")
+                    card_id = str(receipt.get("card_id") or "")
+                    target_uri = str(receipt.get("target_uri") or "")
+                    state_hash = str(
+                        receipt.get("expected_state_hash") or ""
+                    )
+                    mode = str(receipt.get("mode") or "")
+                    status = str(receipt.get("status") or "")
+                    attempt_id = str(receipt.get("attempt_id") or "")
+                    expected_intent_id = stable_id(
+                        "card_sidecar_write_intent",
+                        mode,
+                        card_id,
+                        target_uri,
+                        state_hash,
+                        attempt_id,
+                    )
+                    target_path = resolve_stored_uri(root, target_uri)
+                    default_path = _configured_card_sidecar_path(root, card_id)
+                    managed_target_path = _resolved_managed_card_sidecar_path(
+                        default_path,
+                        target_path,
+                        card_id=card_id,
+                    )
+                    if (
+                        receipt.get("schema")
+                        != CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA
+                        or receipt.get("ok") is not True
+                        or not (
+                            (mode == "write" and status == "adopted")
+                            or (
+                                mode == "history_transition"
+                                and status == "transition_prepared"
+                            )
+                        )
+                        or receipt_path.name != f"{intent_id}.json"
+                        or intent_id != expected_intent_id
+                        or not _is_canonical_card_id(card_id)
+                        or not re.fullmatch(r"[0-9a-f]{64}", state_hash)
+                        or not re.fullmatch(
+                            r"card_sidecar_attempt_\d{8}T\d{6}Z_[0-9a-f]{16}",
+                            attempt_id,
+                        )
+                        or target_uri != lexical_continuum_uri(root, target_path)
+                        or managed_target_path is None
+                    ):
+                        raise ValueError(
+                            "Card sidecar history receipt identity mismatch"
+                        )
+                    target_path = managed_target_path
+                    target_identity = _sidecar_nofollow_path_identity(target_path)
+                    if target_identity is None:
+                        raise ValueError(
+                            "Card sidecar history receipt target is unsafe"
+                        )
+                    _assert_card_sidecar_state_dir_unchanged(receipt_state)
+                    if (
+                        _plain_card_sidecar_state_path_identity(
+                            receipt_path,
+                            directory=False,
+                        )
+                        != receipt_identity
+                    ):
+                        raise ValueError(
+                            "Card sidecar history receipt changed during read"
+                        )
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                if _sidecar_nofollow_path_identity(target_path) != target_identity:
+                    continue
+                path_keys, file_identity = target_identity
+                path_bindings.update(
+                    (path_key, card_id, state_hash) for path_key in path_keys
+                )
+                lexical_bindings.add((target_uri, card_id, state_hash))
+                if file_identity is not None:
+                    file_bindings.add(
+                        (*file_identity, card_id, state_hash)
+                    )
+    except OSError:
+        return frozenset(), frozenset(), frozenset()
+    return (
+        frozenset(path_bindings),
+        frozenset(file_bindings),
+        frozenset(lexical_bindings),
+    )
+
+
+def _history_receipt_binds_card_sidecar(
+    path: Path,
+    *,
+    card_id: str,
+    state_hash: str,
+    receipt_index: CardSidecarHistoryReceiptIndex,
+) -> bool:
+    path_bindings, file_bindings, _lexical_bindings = receipt_index
+    identity = _sidecar_nofollow_path_identity(path)
+    if identity is None:
+        return False
+    path_keys, file_identity = identity
+    binds = any(
+        (path_key, card_id, state_hash) in path_bindings
+        for path_key in path_keys
+    ) or bool(
+        file_identity is not None
+        and (*file_identity, card_id, state_hash) in file_bindings
+    )
+    return bool(
+        binds and _sidecar_nofollow_path_identity(path) == identity
+    )
+
+
+def _is_valid_detached_content_addressed_sidecar(
+    path: Path,
+    *,
+    card_ids: set[str],
+    receipt_index: CardSidecarHistoryReceiptIndex,
+) -> bool:
+    match = re.fullmatch(
+        r"(?P<card_id>.+?)\.live-(?P<state_hash>[0-9a-f]{64})\.yaml",
+        path.name,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    observed_card_id = str(match.group("card_id"))
+    card_id_lookup, _card_id_collisions = _portable_unique_casefold_lookup(
+        card_ids
+    )
+    card_id = card_id_lookup.get(observed_card_id.casefold())
+    if card_id is None:
+        return False
+    entry_identity = _sidecar_nofollow_path_identity(path)
+    if entry_identity is None:
+        return False
+    try:
+        if os.lstat(path).st_size > MAX_VERIFIED_CARD_SIDECAR_BYTES:
+            return False
+        payload = load_atomic_yaml(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    state_hash = str(payload.get("state_hash") or "") if isinstance(payload, dict) else ""
+    valid_payload = bool(
+        isinstance(payload, dict)
+        and payload.get("schema") == "continuum.atomic_memory.v2"
+        and payload.get("id") == card_id
+        and payload.get("card_id") == card_id
+        and state_hash == _atomic_card_state_hash(payload)
+        and state_hash.lower() == str(match.group("state_hash")).lower()
+    )
+    valid = bool(
+        valid_payload
+        and _history_receipt_binds_card_sidecar(
+            path,
+            card_id=card_id,
+            state_hash=state_hash,
+            receipt_index=receipt_index,
+        )
+    )
+    return bool(
+        valid and _sidecar_nofollow_path_identity(path) == entry_identity
+    )
 
 
 def audit_card_sidecars(root: Path, conn: sqlite3.Connection) -> dict[str, int]:
@@ -16000,30 +19380,80 @@ def audit_card_sidecars(root: Path, conn: sqlite3.Connection) -> dict[str, int]:
         "malformed_card_sidecars": 0,
         "stale_card_sidecars": 0,
         "divergent_card_sidecars": 0,
+        "unsafe_card_sidecar_paths": 0,
+        "nonportable_card_id_collisions": 0,
+        "nonportable_card_sidecar_name_collisions": 0,
     }
-    if card_sidecar_path(root, "__probe__") is None:
+    atomic_config = load_config(root).get("atomic_memory", {})
+    sidecar_writes_enabled = bool(atomic_config.get("write_card_sidecars", True))
+    cards_dir = _configured_card_sidecar_dir(
+        root,
+        atomic_config=atomic_config,
+    )
+    if os.path.lexists(cards_dir) and (
+        _card_sidecar_path_is_link_like(cards_dir) or not cards_dir.is_dir()
+    ):
+        result["unsafe_card_sidecar_paths"] += 1
         return result
-    probe_path = card_sidecar_path(root, "__probe__")
-    cards_dir = probe_path.parent if probe_path is not None else root / "catalog" / "cards"
     rows = conn.execute("SELECT * FROM cards").fetchall()
-    expected_paths: set[str] = set()
+    card_ids = {str(row["id"]) for row in rows}
+    _card_id_lookup, card_id_collisions = _portable_unique_casefold_lookup(
+        card_ids
+    )
+    result["nonportable_card_id_collisions"] = card_id_collisions
+    sidecar_paths: list[Path] = []
+    if cards_dir.exists():
+        try:
+            sidecar_paths = [
+                path
+                for path in cards_dir.iterdir()
+                if path.name.casefold().endswith(".yaml")
+            ]
+        except OSError:
+            result["unsafe_card_sidecar_paths"] += 1
+            return result
+    _sidecar_name_lookup, sidecar_name_collisions = (
+        _portable_unique_casefold_lookup(path.name for path in sidecar_paths)
+    )
+    result["nonportable_card_sidecar_name_collisions"] = (
+        sidecar_name_collisions
+    )
+    history_receipt_index = _validated_card_sidecar_history_receipt_index(
+        root
+    )
+    expected_path_keys: set[str] = set()
     for row in rows:
-        default_path = card_sidecar_path(root, row["id"])
-        sidecar_path = resolve_stored_uri(root, row["location_uri"]) if row["location_uri"] else default_path
-        if sidecar_path is None:
+        # Cards created while sidecar writes are disabled have no promised
+        # sidecar. Already-recorded locations remain subject to integrity
+        # checks even after future materialization is disabled.
+        if not sidecar_writes_enabled and not row["location_uri"]:
             continue
         try:
-            expected_paths.add(str(sidecar_path.resolve()))
-        except OSError:
-            expected_paths.add(str(sidecar_path))
-        if not sidecar_path.exists():
-            result["missing_card_sidecars"] += 1
+            sidecar_path = current_card_sidecar_path(root, conn, str(row["id"]))
+        except ValueError:
+            result["unsafe_card_sidecar_paths"] += 1
+            continue
+        if row["location_uri"] and sidecar_path is None:
+            result["divergent_card_sidecars"] += 1
+            continue
+        if sidecar_path is None:
+            continue
+        sidecar_identity = _sidecar_nofollow_path_identity(sidecar_path)
+        if sidecar_identity is None:
+            if os.path.lexists(sidecar_path):
+                result["unsafe_card_sidecar_paths"] += 1
+            else:
+                result["missing_card_sidecars"] += 1
             continue
         try:
             payload = load_atomic_yaml(sidecar_path.read_text(encoding="utf-8"))
         except Exception:
             result["malformed_card_sidecars"] += 1
             continue
+        if _sidecar_nofollow_path_identity(sidecar_path) != sidecar_identity:
+            result["unsafe_card_sidecar_paths"] += 1
+            continue
+        expected_path_keys.update(sidecar_identity[0])
         if not isinstance(payload, dict) or payload.get("schema") != "continuum.atomic_memory.v2":
             result["malformed_card_sidecars"] += 1
             continue
@@ -16035,15 +19465,47 @@ def audit_card_sidecars(root: Path, conn: sqlite3.Connection) -> dict[str, int]:
         if payload.get("card_id") != row["id"] or payload.get("id") != row["id"]:
             result["divergent_card_sidecars"] += 1
             continue
+        filename_state_hash = _card_sidecar_filename_state_hash(
+            sidecar_path,
+            str(row["id"]),
+        )
+        if (
+            filename_state_hash is not None
+            and filename_state_hash != loaded_hash.lower()
+        ):
+            result["divergent_card_sidecars"] += 1
+            continue
         if loaded_hash != expected.get("state_hash"):
             result["stale_card_sidecars"] += 1
+    verified_immutable, _uncertain_immutable = _verified_immutable_card_sidecars(
+        root,
+        conn,
+        cards_dir,
+    )
+    for sidecars in verified_immutable.values():
+        for path, _payload in sidecars:
+            identity = _sidecar_nofollow_path_identity(path)
+            if identity is not None:
+                expected_path_keys.update(identity[0])
     if cards_dir.exists():
-        for path in cards_dir.glob("*.yaml"):
-            try:
-                resolved = str(path.resolve())
-            except OSError:
-                resolved = str(path)
-            if resolved not in expected_paths:
+        for path in sidecar_paths:
+            identity = _sidecar_nofollow_path_identity(path)
+            if identity is None:
+                result["unsafe_card_sidecar_paths"] += 1
+                continue
+            is_expected = bool(identity[0].intersection(expected_path_keys))
+            is_valid_detached = bool(
+                not is_expected
+                and _is_valid_detached_content_addressed_sidecar(
+                    path,
+                    card_ids=card_ids,
+                    receipt_index=history_receipt_index,
+                )
+            )
+            if _sidecar_nofollow_path_identity(path) != identity:
+                result["unsafe_card_sidecar_paths"] += 1
+                continue
+            if not is_expected and not is_valid_detached:
                 result["orphan_card_sidecars"] += 1
     return result
 
@@ -16155,7 +19617,7 @@ def semantic_integrity_report(
                 if actual != expected_hash and legacy_actual != expected_hash:
                     segment_hash_mismatches += 1
         sidecar_audit = (
-            audit_card_sidecars(root, conn)
+            {**audit_card_sidecars(root, conn), **_card_sidecar_recovery_evidence_audit(root)}
             if check_card_sidecars
             else {
                 "orphan_card_sidecars": 0,
@@ -16163,8 +19625,53 @@ def semantic_integrity_report(
                 "malformed_card_sidecars": 0,
                 "stale_card_sidecars": 0,
                 "divergent_card_sidecars": 0,
+                "unsafe_card_sidecar_paths": 0,
+                "nonportable_card_id_collisions": 0,
+                "nonportable_card_sidecar_name_collisions": 0,
+                "unsafe_card_sidecar_recovery_paths": 0,
+                "malformed_card_sidecar_recovery_receipts": 0,
+                "missing_card_sidecar_recoveries": 0,
+                "mismatched_card_sidecar_recoveries": 0,
+                "unreceipted_card_sidecar_recoveries": 0,
+                "card_sidecar_recovery_scan_overflow": 0,
             }
         )
+        unresolved_card_sidecar_write_intents = 0
+        card_sidecar_write_intent_scan_overflow = 0
+        unsafe_card_sidecar_write_intent_paths = 0
+        if check_card_sidecars:
+            try:
+                intent_state = _validated_card_sidecar_state_dir(
+                    root,
+                    purpose="intent",
+                    create=False,
+                )
+            except ValueError:
+                unsafe_card_sidecar_write_intent_paths += 1
+                intent_state = None
+            if intent_state is not None:
+                try:
+                    (
+                        intent_paths,
+                        intent_overflow,
+                    ) = _bounded_card_sidecar_intent_paths(
+                        intent_state[0]
+                    )
+                except OSError:
+                    unsafe_card_sidecar_write_intent_paths += 1
+                    intent_paths = []
+                    intent_overflow = False
+                if intent_overflow:
+                    card_sidecar_write_intent_scan_overflow = 1
+                for intent_path in intent_paths:
+                    unresolved_card_sidecar_write_intents += 1
+                    try:
+                        _plain_card_sidecar_state_path_identity(
+                            intent_path,
+                            directory=False,
+                        )
+                    except ValueError:
+                        unsafe_card_sidecar_write_intent_paths += 1
         malformed_graph_sources = 0
         graph_source_key_mismatches = 0
         graph_source_missing_references = 0
@@ -16425,6 +19932,15 @@ def semantic_integrity_report(
             "segment_coverage_mismatches": segment_coverage_mismatches,
             "segment_hash_missing": segment_hash_missing,
             **sidecar_audit,
+            "unresolved_card_sidecar_write_intents": (
+                unresolved_card_sidecar_write_intents
+            ),
+            "card_sidecar_write_intent_scan_overflow": (
+                card_sidecar_write_intent_scan_overflow
+            ),
+            "unsafe_card_sidecar_write_intent_paths": (
+                unsafe_card_sidecar_write_intent_paths
+            ),
             "malformed_graph_sources": malformed_graph_sources,
             "graph_source_key_mismatches": graph_source_key_mismatches,
             "graph_source_missing_references": graph_source_missing_references,
@@ -16500,6 +20016,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             "deleted": 0,
             "kept": None,
             "paired_review_jobs_deleted": 0,
+            "paired_card_sidecar_receipts_deleted": 0,
             "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
         }
     keep = 20
@@ -16510,6 +20027,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             "deleted": 0,
             "kept": keep,
             "paired_review_jobs_deleted": 0,
+            "paired_card_sidecar_receipts_deleted": 0,
             "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
         }
     snapshots = sorted(
@@ -16535,6 +20053,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             conn.close()
     deleted = 0
     paired_review_jobs_deleted = 0
+    paired_card_sidecar_receipts_deleted = 0
     protected = 0
     retired_snapshot_uris: list[str] = []
     retired_snapshot_ids: list[str] = []
@@ -16548,6 +20067,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             retired_snapshot_ids.append(snapshot_id)
         sidecars = snapshot_sidecars_path(old_snapshot)
         review_jobs = snapshot_review_bridge_jobs_path(old_snapshot)
+        sidecar_receipts = snapshot_card_sidecar_receipts_path(old_snapshot)
         manifest = snapshot_manifest_path(old_snapshot)
         alias_key = snapshot_alias_key_path(old_snapshot)
         for path in (old_snapshot, manifest, alias_key):
@@ -16582,6 +20102,19 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                 paired_review_jobs_deleted += 1
             except OSError:
                 pass
+        if sidecar_receipts.exists() or sidecar_receipts.is_symlink():
+            try:
+                reason = _snapshot_link_like_reason(sidecar_receipts)
+                if reason in {"junction", "reparse_point"}:
+                    os.rmdir(sidecar_receipts)
+                elif reason:
+                    sidecar_receipts.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(sidecar_receipts)
+                deleted += 1
+                paired_card_sidecar_receipts_deleted += 1
+            except OSError:
+                pass
     catalog_rows_retired = _retire_missing_snapshot_catalog_rows(root)
     if retired_snapshot_uris and is_initialized(root):
         conn = connect(root)
@@ -16603,6 +20136,9 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         "kept": keep,
         "protected": protected,
         "paired_review_jobs_deleted": paired_review_jobs_deleted,
+        "paired_card_sidecar_receipts_deleted": (
+            paired_card_sidecar_receipts_deleted
+        ),
         "catalog_rows_retired": catalog_rows_retired,
     }
 
@@ -16665,6 +20201,124 @@ def _snapshot_staged_sidecars_path(root: Path, staged_root: Path, cards_source: 
     return staged_root / relative
 
 
+def _copy_snapshot_card_sidecar_history_receipts(
+    root: Path,
+    *,
+    copied_sidecars: Path,
+    destination: Path,
+) -> int:
+    secure_mkdir(destination, secure_existing=True)
+    try:
+        receipt_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="receipt",
+            create=False,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"snapshot preflight failed: Card sidecar receipt state is unsafe: {exc}"
+        ) from exc
+    if receipt_state is None:
+        return 0
+    included_names = (
+        {
+            path.name.casefold()
+            for path in copied_sidecars.iterdir()
+            if path.is_file()
+        }
+        if copied_sidecars.exists()
+        else set()
+    )
+    copied = 0
+    stream_audit = {"unsafe_card_sidecar_recovery_paths": 0}
+    receipt_paths = _stream_card_sidecar_recovery_receipt_paths(
+        receipt_state[0],
+        stream_audit,
+    )
+    for receipt_path in receipt_paths:
+        try:
+            receipt_identity = _plain_card_sidecar_state_path_identity(
+                receipt_path,
+                directory=False,
+            )
+            if (
+                os.lstat(receipt_path).st_size
+                > MAX_CARD_SIDECAR_WRITE_INTENT_BYTES
+            ):
+                raise ValueError("Card sidecar recovery receipt exceeds its byte limit")
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if not isinstance(receipt, dict):
+                raise ValueError("Card sidecar recovery receipt must be an object")
+            intent_id = str(receipt.get("intent_id") or "")
+            card_id = str(receipt.get("card_id") or "")
+            target_uri = str(receipt.get("target_uri") or "")
+            state_hash = str(receipt.get("expected_state_hash") or "")
+            mode = str(receipt.get("mode") or "")
+            status = str(receipt.get("status") or "")
+            attempt_id = str(receipt.get("attempt_id") or "")
+            expected_intent_id = stable_id(
+                "card_sidecar_write_intent",
+                mode,
+                card_id,
+                target_uri,
+                state_hash,
+                attempt_id,
+            )
+            target_path = resolve_stored_uri(root, target_uri)
+            default_path = _configured_card_sidecar_path(root, card_id)
+            selected = bool(
+                receipt.get("schema")
+                == CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA
+                and receipt.get("ok") is True
+                and (
+                    (mode == "write" and status == "adopted")
+                    or (
+                        mode == "history_transition"
+                        and status == "transition_prepared"
+                    )
+                )
+                and receipt_path.name == f"{intent_id}.json"
+                and intent_id == expected_intent_id
+                and _is_canonical_card_id(card_id)
+                and re.fullmatch(r"[0-9a-f]{64}", state_hash)
+                and re.fullmatch(
+                    r"card_sidecar_attempt_\d{8}T\d{6}Z_[0-9a-f]{16}",
+                    attempt_id,
+                )
+                and target_uri == continuum_uri(root, target_path)
+                and target_path.name.casefold() in included_names
+                and _is_managed_card_sidecar_path(
+                    default_path,
+                    target_path,
+                    card_id=card_id,
+                )
+            )
+            _assert_card_sidecar_state_dir_unchanged(receipt_state)
+            if (
+                _plain_card_sidecar_state_path_identity(
+                    receipt_path,
+                    directory=False,
+                )
+                != receipt_identity
+            ):
+                raise ValueError(
+                    "Card sidecar recovery receipt changed during snapshot selection"
+                )
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"snapshot preflight failed: invalid Card sidecar receipt: {receipt_path}: {exc}"
+            ) from exc
+        if not selected:
+            continue
+        secure_copy_file(receipt_path, destination / receipt_path.name)
+        copied += 1
+    if stream_audit["unsafe_card_sidecar_recovery_paths"]:
+        raise ValueError(
+            "snapshot preflight failed: Card sidecar receipts could not be enumerated"
+        )
+    return copied
+
+
 def _cleanup_snapshot_staging(root: Path, staged_root: Path) -> None:
     try:
         staged_root.resolve(strict=False).relative_to((root / "snapshots").resolve(strict=False))
@@ -16698,8 +20352,14 @@ def _cleanup_uncommitted_snapshot_outputs(
     *,
     snapshot_path: Path,
     card_sidecars_path: Path,
+    card_sidecar_receipts_path: Path,
     review_bridge_jobs_path: Path,
 ) -> None:
+    _cleanup_snapshot_output_tree(
+        root,
+        card_sidecar_receipts_path,
+        name_prefix="continuum_card_sidecar_receipts_",
+    )
     _cleanup_snapshot_output_tree(
         root,
         review_bridge_jobs_path,
@@ -16755,9 +20415,18 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     source_db = root / "catalog" / "catalog.sqlite3"
     snapshot_id = unique_id("snapshot")
     out_path = root / "snapshots" / f"continuum_catalog_{snapshot_id}.sqlite3"
-    probe_sidecar = card_sidecar_path(root, "__probe__")
-    cards_source = probe_sidecar.parent if probe_sidecar is not None else root / "catalog" / "cards"
+    snapshot_config = load_config(root)
+    snapshot_atomic_config = dict(snapshot_config.get("atomic_memory", {}))
+    cards_source = _configured_card_sidecar_dir(
+        root,
+        atomic_config=snapshot_atomic_config,
+    )
+    card_sidecars_write_enabled = bool(
+        snapshot_atomic_config.get("write_card_sidecars", True)
+    )
     cards_out = root / "snapshots" / f"continuum_cards_{snapshot_id}"
+    sidecar_receipts_source = _card_sidecar_recovery_receipt_dir(root)
+    sidecar_receipts_out = snapshot_card_sidecar_receipts_path(out_path)
     review_jobs_source = root / "exports" / "review_bridge" / "jobs"
     review_jobs_out = snapshot_review_bridge_jobs_path(out_path)
     alias_key_source = _partition_alias_key_path(root)
@@ -16765,11 +20434,13 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     staged_root = root / "snapshots" / f".staging_{snapshot_id}"
     staged_db = staged_root / "catalog" / "catalog.sqlite3"
     staged_cards_out = _snapshot_staged_sidecars_path(root, staged_root, cards_source)
+    staged_sidecar_receipts = _card_sidecar_recovery_receipt_dir(staged_root)
     staged_review_jobs = staged_root / "exports" / "review_bridge" / "jobs"
     staged_alias_key = _partition_alias_key_path(staged_root)
     out_uri = continuum_uri(root, out_path)
     source_db_uri = continuum_uri(root, source_db)
     cards_out_uri = continuum_uri(root, cards_out)
+    sidecar_receipts_out_uri = continuum_uri(root, sidecar_receipts_out)
     review_jobs_out_uri = continuum_uri(root, review_jobs_out)
     snapshot_catalog_committed = False
     try:
@@ -16781,11 +20452,11 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 "snapshot preflight failed: immutable artifact ledger is not clean: "
                 f"{artifact_ledger}"
             )
+        if os.path.lexists(cards_source):
+            _raise_if_snapshot_source_has_link_like_path(cards_source)
         semantic_integrity = semantic_integrity_report(root, create=False, conn=conn)
         if not semantic_integrity.get("ok"):
             raise ValueError(f"snapshot preflight failed: semantic integrity is not clean: {semantic_integrity.get('failing')}")
-        if cards_source.exists():
-            _raise_if_snapshot_source_has_link_like_path(cards_source)
         if review_jobs_source.exists():
             if not review_jobs_source.is_dir():
                 raise ValueError(
@@ -16808,8 +20479,42 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
         secure_sqlite_files(staged_db)
         card_sidecar_count = 0
         if cards_source.exists():
-            secure_copytree(cards_source, staged_cards_out, dirs_exist_ok=True, symlinks=False)
-            card_sidecar_count = sum(1 for item in staged_cards_out.glob("*.yaml"))
+            secure_mkdir(staged_cards_out, secure_existing=True)
+            for source_sidecar in sorted(cards_source.iterdir()):
+                if (
+                    source_sidecar.name.casefold().endswith(".yaml")
+                ):
+                    if not source_sidecar.is_file():
+                        raise ValueError(
+                            "snapshot preflight failed: Card sidecar is not a regular file: "
+                            f"{source_sidecar}"
+                        )
+                    secure_copy_file(
+                        source_sidecar,
+                        staged_cards_out / source_sidecar.name,
+                    )
+                    continue
+                if re.fullmatch(
+                    r"\..+\.card_sidecar_write_intent_[0-9a-f]{24}\.uncommitted",
+                    source_sidecar.name,
+                ):
+                    _plain_card_sidecar_state_path_identity(
+                        source_sidecar,
+                        directory=False,
+                    )
+                    continue
+                raise ValueError(
+                    "snapshot preflight failed: unsupported Card sidecar tree entry: "
+                    f"{source_sidecar}"
+                )
+            card_sidecar_count = len(_sidecar_hashes(staged_cards_out))
+        card_sidecar_receipt_count = (
+            _copy_snapshot_card_sidecar_history_receipts(
+                root,
+                copied_sidecars=staged_cards_out,
+                destination=staged_sidecar_receipts,
+            )
+        )
         if review_jobs_source.exists():
             secure_copytree(
                 review_jobs_source,
@@ -16846,6 +20551,7 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
         secure_sqlite_files(out_path)
         if staged_cards_out.exists():
             staged_cards_out.rename(cards_out)
+        staged_sidecar_receipts.rename(sidecar_receipts_out)
         staged_review_jobs.rename(review_jobs_out)
         if staged_alias_key.exists():
             os.replace(staged_alias_key, alias_key_out)
@@ -16860,12 +20566,18 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
             card_sidecars_path=cards_out if cards_out.exists() else None,
             alias_key_path=copied_alias_key_path,
             card_sidecars_source_path=cards_source,
+            card_sidecars_write_enabled=card_sidecars_write_enabled,
+            card_sidecar_receipts_path=sidecar_receipts_out,
+            card_sidecar_receipts_source_path=sidecar_receipts_source,
             review_bridge_jobs_path=review_jobs_out,
             review_bridge_jobs_source_path=review_jobs_source,
             semantic_integrity=snapshot_semantic_integrity,
         )
         written_manifest = load_snapshot_manifest(out_path)
         review_jobs_binding = dict(written_manifest["review_bridge_jobs"])
+        sidecar_receipts_binding = dict(
+            written_manifest["card_sidecar_receipts"]
+        )
         now = utc_now()
         snapshot_hash = file_sha256(out_path)
         manifest_uri = continuum_uri(root, manifest_path)
@@ -16900,6 +20612,11 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 "snapshot_uri": out_uri,
                 "card_sidecars_uri": cards_out_uri,
                 "card_sidecar_count": card_sidecar_count,
+                "card_sidecar_receipts_uri": sidecar_receipts_out_uri,
+                "card_sidecar_receipt_count": card_sidecar_receipt_count,
+                "card_sidecar_receipts_tree_sha256": sidecar_receipts_binding[
+                    "tree_sha256"
+                ],
                 "review_bridge_jobs_uri": review_jobs_out_uri,
                 "review_bridge_jobs_file_count": review_jobs_binding["file_count"],
                 "review_bridge_jobs_directory_count": review_jobs_binding["directory_count"],
@@ -16918,6 +20635,11 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
             "source_db_uri": str(source_db),
             "card_sidecars_uri": str(cards_out),
             "card_sidecar_count": card_sidecar_count,
+            "card_sidecar_receipts_uri": str(sidecar_receipts_out),
+            "card_sidecar_receipt_count": card_sidecar_receipt_count,
+            "card_sidecar_receipts_tree_sha256": sidecar_receipts_binding[
+                "tree_sha256"
+            ],
             "review_bridge_jobs_uri": str(review_jobs_out),
             "review_bridge_jobs_file_count": review_jobs_binding["file_count"],
             "review_bridge_jobs_directory_count": review_jobs_binding["directory_count"],
@@ -16932,6 +20654,7 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 root,
                 snapshot_path=out_path,
                 card_sidecars_path=cards_out,
+                card_sidecar_receipts_path=sidecar_receipts_out,
                 review_bridge_jobs_path=review_jobs_out,
             )
         raise

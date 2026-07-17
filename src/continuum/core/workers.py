@@ -25,11 +25,11 @@ from .store import (
     add_graph_edge,
     audit_event,
     canonical_partition_identifier,
-    card_sidecar_path,
     connect,
     connect_existing,
     content_hash,
     continuum_uri,
+    current_card_sidecar_path,
     enqueue_job,
     extract_terms,
     file_sha256,
@@ -39,6 +39,8 @@ from .store import (
     json_loads,
     mark_card_sidecar_outbox,
     NON_CURRENT_CARD_STATUSES,
+    reconcile_card_sidecar_write_intents,
+    register_card_sidecar_compensation_intents,
     refresh_graph_edge_aggregate,
     resolve_stored_uri,
     roll_scroll_segment,
@@ -73,6 +75,8 @@ _WORKER_SERVICE_ROOTS: set[str] = set()
 _WORKER_SERVICE_ROOTS_GUARD = threading.Lock()
 _WORKER_EFFECT_ACTION = "worker_job_effect_committed"
 _WORKER_EFFECT_SCHEMA = "continuum.worker_job_effect.v1"
+_SIDECAR_WORKER_PHASE_ACTION = "worker_card_sidecar_phase_committed"
+_SIDECAR_WORKER_PHASE_SCHEMA = "continuum.worker_card_sidecar_phase.v1"
 _SCRIBE_STEP_ACTION = "worker_scribe_segment_step_intent"
 _SCRIBE_STEP_COMMITTED_ACTION = "worker_scribe_segment_step_committed"
 
@@ -413,6 +417,64 @@ def _begin_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None
     return _prior_worker_effect(conn, lease)
 
 
+def _commit_sidecar_worker_phase(
+    conn,
+    lease: _JobLease | None,
+    *,
+    result: dict[str, Any],
+    phase: str,
+    terminal: bool,
+) -> None:
+    """Fence and durably bind each sidecar-worker database commit."""
+
+    if lease is not None:
+        if not lease.renew_in_transaction(conn):
+            raise RuntimeError("worker lease lost before committing job effects")
+        if terminal:
+            _record_worker_effect(
+                conn,
+                lease,
+                job_type="sync_card_sidecar",
+                result=result,
+            )
+        else:
+            lease.assert_owned(conn)
+            audit_event(
+                conn,
+                action=_SIDECAR_WORKER_PHASE_ACTION,
+                target_type="queue_job",
+                target_id=lease.job_id,
+                payload={
+                    "schema": _SIDECAR_WORKER_PHASE_SCHEMA,
+                    "job_type": "sync_card_sidecar",
+                    "phase": phase,
+                    "result": result,
+                },
+            )
+    conn.commit()
+
+
+def _reconcile_sidecar_worker_intents(root: Path, card_id: str) -> dict[str, Any]:
+    """Convert transient reconciliation exceptions into durable retry state."""
+
+    try:
+        return reconcile_card_sidecar_write_intents(
+            root,
+            card_ids=[card_id],
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {str(exc)[:512]}"
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 1,
+            "failures": [{"card_id": card_id, "error": error}],
+            "results": [],
+            "raised": True,
+            "error": error,
+        }
+
+
 def _record_scribe_step_intent(
     root: Path,
     lease: _JobLease | None,
@@ -529,33 +591,41 @@ def _committed_scribe_steps(
     committed: list[dict[str, Any]] = []
     seen_segments: set[str] = set()
     max_batch_number = 0
-    for row in rows:
-        payload = json_loads(row["payload_json"], {})
-        if not isinstance(payload, dict):
-            continue
-        step_result = payload.get("result")
-        if not isinstance(step_result, dict):
-            continue
-        segment_id = str(step_result.get("segment_id") or "")
-        if not segment_id or segment_id in seen_segments:
-            continue
-        seen_segments.add(segment_id)
-        materialized = dict(step_result)
-        card_id = str(materialized.get("card_id") or "")
-        sidecar_path = card_sidecar_path(root, card_id) if card_id else None
-        materialized["card_uri"] = (
-            str(sidecar_path)
-            if sidecar_path is not None and sidecar_path.exists()
-            else None
-        )
-        committed.append(materialized)
-        try:
-            max_batch_number = max(
-                max_batch_number,
-                int(payload.get("batch_number") or 0),
+    location_conn = connect_existing(root)
+    try:
+        for row in rows:
+            payload = json_loads(row["payload_json"], {})
+            if not isinstance(payload, dict):
+                continue
+            step_result = payload.get("result")
+            if not isinstance(step_result, dict):
+                continue
+            segment_id = str(step_result.get("segment_id") or "")
+            if not segment_id or segment_id in seen_segments:
+                continue
+            seen_segments.add(segment_id)
+            materialized = dict(step_result)
+            card_id = str(materialized.get("card_id") or "")
+            sidecar_path = (
+                current_card_sidecar_path(root, location_conn, card_id)
+                if card_id
+                else None
             )
-        except (TypeError, ValueError):
-            pass
+            materialized["card_uri"] = (
+                str(sidecar_path)
+                if sidecar_path is not None and sidecar_path.exists()
+                else None
+            )
+            committed.append(materialized)
+            try:
+                max_batch_number = max(
+                    max_batch_number,
+                    int(payload.get("batch_number") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+    finally:
+        location_conn.close()
     return committed, max_batch_number
 
 
@@ -610,6 +680,41 @@ def _finish_owned_job(
         raise RuntimeError("worker lease lost before job finish")
     if not _finish_job(conn, job_id, status=status, result=result, error=error, lease_owner=lease_owner):
         raise RuntimeError("worker lease lost before job finish")
+
+
+def _retry_owned_job(
+    conn,
+    job_id: str,
+    *,
+    lease_owner: str,
+    lease_seconds: int,
+    result: dict[str, Any],
+) -> None:
+    """Release an owned lease back to pending without recording a failure."""
+
+    if not _heartbeat_job(conn, job_id, lease_owner=lease_owner, lease_seconds=lease_seconds):
+        raise RuntimeError("worker lease lost before job retry")
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        UPDATE queue_jobs
+        SET status = ?, finished_at = NULL, updated_at = ?, error_json = ?,
+            lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
+        WHERE id = ? AND status = ? AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+        """,
+        (
+            PENDING_JOB_STATUS,
+            now,
+            json_dumps({"error": None, "result": result, "retry_pending": True}),
+            job_id,
+            ACTIVE_JOB_STATUS,
+            lease_owner,
+            now,
+        ),
+    )
+    if int(cursor.rowcount or 0) != 1:
+        raise RuntimeError("worker lease lost before job retry")
 
 
 def _bounded_reconcile_limit(value: int, *, field: str) -> int:
@@ -4013,12 +4118,56 @@ def _prune_memory_match_sql(topic: str | None) -> tuple[str, tuple[str, ...]]:
     )
 
 
+def _validated_sidecar_compensation_cas_rows(
+    result: dict[str, Any],
+    *,
+    card_ids: list[str],
+) -> dict[str, dict[str, Any]] | None:
+    """Validate transaction-bound sidecar fields returned by the sync layer."""
+
+    if result.get("compensation_cas_complete") is not True:
+        return None
+    raw_rows = result.get("compensation_cas_rows")
+    if not isinstance(raw_rows, list) or len(raw_rows) != len(card_ids):
+        return None
+    expected_ids = set(card_ids)
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            return None
+        card_id = raw_row.get("card_id")
+        location_uri = raw_row.get("location_uri")
+        sidecar_generation = raw_row.get("sidecar_generation")
+        if (
+            not isinstance(card_id, str)
+            or card_id not in expected_ids
+            or card_id in rows_by_id
+            or (location_uri is not None and not isinstance(location_uri, str))
+            or (
+                sidecar_generation is not None
+                and (
+                    not isinstance(sidecar_generation, str)
+                    or not sidecar_generation
+                )
+            )
+        ):
+            return None
+        rows_by_id[card_id] = {
+            "location_uri": location_uri,
+            "sidecar_generation": sidecar_generation,
+        }
+    if set(rows_by_id) != expected_ids:
+        return None
+    return rows_by_id
+
+
 def _restore_prune_memory_rows(
     root: Path,
     original_rows: list[dict[str, Any]],
     *,
     expected_rows: list[dict[str, Any]],
     failure_reason: str,
+    cleanup_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     card_ids = [str(row["id"]) for row in original_rows]
     original_by_id = {str(row["id"]): row for row in original_rows}
@@ -4057,6 +4206,11 @@ def _restore_prune_memory_rows(
                 "reason": "Card state changed after prune commit",
             }
 
+        registered_cleanup_intents = register_card_sidecar_compensation_intents(
+            root,
+            cleanup_candidates or [],
+        )
+
         for card_id in card_ids:
             row = original_by_id[card_id]
             restored = conn.execute(
@@ -4092,12 +4246,23 @@ def _restore_prune_memory_rows(
         conn.close()
 
     sidecar_sync = sync_card_sidecars_after_commit(root, card_ids)
+    cleanup_reconciliation = reconcile_card_sidecar_write_intents(
+        root,
+        card_ids=card_ids,
+    )
     semantic_integrity = semantic_integrity_report(root, create=False)
     return {
-        "ok": bool(sidecar_sync.get("ok")) and bool(semantic_integrity.get("ok")),
+        "ok": (
+            bool(sidecar_sync.get("ok"))
+            and bool(cleanup_reconciliation.get("ok"))
+            and not cleanup_reconciliation.get("pending")
+            and bool(semantic_integrity.get("ok"))
+        ),
         "restored": True,
         "cas_mismatch_card_ids": [],
         "sidecar_sync": sidecar_sync,
+        "registered_cleanup_intents": registered_cleanup_intents,
+        "cleanup_reconciliation": cleanup_reconciliation,
         "semantic_integrity": semantic_integrity,
     }
 
@@ -4289,6 +4454,10 @@ def prune_memory(
             ],
             "raised": True,
         }
+    post_sync_sidecar_rows = _validated_sidecar_compensation_cas_rows(
+        sidecar_sync,
+        card_ids=eligible_ids,
+    )
     try:
         postflight_integrity = semantic_integrity_report(root, create=False)
     except Exception as exc:
@@ -4308,34 +4477,41 @@ def prune_memory(
                 f"{postflight_integrity.get('failing')}"
             )
         failure_reason = "; ".join(failure_reasons)
-        failed_sidecar_ids = {
-            str(failure.get("card_id"))
-            for failure in sidecar_sync.get("failures", [])
-            if failure.get("card_id")
-        }
-        unknown_sidecar_failure = not sidecar_sync.get("ok") and not failed_sidecar_ids
-        expected_rows: list[dict[str, Any]] = []
-        for applied in applied_rows:
-            expected = dict(applied)
-            card_id = str(expected["id"])
-            sidecar_failed = unknown_sidecar_failure or card_id in failed_sidecar_ids
-            if not sidecar_failed:
-                sidecar_path = card_sidecar_path(root, card_id)
-                if sidecar_path is not None:
-                    expected["location_uri"] = continuum_uri(root, sidecar_path)
-                expected["sidecar_generation"] = None
-            expected_rows.append(expected)
-        rollback_result = _restore_prune_memory_rows(
-            root,
-            original_rows,
-            expected_rows=expected_rows,
-            failure_reason=failure_reason,
-        )
+        if post_sync_sidecar_rows is None:
+            rollback_result = {
+                "ok": False,
+                "restored": False,
+                "cas_mismatch_card_ids": [],
+                "reason": "sidecar compensation CAS evidence unavailable",
+            }
+        else:
+            expected_rows: list[dict[str, Any]] = []
+            for applied in applied_rows:
+                expected = dict(applied)
+                card_id = str(expected["id"])
+                post_sync = post_sync_sidecar_rows[card_id]
+                expected["location_uri"] = post_sync["location_uri"]
+                expected["sidecar_generation"] = post_sync["sidecar_generation"]
+                expected_rows.append(expected)
+            rollback_result = _restore_prune_memory_rows(
+                root,
+                original_rows,
+                expected_rows=expected_rows,
+                failure_reason=failure_reason,
+                cleanup_candidates=list(
+                    sidecar_sync.get("generated_sidecar_candidates", [])
+                ),
+            )
         if rollback_result.get("ok"):
             rollback_message = "Card mutations were rolled back"
         elif rollback_result.get("restored"):
             rollback_message = (
                 "Card mutations were restored, but rollback verification did not complete"
+            )
+        elif rollback_result.get("reason") == "sidecar compensation CAS evidence unavailable":
+            rollback_message = (
+                "Card mutations were not rolled back because transaction-bound "
+                "sidecar compensation evidence was unavailable"
             )
         else:
             rollback_message = (
@@ -4357,30 +4533,103 @@ def prune_memory(
 def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
     conn = connect(root)
     lease = _CURRENT_JOB_LEASE.get()
+    write_observation: dict[str, Any] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
         if prior is not None:
             conn.commit()
+            reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
+            prior["intent_reconciliation"] = reconciliation
+            reconciliation_clean = bool(reconciliation.get("ok")) and int(
+                reconciliation.get("pending", 0)
+            ) == 0
+            if not reconciliation_clean:
+                prior["ok"] = False
+                conn.execute("BEGIN IMMEDIATE")
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="intent_reconciliation_incomplete",
+                )
+                _commit_sidecar_worker_phase(
+                    conn,
+                    lease,
+                    result=prior,
+                    phase="reconciliation_deferred",
+                    terminal=False,
+                )
             return prior
-        location_uri = sync_card_sidecar(root, conn, card_id)
+        location_uri = sync_card_sidecar(
+            root,
+            conn,
+            card_id,
+            write_observation=write_observation,
+        )
         if location_uri is None:
+            card_row = conn.execute(
+                "SELECT location_uri FROM cards WHERE id = ?",
+                (card_id,),
+            ).fetchone()
+            card_exists = card_row is not None
+            unmaterialized = bool(
+                card_row is not None and not card_row["location_uri"]
+            )
+            reason = "sidecars_disabled" if card_exists else "card_missing"
+            if unmaterialized:
+                reason = "sidecars_disabled_unmaterialized"
             audit_event(
                 conn,
                 action="card_sidecar_sync_skipped",
                 target_type="card",
                 target_id=card_id,
-                payload={"reason": "card_missing_or_sidecars_disabled"},
+                payload={"reason": reason},
             )
-            conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
-            result = {"ok": False, "reason": "card_missing_or_sidecars_disabled", "card_id": card_id}
-            _record_worker_effect(
+            if card_exists and not unmaterialized:
+                if conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone() is None:
+                    mark_card_sidecar_outbox(
+                        conn,
+                        [card_id],
+                        reason="sidecars_disabled",
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE card_sidecar_outbox
+                        SET attempt_count = attempt_count + 1,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE card_id = ?
+                        """,
+                        ("Card sidecar materialization is disabled", utc_now(), card_id),
+                    )
+            else:
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+            result = {
+                "ok": bool(unmaterialized),
+                "reason": reason,
+                "card_id": card_id,
+            }
+            terminal = not card_exists or unmaterialized
+            if not terminal:
+                result["retry_pending"] = True
+            _commit_sidecar_worker_phase(
                 conn,
                 lease,
-                job_type="sync_card_sidecar",
                 result=result,
+                phase=(
+                    "sidecar_not_required"
+                    if terminal
+                    else "sidecars_disabled_retry_pending"
+                ),
+                terminal=terminal,
             )
-            conn.commit()
             return result
         audit_event(
             conn,
@@ -4391,13 +4640,54 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
         )
         conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
         result = {"ok": True, "card_id": card_id, "location_uri": location_uri}
-        _record_worker_effect(
+        _commit_sidecar_worker_phase(
             conn,
             lease,
-            job_type="sync_card_sidecar",
             result=result,
+            phase="materialized_pending_reconciliation",
+            terminal=False,
         )
-        conn.commit()
+        reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
+        result["intent_reconciliation"] = reconciliation
+        reconciliation_clean = bool(reconciliation.get("ok")) and int(
+            reconciliation.get("pending", 0)
+        ) == 0
+        if not reconciliation_clean:
+            result["ok"] = False
+            result["reason"] = "intent_reconciliation_incomplete"
+            result["retry_pending"] = True
+            conn.execute("BEGIN IMMEDIATE")
+            mark_card_sidecar_outbox(
+                conn,
+                [card_id],
+                reason="intent_reconciliation_incomplete",
+            )
+            audit_event(
+                conn,
+                action="card_sidecar_intent_reconciliation_incomplete",
+                target_type="card",
+                target_id=card_id,
+                payload={
+                    "pending": int(reconciliation.get("pending", 0)),
+                    "failure_count": len(reconciliation.get("failures", [])),
+                },
+            )
+            _commit_sidecar_worker_phase(
+                conn,
+                lease,
+                result=result,
+                phase="reconciliation_deferred",
+                terminal=False,
+            )
+            return result
+        conn.execute("BEGIN IMMEDIATE")
+        _commit_sidecar_worker_phase(
+            conn,
+            lease,
+            result=result,
+            phase="complete",
+            terminal=True,
+        )
         return result
     except Exception:
         if conn.in_transaction:
@@ -4505,22 +4795,42 @@ def run_worker_pass(
                 result = _process_job(root, job)
             renewer.stop()
             job_ok = bool(result.get("ok", True))
-            job_status = "skipped" if result.get("skipped") else ("succeeded" if job_ok else "failed")
+            retry_pending = bool(result.get("retry_pending"))
+            job_status = (
+                "pending"
+                if retry_pending
+                else "skipped"
+                if result.get("skipped")
+                else "succeeded"
+                if job_ok
+                else "failed"
+            )
             conn = connect(root)
             try:
-                _finish_owned_job(
-                    conn,
-                    job["id"],
-                    lease_owner=worker_id,
-                    lease_seconds=lease_seconds,
-                    status=job_status,
-                    result=result,
-                    error=None if job_ok else str(result.get("reason") or result.get("error") or "worker result reported ok=false"),
-                )
+                if retry_pending:
+                    _retry_owned_job(
+                        conn,
+                        job["id"],
+                        lease_owner=worker_id,
+                        lease_seconds=lease_seconds,
+                        result=result,
+                    )
+                else:
+                    _finish_owned_job(
+                        conn,
+                        job["id"],
+                        lease_owner=worker_id,
+                        lease_seconds=lease_seconds,
+                        status=job_status,
+                        result=result,
+                        error=None if job_ok else str(result.get("reason") or result.get("error") or "worker result reported ok=false"),
+                    )
                 conn.commit()
             finally:
                 conn.close()
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "status": job_status, "ok": job_ok, "result": result})
+            if retry_pending:
+                break
         except Exception as exc:
             renewer.stop()
             conn = connect(root)

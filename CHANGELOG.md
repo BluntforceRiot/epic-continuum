@@ -212,10 +212,31 @@
 - Added background lease renewal for every queue job type plus unexpired-owner
   commit fencing and durable per-job effect receipts. Reclaimed or replayed jobs
   cannot duplicate database-visible effects. Card sidecar snapshot, atomic file
-  replacement, and generation-specific outbox acknowledgement are serialized so
-  a process exit after replacement cannot let an older writer overtake newer
-  Card state. Scribe frontier reads, segment/Card writes, roll audit emission,
-  and per-segment committed-step receipts now share one lease-fenced writer
+  replacement, and generation-specific outbox acknowledgement are serialized.
+  Immutable artifact-bound sidecars are never overwritten: current state follows
+  `cards.location_uri` through `<card>.yaml`, `<card>.live.yaml`, and then
+  `<card>.live-<state_hash>.yaml` generations. Every newly created target has a
+  unique durable pre-write intent and a terminal recovery receipt; interrupted,
+  uncommitted bytes are preserved under a receipted `.uncommitted` quarantine,
+  while incomplete reconciliation stays pending and non-successful. Snapshot
+  manifests now bind the exact committed top-level sidecar inventory, exclude
+  recovery quarantines, and bind the configured directory plus snapshot-time
+  write policy. Restore drills compare the copied tree only after all durable
+  overlays and nested recovery work. Hash-named generations are
+  content-addressed before artifact binding; only exact adopted-write or
+  prepared-transition receipts let detached generations remain as
+  non-authoritative history. Snapshot/manifest/restore pairs now preserve the
+  required receipt subset, including compatibility transitions for legacy
+  receiptless current hashes. Disabled
+  never-materialized Cards no longer strand snapshot-blocking outbox work and
+  are backfilled when writes are enabled again. Physical path authority requires
+  a stable regular no-follow namespace entry plus object/file identity; cached
+  Card, artifact, receipt, verifier, and audit identities are rechecked before
+  they can bind later work. A case-renamed current hash receives an exact-spelling
+  transition receipt before detachment so its snapshot remains portable, and
+  active intent scans retain only a bounded cap-plus-sentinel set.
+  Scribe frontier reads, segment/Card writes, roll audit emission, and
+  per-segment committed-step receipts now share one lease-fenced writer
   transaction, including when an expired attempt overlaps its reclaimed
   successor; a replay reconstructs the final job receipt from those steps.
   Bounded MemPalace review batches use an indexed `LIMIT + 1` window, report

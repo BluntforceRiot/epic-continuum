@@ -46,6 +46,27 @@ Existing snapshot-backed proof packs remain valid and verify unchanged.
 Operators should keep periodic explicit snapshots even when routine operations
 use state-manifest mode.
 
+### Card sidecar snapshot binding
+
+Snapshot manifests inventory every committed top-level Card sidecar by exact
+name, size, and SHA-256, and snapshot creation refuses link-like or unsupported
+tree entries. A valid, receipted `.uncommitted` recovery quarantine remains in
+the live root but is not copied as committed Card state. Restore drills rehash
+the copied sidecar tree and compare it exactly with the manifest. Semantic
+verification separately rejects unresolved write intents and missing,
+malformed, mismatched, or unreceipted recovery evidence, so exclusion cannot
+silently discard an interrupted write.
+
+The manifest also binds the snapshot-time sidecar source directory and
+`write_card_sidecars` policy. Restore reapplies both and performs its final
+sidecar inventory only after every durable overlay and recovery probe has
+finished, so a later live file or nested drill output cannot escape comparison.
+Snapshots also carry a manifest-bound sibling tree containing only the validated
+history receipts needed by included detached hash generations. Restore places
+that exact pair before semantic verification and compares it again after the
+drill, while retention and failed-publication cleanup remove the pair with its
+catalog snapshot.
+
 Applied pruning and legacy-secret redaction force snapshot proof mode through
 both CLI and MCP entry points. MemPalace import already creates a dedicated full
 catalog backup and binds it into the import proof. Routine append, worker, and

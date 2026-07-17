@@ -205,6 +205,25 @@ root-relative paths. Absolute, drive-qualified, UNC, and parent-traversing paths
 are rejected, and existing link-like components may not resolve outside the
 Continuum root.
 
+The configured Card directory can contain multiple immutable generations for
+one Card. `cards.location_uri` selects the current generation; operators should
+not assume `<card>.yaml` is current. Do not manually delete `.uncommitted`
+recovery files or their JSON recovery receipts. They are paired evidence used
+by semantic verification and safe reconciliation. Setting
+`atomic_memory.write_card_sidecars` to false stops new materialization but does
+not erase or exempt already-recorded sidecars from integrity checks; refresh
+work for an existing location remains pending until writes are enabled again.
+A Card created while writes are disabled has no promised sidecar and does not
+block snapshots. When writes are enabled later, pending synchronization
+backfills every such null-location Card before semantic and snapshot checks.
+Card ids used for sidecars are restricted to one portable filename component;
+path traversal, Windows device names, and link/`..` parent aliases are refused.
+Managed sidecar basenames use one portable case-insensitive grammar so a frozen
+Windows snapshot remains readable on a case-sensitive host. This never folds or
+aliases the parent directory. Casefold-colliding Card ids or sidecar filenames
+are ambiguous for portable handoff, fail semantic verification, and block a
+snapshot before it can be sealed.
+
 `security.ignore_file` defaults to `.continuumignore`. `ingest_file` combines
 built-in ignore rules with patterns from that file and refuses ignored paths such
 as `.env`, private keys, virtual environments, `node_modules`, and `.git`.

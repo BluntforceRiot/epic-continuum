@@ -67,9 +67,34 @@ Hermes and other agent shells can use this as an interchange format:
 - The core package includes a minimal reader for the deterministic YAML subset
   it emits, so sidecars can be audited, diffed, and used as portable evidence
   without a separate YAML runtime.
-- Lifecycle workers rewrite sidecars after committed placement, recall, and
-  pruning changes so the sidecar reflects current durable Card state rather than
-  only creation state.
+- Lifecycle workers refresh sidecars after committed placement, recall, and
+  pruning changes. A mutable current sidecar may be replaced atomically, but an
+  artifact-bound immutable sidecar is retained and the new state is written to
+  `<card>.live.yaml` or `<card>.live-<state_hash>.yaml`. Consumers must follow
+  the Card row's `location_uri`; `<card>.yaml` can be a historical generation.
+  A hash-suffixed filename is content-addressed and is never overwritten with a
+  different state, even before artifact registration. Detached hash-named bytes
+  remain non-authoritative history only when an adopted-write or
+  prepared-transition receipt and the independently parsed payload bind the
+  same managed path and state hash. Snapshot pairs carry those receipts with the
+  sidecars that require them.
+- Managed sidecar basenames and receipt targets use the same case-insensitive
+  portable grammar on every runtime, but parent-directory identity remains
+  native and exact. Casefold-colliding Card ids or filenames are rejected rather
+  than selected arbitrarily, so a Windows-created snapshot can be verified and
+  restored on a case-sensitive host without weakening path confinement. The
+  actual directory-entry spelling is recorded before a hash generation is
+  detached; a case-only rename therefore receives a prepared-transition receipt
+  whose URI remains exact after copying to a case-sensitive host.
+- A managed leaf must remain the same regular, no-follow namespace entry while
+  it is indexed, read, hashed, classified, or bound to a receipt. Symlinks,
+  junctions, reparse points, non-files, and entries replaced across those
+  boundaries do not inherit authority from their targets.
+- Each newly created sidecar target is preceded by a unique durable intent and is
+  closed by a recovery receipt. A process interruption cannot silently bless
+  uncommitted bytes: reconciliation either adopts the catalog-bound state,
+  leaves retry authority pending, or preserves the bytes in a receipted
+  `.uncommitted` quarantine.
 - A damaged SQLite catalog is recovered from snapshots and bundles today.
   Sidecar-driven catalog rebuild/import is an explicit tool boundary, not an
   implied automatic recovery path.

@@ -19,10 +19,26 @@ transactions re-check the unexpired owner token before committing and write a
 versioned effect receipt in the same transaction. If a process stops after that
 commit but before finishing the queue row, the reclaimed job returns the prior
 receipt instead of repeating database-visible work. Card sidecar synchronization
-holds a per-Card SQLite writer lock across the durable snapshot, atomic file
-replacement, and generation-specific outbox acknowledgement. A process exit
-after replacement therefore cannot allow an older writer to overtake a newer
-Card update. Each Scribe segment also holds one writer transaction from its
+serializes the Card snapshot and generation-specific outbox acknowledgement in
+one SQLite writer transaction. Before creating a new physical target it writes
+a unique durable intent, chooses a copy-on-write generation when the prior path
+is artifact-bound, atomically writes the YAML, and commits the catalog-selected
+`location_uri`. Post-commit reconciliation emits a terminal receipt. It adopts
+only bytes bound to the committed Card, preserves immutable bytes, quarantines
+uncommitted bytes without deleting them, and requeues any incomplete result.
+Disabling future sidecar writes leaves existing locations readable and pending
+refresh work unacknowledged until writes are re-enabled. Cards that never had a
+sidecar are intentional skips while disabled and are backfilled by pending sync
+after re-enable. Hash-suffixed generations are immutable by content-addressed
+name even before artifact registration; moving to a later state selects a new
+hash name. Detached generations remain non-authoritative and audit-clean only
+when a validated adopted-write or prepared-transition receipt binds the exact
+path and hash. A legacy current hash without such evidence receives a durable
+transition receipt before detachment. A case-renamed current hash likewise gets
+an exact-spelling transition receipt so a copied snapshot remains self-contained
+on a case-sensitive host. A missing, changed, linked, or unreferenced target
+leaves the intent unresolved instead of emitting a self-invalid receipt. Each
+Scribe segment also holds one writer transaction from its
 frontier read through its segment, Card, queue, audit effects, and committed-step
 receipt, with live ownership checked at entry and immediately before commit. If
 the process exits before the final job receipt, replay aggregates the exact

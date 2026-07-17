@@ -62,6 +62,25 @@ without this pair restores an empty jobs tree only when its frozen catalog has
 no Review Relay evidence; otherwise restore fails because the matching evidence
 cannot be reconstructed safely.
 
+The same manifest binds every committed top-level Card YAML sidecar by name,
+size, and SHA-256. Live `.uncommitted` recovery quarantines remain available for
+forensic recovery but are excluded from snapshots only when their durable intent
+and recovery receipt validate. Link-like or unsupported sidecar-tree entries are
+refused. A restore drill inventories and rehashes the copied sidecar tree after
+all durable overlays and the nested recovery probe have finished. It aligns the
+disposable root's sidecar-directory and write-enabled settings with the
+manifest-bound snapshot-time values, and requires an exact final inventory
+match before it passes even if the live root's configuration later changed.
+Legacy manifests without the write-policy field retain their historical
+behavior by using the live configuration copied into the drill.
+Managed sidecar basenames are interpreted with one portable case-insensitive
+grammar on every host; parent paths remain exact. Snapshot preflight rejects
+casefold-colliding Card ids or sidecar filenames, preventing a root that verifies
+only on its producing filesystem from being sealed for handoff. Before a
+case-renamed current hash is detached, Continuum emits a prepared-transition
+receipt using the directory entry's actual spelling; the copied receipt can then
+bind that generation without relying on source-filesystem case folding.
+
 ## Handoff Bundles
 
 `pack-root` creates a verified portable bundle. `verify-bundle` checks the archive envelope, manifest, hashes, portability, proof state, and semantic root health, including the temporal authority checks applied to snapshots and restores.
@@ -233,8 +252,27 @@ refreshed. If that post-commit refresh or the full semantic postflight fails,
 repair returns `ok: false` with `catalog_repair_committed: true`, the
 `sidecar_sync` result, and `post_repair_semantic_integrity`; the guarded CLI
 receipt is failed and explicitly records that this was not an atomic refusal.
-The durable sidecar outbox remains available for normal worker maintenance;
-after reconciliation, run strict root verification before resuming.
+The durable sidecar outbox remains available for normal worker maintenance.
+Every new target has a unique pre-write intent. Reconciliation can adopt the
+exact committed state, preserve an immutable generation, recognize a newer
+committed state, or move otherwise unbound bytes to a hashed `.uncommitted`
+quarantine. Its terminal receipt binds the attempt, target, expected state, and
+any retained recovery bytes. Missing, malformed, mismatched, or unreceipted
+recovery evidence fails semantic integrity. Incomplete reconciliation is never
+acknowledged as success: the outbox remains or is recreated for retry. After
+reconciliation, run strict root verification before resuming.
+
+Active intent discovery retains at most the configured intent ceiling plus one
+overflow sentinel before sorting. Terminal receipts are streamed separately and
+are not truncated by that active-work ceiling. A detached
+`<card>.live-<state_hash>.yaml` generation is recognized as non-authoritative
+history only when a validated v2 adopted-write or prepared-transition receipt
+binds its canonical managed target, Card id, and state hash and the file
+independently matches all three. Before a legacy receiptless current hash
+generation is detached, Continuum writes the prepared-transition intent and
+receipt; interrupted preparation remains safely reconcilable only while that
+physical path is still the Card's selected `location_uri`. It is not added to
+immutable artifact authority merely by existing.
 
 `authority_boundaries` describes the inspected pre-repair state. Preview and
 apply both disclose any additional non-direct predecessors that would be retired

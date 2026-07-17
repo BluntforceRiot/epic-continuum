@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from functools import lru_cache
@@ -127,6 +130,133 @@ def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
             pass
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def secure_write_text_exclusive(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """Durably publish a private file only when its final name is absent.
+
+    The fully written temporary file is moved into the destination namespace
+    with the platform's atomic no-replace primitive.  This is used for new
+    content-addressed names where replacing a concurrently-created entry would
+    destroy evidence that this writer never inspected.
+    """
+
+    secure_mkdir(path.parent)
+    data = text.encode(encoding)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    # Capture the file identity before any operation that can fail.  Cleanup
+    # must stay bound to the exact mkstemp entry even when chmod, write, flush,
+    # or fsync raises before publication begins.
+    metadata = os.fstat(fd)
+    tmp_identity: tuple[int, int] | None = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+    )
+    try:
+        if posix_permissions_supported(tmp_path):
+            os.fchmod(fd, PRIVATE_FILE_MODE)  # type: ignore[attr-defined]  # POSIX-only API
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            metadata = os.fstat(handle.fileno())
+            if (int(metadata.st_dev), int(metadata.st_ino)) != tmp_identity:
+                raise OSError(f"exclusive temporary identity changed: {tmp_path}")
+        fd = -1
+
+        # The destination is created in one namespace operation and an existing
+        # path is never replaced.  Refuse to claim success unless the published
+        # entry is the exact file that was flushed above.
+        replace_file_noclobber(tmp_path, path)
+        published = os.lstat(path)
+        if (int(published.st_dev), int(published.st_ino)) != tmp_identity:
+            raise OSError(f"exclusive publication identity changed: {path}")
+        _chmod(path, PRIVATE_FILE_MODE)
+        fsync_parent(path)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        # Never unlink a namespace entry that no longer denotes our temporary
+        # file.  A stale private temp is safer than deleting replacement bytes.
+        current_identity: tuple[int, int] | None
+        try:
+            current = os.lstat(tmp_path)
+            current_identity = (int(current.st_dev), int(current.st_ino))
+        except OSError:
+            current_identity = None
+        if tmp_identity is not None and current_identity == tmp_identity:
+            tmp_path.unlink(missing_ok=True)
+
+
+def replace_file_noclobber(source: Path, destination: Path) -> None:
+    """Atomically move ``source`` to an absent ``destination``.
+
+    Windows rename already has no-replace semantics.  Linux exposes the same
+    operation as ``renameat2(RENAME_NOREPLACE)``.  Refuse the operation on a
+    platform that cannot provide that primitive; copying followed by unlinking
+    would introduce both a clobber window and an identity-unbound deletion.
+    """
+
+    secure_mkdir(destination.parent)
+    if os.name == "nt":
+        os.rename(source, destination)
+    elif sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-clobber rename is unavailable",
+                str(destination),
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        at_fdcwd = -100
+        rename_noreplace = 1
+        if (
+            renameat2(
+                at_fdcwd,
+                os.fsencode(source),
+                at_fdcwd,
+                os.fsencode(destination),
+                rename_noreplace,
+            )
+            != 0
+        ):
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                str(destination),
+            )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-clobber rename is unsupported on this platform",
+            str(destination),
+        )
+    fsync_parent(destination)
 
 
 def secure_append_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:

@@ -44,7 +44,8 @@ A portable v2 sidecar representation of a single memory unit. Epic Continuum
 stores indexed truth in SQLite, then writes human-readable YAML for Cards,
 including scope, ownership, status, placement, and tier fields, so recovery tools,
 Hermes, git review, and other agents can exchange memory without needing direct
-catalog access.
+catalog access. The Card row's `location_uri` selects the current generation;
+artifact-bound historical generations remain immutable beside it.
 
 ## Thread Recovery Packet
 

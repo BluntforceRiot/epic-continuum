@@ -2995,6 +2995,284 @@ class OperationLedgerTest(unittest.TestCase):
             roll_scroll_segment(Path(result["drill_root"]), session_id="custom-sidecar", start_seq=2, end_seq=2)
             self.assertGreaterEqual(len(list((Path(result["drill_root"]) / "catalog" / "custom-cards").glob("*.yaml"))), 2)
 
+    def test_restore_drill_uses_snapshot_sidecar_directory_after_config_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            snapshot_config = load_config(root)
+            snapshot_config["atomic_memory"]["card_sidecar_dir"] = (
+                "catalog/cards-a"
+            )
+            write_config(root, snapshot_config)
+            append_scroll_event(
+                root,
+                session_id="sidecar-config-drift",
+                event_type="message",
+                role="user",
+                content="Snapshot-bound sidecars remain restorable after config drift.",
+            )
+            roll_scroll_segment(
+                root,
+                session_id="sidecar-config-drift",
+                start_seq=1,
+                end_seq=1,
+            )
+            snap = snapshot(root, reason="sidecar_config_drift")
+
+            live_config = load_config(root)
+            live_config["atomic_memory"]["card_sidecar_dir"] = "catalog/cards-b"
+            write_config(root, live_config)
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(
+                result["restored_card_sidecar_source_uri"],
+                "catalog/cards-a",
+            )
+            drill_root = Path(result["drill_root"])
+            restored_config = load_config(drill_root)
+            self.assertEqual(
+                restored_config["atomic_memory"]["card_sidecar_dir"],
+                "catalog/cards-a",
+            )
+            self.assertTrue(any((drill_root / "catalog" / "cards-a").glob("*.yaml")))
+
+    def test_restore_drill_restores_snapshot_sidecar_write_policy_after_config_drift(self) -> None:
+        for snapshot_enabled, live_enabled in ((True, False), (False, True)):
+            with self.subTest(
+                snapshot_enabled=snapshot_enabled,
+                live_enabled=live_enabled,
+            ), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                init_db(root)
+                snapshot_config = load_config(root)
+                snapshot_config["atomic_memory"][
+                    "write_card_sidecars"
+                ] = snapshot_enabled
+                write_config(root, snapshot_config)
+                if snapshot_enabled:
+                    append_scroll_event(
+                        root,
+                        session_id="sidecar-policy-snapshot",
+                        event_type="message",
+                        role="user",
+                        content="Bind the enabled sidecar policy to this snapshot.",
+                    )
+                    roll_scroll_segment(
+                        root,
+                        session_id="sidecar-policy-snapshot",
+                        start_seq=1,
+                        end_seq=1,
+                    )
+                snap = snapshot(root, reason="sidecar_write_policy_drift")
+                manifest = json.loads(
+                    snapshot_manifest_path(Path(snap["snapshot_uri"])).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertIs(
+                    manifest["card_sidecars_write_enabled"],
+                    snapshot_enabled,
+                )
+
+                live_config = load_config(root)
+                live_config["atomic_memory"][
+                    "write_card_sidecars"
+                ] = live_enabled
+                write_config(root, live_config)
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                )
+
+                self.assertTrue(result["ok"], result["checks"])
+                drill_root = Path(result["drill_root"])
+                restored_config = load_config(drill_root)
+                self.assertIs(
+                    restored_config["atomic_memory"][
+                        "write_card_sidecars"
+                    ],
+                    snapshot_enabled,
+                )
+                before = len(
+                    list((drill_root / "catalog" / "cards").glob("*.yaml"))
+                )
+                append_scroll_event(
+                    drill_root,
+                    session_id="sidecar-policy-post-restore",
+                    event_type="message",
+                    role="user",
+                    content="Exercise the restored write policy.",
+                )
+                roll_scroll_segment(
+                    drill_root,
+                    session_id="sidecar-policy-post-restore",
+                    start_seq=1,
+                    end_seq=1,
+                )
+                after = len(
+                    list((drill_root / "catalog" / "cards").glob("*.yaml"))
+                )
+                self.assertEqual(after - before, int(snapshot_enabled))
+
+    def test_restore_drill_legacy_manifest_uses_live_sidecar_write_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="legacy-sidecar-policy",
+                event_type="message",
+                role="user",
+                content="Legacy manifests remain restorable.",
+            )
+            snap = snapshot(root, reason="legacy_sidecar_write_policy")
+            snapshot_path = Path(snap["snapshot_uri"])
+            manifest_path = snapshot_manifest_path(snapshot_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("card_sidecars_write_enabled")
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE snapshots SET manifest_hash = ? WHERE id = ?",
+                    (
+                        hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                        snap["snapshot_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            live_config = load_config(root)
+            live_config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, live_config)
+
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertFalse(result["restored_card_sidecars_write_enabled"])
+            self.assertFalse(
+                load_config(Path(result["drill_root"]))["atomic_memory"][
+                    "write_card_sidecars"
+                ]
+            )
+
+    def test_restore_drill_checks_sidecars_after_overlapping_durable_copy(self) -> None:
+        for mutation in ("late_file", "changed_sidecar"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                init_db(root)
+                config = load_config(root)
+                config["atomic_memory"]["card_sidecar_dir"] = "archive/cards"
+                write_config(root, config)
+                append_scroll_event(
+                    root,
+                    session_id="overlapping-sidecar-source",
+                    event_type="message",
+                    role="user",
+                    content="Bind this sidecar before the durable overlay.",
+                )
+                rolled = roll_scroll_segment(
+                    root,
+                    session_id="overlapping-sidecar-source",
+                    start_seq=1,
+                    end_seq=1,
+                )
+                snap = snapshot(root, reason=f"sidecar_overlay_{mutation}")
+                cards_dir = root / "archive" / "cards"
+                if mutation == "late_file":
+                    (cards_dir / "late.bin").write_bytes(b"not in snapshot")
+                else:
+                    conn = connect(root)
+                    try:
+                        conn.execute(
+                            "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                            (
+                                "Valid live bytes newer than the snapshot.",
+                                store_module.utc_now(),
+                                rolled["card_id"],
+                            ),
+                        )
+                        store_module.mark_card_sidecar_outbox(
+                            conn,
+                            [rolled["card_id"]],
+                            reason="post_snapshot_durable_overlay",
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    self.assertTrue(
+                        sync_card_sidecars_after_commit(
+                            root,
+                            [rolled["card_id"]],
+                        )["ok"]
+                    )
+
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                )
+
+                self.assertFalse(result["ok"], result["checks"])
+                checks = {check["name"]: check for check in result["checks"]}
+                self.assertFalse(
+                    checks[
+                        "restored_card_sidecars_match_snapshot_manifest"
+                    ]["ok"]
+                )
+
+    def test_restore_drill_checks_sidecars_after_recovery_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            config = load_config(root)
+            config["atomic_memory"][
+                "card_sidecar_dir"
+            ] = "run/recovery_drills"
+            write_config(root, config)
+            append_scroll_event(
+                root,
+                session_id="sidecars-overlap-recovery-probe",
+                event_type="message",
+                role="user",
+                content="The final inventory must include later drill mutations.",
+            )
+            roll_scroll_segment(
+                root,
+                session_id="sidecars-overlap-recovery-probe",
+                start_seq=1,
+                end_seq=1,
+            )
+            snap = snapshot(root, reason="sidecars_overlap_recovery_probe")
+
+            result = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertFalse(result["ok"], result["checks"])
+            checks = {check["name"]: check for check in result["checks"]}
+            inventory_check = checks[
+                "restored_card_sidecars_match_snapshot_manifest"
+            ]
+            self.assertFalse(inventory_check["ok"])
+            self.assertIn("unsupported entry", inventory_check["error"])
+
     def test_restore_drill_without_snapshot_seeds_current_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3040,6 +3318,55 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertFalse(result["ok"], result["checks"])
             checks = {check["name"]: check for check in result["checks"]}
             self.assertFalse(checks["restored_counts_match_snapshot_manifest"]["ok"])
+
+    def test_restore_drill_rejects_sidecar_tree_changed_after_manifest_precheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-sidecar-toctou",
+                event_type="message",
+                role="user",
+                content="bind the copied sidecar inventory after copy",
+            )
+            roll_scroll_segment(
+                root,
+                session_id="restore-sidecar-toctou",
+                start_seq=1,
+                end_seq=1,
+            )
+            snap = snapshot(root, reason="restore_sidecar_postcopy_binding")
+            snapshot_sidecars = Path(str(snap["card_sidecars_uri"]))
+            real_copytree = operations_module._restore_copytree
+            injected = False
+
+            def copytree_with_late_sidecar(source_root, source, destination, **kwargs):
+                nonlocal injected
+                if Path(source) == snapshot_sidecars and not injected:
+                    injected = True
+                    (snapshot_sidecars / "unmanifested.bin").write_bytes(b"late mutation")
+                return real_copytree(source_root, source, destination, **kwargs)
+
+            with patch.object(
+                operations_module,
+                "_restore_copytree",
+                side_effect=copytree_with_late_sidecar,
+            ):
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                )
+
+            self.assertTrue(injected)
+            self.assertFalse(result["ok"], result["checks"])
+            checks = {check["name"]: check for check in result["checks"]}
+            self.assertFalse(
+                checks["restored_card_sidecars_match_snapshot_manifest"]["ok"]
+            )
+            self.assertTrue(
+                (Path(result["drill_root"]) / "catalog" / "cards" / "unmanifested.bin").is_file()
+            )
 
     def test_pre_receipt_v2_snapshot_count_manifest_remains_restorable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3186,19 +3513,31 @@ class OperationLedgerTest(unittest.TestCase):
             root = Path(tmp) / "epic-continuum"
             append_scroll_event(root, session_id="semantic-sidecar-race", event_type="message", role="user", content="original")
             roll_scroll_segment(root, session_id="semantic-sidecar-race", start_seq=1, end_seq=1)
-            original_copytree = store_module.secure_copytree
+            original_copy_file = store_module.secure_copy_file
 
-            def corrupt_copied_sidecar(src: Path, dst: Path, *args: object, **kwargs: object) -> object:
-                result = original_copytree(src, dst, *args, **kwargs)
-                for sidecar in Path(dst).glob("*.yaml"):
+            def corrupt_copied_sidecar(
+                src: Path,
+                dst: Path,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                result = original_copy_file(src, dst, *args, **kwargs)
+                if Path(src).parent == root / "catalog" / "cards":
+                    sidecar = Path(dst)
                     sidecar.write_text(
-                        sidecar.read_text(encoding="utf-8").replace("schema:", "schema_corrupted:", 1),
+                        sidecar.read_text(encoding="utf-8").replace(
+                            "schema:",
+                            "schema_corrupted:",
+                            1,
+                        ),
                         encoding="utf-8",
                     )
-                    break
                 return result
 
-            with patch("continuum.core.store.secure_copytree", side_effect=corrupt_copied_sidecar):
+            with patch(
+                "continuum.core.store.secure_copy_file",
+                side_effect=corrupt_copied_sidecar,
+            ):
                 with self.assertRaisesRegex(ValueError, "copied snapshot semantic integrity"):
                     snapshot(root, reason="semantic_sidecar_race")
 
@@ -3237,6 +3576,25 @@ class OperationLedgerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "link-like card sidecar"):
                 snapshot(root, reason="sidecar_link_guard")
 
+    @unittest.skipUnless(os.name == "posix", "broken sidecar symlinks are POSIX-only")
+    def test_snapshot_rejects_broken_configured_sidecar_directory_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            cards_dir = root / "catalog" / "cards"
+            cards_dir.rmdir()
+            cards_dir.symlink_to(root / "missing-sidecar-target", target_is_directory=True)
+
+            integrity = store_module.semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertEqual(
+                integrity["checks"]["unsafe_card_sidecar_paths"],
+                1,
+                integrity,
+            )
+            with self.assertRaisesRegex(ValueError, "link-like card sidecar"):
+                snapshot(root, reason="broken_sidecar_link_guard")
+
     def test_snapshot_binds_empty_review_jobs_pair_and_rootless_manifest_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -3257,6 +3615,123 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertEqual(binding["files"], {})
             rootless = store_module.verify_snapshot_manifest(snapshot_path)
             self.assertTrue(rootless["ok"], rootless)
+
+    def test_snapshot_binds_empty_receipt_pair_when_custom_cards_dir_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            config = load_config(root)
+            config["atomic_memory"][
+                "card_sidecar_dir"
+            ] = "catalog/not-created-cards"
+            write_config(root, config)
+            self.assertFalse((root / "catalog" / "not-created-cards").exists())
+
+            created = snapshot(root, reason="empty_sidecar_receipt_pair")
+
+            snapshot_path = Path(created["snapshot_uri"])
+            manifest = json.loads(
+                Path(created["snapshot_manifest_uri"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            receipt_binding = manifest["card_sidecar_receipts"]
+            self.assertEqual(receipt_binding["file_count"], 0)
+            self.assertEqual(receipt_binding["files"], {})
+            self.assertTrue(
+                (root / str(receipt_binding["uri"])).is_dir()
+            )
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(snapshot_path)["ok"]
+            )
+            restored = restore_drill(
+                root,
+                snapshot_uri=created["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+            self.assertTrue(restored["ok"], restored["checks"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows 8.3 aliases are Windows-only")
+    def test_restore_drill_accepts_snapshot_through_short_root_alias(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum-long-root"
+            init_db(root)
+            created = snapshot(root, reason="short_root_receipt_pair_alias")
+            snapshot_path = Path(str(created["snapshot_uri"]))
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_short_path_name = kernel32.GetShortPathNameW
+            get_short_path_name.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+            ]
+            get_short_path_name.restype = wintypes.DWORD
+            required = int(get_short_path_name(str(root), None, 0))
+            if required == 0:
+                self.fail(
+                    "GetShortPathNameW sizing failed: "
+                    f"{ctypes.WinError(ctypes.get_last_error())}"
+                )
+            buffer = ctypes.create_unicode_buffer(required)
+            written = int(get_short_path_name(str(root), buffer, required))
+            if written == 0 or written >= required:
+                self.fail(
+                    "GetShortPathNameW failed to return the sized alias: "
+                    f"{ctypes.WinError(ctypes.get_last_error())}"
+                )
+            short_root = Path(buffer.value)
+            if os.path.normcase(os.path.abspath(short_root)) == os.path.normcase(
+                os.path.abspath(root)
+            ):
+                self.skipTest("volume provides no distinct 8.3 alias for the test root")
+            self.assertTrue(short_root.samefile(root))
+
+            short_snapshot = short_root / snapshot_path.relative_to(root)
+            expected_pair = store_module.snapshot_card_sidecar_receipts_path(
+                snapshot_path
+            )
+            short_pair = store_module.snapshot_card_sidecar_receipts_path(
+                short_snapshot
+            )
+            self.assertNotEqual(short_pair, expected_pair)
+            self.assertTrue(short_pair.samefile(expected_pair))
+
+            restored = restore_drill(
+                root,
+                snapshot_uri=str(short_snapshot),
+                verify_recent_proof_packs=0,
+            )
+
+            self.assertTrue(restored["ok"], restored["checks"])
+            self.assertEqual(
+                restored["restored_card_sidecar_receipts_mode"],
+                "snapshot_pair",
+            )
+
+    def test_restore_drill_rejects_link_like_alias_to_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "epic-continuum"
+            init_db(root)
+            created = snapshot(root, reason="link_like_root_alias")
+            snapshot_path = Path(str(created["snapshot_uri"]))
+            root_alias = base / "continuum-root-alias"
+            make_link_like_dir(self, root_alias, root)
+            aliased_snapshot = root_alias / snapshot_path.relative_to(root)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "unsafe_restore_drill_source_paths: source outside root",
+            ):
+                restore_drill(
+                    root,
+                    snapshot_uri=str(aliased_snapshot),
+                    verify_recent_proof_packs=0,
+                )
 
     def test_snapshot_manifest_failure_cleans_moved_catalog_and_review_pair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3285,6 +3760,14 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertEqual(list(snapshots_dir.glob("continuum_catalog_*.sqlite3")), [])
             self.assertEqual(list(snapshots_dir.glob("continuum_snapshot_*.manifest.json")), [])
             self.assertEqual(list(snapshots_dir.glob("continuum_cards_*")), [])
+            self.assertEqual(
+                list(
+                    snapshots_dir.glob(
+                        "continuum_card_sidecar_receipts_*"
+                    )
+                ),
+                [],
+            )
             self.assertEqual(list(snapshots_dir.glob("continuum_review_bridge_jobs_*")), [])
             conn = connect(root)
             try:
@@ -3318,6 +3801,12 @@ class OperationLedgerTest(unittest.TestCase):
                 (root / "snapshots").glob("continuum_review_bridge_jobs_*")
             )
             self.assertEqual(len(review_job_trees), 20)
+            sidecar_receipt_trees = sorted(
+                (root / "snapshots").glob(
+                    "continuum_card_sidecar_receipts_*"
+                )
+            )
+            self.assertEqual(len(sidecar_receipt_trees), 20)
             conn = sqlite3.connect(root / "catalog" / "catalog.sqlite3")
             conn.row_factory = sqlite3.Row
             try:

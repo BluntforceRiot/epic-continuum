@@ -16,7 +16,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
-from .config import CATALOG_PROOF_MODES, config_path, load_config, write_default_config
+from .config import (
+    CATALOG_PROOF_MODES,
+    config_path,
+    load_config,
+    write_config,
+    write_default_config,
+)
 from .permissions import (
     audit_private_permissions,
     repair_private_permissions,
@@ -32,6 +38,8 @@ from .store import (
     SCHEMA_PATH,
     SCHEMA_VERSION,
     SNAPSHOT_DURABLE_TABLES,
+    _sidecar_hashes,
+    _snapshot_tree_inventory,
     audit,
     audit_search_index,
     audit_secrets,
@@ -52,6 +60,7 @@ from .store import (
     snapshot_manifest_count_comparison,
     load_snapshot_manifest,
     snapshot_alias_key_path,
+    snapshot_card_sidecar_receipts_path,
     snapshot_sidecars_path as store_snapshot_sidecars_path,
     sqlite_readonly_uri,
     status,
@@ -3201,6 +3210,16 @@ def _link_like_reason(path: Path) -> str | None:
     return None
 
 
+def _same_restore_source_object(left: Path, right: Path) -> bool:
+    """Compare two existing, non-link-like restore sources by filesystem identity."""
+    if _link_like_reason(left) is not None or _link_like_reason(right) is not None:
+        return False
+    try:
+        return left.samefile(right)
+    except (OSError, ValueError):
+        return False
+
+
 def _display_relative(root: Path, path: Path) -> str:
     try:
         return path.relative_to(root).as_posix()
@@ -3351,13 +3370,51 @@ def _raise_unsafe_restore_path(reason: str, audit: dict[str, Any]) -> None:
 
 
 def _ensure_restore_source_safe(root: Path, source: Path, *, subtree: bool = False) -> None:
+    if ".." in source.parts:
+        raise ValueError(
+            f"unsafe_restore_drill_source_paths: parent traversal is not allowed: {source}"
+        )
     try:
         rel_path = source.relative_to(root)
+        lexical_root = root
     except ValueError:
-        raise ValueError(f"unsafe_restore_drill_source_paths: source outside root: {source}") from None
+        suffix_parts: list[str] = []
+        candidate = source
+        alias_root: Path | None = None
+        while True:
+            if _same_restore_source_object(candidate, root):
+                alias_root = candidate
+                break
+            if candidate == candidate.parent:
+                break
+            reason = _link_like_reason(candidate)
+            if reason is not None:
+                raise ValueError(
+                    "unsafe_restore_drill_source_paths: source outside root "
+                    f"or link-like alias: {source}"
+                )
+            if candidate.name in {"", ".", ".."}:
+                break
+            suffix_parts.append(candidate.name)
+            candidate = candidate.parent
+        if alias_root is None:
+            raise ValueError(
+                f"unsafe_restore_drill_source_paths: source outside root: {source}"
+            ) from None
+        lexical_root = alias_root
+        rel_path = Path(*reversed(suffix_parts))
+    if any(part in {"", ".", ".."} for part in rel_path.parts):
+        raise ValueError(
+            f"unsafe_restore_drill_source_paths: parent traversal is not allowed: {source}"
+        )
     checked: list[str] = []
     findings: list[dict[str, str]] = []
-    components_safe = _audit_relative_tree_components(root, rel_path, checked=checked, findings=findings)
+    components_safe = _audit_relative_tree_components(
+        lexical_root,
+        rel_path,
+        checked=checked,
+        findings=findings,
+    )
     if components_safe and subtree and source.exists() and source.is_dir():
         _scan_tree_for_link_like_paths(root, source, checked=checked, findings=findings)
     if findings:
@@ -4339,6 +4396,7 @@ def _restore_drill_impl(
     else:
         created_seed_snapshot = snapshot(root, reason="restore_drill_seed_snapshot")
         selected_snapshot = Path(str(created_seed_snapshot["snapshot_uri"]))
+    _ensure_restore_source_safe(root, selected_snapshot)
     if not selected_snapshot.exists():
         raise FileNotFoundError(str(selected_snapshot))
     manifest_verification = verify_snapshot_manifest_for_root(
@@ -4436,6 +4494,33 @@ def _restore_drill_impl(
     else:
         raise ValueError("snapshot Review Relay jobs binding is malformed")
 
+    sidecar_receipts_manifest = selected_manifest.get(
+        "card_sidecar_receipts"
+    )
+    sidecar_receipts_pair_source: Path | None = None
+    sidecar_receipts_restore_mode = "snapshot_pair"
+    if sidecar_receipts_manifest is None:
+        sidecar_receipts_restore_mode = "legacy_absent"
+    elif isinstance(sidecar_receipts_manifest, dict):
+        pair_uri = str(sidecar_receipts_manifest.get("uri") or "")
+        if not pair_uri:
+            raise ValueError(
+                "snapshot Card sidecar receipt binding has no URI"
+            )
+        expected_pair_path = snapshot_card_sidecar_receipts_path(
+            selected_snapshot
+        )
+        sidecar_receipts_pair_source = resolve_stored_uri(root, pair_uri)
+        if not _same_restore_source_object(
+            sidecar_receipts_pair_source,
+            expected_pair_path,
+        ):
+            raise ValueError(
+                "snapshot Card sidecar receipt binding selects the wrong pair"
+            )
+    else:
+        raise ValueError("snapshot Card sidecar receipt binding is malformed")
+
     drill_id = unique_id("restore")
     drill_root = root / "run" / "restore_drills" / drill_id
     drill_root_reservation = _reserve_restore_drill_root(root, drill_root)
@@ -4480,11 +4565,34 @@ def _restore_drill_impl(
     sidecars_source_candidate = Path(sidecars_source_uri)
     if sidecars_source_candidate.is_absolute() or any(part == ".." for part in sidecars_source_candidate.parts):
         sidecars_source_uri = "catalog/cards"
+    restored_runtime_config = load_config(drill_root)
+    restored_atomic_memory = dict(
+        restored_runtime_config.get("atomic_memory", {})
+    )
+    restored_atomic_memory["card_sidecar_dir"] = sidecars_source_uri
+    snapshot_write_policy = selected_manifest.get(
+        "card_sidecars_write_enabled"
+    )
+    if isinstance(snapshot_write_policy, bool):
+        restored_atomic_memory["write_card_sidecars"] = snapshot_write_policy
+    restored_runtime_config["atomic_memory"] = restored_atomic_memory
+    write_config(drill_root, restored_runtime_config)
     restored_sidecars = drill_root / sidecars_source_uri
-    sidecar_count = 0
     if sidecars is not None:
         _restore_copytree(root, sidecars, restored_sidecars, dirs_exist_ok=True)
-        sidecar_count = sum(1 for item in restored_sidecars.glob("*.yaml"))
+    restored_sidecar_receipts = (
+        drill_root / "exports" / "card_sidecar_recovery_receipts"
+    )
+    if sidecar_receipts_pair_source is not None:
+        _restore_copytree(
+            root,
+            sidecar_receipts_pair_source,
+            restored_sidecar_receipts,
+            dirs_exist_ok=False,
+        )
+    expected_sidecar_inventory = selected_manifest.get("card_sidecars")
+    if not isinstance(expected_sidecar_inventory, dict):
+        expected_sidecar_inventory = {}
 
     copied_durable_paths: list[str] = []
     for rel_path in RESTORE_DRILL_DURABLE_REL_PATHS:
@@ -4526,6 +4634,56 @@ def _restore_drill_impl(
             raise ValueError(f"unsafe_restore_drill_output_paths: {restored_archive_locator}: {reason}")
         restored_archive_locator.unlink()
         removed_machine_local_config.append("proof-archive.json")
+    restored_sidecar_inventory: dict[str, dict[str, Any]] = {}
+    sidecar_inventory_error: str | None = None
+    try:
+        restored_sidecar_inventory = _sidecar_hashes(
+            restored_sidecars if restored_sidecars.exists() else None
+        )
+    except (OSError, ValueError) as exc:
+        sidecar_inventory_error = str(exc)
+    sidecar_inventory_matches = (
+        sidecar_inventory_error is None
+        and restored_sidecar_inventory == expected_sidecar_inventory
+    )
+    sidecar_count = (
+        len(restored_sidecar_inventory)
+        if sidecar_inventory_error is None
+        else None
+    )
+    restored_sidecar_receipt_inventory: dict[str, Any] = {}
+    sidecar_receipt_inventory_error: str | None = None
+    if sidecar_receipts_pair_source is not None:
+        try:
+            restored_sidecar_receipt_inventory = _snapshot_tree_inventory(
+                restored_sidecar_receipts,
+                label="Card sidecar history receipts",
+            )
+        except (OSError, ValueError) as exc:
+            sidecar_receipt_inventory_error = str(exc)
+    expected_sidecar_receipt_inventory = (
+        sidecar_receipts_manifest
+        if isinstance(sidecar_receipts_manifest, dict)
+        else None
+    )
+    sidecar_receipt_inventory_fields = (
+        "directory_count",
+        "file_count",
+        "directories",
+        "files",
+        "tree_sha256",
+    )
+    sidecar_receipt_inventory_matches = bool(
+        expected_sidecar_receipt_inventory is None
+        or (
+            sidecar_receipt_inventory_error is None
+            and all(
+                restored_sidecar_receipt_inventory.get(field)
+                == expected_sidecar_receipt_inventory.get(field)
+                for field in sidecar_receipt_inventory_fields
+            )
+        )
+    )
     checks = [
         {"name": "snapshot_exists", "ok": selected_snapshot.exists(), "path": str(selected_snapshot)},
         {
@@ -4556,6 +4714,29 @@ def _restore_drill_impl(
             "tolerated_absent_tables": count_comparison[
                 "tolerated_absent_tables"
             ],
+        },
+        {
+            "name": "restored_card_sidecars_match_snapshot_manifest",
+            "ok": sidecar_inventory_matches,
+            "expected_count": len(expected_sidecar_inventory),
+            "restored_count": sidecar_count,
+            "error": sidecar_inventory_error,
+        },
+        {
+            "name": "restored_card_sidecar_receipts_match_snapshot_manifest",
+            "ok": sidecar_receipt_inventory_matches,
+            "mode": sidecar_receipts_restore_mode,
+            "expected_count": (
+                expected_sidecar_receipt_inventory.get("file_count")
+                if expected_sidecar_receipt_inventory is not None
+                else 0
+            ),
+            "restored_count": (
+                restored_sidecar_receipt_inventory.get("file_count")
+                if sidecar_receipt_inventory_error is None
+                else None
+            ),
+            "error": sidecar_receipt_inventory_error,
         },
         {
             "name": "semantic_integrity_clean",
@@ -4605,6 +4786,16 @@ def _restore_drill_impl(
         "restored_partition_alias_key_uri": str(restored_alias_key) if alias_key_restored else None,
         "restored_card_sidecars_uri": str(restored_sidecars) if restored_sidecars.exists() else None,
         "restored_card_sidecar_count": sidecar_count,
+        "restored_card_sidecar_receipts_uri": (
+            str(restored_sidecar_receipts)
+            if restored_sidecar_receipts.exists()
+            else None
+        ),
+        "restored_card_sidecar_receipt_count": (
+            restored_sidecar_receipt_inventory.get("file_count", 0)
+            if sidecar_receipt_inventory_error is None
+            else None
+        ),
         "copied_durable_paths": copied_durable_paths,
         "review_bridge_jobs_restore": {
             "mode": review_jobs_restore_mode,
@@ -4613,6 +4804,13 @@ def _restore_drill_impl(
             "frozen_evidence_count": int(legacy_review_evidence.get("count") or 0),
         },
         "removed_machine_local_config": removed_machine_local_config,
+        "restored_card_sidecar_source_uri": sidecars_source_uri,
+        "restored_card_sidecar_receipts_mode": (
+            sidecar_receipts_restore_mode
+        ),
+        "restored_card_sidecars_write_enabled": bool(
+            restored_atomic_memory.get("write_card_sidecars", True)
+        ),
         "restored_writer_claim": restored_writer_claim,
         "restore_drill_output_paths": output_audit,
         "restore_drill_source_paths": source_audit,

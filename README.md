@@ -48,6 +48,12 @@ Epic Continuum 0.3 turns durable memory into a safer daily recovery system:
   false-positive conflict while retaining historical evidence. System-owned
   receipts bind every resolved member, its authority boundary, and the audit
   event in the same transaction.
+- **Immutable, crash-recoverable Card sidecars** use content-addressed
+  copy-on-write generations, durable write/transition intents, paired recovery
+  receipts, and exact snapshot/restore inventories so historical proof bytes
+  are preserved without losing the catalog-selected current state. Managed
+  filename aliases remain portable across case-sensitive and case-insensitive
+  filesystems, while case-colliding IDs or filenames fail closed.
 - **Yarn/Qwythos local assistance** can produce citation-bound, non-authoritative
   recovery briefings through a loopback llama.cpp endpoint. It is optional and
   fails back to the deterministic packet.

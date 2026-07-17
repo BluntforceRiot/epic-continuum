@@ -27,6 +27,7 @@ from continuum.core.store import (
     semantic_integrity_report,
     snapshot,
     snapshot_alias_key_path,
+    snapshot_card_sidecar_receipts_path,
     sync_card_sidecar,
     write_snapshot_manifest,
 )
@@ -368,6 +369,14 @@ class AuthoritySemanticIntegrityTest(unittest.TestCase):
                     card_sidecars_path=sidecars_path,
                     alias_key_path=alias_path if alias_path.exists() else None,
                     card_sidecars_source_path=root / "catalog" / "cards",
+                    card_sidecar_receipts_path=(
+                        snapshot_card_sidecar_receipts_path(snap_path)
+                    ),
+                    card_sidecar_receipts_source_path=(
+                        root
+                        / "exports"
+                        / "card_sidecar_recovery_receipts"
+                    ),
                     semantic_integrity={"ok": True, "failing": {}},
                 )
                 conn = connect(root)

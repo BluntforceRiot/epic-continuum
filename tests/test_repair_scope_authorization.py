@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
 from continuum.core import store as store_module
+from continuum.core.config import load_config, write_config
 from continuum.core.store import (
     append_scroll_event,
     connect,
@@ -2014,6 +2017,22 @@ class RepairScopeAuthorizationTests(unittest.TestCase):
             )
             conn = connect(root)
             try:
+                location_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (state["card_id"],),
+                ).fetchone()["location_uri"]
+                immutable_path = store_module.resolve_stored_uri(root, location_uri)
+                immutable_bytes = immutable_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=location_uri,
+                    sha256=hashlib.sha256(immutable_bytes).hexdigest(),
+                    size_bytes=len(immutable_bytes),
+                    source_type="preserved_project_state_sidecar",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
                 conn.execute(
                     "UPDATE cards SET visibility_scope = 'project', "
                     "metadata_json = '{}', source_refs_json = '[]', "
@@ -2034,9 +2053,33 @@ class RepairScopeAuthorizationTests(unittest.TestCase):
                     "DELETE FROM audit_events WHERE target_id IN (?, ?)",
                     (state["card_id"], state["event_id"]),
                 )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [str(state["card_id"])],
+                    reason="preserved_project_state_sidecar_drift",
+                )
                 conn.commit()
             finally:
                 conn.close()
+
+            sync_result = sync_card_sidecars_after_commit(
+                root,
+                [str(state["card_id"])],
+            )
+            self.assertTrue(sync_result["ok"], sync_result)
+            self.assertEqual(immutable_path.read_bytes(), immutable_bytes)
+            conn = connect(root)
+            try:
+                live_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (state["card_id"],),
+                ).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertNotEqual(
+                store_module.resolve_stored_uri(root, live_uri),
+                immutable_path,
+            )
 
             preview = self._assert_project_only_withholds_checkpoint(
                 root,
@@ -2047,6 +2090,283 @@ class RepairScopeAuthorizationTests(unittest.TestCase):
             self.assertEqual(
                 preview["withheld_uncertain_candidate_count"],
                 0,
+                preview,
+            )
+
+    def test_disabling_future_sidecar_writes_preserves_existing_read_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="sidecar-read-toggle-session",
+                agent_id="sidecar-read-toggle-agent",
+                project_id="sidecar-read-toggle-project",
+                objective="EXISTING SIDECAR REMAINS READ AUTHORITY",
+            )
+            before = resume_latest(
+                root,
+                project_id="sidecar-read-toggle-project",
+                model_assist=False,
+            )
+            self.assertTrue(before["ok"], before)
+
+            config = load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+
+            after = resume_latest(
+                root,
+                project_id="sidecar-read-toggle-project",
+                model_assist=False,
+            )
+            semantic = store_module.semantic_integrity_report(root)
+            self.assertTrue(after["ok"], after)
+            self.assertEqual(after["discovery"]["checkpoint_id"], state["card_id"])
+            self.assertTrue(semantic["ok"], semantic)
+
+            conn = connect(root)
+            try:
+                sidecar_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (state["card_id"],),
+                ).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            store_module.resolve_stored_uri(root, sidecar_uri).write_text(
+                "not: [valid atomic memory",
+                encoding="utf-8",
+            )
+            damaged = store_module.semantic_integrity_report(root)
+            self.assertFalse(damaged["ok"], damaged)
+            self.assertGreater(
+                damaged["checks"]["malformed_card_sidecars"],
+                0,
+                damaged,
+            )
+
+    def test_unrelated_immutable_artifact_with_card_basename_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="unrelated-artifact-session",
+                agent_id="unrelated-artifact-agent",
+                project_id="unrelated-artifact-project",
+                objective="UNRELATED ARTIFACT MUST NOT ALTER CARD AUTHORITY",
+            )
+            proof_path = root / "proofs" / f"{state['card_id']}.yaml"
+            proof_path.parent.mkdir(parents=True)
+            proof_bytes = b"ordinary proof bytes\n"
+            proof_path.write_bytes(proof_bytes)
+            conn = connect(root)
+            try:
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=store_module.continuum_uri(root, proof_path),
+                    sha256=hashlib.sha256(proof_bytes).hexdigest(),
+                    size_bytes=len(proof_bytes),
+                    immutable=True,
+                )
+                cards_dir = store_module._configured_card_sidecar_dir(root)
+                verified, uncertain = store_module._verified_immutable_card_sidecars(
+                    root,
+                    conn,
+                    cards_dir,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resumed = resume_latest(
+                root,
+                project_id="unrelated-artifact-project",
+                model_assist=False,
+            )
+            self.assertNotIn(state["card_id"], verified)
+            self.assertNotIn(state["card_id"], uncertain)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["discovery"]["checkpoint_id"], state["card_id"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases are Windows-only")
+    def test_windows_short_and_long_root_aliases_share_managed_sidecar_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="windows-sidecar-alias-session",
+                agent_id="windows-sidecar-alias-agent",
+                project_id="windows-sidecar-alias-project",
+                objective="WINDOWS PATH ALIASES SHARE ONE SIDECAR",
+            )
+            conn = connect(root)
+            try:
+                location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()["location_uri"]
+                )
+                short_path = store_module.resolve_stored_uri(root, location_uri)
+                long_path = short_path.resolve()
+                if os.path.normcase(os.path.abspath(short_path)) == os.path.normcase(
+                    os.path.abspath(long_path)
+                ):
+                    self.skipTest("temporary root has no distinct short/long spelling")
+                sidecar_bytes = short_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=str(long_path),
+                    sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
+                    size_bytes=len(sidecar_bytes),
+                    immutable=True,
+                    source_type="preserved_project_state_sidecar",
+                )
+                conn.execute(
+                    "UPDATE cards SET location_uri = ? WHERE id = ?",
+                    (str(long_path), state["card_id"]),
+                )
+                cards_dir = short_path.parent
+                verified, uncertain = store_module._verified_immutable_card_sidecars(
+                    root,
+                    conn,
+                    cards_dir,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            resumed = resume_latest(
+                root,
+                project_id="windows-sidecar-alias-project",
+                model_assist=False,
+            )
+            semantic = store_module.semantic_integrity_report(root)
+            self.assertIn(state["card_id"], verified)
+            self.assertNotIn(state["card_id"], uncertain)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertTrue(semantic["ok"], semantic)
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_immutable_sidecar_symlink_is_uncertain_and_not_orphan_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="immutable-sidecar-link-session",
+                agent_id="immutable-sidecar-link-agent",
+                project_id="immutable-sidecar-link-project",
+                objective="LINKED IMMUTABLE ARTIFACT IS NOT CARD AUTHORITY",
+            )
+            conn = connect(root)
+            try:
+                location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (state["card_id"],),
+                    ).fetchone()["location_uri"]
+                )
+                current_path = store_module.resolve_stored_uri(root, location_uri)
+                backup_path = current_path.parent / "unrelated-backup.yaml"
+                backup_path.write_bytes(current_path.read_bytes())
+                linked_path = current_path.with_name(
+                    f"{state['card_id']}.live-{'a' * 64}.yaml"
+                )
+                linked_path.symlink_to(backup_path.name)
+                linked_bytes = linked_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=store_module.lexical_continuum_uri(root, linked_path),
+                    sha256=hashlib.sha256(linked_bytes).hexdigest(),
+                    size_bytes=len(linked_bytes),
+                    immutable=True,
+                    source_type="preserved_project_state_sidecar",
+                )
+                verified, uncertain = store_module._verified_immutable_card_sidecars(
+                    root,
+                    conn,
+                    current_path.parent,
+                )
+                sidecar_audit = store_module.audit_card_sidecars(root, conn)
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertNotIn(
+                linked_path,
+                [path for path, _payload in verified.get(str(state["card_id"]), [])],
+            )
+            self.assertIn(state["card_id"], uncertain)
+            self.assertEqual(sidecar_audit["orphan_card_sidecars"], 1, sidecar_audit)
+            self.assertEqual(
+                sidecar_audit["unsafe_card_sidecar_paths"],
+                1,
+                sidecar_audit,
+            )
+
+    def test_external_card_sidecar_uri_cannot_supply_repair_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            session_id = "external-sidecar-private-session"
+            project_id = "external-sidecar-project"
+            objective = "EXTERNAL SIDECAR MUST NOT BECOME AUTHORITY"
+            state = record_project_state(
+                root,
+                session_id=session_id,
+                agent_id="external-sidecar-agent",
+                project_id=project_id,
+                objective=objective,
+                metadata={"visibility_scope": "private"},
+            )
+            conn = connect(root)
+            try:
+                location_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (state["card_id"],),
+                ).fetchone()["location_uri"]
+                external_path = Path(tmp) / "attacker-controlled-card.yaml"
+                external_path.write_bytes(
+                    store_module.resolve_stored_uri(root, location_uri).read_bytes()
+                )
+                conn.execute(
+                    "UPDATE cards SET visibility_scope = 'project', "
+                    "metadata_json = '{}', source_refs_json = '[]', "
+                    "summary = summary || ' damaged', location_uri = ? WHERE id = ?",
+                    (str(external_path), state["card_id"]),
+                )
+                conn.execute(
+                    "DELETE FROM scroll_events WHERE id = ?",
+                    (state["event_id"],),
+                )
+                conn.execute(
+                    "DELETE FROM queue_jobs WHERE job_type = "
+                    "'review_card_placement' AND "
+                    "json_extract(payload_json, '$.card_id') = ?",
+                    (state["card_id"],),
+                )
+                conn.execute(
+                    "DELETE FROM audit_events WHERE target_id IN (?, ?)",
+                    (state["card_id"], state["event_id"]),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            sidecar_audit = store_module.audit(root)
+            self.assertEqual(sidecar_audit["divergent_card_sidecars"], 1, sidecar_audit)
+            self.assertEqual(sidecar_audit["orphan_card_sidecars"], 1, sidecar_audit)
+            self.assertFalse(store_module.semantic_integrity_report(root)["ok"])
+            preview = self._assert_project_only_withholds_checkpoint(
+                root,
+                state,
+                project_id=project_id,
+                markers=(session_id, objective),
+            )
+            self.assertEqual(
+                preview["withheld_uncertain_candidate_count"],
+                1,
                 preview,
             )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from continuum.core import store as store_module
 from continuum.core import workers as worker_module
 from continuum.core.config import default_config, write_config
 from continuum.core.evals import run_memory_quality_evals
+from continuum.core.operations import restore_drill
 from continuum.core.store import (
     append_scroll_event,
     add_graph_edge,
@@ -50,6 +52,109 @@ from continuum.integrations.common import record_turn
 
 
 class EpicContinuumWorkerDesignTest(unittest.TestCase):
+    @staticmethod
+    def _running_sidecar_job_lease(
+        root: Path,
+        card_id: str,
+        *,
+        suffix: str,
+    ) -> tuple[str, worker_module._JobLease]:
+        owner = f"sidecar-fence-owner-{suffix}"
+        now = store_module.utc_now()
+        future = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+        ).isoformat()
+        conn = connect(root)
+        try:
+            job_id = enqueue_job(
+                conn,
+                role="archivist",
+                job_type="sync_card_sidecar",
+                priority=1,
+                payload={"card_id": card_id},
+                related_card_ids=[card_id],
+                dedupe_key=f"sidecar-fence:{suffix}",
+            )
+            conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                    heartbeat_at = ?, started_at = ?
+                WHERE id = ?
+                """,
+                (owner, future, now, now, job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return job_id, worker_module._JobLease(root, job_id, owner, 300)
+
+    @unittest.skipUnless(os.name == "nt", "Windows path aliases are Windows-only")
+    def test_scribe_replay_resolves_long_alias_for_managed_card_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            session_id = "scribe-windows-sidecar-alias"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="Replay one committed Scribe step through a path alias.",
+            )
+            rolled = roll_scroll_segment(
+                root,
+                session_id=session_id,
+                start_seq=1,
+                end_seq=1,
+            )
+            card_id = str(rolled["card_id"])
+            job_id = "job_scribe_windows_sidecar_alias"
+            conn = connect(root)
+            try:
+                location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                short_path = resolve_stored_uri(root, location_uri)
+                long_path = short_path.resolve()
+                if os.path.normcase(os.path.abspath(short_path)) == os.path.normcase(
+                    os.path.abspath(long_path)
+                ):
+                    self.skipTest("temporary root has no distinct short/long spelling")
+                conn.execute(
+                    "UPDATE cards SET location_uri = ? WHERE id = ?",
+                    (str(long_path), card_id),
+                )
+                store_module.audit_event(
+                    conn,
+                    action=worker_module._SCRIBE_STEP_COMMITTED_ACTION,
+                    target_type="queue_job",
+                    target_id=job_id,
+                    payload={
+                        "schema": "continuum.worker_scribe_segment_step_committed.v1",
+                        "step_key": f"{session_id}:1:1",
+                        "session_id": session_id,
+                        "start_seq": 1,
+                        "end_seq": 1,
+                        "batch_number": 1,
+                        "result": rolled,
+                    },
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            committed, max_batch = worker_module._committed_scribe_steps(
+                root,
+                worker_module._JobLease(root, job_id, "alias-owner", 30),
+            )
+            self.assertEqual(max_batch, 1)
+            self.assertEqual(len(committed), 1)
+            self.assertEqual(Path(str(committed[0]["card_uri"])).resolve(), long_path)
+
     def test_conflict_resolution_marks_temporal_authority_and_syncs_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -395,6 +500,27 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(row["summary"], "NEW-SIDECAR-SUMMARY")
             self.assertEqual(sidecar["summary"], "NEW-SIDECAR-SUMMARY")
             self.assertEqual(pending_after_drain, 0)
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (
+                    root / "exports" / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            ]
+            self.assertTrue(
+                any(
+                    receipt.get("status") == "superseded_by_newer_state"
+                    for receipt in receipts
+                ),
+                receipts,
+            )
+            content_addressed_integrity = semantic_integrity_report(root)
+            self.assertTrue(
+                content_addressed_integrity["ok"],
+                content_addressed_integrity,
+            )
 
     def test_sidecar_outbox_survives_commit_until_worker_drains_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2243,15 +2369,53 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     real_sync = worker_module.sync_card_sidecars_after_commit
                     sync_calls = 0
 
+                    def controlled_failure_result(sync_root, card_ids):
+                        evidence_conn = connect_existing(sync_root)
+                        try:
+                            rows = []
+                            for evidence_card_id in card_ids:
+                                evidence_row = evidence_conn.execute(
+                                    """
+                                    SELECT card.location_uri,
+                                           outbox.generation AS sidecar_generation
+                                    FROM cards AS card
+                                    LEFT JOIN card_sidecar_outbox AS outbox
+                                      ON outbox.card_id = card.id
+                                    WHERE card.id = ?
+                                    """,
+                                    (evidence_card_id,),
+                                ).fetchone()
+                                self.assertIsNotNone(evidence_row)
+                                rows.append(
+                                    {
+                                        "card_id": evidence_card_id,
+                                        "location_uri": evidence_row["location_uri"],
+                                        "sidecar_generation": evidence_row[
+                                            "sidecar_generation"
+                                        ],
+                                    }
+                                )
+                        finally:
+                            evidence_conn.close()
+                        return {
+                            "ok": False,
+                            "synced": 0,
+                            "deferred": 1,
+                            "failed": 1,
+                            "failures": [],
+                            "compensation_cas_complete": True,
+                            "compensation_cas_rows": rows,
+                        }
+
                     def sync_with_first_failure(*args, **kwargs):
                         nonlocal sync_calls
                         sync_calls += 1
                         if failure_mode == "rollback_sync_failure" and sync_calls <= 2:
-                            return {"ok": False, "synced": 0, "deferred": 1, "failed": 1, "failures": []}
+                            return controlled_failure_result(*args, **kwargs)
                         if sync_calls == 1:
                             if failure_mode == "sidecar_sync_exception":
                                 raise RuntimeError("simulated sidecar sync exception")
-                            return {"ok": False, "synced": 0, "deferred": 1, "failed": 1, "failures": []}
+                            return controlled_failure_result(*args, **kwargs)
                         return real_sync(*args, **kwargs)
 
                     failure_patch = patch.object(
@@ -2263,6 +2427,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 expected_message = (
                     "restored, but rollback verification did not complete"
                     if failure_mode == "rollback_sync_failure"
+                    else "sidecar compensation evidence was unavailable"
+                    if failure_mode == "sidecar_sync_exception"
                     else "Card mutations were rolled back"
                 )
                 with failure_patch, self.assertRaisesRegex(RuntimeError, expected_message):
@@ -2278,8 +2444,4244 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     )
                 finally:
                     conn.close()
-                self.assertEqual(restored, original)
-                self.assertTrue(semantic_integrity_report(root)["ok"])
+                if failure_mode == "sidecar_sync_exception":
+                    self.assertEqual(restored["status"], "pruned")
+                    self.assertNotEqual(restored, original)
+                    self.assertFalse(semantic_integrity_report(root)["ok"])
+                else:
+                    self.assertEqual(restored, original)
+                    self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_sidecar_sync_builds_one_immutable_index_per_bounded_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_ids = [
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"bounded-index-{index}",
+                        summary="A multi-Card sync must not rescan the artifact ledger per Card.",
+                        source_refs=[],
+                    )
+                    for index in range(8)
+                ]
+                for index in range(64):
+                    store_module.record_artifact(
+                        conn,
+                        kind="proof_input",
+                        uri=f"continuum://proofs/unrelated-{index}.bin",
+                        sha256="0" * 64,
+                        size_bytes=0,
+                        source_type="bounded_index_regression",
+                        trust_level="local_generated",
+                        immutable=True,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            real_index = store_module._immutable_artifact_path_index
+            real_card_index = store_module._card_intent_batch_index
+            with patch.object(
+                store_module,
+                "_immutable_artifact_path_index",
+                wraps=real_index,
+            ) as index_builder, patch.object(
+                store_module,
+                "_card_intent_batch_index",
+                wraps=real_card_index,
+            ) as card_index_builder:
+                result = sync_card_sidecars_after_commit(root, card_ids)
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["synced"], len(card_ids))
+            self.assertEqual(
+                index_builder.call_count,
+                2,
+                "one ledger scan is allowed for the sync batch and one for its intent batch",
+            )
+            self.assertEqual(
+                card_index_builder.call_count,
+                1,
+                "all intent resolutions must share one Card-location/outbox index",
+            )
+
+    def test_sidecar_write_intent_adopts_crash_completed_copy_on_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="crash-complete-sidecar",
+                    summary="The frozen default is the first durable state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            first_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(first_sync["ok"], first_sync)
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="crash_complete_default",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The copy-on-write state survives a process death before catalog commit.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="crash_complete_copy_on_write",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            conn = connect(root)
+            observation: dict[str, object] = {}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                artifact_index = store_module._immutable_artifact_path_index(root, conn)
+                live_uri = store_module.sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    artifact_index=artifact_index,
+                    write_observation=observation,
+                )
+                self.assertIsNotNone(live_uri)
+                self.assertTrue(observation.get("write_completed"))
+                conn.rollback()
+            finally:
+                conn.close()
+
+            live_path = resolve_stored_uri(root, str(observation["target_uri"]))
+            intent_paths = list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            self.assertEqual(len(intent_paths), 1)
+            self.assertTrue(live_path.is_file())
+            pending = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(pending["ok"], pending)
+            self.assertEqual(pending["pending"], 1)
+            self.assertEqual(pending["results"][0]["status"], "pending_retry")
+
+            adopted = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(adopted["ok"], adopted)
+            self.assertTrue(
+                any(
+                    result.get("ok") and result.get("status") == "adopted"
+                    for result in adopted["intent_reconciliation_results"]
+                ),
+                adopted,
+            )
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (root / "exports" / "card_sidecar_recovery_receipts").glob("*.json")
+            ]
+            self.assertTrue(
+                any(receipt.get("status") == "adopted" for receipt in receipts),
+                receipts,
+            )
+            self.assertEqual(default_path.read_bytes(), default_bytes)
+            self.assertEqual(audit(root)["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_direct_copy_on_write_requires_durable_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="durable-observation-required",
+                    summary="The default state is frozen before direct copy-on-write.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="durable_observation_default",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "A new copy-on-write target needs a durable intent.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="durable_observation_required",
+                )
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(RuntimeError, "durable write observation"):
+                    store_module.sync_card_sidecar(root, conn, card_id)
+                conn.rollback()
+            finally:
+                conn.close()
+
+            self.assertFalse((default_path.parent / f"{card_id}.live.yaml").exists())
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            wrapped = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(wrapped["ok"], wrapped)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_sync_failure_requeues_when_intent_receipt_cannot_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="receipt-finalization-retry",
+                    summary="The initial state becomes immutable.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            receipt_dir = root / "exports" / "card_sidecar_recovery_receipts"
+            for receipt_path in receipt_dir.glob("*"):
+                receipt_path.unlink()
+            receipt_dir.rmdir()
+            receipt_dir.write_text("blocked", encoding="utf-8")
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="receipt_retry_default",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "Receipt finalization is deliberately unavailable.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="receipt_finalization_retry",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            failed = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertFalse(failed["ok"], failed)
+            self.assertFalse(failed["intent_reconciliation"]["ok"], failed)
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                conn.close()
+            self.assertTrue(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            self.assertFalse(semantic_integrity_report(root)["ok"])
+
+            receipt_dir.unlink()
+            recovered = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(recovered["ok"], recovered)
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_sidecar_recovery_refuses_non_file_and_existing_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="recovery-destination-boundary",
+                    summary="Recovery must never overwrite or bless an unexpected destination.",
+                    source_refs=[],
+                )
+                row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+            finally:
+                conn.close()
+
+            target_path = store_module.card_sidecar_path(root, card_id)
+            self.assertIsNotNone(target_path)
+            target_path = Path(target_path)
+            target_uri = store_module.continuum_uri(root, target_path)
+            expected_state_hash = str(payload["state_hash"])
+            intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=target_uri,
+                expected_state_hash=expected_state_hash,
+            )
+            recovery_path = target_path.with_name(
+                f".{target_path.name}.{intent_id}.uncommitted"
+            )
+            recovery_path.mkdir(parents=True)
+
+            non_file = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(non_file["ok"], non_file)
+            self.assertEqual(non_file["results"][0]["status"], "link_or_non_file_recovery")
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(recovery_path.is_dir())
+
+            recovery_path.rmdir()
+            recovery_path.write_bytes(b"\xffnot-utf8")
+            malformed = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(malformed["ok"], malformed)
+            self.assertEqual(malformed["results"][0]["status"], "invalid_recovery")
+            self.assertTrue(intent_path.is_file())
+            self.assertEqual(recovery_path.read_bytes(), b"\xffnot-utf8")
+
+            recovery_path.unlink()
+            with recovery_path.open("wb") as oversized_handle:
+                oversized_handle.truncate(
+                    store_module.MAX_VERIFIED_CARD_SIDECAR_BYTES + 1
+                )
+            oversized = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(oversized["ok"], oversized)
+            self.assertEqual(oversized["results"][0]["status"], "invalid_recovery")
+            self.assertTrue(intent_path.is_file())
+            self.assertEqual(
+                recovery_path.stat().st_size,
+                store_module.MAX_VERIFIED_CARD_SIDECAR_BYTES + 1,
+            )
+
+            recovery_path.unlink()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+            live_path = target_path.with_name(f"{card_id}.live.yaml")
+            live_uri = store_module.continuum_uri(root, live_path)
+            live_intent_id, live_intent_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=live_uri,
+                expected_state_hash=expected_state_hash,
+            )
+            store_module.write_atomic_yaml(live_path, payload)
+            live_recovery_path = live_path.with_name(
+                f".{live_path.name}.{live_intent_id}.uncommitted"
+            )
+            live_recovery_path.write_bytes(b"do-not-overwrite")
+            existing = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(existing["ok"], existing)
+            self.assertEqual(existing["results"][0]["status"], "recovery_target_exists")
+            self.assertEqual(live_recovery_path.read_bytes(), b"do-not-overwrite")
+            self.assertTrue(live_path.is_file())
+            self.assertTrue(live_intent_path.is_file())
+
+    def test_sidecar_intent_reference_index_detects_hardlink_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                referenced_card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="hardlink-reference-owner",
+                    summary="This Card location aliases another inode name.",
+                    source_refs=[],
+                )
+                intent_card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="hardlink-intent-owner",
+                    summary="This Card payload is the pending intent target.",
+                    source_refs=[],
+                )
+                intent_row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (intent_card_id,),
+                ).fetchone()
+                intent_payload = store_module._card_sidecar_payload_for_row(intent_row)
+                referenced_path = Path(
+                    store_module.card_sidecar_path(root, referenced_card_id)
+                )
+                intent_path = Path(store_module.card_sidecar_path(root, intent_card_id))
+                conn.execute(
+                    "UPDATE cards SET location_uri = NULL WHERE id = ?",
+                    (intent_card_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            store_module.write_atomic_yaml(intent_path, intent_payload)
+            try:
+                os.link(intent_path, referenced_path)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"hardlink creation unavailable: {exc}")
+            intent_id, durable_intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=intent_card_id,
+                    target_uri=store_module.continuum_uri(root, intent_path),
+                    expected_state_hash=str(intent_payload["state_hash"]),
+                )
+            )
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertEqual(
+                reconciled["results"][0]["status"],
+                "referenced_target_mismatch",
+            )
+            self.assertEqual(
+                reconciled["results"][0]["referenced_by"],
+                [referenced_card_id],
+            )
+            self.assertEqual(
+                durable_intent_path.name,
+                f"{intent_id}.json",
+            )
+            self.assertTrue(durable_intent_path.is_file())
+            self.assertTrue(intent_path.samefile(referenced_path))
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_sidecar_intent_rechecks_card_reference_before_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="reference-replacement-boundary",
+                    summary="The catalog reference remains the selected generation.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                reference_uri = str(row["location_uri"])
+                reference_path = resolve_stored_uri(root, reference_uri)
+                payload = store_module._card_sidecar_payload_for_row(row)
+            finally:
+                conn.close()
+            reference_bytes = reference_path.read_bytes()
+            target_path = reference_path.with_name(
+                f"{card_id}.live-{payload['state_hash']}.yaml"
+            )
+            store_module.write_atomic_yaml(target_path, payload)
+            target_bytes = target_path.read_bytes()
+            intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=store_module.continuum_uri(root, target_path),
+                expected_state_hash=str(payload["state_hash"]),
+            )
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            preserved_reference = Path(tmp) / "preserved-reference.yaml"
+            real_identity = store_module._sidecar_nofollow_path_identity
+            reference_checks = 0
+
+            def replace_reference_on_recheck(
+                path: Path,
+                *,
+                allow_missing: bool = False,
+            ):
+                nonlocal reference_checks
+                if path == reference_path:
+                    reference_checks += 1
+                    if reference_checks == 2:
+                        reference_path.replace(preserved_reference)
+                        reference_path.symlink_to(target_path)
+                return real_identity(path, allow_missing=allow_missing)
+
+            with patch.object(
+                store_module,
+                "_sidecar_nofollow_path_identity",
+                side_effect=replace_reference_on_recheck,
+            ):
+                reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertEqual(
+                reconciled["results"][0]["status"],
+                "card_reference_unstable",
+            )
+            self.assertGreaterEqual(reference_checks, 2)
+            self.assertTrue(reference_path.is_symlink())
+            self.assertEqual(preserved_reference.read_bytes(), reference_bytes)
+            self.assertEqual(target_path.read_bytes(), target_bytes)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(receipt_path.exists())
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"],
+                    reference_uri,
+                )
+            finally:
+                conn.close()
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_immutable_index_rechecks_source_entry_before_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="immutable-index-replacement-boundary",
+                    summary="The initial default generation is mutable.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            conn = connect(root)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                original_uri = str(row["location_uri"])
+                default_path = resolve_stored_uri(root, original_uri)
+                original_bytes = default_path.read_bytes()
+                artifact_alias = root / "archive" / "immutable-sidecar-alias.yaml"
+                artifact_alias.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(default_path, artifact_alias)
+                except (NotImplementedError, OSError) as exc:
+                    self.skipTest(f"hardlink creation unavailable: {exc}")
+                store_module.record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=store_module.continuum_uri(root, artifact_alias),
+                    sha256=hashlib.sha256(original_bytes).hexdigest(),
+                    size_bytes=len(original_bytes),
+                    immutable=True,
+                    source_type="immutable_index_replacement_boundary",
+                    trust_level="local_evidence",
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "A changed artifact entry must not freeze this mutable default.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="immutable_index_source_replaced",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            preserved_alias = Path(tmp) / "preserved-immutable-alias.yaml"
+            real_identity = store_module._sidecar_nofollow_path_identity
+            alias_checks = 0
+
+            def replace_alias_on_recheck(
+                path: Path,
+                *,
+                allow_missing: bool = False,
+            ):
+                nonlocal alias_checks
+                if path == artifact_alias:
+                    alias_checks += 1
+                    if alias_checks == 2:
+                        artifact_alias.replace(preserved_alias)
+                        artifact_alias.symlink_to(default_path)
+                return real_identity(path, allow_missing=allow_missing)
+
+            with patch.object(
+                store_module,
+                "_sidecar_nofollow_path_identity",
+                side_effect=replace_alias_on_recheck,
+            ):
+                updated = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(updated["ok"], updated)
+            self.assertGreaterEqual(alias_checks, 2)
+            self.assertTrue(artifact_alias.is_symlink())
+            self.assertEqual(preserved_alias.read_bytes(), original_bytes)
+            self.assertNotEqual(default_path.read_bytes(), original_bytes)
+            self.assertFalse(
+                (default_path.parent / f"{card_id}.live.yaml").exists()
+            )
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"],
+                    original_uri,
+                )
+            finally:
+                conn.close()
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_immutable_verifier_rechecks_candidate_and_artifact_entries(self) -> None:
+        for boundary in ("candidate", "artifact"):
+            for phase in ("before_read", "after_hash"):
+                with self.subTest(
+                    boundary=boundary,
+                    phase=phase,
+                ), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    init_db(root)
+                    conn = connect(root)
+                    try:
+                        card_id = create_card(
+                            conn,
+                            root=root,
+                            card_type="note",
+                            title=f"immutable-verifier-{boundary}-{phase}-boundary",
+                            summary=(
+                                "Only stable regular entries may become immutable evidence."
+                            ),
+                            source_refs=[],
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    self.assertTrue(
+                        sync_card_sidecars_after_commit(root, [card_id])["ok"]
+                    )
+
+                    conn = connect(root)
+                    try:
+                        row = conn.execute(
+                            "SELECT * FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()
+                        candidate_path = resolve_stored_uri(
+                            root,
+                            str(row["location_uri"]),
+                        )
+                        candidate_bytes = candidate_path.read_bytes()
+                        artifact_alias = (
+                            root / "archive" / f"{boundary}-{phase}-alias.yaml"
+                        )
+                        artifact_alias.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            os.link(candidate_path, artifact_alias)
+                        except (NotImplementedError, OSError) as exc:
+                            self.skipTest(f"hardlink creation unavailable: {exc}")
+                        store_module.record_artifact(
+                            conn,
+                            kind="sidecar_proof",
+                            uri=store_module.continuum_uri(root, artifact_alias),
+                            sha256=hashlib.sha256(candidate_bytes).hexdigest(),
+                            size_bytes=len(candidate_bytes),
+                            immutable=True,
+                            source_type=(
+                                f"immutable_verifier_{boundary}_{phase}_replacement"
+                            ),
+                            trust_level="local_evidence",
+                        )
+                        conn.commit()
+
+                        replaced_path = (
+                            candidate_path
+                            if boundary == "candidate"
+                            else artifact_alias
+                        )
+                        link_target = (
+                            artifact_alias
+                            if boundary == "candidate"
+                            else candidate_path
+                        )
+                        preserved_path = (
+                            Path(tmp) / f"preserved-{boundary}-{phase}.yaml"
+                        )
+                        real_identity = store_module._sidecar_nofollow_path_identity
+                        real_hash = store_module.file_sha256
+                        entry_checks = 0
+                        hash_completed = False
+
+                        def replace_entry() -> None:
+                            if not replaced_path.is_symlink():
+                                replaced_path.replace(preserved_path)
+                                replaced_path.symlink_to(link_target)
+
+                        def replace_entry_on_recheck(
+                            path: Path,
+                            *,
+                            allow_missing: bool = False,
+                        ):
+                            nonlocal entry_checks
+                            if path == replaced_path:
+                                entry_checks += 1
+                                if entry_checks == 2:
+                                    replace_entry()
+                            return real_identity(path, allow_missing=allow_missing)
+
+                        def replace_entry_after_hash(path: Path) -> str:
+                            nonlocal hash_completed
+                            digest = real_hash(path)
+                            replace_entry()
+                            hash_completed = True
+                            return digest
+
+                        if phase == "before_read":
+                            with patch.object(
+                                store_module,
+                                "_sidecar_nofollow_path_identity",
+                                side_effect=replace_entry_on_recheck,
+                            ):
+                                verified, uncertain = (
+                                    store_module._verified_immutable_card_sidecars(
+                                        root,
+                                        conn,
+                                        candidate_path.parent,
+                                    )
+                                )
+                        else:
+                            with patch.object(
+                                store_module,
+                                "file_sha256",
+                                side_effect=replace_entry_after_hash,
+                            ):
+                                verified, uncertain = (
+                                    store_module._verified_immutable_card_sidecars(
+                                        root,
+                                        conn,
+                                        candidate_path.parent,
+                                    )
+                                )
+                    finally:
+                        conn.close()
+
+                    if phase == "before_read":
+                        self.assertGreaterEqual(entry_checks, 2)
+                    else:
+                        self.assertTrue(hash_completed)
+                    self.assertNotIn(card_id, verified)
+                    self.assertIn(card_id, uncertain)
+                    self.assertTrue(replaced_path.is_symlink())
+                    self.assertEqual(preserved_path.read_bytes(), candidate_bytes)
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_orphan_audit_rechecks_entry_before_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="orphan-audit-replacement-boundary",
+                    summary="The expected Card remains stable during orphan review.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect_existing(root)
+            try:
+                current_path = resolve_stored_uri(
+                    root,
+                    str(
+                        conn.execute(
+                            "SELECT location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()["location_uri"]
+                    ),
+                )
+            finally:
+                conn.close()
+            orphan_path = current_path.parent / "card_orphan.yaml"
+            orphan_bytes = b"schema: intentionally-orphaned\n"
+            orphan_path.write_bytes(orphan_bytes)
+            preserved_orphan = Path(tmp) / "preserved-orphan.yaml"
+            real_identity = store_module._sidecar_nofollow_path_identity
+            orphan_checks = 0
+
+            def replace_orphan_on_recheck(
+                path: Path,
+                *,
+                allow_missing: bool = False,
+            ):
+                nonlocal orphan_checks
+                if path == orphan_path:
+                    orphan_checks += 1
+                    if orphan_checks == 2:
+                        orphan_path.replace(preserved_orphan)
+                        orphan_path.symlink_to(current_path)
+                return real_identity(path, allow_missing=allow_missing)
+
+            conn = connect_existing(root)
+            try:
+                with patch.object(
+                    store_module,
+                    "_sidecar_nofollow_path_identity",
+                    side_effect=replace_orphan_on_recheck,
+                ):
+                    state = store_module.audit_card_sidecars(root, conn)
+            finally:
+                conn.close()
+
+            self.assertGreaterEqual(orphan_checks, 2)
+            self.assertEqual(state["unsafe_card_sidecar_paths"], 1, state)
+            self.assertEqual(state["orphan_card_sidecars"], 0, state)
+            self.assertTrue(orphan_path.is_symlink())
+            self.assertEqual(preserved_orphan.read_bytes(), orphan_bytes)
+
+    @unittest.skipUnless(os.name == "posix", "real sidecar symlinks are POSIX-only")
+    def test_history_receipt_binding_rechecks_current_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="history-receipt-replacement-boundary",
+                    summary="The mutable default becomes the first generation.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            def current() -> tuple[str, Path]:
+                current_conn = connect_existing(root)
+                try:
+                    uri = str(
+                        current_conn.execute(
+                            "SELECT location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()["location_uri"]
+                    )
+                finally:
+                    current_conn.close()
+                return uri, resolve_stored_uri(root, uri)
+
+            def freeze_current(source_type: str) -> None:
+                uri, path = current()
+                artifact_conn = connect(root)
+                try:
+                    store_module.record_artifact(
+                        artifact_conn,
+                        kind="sidecar_proof",
+                        uri=uri,
+                        sha256=store_module.file_sha256(path),
+                        size_bytes=path.stat().st_size,
+                        immutable=True,
+                        source_type=source_type,
+                        trust_level="local_evidence",
+                    )
+                    artifact_conn.commit()
+                finally:
+                    artifact_conn.close()
+
+            def advance(summary: str, reason: str) -> tuple[str, Path]:
+                update_conn = connect(root)
+                try:
+                    update_conn.execute(
+                        "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                        (summary, store_module.utc_now(), card_id),
+                    )
+                    store_module.mark_card_sidecar_outbox(
+                        update_conn,
+                        [card_id],
+                        reason=reason,
+                    )
+                    update_conn.commit()
+                finally:
+                    update_conn.close()
+                result = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(result["ok"], result)
+                return current()
+
+            freeze_current("history_receipt_default")
+            _live_uri, live_path = advance(
+                "The stable live generation becomes current.",
+                "history_receipt_live",
+            )
+            self.assertEqual(live_path.name, f"{card_id}.live.yaml")
+            freeze_current("history_receipt_live")
+            current_uri, current_path = advance(
+                "The content-addressed generation becomes current.",
+                "history_receipt_hash",
+            )
+            self.assertIn(".live-", current_path.name)
+            current_bytes = current_path.read_bytes()
+
+            update_conn = connect(root)
+            try:
+                update_conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The next state must not inherit a replaced history entry.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    update_conn,
+                    [card_id],
+                    reason="history_receipt_entry_replaced",
+                )
+                update_conn.commit()
+            finally:
+                update_conn.close()
+
+            receipt_dir = root / "exports" / "card_sidecar_recovery_receipts"
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            cards_dir = current_path.parent
+            receipts_before = {path.name for path in receipt_dir.glob("*.json")}
+            intents_before = {path.name for path in intent_dir.glob("*.json")}
+            sidecars_before = {path.name for path in cards_dir.glob("*.yaml")}
+            preserved_current = Path(tmp) / "preserved-current-generation.yaml"
+            real_binder = store_module._history_receipt_binds_card_sidecar
+            real_identity = store_module._sidecar_nofollow_path_identity
+            replaced = False
+            binder_identity_checks = 0
+
+            receipt_index = store_module._validated_card_sidecar_history_receipt_index(
+                root
+            )
+            current_payload = load_atomic_yaml(
+                current_path.read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                real_binder(
+                    current_path,
+                    card_id=card_id,
+                    state_hash=str(current_payload["state_hash"]),
+                    receipt_index=receipt_index,
+                )
+            )
+
+            def replace_before_binding(path: Path, **kwargs):
+                def replace_on_binder_recheck(
+                    candidate: Path,
+                    *,
+                    allow_missing: bool = False,
+                ):
+                    nonlocal replaced, binder_identity_checks
+                    if candidate == current_path:
+                        binder_identity_checks += 1
+                        if binder_identity_checks == 2:
+                            current_path.replace(preserved_current)
+                            current_path.symlink_to(preserved_current)
+                            replaced = True
+                    return real_identity(candidate, allow_missing=allow_missing)
+
+                with patch.object(
+                    store_module,
+                    "_sidecar_nofollow_path_identity",
+                    side_effect=replace_on_binder_recheck,
+                ):
+                    return real_binder(path, **kwargs)
+
+            with patch.object(
+                store_module,
+                "_history_receipt_binds_card_sidecar",
+                side_effect=replace_before_binding,
+            ):
+                failed = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(replaced)
+            self.assertGreaterEqual(binder_identity_checks, 2)
+            self.assertFalse(failed["ok"], failed)
+            self.assertTrue(
+                any(
+                    "changed during receipt binding"
+                    in str(failure.get("error") or "")
+                    for failure in failed["failures"]
+                ),
+                failed,
+            )
+            self.assertTrue(current_path.is_symlink())
+            self.assertEqual(preserved_current.read_bytes(), current_bytes)
+            self.assertEqual(
+                {path.name for path in receipt_dir.glob("*.json")},
+                receipts_before,
+            )
+            self.assertEqual(
+                {path.name for path in intent_dir.glob("*.json")},
+                intents_before,
+            )
+            self.assertEqual(
+                {path.name for path in cards_dir.glob("*.yaml")},
+                sidecars_before,
+            )
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"],
+                    current_uri,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                conn.close()
+
+    def test_compensation_intent_terminalizes_when_rollback_never_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="rollback-not-committed",
+                    summary="The referenced candidate remains the committed state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect_existing(root)
+            try:
+                row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+                target_uri = str(row["location_uri"])
+                payload = store_module._card_sidecar_payload_for_row(row)
+            finally:
+                conn.close()
+            target_path = resolve_stored_uri(root, target_uri)
+            target_bytes = target_path.read_bytes()
+            store_module.register_card_sidecar_compensation_intents(
+                root,
+                [
+                    {
+                        "card_id": card_id,
+                        "uri": target_uri,
+                        "state_hash": payload["state_hash"],
+                    }
+                ],
+            )
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["pending"], 0)
+            self.assertEqual(reconciled["results"][0]["status"], "rollback_not_committed")
+            self.assertEqual(target_path.read_bytes(), target_bytes)
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    @unittest.skipUnless(os.name == "posix", "real state-directory symlinks are POSIX-only")
+    def test_sidecar_intent_and_receipt_paths_reject_redirects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            card_id = "card_redirect_regression"
+            target_path = root / "catalog" / "cards" / f"{card_id}.yaml"
+            target_uri = store_module.continuum_uri(root, target_path)
+            expected_state_hash = "a" * 64
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            external_intents = Path(tmp) / "external-intents"
+            external_intents.mkdir()
+            intent_dir.symlink_to(external_intents, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "link-like"):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=expected_state_hash,
+                )
+            self.assertFalse(list(external_intents.iterdir()))
+            intent_dir.unlink()
+
+            prior_umask = os.umask(0o022)
+            try:
+                _intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=expected_state_hash,
+                )
+            finally:
+                os.umask(prior_umask)
+            self.assertEqual(intent_dir.stat().st_mode & 0o077, 0)
+
+            receipt_dir = root / "exports" / "card_sidecar_recovery_receipts"
+            external_receipts = Path(tmp) / "external-receipts"
+            external_receipts.mkdir()
+            receipt_dir.symlink_to(external_receipts, target_is_directory=True)
+            redirected_receipt = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(redirected_receipt["ok"], redirected_receipt)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(list(external_receipts.iterdir()))
+            receipt_dir.unlink()
+
+            external_intent_file = external_intents / intent_path.name
+            intent_path.replace(external_intent_file)
+            external_bytes = external_intent_file.read_bytes()
+            intent_path.symlink_to(external_intent_file)
+            redirected_entry = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(redirected_entry["ok"], redirected_entry)
+            self.assertEqual(external_intent_file.read_bytes(), external_bytes)
+            integrity = semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertGreater(
+                integrity["checks"]["unsafe_card_sidecar_write_intent_paths"],
+                0,
+            )
+
+    def test_forged_card_sidecar_recovery_receipt_is_not_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="forged-recovery-receipt",
+                    summary="Only a bound recovery receipt may legitimize quarantine bytes.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect_existing(root)
+            try:
+                row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+                target_uri = str(row["location_uri"])
+                payload = store_module._card_sidecar_payload_for_row(row)
+            finally:
+                conn.close()
+            target_path = resolve_stored_uri(root, target_uri)
+            forged_intent_id = "forged_receipt_authority"
+            recovery_path = target_path.with_name(
+                f".{target_path.name}.{forged_intent_id}.uncommitted"
+            )
+            recovery_path.write_bytes(target_path.read_bytes())
+            receipt = {
+                "ok": True,
+                "schema": store_module.CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA,
+                "intent_id": forged_intent_id,
+                "card_id": card_id,
+                "target_uri": target_uri,
+                "expected_state_hash": payload["state_hash"],
+                "mode": "write",
+                "status": "quarantined",
+                "resolved_at": store_module.utc_now(),
+                "recovery_uri": store_module.continuum_uri(root, recovery_path),
+                "recovery_sha256": hashlib.sha256(recovery_path.read_bytes()).hexdigest(),
+                "recovery_size_bytes": recovery_path.stat().st_size,
+            }
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{forged_intent_id}.json"
+            )
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            integrity = semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertGreater(
+                integrity["checks"]["malformed_card_sidecar_recovery_receipts"],
+                0,
+            )
+
+    def test_superseded_recovery_receipt_requires_write_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="superseded-receipt-mode",
+                    summary="Superseded recovery receipts are valid only for writes.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                target_uri = str(row["location_uri"])
+                state_hash = str(
+                    store_module._card_sidecar_payload_for_row(row)["state_hash"]
+                )
+            finally:
+                conn.close()
+
+            mode = "compensation_cleanup"
+            attempt_id = store_module.unique_id("card_sidecar_attempt")
+            intent_id = store_module.stable_id(
+                "card_sidecar_write_intent",
+                mode,
+                card_id,
+                target_uri,
+                state_hash,
+                attempt_id,
+            )
+            receipt = {
+                "ok": True,
+                "schema": store_module.CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA,
+                "intent_id": intent_id,
+                "card_id": card_id,
+                "target_uri": target_uri,
+                "expected_state_hash": state_hash,
+                "mode": mode,
+                "attempt_id": attempt_id,
+                "status": "superseded_by_newer_state",
+                "resolved_at": store_module.utc_now(),
+                "recovery_uri": None,
+                "recovery_sha256": None,
+                "recovery_size_bytes": None,
+            }
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            integrity = semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertGreater(
+                integrity["checks"]["malformed_card_sidecar_recovery_receipts"],
+                0,
+            )
+
+    def test_reused_sidecar_intent_coordinates_keep_prior_recovery_receipted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="reused-intent-coordinates",
+                    summary="Each physical write attempt has a distinct durable identity.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "UPDATE cards SET location_uri = NULL WHERE id = ?",
+                    (card_id,),
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            target_path = root / "catalog" / "cards" / f"{card_id}.live.yaml"
+            target_uri = store_module.continuum_uri(root, target_path)
+            state_hash = str(payload["state_hash"])
+            first_id, _first_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=target_uri,
+                expected_state_hash=state_hash,
+            )
+            store_module.write_atomic_yaml(target_path, payload)
+            first = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["results"][0]["status"], "quarantined")
+            first_recovery = target_path.with_name(
+                f".{target_path.name}.{first_id}.uncommitted"
+            )
+            self.assertTrue(first_recovery.is_file())
+
+            second_id, _second_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=target_uri,
+                expected_state_hash=state_hash,
+            )
+            self.assertNotEqual(first_id, second_id)
+            store_module.write_atomic_yaml(target_path, payload)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET location_uri = ? WHERE id = ?",
+                    (target_uri, card_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            second = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(second["results"][0]["status"], "adopted")
+
+            receipts = {
+                path.stem: json.loads(path.read_text(encoding="utf-8"))
+                for path in (
+                    root / "exports" / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            }
+            self.assertEqual(receipts[first_id]["status"], "quarantined")
+            self.assertEqual(receipts[second_id]["status"], "adopted")
+            self.assertTrue(first_recovery.is_file())
+            integrity = semantic_integrity_report(root)
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_hardlink_alias_artifact_preserves_and_audits_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="hardlink-artifact-sidecar",
+                    summary="A differently named hardlink still binds immutable bytes.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial["ok"], initial)
+            original_path = root / "catalog" / "cards" / f"{card_id}.yaml"
+            alias_path = root / "proofs" / "sidecar-proof.bin"
+            alias_path.parent.mkdir(parents=True)
+            try:
+                os.link(original_path, alias_path)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"hardlink creation unavailable: {exc}")
+
+            conn = connect(root)
+            try:
+                store_module.record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=store_module.continuum_uri(root, alias_path),
+                    sha256=store_module.file_sha256(alias_path),
+                    size_bytes=alias_path.stat().st_size,
+                    immutable=True,
+                    source_type="local_generated",
+                    trust_level="local_evidence",
+                )
+                conn.execute(
+                    "UPDATE cards SET status = ?, updated_at = ? WHERE id = ?",
+                    ("archived", store_module.utc_now(), card_id),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="hardlink_alias_state_change",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            updated = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(updated["ok"], updated)
+            conn = connect_existing(root)
+            try:
+                current_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertNotEqual(
+                store_module.resolve_stored_uri(root, current_uri),
+                original_path,
+            )
+            self.assertTrue(original_path.samefile(alias_path))
+            integrity = semantic_integrity_report(root)
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_hash_named_sidecar_generations_are_content_addressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="content-addressed-sidecar-generations",
+                    summary="The default generation is mutable before freezing.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            def freeze_current(source_type: str) -> Path:
+                artifact_conn = connect(root)
+                try:
+                    location_uri = artifact_conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                    path = resolve_stored_uri(root, location_uri)
+                    store_module.record_artifact(
+                        artifact_conn,
+                        kind="sidecar_proof",
+                        uri=location_uri,
+                        sha256=store_module.file_sha256(path),
+                        size_bytes=path.stat().st_size,
+                        immutable=True,
+                        source_type=source_type,
+                        trust_level="local_evidence",
+                    )
+                    artifact_conn.commit()
+                    return path
+                finally:
+                    artifact_conn.close()
+
+            def update_and_sync(summary: str, reason: str) -> Path:
+                update_conn = connect(root)
+                try:
+                    update_conn.execute(
+                        "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                        (summary, store_module.utc_now(), card_id),
+                    )
+                    store_module.mark_card_sidecar_outbox(
+                        update_conn,
+                        [card_id],
+                        reason=reason,
+                    )
+                    update_conn.commit()
+                finally:
+                    update_conn.close()
+                sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(sync["ok"], sync)
+                current_conn = connect_existing(root)
+                try:
+                    location_uri = current_conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                finally:
+                    current_conn.close()
+                return resolve_stored_uri(root, location_uri)
+
+            freeze_current("content_addressed_default")
+            live_path = update_and_sync(
+                "The stable live generation is mutable before freezing.",
+                "content_addressed_live",
+            )
+            self.assertEqual(live_path.name, f"{card_id}.live.yaml")
+            freeze_current("content_addressed_live")
+            hashed_s2 = update_and_sync(
+                "The first hash-named generation is content addressed.",
+                "content_addressed_s2",
+            )
+            payload_s2 = load_atomic_yaml(hashed_s2.read_text(encoding="utf-8"))
+            bytes_s2 = hashed_s2.read_bytes()
+            self.assertEqual(
+                hashed_s2.name,
+                f"{card_id}.live-{payload_s2['state_hash']}.yaml",
+            )
+            hashed_s2_uri = store_module.continuum_uri(root, hashed_s2)
+            removed_adopted_receipts = 0
+            for receipt_path in (
+                root / "exports" / "card_sidecar_recovery_receipts"
+            ).glob("*.json"):
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if (
+                    receipt.get("mode") == "write"
+                    and receipt.get("status") == "adopted"
+                    and receipt.get("target_uri") == hashed_s2_uri
+                ):
+                    receipt_path.unlink()
+                    removed_adopted_receipts += 1
+            self.assertEqual(removed_adopted_receipts, 1)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            hashed_s3 = update_and_sync(
+                "A later state must select its own hash-named generation.",
+                "content_addressed_s3",
+            )
+            payload_s3 = load_atomic_yaml(hashed_s3.read_text(encoding="utf-8"))
+
+            self.assertNotEqual(hashed_s3, hashed_s2)
+            self.assertEqual(hashed_s2.read_bytes(), bytes_s2)
+            self.assertEqual(
+                hashed_s3.name,
+                f"{card_id}.live-{payload_s3['state_hash']}.yaml",
+            )
+            content_addressed_integrity = semantic_integrity_report(root)
+            self.assertTrue(
+                content_addressed_integrity["ok"],
+                content_addressed_integrity,
+            )
+            transition_receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (
+                    root / "exports" / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            ]
+            self.assertTrue(
+                any(
+                    receipt.get("mode") == "history_transition"
+                    and receipt.get("status") == "transition_prepared"
+                    and receipt.get("target_uri") == hashed_s2_uri
+                    for receipt in transition_receipts
+                ),
+                transition_receipts,
+            )
+
+            snap = store_module.snapshot(
+                root,
+                reason="multi-generation content-addressed sidecar recovery",
+            )
+            snapshot_path = Path(str(snap["snapshot_uri"]))
+            manifest = store_module.load_snapshot_manifest(snapshot_path)
+            self.assertGreaterEqual(
+                manifest["card_sidecar_receipts"]["file_count"],
+                2,
+            )
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(snapshot_path)["ok"]
+            )
+            restored = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+            self.assertTrue(restored["ok"], restored["checks"])
+            restored_checks = {
+                check["name"]: check for check in restored["checks"]
+            }
+            self.assertTrue(
+                restored_checks[
+                    "restored_card_sidecar_receipts_match_snapshot_manifest"
+                ]["ok"]
+            )
+
+            unreceipted_payload = dict(payload_s3)
+            unreceipted_payload["summary"] = (
+                "A self-consistent injected generation has no terminal receipt."
+            )
+            unreceipted_payload["state_hash"] = (
+                store_module._atomic_card_state_hash(unreceipted_payload)
+            )
+            unreceipted_path = hashed_s3.with_name(
+                f"{card_id}.live-{unreceipted_payload['state_hash']}.yaml"
+            )
+            store_module.write_atomic_yaml(
+                unreceipted_path,
+                unreceipted_payload,
+            )
+            unreceipted_integrity = semantic_integrity_report(root)
+            self.assertFalse(unreceipted_integrity["ok"])
+            self.assertEqual(
+                unreceipted_integrity["checks"]["orphan_card_sidecars"],
+                1,
+            )
+            unreceipted_path.unlink()
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            bad_hash_path = hashed_s3.with_name(
+                f"{card_id}.live-{'0' * 64}.yaml"
+            )
+            bad_hash_path.write_bytes(hashed_s3.read_bytes())
+            conn = connect(root)
+            try:
+                store_module.record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=store_module.continuum_uri(root, bad_hash_path),
+                    sha256=store_module.file_sha256(bad_hash_path),
+                    size_bytes=bad_hash_path.stat().st_size,
+                    immutable=True,
+                    source_type="mismatched_content_addressed_name",
+                    trust_level="local_evidence",
+                )
+                verified, uncertain = (
+                    store_module._verified_immutable_card_sidecars(
+                        root,
+                        conn,
+                        bad_hash_path.parent,
+                    )
+                )
+                conn.execute(
+                    "UPDATE cards SET location_uri = ? WHERE id = ?",
+                    (
+                        store_module.continuum_uri(root, bad_hash_path),
+                        card_id,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertIn(card_id, uncertain)
+            self.assertFalse(
+                any(path == bad_hash_path for path, _payload in verified.get(card_id, []))
+            )
+            mismatched = semantic_integrity_report(root)
+            self.assertFalse(mismatched["ok"], mismatched)
+            self.assertGreaterEqual(
+                mismatched["checks"]["divergent_card_sidecars"],
+                1,
+            )
+
+    @unittest.skipUnless(os.name == "nt", "NTFS case aliases are Windows-only")
+    def test_case_renamed_hash_generation_with_lower_catalog_uri_is_portable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="windows-case-content-addressed-generation",
+                    summary="The default generation begins mutable.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            def current_path() -> Path:
+                current_conn = connect_existing(root)
+                try:
+                    uri = current_conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                finally:
+                    current_conn.close()
+                return resolve_stored_uri(root, uri)
+
+            def freeze_current(source_type: str) -> None:
+                path = current_path()
+                artifact_conn = connect(root)
+                try:
+                    store_module.record_artifact(
+                        artifact_conn,
+                        kind="sidecar_proof",
+                        uri=store_module.continuum_uri(root, path),
+                        sha256=store_module.file_sha256(path),
+                        size_bytes=path.stat().st_size,
+                        immutable=True,
+                        source_type=source_type,
+                        trust_level="local_evidence",
+                    )
+                    artifact_conn.commit()
+                finally:
+                    artifact_conn.close()
+
+            def advance(summary: str, reason: str) -> Path:
+                update_conn = connect(root)
+                try:
+                    update_conn.execute(
+                        "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                        (summary, store_module.utc_now(), card_id),
+                    )
+                    store_module.mark_card_sidecar_outbox(
+                        update_conn,
+                        [card_id],
+                        reason=reason,
+                    )
+                    update_conn.commit()
+                finally:
+                    update_conn.close()
+                sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(sync["ok"], sync)
+                return current_path()
+
+            freeze_current("windows_case_default")
+            live_path = advance(
+                "The stable live generation is now selected.",
+                "windows_case_live",
+            )
+            self.assertEqual(live_path.name, f"{card_id}.live.yaml")
+            freeze_current("windows_case_live")
+            hash_path = advance(
+                "The first content-addressed generation is current.",
+                "windows_case_hash",
+            )
+            self.assertIn(".live-", hash_path.name)
+            lower_location_uri = store_module.continuum_uri(root, hash_path)
+            self.assertEqual(
+                Path(lower_location_uri.removeprefix("continuum://")).name,
+                hash_path.name,
+            )
+            hop = hash_path.with_name(f".{hash_path.name}.case-hop")
+            uppercase_path = hash_path.with_name(hash_path.name.upper())
+            os.replace(hash_path, hop)
+            os.replace(hop, uppercase_path)
+            conn = connect(root)
+            try:
+                stored_location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(stored_location_uri, lower_location_uri)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            next_path = advance(
+                "The uppercase historical generation remains receipted.",
+                "windows_case_next_hash",
+            )
+
+            self.assertNotEqual(next_path.name.casefold(), uppercase_path.name.casefold())
+            self.assertTrue(uppercase_path.is_file())
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            transition_receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (
+                    root / "exports" / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            ]
+            uppercase_payload = load_atomic_yaml(
+                uppercase_path.read_text(encoding="utf-8")
+            )
+            history_index = (
+                store_module._validated_card_sidecar_history_receipt_index(root)
+            )
+            self.assertTrue(
+                any(
+                    receipt.get("mode") == "history_transition"
+                    and receipt.get("status") == "transition_prepared"
+                    and Path(str(receipt.get("target_uri") or "")).name
+                    == uppercase_path.name
+                    for receipt in transition_receipts
+                ),
+                transition_receipts,
+            )
+            self.assertTrue(
+                store_module._history_receipt_binds_card_sidecar(
+                    uppercase_path,
+                    card_id=card_id,
+                    state_hash=str(uppercase_payload["state_hash"]),
+                    receipt_index=history_index,
+                ),
+                transition_receipts,
+            )
+            snap = store_module.snapshot(
+                root,
+                reason="windows case-renamed hash generation",
+            )
+            snapshot_path = Path(str(snap["snapshot_uri"]))
+            manifest = store_module.load_snapshot_manifest(snapshot_path)
+            self.assertGreaterEqual(
+                manifest["card_sidecar_receipts"]["file_count"],
+                1,
+            )
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(snapshot_path)["ok"]
+            )
+            restored = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+            self.assertTrue(restored["ok"], restored["checks"])
+
+    def test_portable_uppercase_historical_generation_and_receipt_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="portable-case-alias",
+                    summary="The default sidecar begins mutable.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            def current_path() -> Path:
+                current_conn = connect_existing(root)
+                try:
+                    location_uri = str(
+                        current_conn.execute(
+                            "SELECT location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()["location_uri"]
+                    )
+                finally:
+                    current_conn.close()
+                return resolve_stored_uri(root, location_uri)
+
+            def freeze_current(source_type: str) -> None:
+                path = current_path()
+                artifact_conn = connect(root)
+                try:
+                    store_module.record_artifact(
+                        artifact_conn,
+                        kind="sidecar_proof",
+                        uri=store_module.continuum_uri(root, path),
+                        sha256=store_module.file_sha256(path),
+                        size_bytes=path.stat().st_size,
+                        immutable=True,
+                        source_type=source_type,
+                        trust_level="local_evidence",
+                    )
+                    artifact_conn.commit()
+                finally:
+                    artifact_conn.close()
+
+            def advance(summary: str, reason: str) -> Path:
+                update_conn = connect(root)
+                try:
+                    update_conn.execute(
+                        "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                        (summary, store_module.utc_now(), card_id),
+                    )
+                    store_module.mark_card_sidecar_outbox(
+                        update_conn,
+                        [card_id],
+                        reason=reason,
+                    )
+                    update_conn.commit()
+                finally:
+                    update_conn.close()
+                sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(sync["ok"], sync)
+                return current_path()
+
+            freeze_current("portable_case_default")
+            live_path = advance(
+                "The stable live sidecar is now selected.",
+                "portable_case_live",
+            )
+            self.assertEqual(live_path.name, f"{card_id}.live.yaml")
+            freeze_current("portable_case_live")
+            historical_path = advance(
+                "The first content-addressed generation is current.",
+                "portable_case_first_hash",
+            )
+            historical_uri = store_module.continuum_uri(root, historical_path)
+            current_generation = advance(
+                "A second content-addressed generation becomes current.",
+                "portable_case_second_hash",
+            )
+            self.assertNotEqual(current_generation, historical_path)
+
+            hop = historical_path.with_name(f".{historical_path.name}.case-hop")
+            uppercase_path = historical_path.with_name(historical_path.name.upper())
+            os.replace(historical_path, hop)
+            os.replace(hop, uppercase_path)
+            receipt_dir = root / "exports" / "card_sidecar_recovery_receipts"
+            historical_receipt_path: Path | None = None
+            historical_receipt: dict[str, object] | None = None
+            for receipt_path in receipt_dir.glob("*.json"):
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if (
+                    receipt.get("target_uri") == historical_uri
+                    and receipt.get("mode") == "write"
+                    and receipt.get("status") == "adopted"
+                ):
+                    historical_receipt_path = receipt_path
+                    historical_receipt = receipt
+                    break
+            self.assertIsNotNone(historical_receipt_path)
+            self.assertIsNotNone(historical_receipt)
+            assert historical_receipt_path is not None
+            assert historical_receipt is not None
+            uppercase_uri = store_module.continuum_uri(root, uppercase_path)
+            historical_receipt["target_uri"] = uppercase_uri
+            replacement_intent_id = store_module.stable_id(
+                "card_sidecar_write_intent",
+                str(historical_receipt["mode"]),
+                str(historical_receipt["card_id"]),
+                uppercase_uri,
+                str(historical_receipt["expected_state_hash"]),
+                str(historical_receipt["attempt_id"]),
+            )
+            historical_receipt["intent_id"] = replacement_intent_id
+            replacement_receipt_path = receipt_dir / f"{replacement_intent_id}.json"
+            store_module.secure_write_text(
+                replacement_receipt_path,
+                store_module.json_dumps(historical_receipt) + "\n",
+            )
+            if replacement_receipt_path != historical_receipt_path:
+                historical_receipt_path.unlink()
+
+            portable_integrity = semantic_integrity_report(root)
+            self.assertTrue(portable_integrity["ok"], portable_integrity)
+            snap = store_module.snapshot(
+                root,
+                reason="portable uppercase historical Card generation",
+            )
+            snapshot_path = Path(str(snap["snapshot_uri"]))
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(snapshot_path)["ok"]
+            )
+            restored = restore_drill(
+                root,
+                snapshot_uri=snap["snapshot_uri"],
+                verify_recent_proof_packs=0,
+            )
+            self.assertTrue(restored["ok"], restored["checks"])
+
+    @unittest.skipUnless(os.name == "posix", "case-distinct files require POSIX")
+    def test_snapshot_rejects_portable_sidecar_filename_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="portable-name-collision",
+                    summary="A sidecar name must be unique under case folding.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            sidecar = store_module.card_sidecar_path(root, card_id)
+            assert sidecar is not None
+            uppercase = sidecar.with_name(sidecar.name.upper())
+            uppercase.write_bytes(sidecar.read_bytes())
+            integrity = semantic_integrity_report(root)
+            self.assertEqual(
+                integrity["checks"]["nonportable_card_sidecar_name_collisions"],
+                1,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "nonportable_card_sidecar_name_collisions|portable filename collision",
+            ):
+                store_module.snapshot(root, reason="reject portable name collision")
+
+    def test_snapshot_rejects_casefold_colliding_card_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                first_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="portable-id-one",
+                    summary="The first portable Card identifier.",
+                    source_refs=[],
+                )
+                second_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="portable-id-two",
+                    summary="The second identifier is replaced for the probe.",
+                    source_refs=[],
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (second_id,),
+                )
+                conn.execute(
+                    "UPDATE cards SET id = ? WHERE id = ?",
+                    (first_id.upper(), second_id),
+                )
+                conn.commit()
+                integrity = semantic_integrity_report(root, conn=conn)
+            finally:
+                conn.close()
+            self.assertEqual(
+                integrity["checks"]["nonportable_card_id_collisions"],
+                1,
+            )
+            self.assertFalse(integrity["ok"], integrity)
+            with self.assertRaisesRegex(
+                ValueError,
+                "snapshot preflight failed: .*semantic integrity",
+            ):
+                store_module.snapshot(root, reason="reject colliding Card ids")
+
+    def test_disabled_sidecar_writes_remain_pending_until_reenabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="disabled-sidecar-retry",
+                    summary="The first committed sidecar state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial["ok"], initial)
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The committed Card now requires a later sidecar state.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="disabled_sidecar_update",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            disabled = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertFalse(disabled["ok"], disabled)
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            worker_disabled = worker_module.sync_card_sidecar_job(
+                root,
+                card_id=card_id,
+            )
+            self.assertFalse(worker_disabled["ok"], worker_disabled)
+            self.assertEqual(worker_disabled["reason"], "sidecars_disabled")
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = True
+            write_config(root, config)
+            recovered = store_module.sync_pending_card_sidecars(root)
+            self.assertTrue(recovered["ok"], recovered)
+            conn = connect_existing(root)
+            try:
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            integrity = semantic_integrity_report(root)
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_disabled_sidecar_worker_effect_retries_same_job_after_reenable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="disabled-worker-reclaim",
+                    summary="Initial sidecar state before a disabled worker attempt.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            first_owner = "disabled-sidecar-owner-one"
+            future = (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+            ).isoformat()
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "A reclaimed worker must write this later state.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="disabled_worker_reclaim",
+                )
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                    dedupe_key=f"card:{card_id}",
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                        heartbeat_at = ?, started_at = ?
+                    WHERE id = ?
+                    """,
+                    (first_owner, future, future, future, job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            first_lease = worker_module._JobLease(
+                root,
+                job_id,
+                first_owner,
+                300,
+            )
+            first_token = worker_module._CURRENT_JOB_LEASE.set(first_lease)
+            try:
+                disabled = worker_module.sync_card_sidecar_job(
+                    root,
+                    card_id=card_id,
+                )
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(first_token)
+            self.assertFalse(disabled["ok"], disabled)
+            conn = connect_existing(root)
+            try:
+                disabled_effect_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_id = ?
+                        """,
+                        (job_id,),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(disabled_effect_count, 0)
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = True
+            write_config(root, config)
+            second_owner = "disabled-sidecar-owner-two"
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                        heartbeat_at = ?
+                    WHERE id = ?
+                    """,
+                    (second_owner, future, future, job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            second_lease = worker_module._JobLease(
+                root,
+                job_id,
+                second_owner,
+                300,
+            )
+            second_token = worker_module._CURRENT_JOB_LEASE.set(second_lease)
+            try:
+                recovered = worker_module.sync_card_sidecar_job(
+                    root,
+                    card_id=card_id,
+                )
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(second_token)
+            self.assertTrue(recovered["ok"], recovered)
+            conn = connect_existing(root)
+            try:
+                recovered_effect_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_id = ?
+                        """,
+                        (job_id,),
+                    ).fetchone()[0]
+                )
+                pending_outbox = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(recovered_effect_count, 1)
+            self.assertIsNone(pending_outbox)
+            integrity = semantic_integrity_report(root)
+            self.assertTrue(integrity["ok"], integrity)
+
+    def test_worker_pass_requeues_deferred_sidecar_without_failed_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="worker-pass-deferred-sidecar",
+                    summary="Initial materialized state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    ("Deferred until writes are enabled.", store_module.utc_now(), card_id),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="worker_pass_deferred_sidecar",
+                )
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                    dedupe_key=f"card:{card_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            deferred = run_worker_pass(
+                root,
+                roles=["archivist"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertFalse(deferred["ok"], deferred)
+            self.assertEqual(deferred["processed"][0]["job_id"], job_id)
+            self.assertEqual(deferred["processed"][0]["status"], "pending")
+            conn = connect_existing(root)
+            try:
+                deferred_row = conn.execute(
+                    "SELECT status, lease_owner FROM queue_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                failed_jobs = int(
+                    conn.execute(
+                        "SELECT count(*) FROM queue_jobs WHERE status = 'failed'"
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(dict(deferred_row), {"status": "pending", "lease_owner": None})
+            self.assertEqual(failed_jobs, 0)
+            self.assertEqual(memory_health(root)["failed_jobs"], 0)
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = True
+            write_config(root, config)
+            recovered = run_worker_pass(
+                root,
+                roles=["archivist"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(recovered["ok"], recovered)
+            self.assertEqual(recovered["processed"][0]["job_id"], job_id)
+            self.assertEqual(recovered["processed"][0]["status"], "succeeded")
+            conn = connect_existing(root)
+            try:
+                recovered_status = conn.execute(
+                    "SELECT status FROM queue_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()["status"]
+                pending_outbox = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(recovered_status, "succeeded")
+            self.assertIsNone(pending_outbox)
+            self.assertEqual(memory_health(root)["failed_jobs"], 0)
+
+    def test_sidecar_worker_expiry_at_first_materialized_commit_is_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-first-commit-fence",
+                    summary="A lease must still be owned at the first sidecar commit.",
+                    source_refs=[],
+                )
+                before = dict(
+                    conn.execute(
+                        """
+                        SELECT card.location_uri,
+                               outbox.generation AS sidecar_generation
+                        FROM cards AS card
+                        LEFT JOIN card_sidecar_outbox AS outbox
+                          ON outbox.card_id = card.id
+                        WHERE card.id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            job_id, lease = self._running_sidecar_job_lease(
+                root,
+                card_id,
+                suffix="materialized",
+            )
+            real_commit = worker_module._commit_sidecar_worker_phase
+
+            def expire_at_first_commit(transaction_conn, active_lease, **kwargs):
+                transaction_conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET lease_expires_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                return real_commit(
+                    transaction_conn,
+                    active_lease,
+                    **kwargs,
+                )
+
+            token = worker_module._CURRENT_JOB_LEASE.set(lease)
+            try:
+                with patch.object(
+                    worker_module,
+                    "_commit_sidecar_worker_phase",
+                    side_effect=expire_at_first_commit,
+                ), self.assertRaisesRegex(RuntimeError, "worker lease lost"):
+                    worker_module.sync_card_sidecar_job(root, card_id=card_id)
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(token)
+
+            conn = connect_existing(root)
+            try:
+                after = dict(
+                    conn.execute(
+                        """
+                        SELECT card.location_uri,
+                               outbox.generation AS sidecar_generation
+                        FROM cards AS card
+                        LEFT JOIN card_sidecar_outbox AS outbox
+                          ON outbox.card_id = card.id
+                        WHERE card.id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+                phase_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._SIDECAR_WORKER_PHASE_ACTION),
+                    ).fetchone()[0]
+                )
+                effect_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._WORKER_EFFECT_ACTION),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(after, before)
+            self.assertEqual(phase_count, 0)
+            self.assertEqual(effect_count, 0)
+            self.assertTrue(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+
+    def test_sidecar_worker_expiry_fences_disabled_retry_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-disabled-commit-fence",
+                    summary="Initial materialized state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    ("This update remains pending while disabled.", store_module.utc_now(), card_id),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="disabled_commit_fence",
+                )
+                before = dict(
+                    conn.execute(
+                        """
+                        SELECT generation, attempt_count, last_error
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            job_id, lease = self._running_sidecar_job_lease(
+                root,
+                card_id,
+                suffix="disabled",
+            )
+            real_commit = worker_module._commit_sidecar_worker_phase
+
+            def expire_at_disabled_commit(transaction_conn, active_lease, **kwargs):
+                transaction_conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET lease_expires_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                return real_commit(transaction_conn, active_lease, **kwargs)
+
+            token = worker_module._CURRENT_JOB_LEASE.set(lease)
+            try:
+                with patch.object(
+                    worker_module,
+                    "_commit_sidecar_worker_phase",
+                    side_effect=expire_at_disabled_commit,
+                ), self.assertRaisesRegex(RuntimeError, "worker lease lost"):
+                    worker_module.sync_card_sidecar_job(root, card_id=card_id)
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(token)
+
+            conn = connect_existing(root)
+            try:
+                after = dict(
+                    conn.execute(
+                        """
+                        SELECT generation, attempt_count, last_error
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+                phase_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._SIDECAR_WORKER_PHASE_ACTION),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(after, before)
+            self.assertEqual(phase_count, 0)
+
+    def test_sidecar_worker_reconciliation_commit_is_fenced_and_phase_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-reconciliation-commit-fence",
+                    summary="The materialized phase must survive a later lost lease.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            job_id, lease = self._running_sidecar_job_lease(
+                root,
+                card_id,
+                suffix="reconciliation",
+            )
+            real_commit = worker_module._commit_sidecar_worker_phase
+            commit_calls = 0
+
+            def expire_at_second_commit(transaction_conn, active_lease, **kwargs):
+                nonlocal commit_calls
+                commit_calls += 1
+                if commit_calls == 2:
+                    transaction_conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET lease_expires_at = '2000-01-01T00:00:00+00:00'
+                        WHERE id = ?
+                        """,
+                        (job_id,),
+                    )
+                return real_commit(transaction_conn, active_lease, **kwargs)
+
+            token = worker_module._CURRENT_JOB_LEASE.set(lease)
+            try:
+                with (
+                    patch.object(
+                        worker_module,
+                        "reconcile_card_sidecar_write_intents",
+                        return_value={
+                            "ok": False,
+                            "pending": 1,
+                            "failures": [{"error": "forced reconciliation delay"}],
+                            "results": [],
+                        },
+                    ),
+                    patch.object(
+                        worker_module,
+                        "_commit_sidecar_worker_phase",
+                        side_effect=expire_at_second_commit,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "worker lease lost"),
+                ):
+                    worker_module.sync_card_sidecar_job(root, card_id=card_id)
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(token)
+
+            conn = connect_existing(root)
+            try:
+                location_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()[0]
+                pending = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+                phase_rows = list(
+                    conn.execute(
+                        """
+                        SELECT payload_json FROM audit_events
+                        WHERE target_id = ? AND action = ?
+                        ORDER BY created_at, id
+                        """,
+                        (job_id, worker_module._SIDECAR_WORKER_PHASE_ACTION),
+                    )
+                )
+                effect_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._WORKER_EFFECT_ACTION),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertIsNotNone(location_uri)
+            self.assertIsNone(pending)
+            self.assertEqual(len(phase_rows), 1)
+            self.assertEqual(
+                json.loads(phase_rows[0]["payload_json"])["phase"],
+                "materialized_pending_reconciliation",
+            )
+            self.assertEqual(effect_count, 0)
+
+    def test_sidecar_worker_requeues_when_fresh_reconciliation_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-fresh-reconciliation-exception",
+                    summary="A transient reconciliation exception must retain retry authority.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            job_id, lease = self._running_sidecar_job_lease(
+                root,
+                card_id,
+                suffix="fresh-reconciliation-exception",
+            )
+            token = worker_module._CURRENT_JOB_LEASE.set(lease)
+            try:
+                with patch.object(
+                    worker_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=OSError("forced fresh reconciliation failure"),
+                ):
+                    result = worker_module.sync_card_sidecar_job(
+                        root,
+                        card_id=card_id,
+                    )
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(token)
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "intent_reconciliation_incomplete")
+            self.assertTrue(result["intent_reconciliation"]["raised"])
+            self.assertIn(
+                "forced fresh reconciliation failure",
+                result["intent_reconciliation"]["error"],
+            )
+            conn = connect_existing(root)
+            try:
+                pending = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+                phase_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._SIDECAR_WORKER_PHASE_ACTION),
+                    ).fetchone()[0]
+                )
+                effect_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._WORKER_EFFECT_ACTION),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertIsNotNone(pending)
+            self.assertEqual(phase_count, 2)
+            self.assertEqual(effect_count, 0)
+            self.assertTrue(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+
+    def test_sidecar_worker_requeues_when_terminal_replay_reconciliation_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-terminal-replay-exception",
+                    summary="A terminal replay must still retain reconciliation retry authority.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            job_id, lease = self._running_sidecar_job_lease(
+                root,
+                card_id,
+                suffix="terminal-replay-exception",
+            )
+            token = worker_module._CURRENT_JOB_LEASE.set(lease)
+            try:
+                first = worker_module.sync_card_sidecar_job(root, card_id=card_id)
+                self.assertTrue(first["ok"], first)
+                with patch.object(
+                    worker_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=OSError("forced terminal replay reconciliation failure"),
+                ):
+                    replay = worker_module.sync_card_sidecar_job(
+                        root,
+                        card_id=card_id,
+                    )
+            finally:
+                worker_module._CURRENT_JOB_LEASE.reset(token)
+
+            self.assertFalse(replay["ok"], replay)
+            self.assertTrue(replay["idempotent_replay"])
+            self.assertTrue(replay["intent_reconciliation"]["raised"])
+            self.assertIn(
+                "forced terminal replay reconciliation failure",
+                replay["intent_reconciliation"]["error"],
+            )
+            conn = connect_existing(root)
+            try:
+                pending = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+                phase_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._SIDECAR_WORKER_PHASE_ACTION),
+                    ).fetchone()[0]
+                )
+                effect_count = int(
+                    conn.execute(
+                        "SELECT count(*) FROM audit_events WHERE target_id = ? AND action = ?",
+                        (job_id, worker_module._WORKER_EFFECT_ACTION),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertIsNotNone(pending)
+            self.assertEqual(phase_count, 2)
+            self.assertEqual(effect_count, 1)
+
+    def test_terminal_sidecar_receipts_do_not_share_active_intent_count_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with patch.object(
+                store_module,
+                "MAX_CARD_SIDECAR_WRITE_INTENTS",
+                2,
+            ):
+                for index in range(3):
+                    conn = connect(root)
+                    try:
+                        card_id = create_card(
+                            conn,
+                            root=root,
+                            card_type="note",
+                            title=f"receipt-history-{index}",
+                            summary=f"Successful sidecar write {index}.",
+                            source_refs=[],
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    sync = sync_card_sidecars_after_commit(root, [card_id])
+                    self.assertTrue(sync["ok"], sync)
+
+                receipt_paths = list(
+                    (
+                        root / "exports" / "card_sidecar_recovery_receipts"
+                    ).glob("*.json")
+                )
+                self.assertEqual(len(receipt_paths), 3)
+                integrity = semantic_integrity_report(root)
+                self.assertTrue(integrity["ok"], integrity)
+                self.assertEqual(
+                    integrity["checks"]["card_sidecar_recovery_scan_overflow"],
+                    0,
+                )
+
+    def test_active_sidecar_intent_scans_retain_only_bounded_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="bounded-intent-scan",
+                    summary="Active recovery work must have a real scan bound.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+            finally:
+                conn.close()
+            target_uri = f"catalog/cards/{card_id}.yaml"
+            for _index in range(3):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+
+            with patch.object(
+                store_module,
+                "MAX_CARD_SIDECAR_WRITE_INTENTS",
+                2,
+            ):
+                bounded_paths, overflow = (
+                    store_module._bounded_card_sidecar_intent_paths(intent_dir)
+                )
+                reconciled = store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    card_ids=["not-the-card"],
+                )
+                integrity = semantic_integrity_report(root)
+
+            self.assertTrue(overflow)
+            self.assertEqual(len(bounded_paths), 2)
+            self.assertTrue(reconciled["overflow"], reconciled)
+            self.assertEqual(reconciled["processed"], 0)
+            self.assertEqual(
+                integrity["checks"]["card_sidecar_write_intent_scan_overflow"],
+                1,
+            )
+            self.assertEqual(
+                integrity["checks"]["unresolved_card_sidecar_write_intents"],
+                2,
+            )
+
+    def test_disabled_unmaterialized_card_review_does_not_block_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="disabled-unmaterialized-review",
+                    summary="No sidecar was promised while writes were disabled.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            reviewed = worker_module.review_card_placement(
+                root,
+                card_id=card_id,
+            )
+
+            self.assertTrue(reviewed["ok"], reviewed)
+            conn = connect_existing(root)
+            try:
+                card_row = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                pending = conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNone(card_row["location_uri"])
+            self.assertIsNone(pending)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            snap = store_module.snapshot(
+                root,
+                reason="disabled unmaterialized Card remains snapshot compatible",
+            )
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(
+                    Path(str(snap["snapshot_uri"]))
+                )["ok"]
+            )
+
+    def test_reenable_backfills_unmaterialized_disabled_card_before_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="reenable-unmaterialized-backfill",
+                    summary="Re-enabling writes must backfill this Card.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = True
+            write_config(root, config)
+            backfill = store_module.sync_pending_card_sidecars(root)
+
+            self.assertTrue(backfill["ok"], backfill)
+            self.assertEqual(backfill["synced"], 1)
+            conn = connect_existing(root)
+            try:
+                location_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertTrue(resolve_stored_uri(root, location_uri).is_file())
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            snap = store_module.snapshot(
+                root,
+                reason="reenabled Cards are backfilled before snapshot",
+            )
+            self.assertTrue(
+                store_module.verify_snapshot_manifest(
+                    Path(str(snap["snapshot_uri"]))
+                )["ok"]
+            )
+
+    def test_traversal_card_id_intent_is_rejected_without_moving_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                source_card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="intent-card-id-confinement",
+                    summary="A forged Card id must not escape the configured directory.",
+                    source_refs=[],
+                )
+                source_row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (source_card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(source_row)
+                conn.commit()
+            finally:
+                conn.close()
+
+            malicious_card_id = "../../escaped"
+            payload["id"] = malicious_card_id
+            payload["card_id"] = malicious_card_id
+            payload["state_hash"] = store_module._atomic_card_state_hash(payload)
+            target_path = root / "escaped.yaml"
+            store_module.write_atomic_yaml(target_path, payload)
+            target_bytes = target_path.read_bytes()
+            target_uri = store_module.continuum_uri(root, target_path)
+            with self.assertRaisesRegex(ValueError, "invalid Card id"):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=malicious_card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            attempt_id = store_module.unique_id("card_sidecar_attempt")
+            intent_id = store_module.stable_id(
+                "card_sidecar_write_intent",
+                "write",
+                malicious_card_id,
+                target_uri,
+                str(payload["state_hash"]),
+                attempt_id,
+            )
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            intent_path = intent_state[0] / f"{intent_id}.json"
+            intent_path.write_text(
+                json.dumps(
+                    {
+                        "schema": store_module.CARD_SIDECAR_WRITE_INTENT_SCHEMA,
+                        "intent_id": intent_id,
+                        "card_id": malicious_card_id,
+                        "target_uri": target_uri,
+                        "expected_state_hash": payload["state_hash"],
+                        "mode": "write",
+                        "attempt_id": attempt_id,
+                        "created_at": store_module.utc_now(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["results"][0]["status"], "invalid_intent")
+            self.assertTrue(target_path.is_file())
+            self.assertEqual(target_path.read_bytes(), target_bytes)
+            self.assertFalse(list(root.glob(".escaped.yaml.*.uncommitted")))
+            self.assertFalse(
+                store_module._is_managed_card_sidecar_path(
+                    root / "catalog" / "cards" / malicious_card_id / "escaped.yaml",
+                    target_path,
+                    card_id=malicious_card_id,
+                )
+            )
+
+    @unittest.skipUnless(os.name == "posix", "real parent symlinks are POSIX-only")
+    def test_sidecar_intent_rejects_symlink_parent_dotdot_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            outside = Path(tmp) / "outside"
+            (outside / "child").mkdir(parents=True)
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="parent-alias-confinement",
+                    summary="A lexical parent alias must not become authority.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+            finally:
+                conn.close()
+            link = root / "catalog" / "cards" / "link"
+            link.symlink_to(outside / "child", target_is_directory=True)
+            outside_target = outside / f"{card_id}.yaml"
+            store_module.write_atomic_yaml(outside_target, payload)
+            original_bytes = outside_target.read_bytes()
+            forged_uri = f"catalog/cards/link/../{card_id}.yaml"
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=forged_uri,
+                expected_state_hash=str(payload["state_hash"]),
+            )
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["results"][0]["status"], "unmanaged_target")
+            self.assertEqual(outside_target.read_bytes(), original_bytes)
+            self.assertFalse(
+                list(outside.glob(f".{card_id}.yaml.*.uncommitted"))
+            )
+
+    @unittest.skipUnless(os.name == "posix", "real parent symlinks are POSIX-only")
+    def test_symlink_parent_dotdot_artifact_does_not_bind_default_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            outside = Path(tmp) / "outside"
+            (outside / "child").mkdir(parents=True)
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="false-immutable-alias",
+                    summary="The default sidecar is still mutable.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect(root)
+            try:
+                default_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+                default_path = resolve_stored_uri(root, default_uri)
+                original_bytes = default_path.read_bytes()
+                outside_target = outside / f"{card_id}.yaml"
+                outside_target.write_bytes(original_bytes)
+                link = root / "catalog" / "cards" / "link"
+                link.symlink_to(outside / "child", target_is_directory=True)
+                forged_uri = f"catalog/cards/link/../{card_id}.yaml"
+                store_module.record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=forged_uri,
+                    sha256=store_module.file_sha256(outside_target),
+                    size_bytes=outside_target.stat().st_size,
+                    immutable=True,
+                    source_type="false_parent_alias",
+                    trust_level="local_evidence",
+                )
+                artifact_index = store_module._immutable_artifact_path_index(
+                    root,
+                    conn,
+                )
+                self.assertFalse(
+                    store_module._immutable_artifact_binds_path(
+                        root,
+                        conn,
+                        default_path,
+                        artifact_index=artifact_index,
+                    )
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The default sidecar receives the newer mutable state.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="false_immutable_alias_update",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            updated = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(updated["ok"], updated)
+            self.assertNotEqual(default_path.read_bytes(), original_bytes)
+            self.assertEqual(outside_target.read_bytes(), original_bytes)
+            conn = connect_existing(root)
+            try:
+                current_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+            finally:
+                conn.close()
+            self.assertEqual(resolve_stored_uri(root, current_uri), default_path)
+            self.assertFalse(
+                (default_path.parent / f"{card_id}.live.yaml").exists()
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_history_transition_intent_requires_current_physical_reference(self) -> None:
+        for scenario, expected_status in (
+            ("unreferenced", "history_transition_unreferenced"),
+            ("missing", "history_transition_target_missing"),
+            ("changed", "history_transition_target_mismatch"),
+        ):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                init_db(root)
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"history-transition-{scenario}",
+                        summary="Only the DB-selected physical generation may transition.",
+                        source_refs=[],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                self.assertTrue(
+                    sync_card_sidecars_after_commit(root, [card_id])["ok"]
+                )
+                conn = connect_existing(root)
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    payload = store_module._card_sidecar_payload_for_row(row)
+                finally:
+                    conn.close()
+                expected_state_hash = str(payload["state_hash"])
+                target = (
+                    root
+                    / "catalog"
+                    / "cards"
+                    / f"{card_id}.live-{expected_state_hash}.yaml"
+                )
+                if scenario != "missing":
+                    target_payload = dict(payload)
+                    if scenario == "changed":
+                        target_payload["summary"] = "Changed after intent creation."
+                        target_payload["state_hash"] = (
+                            store_module._atomic_card_state_hash(target_payload)
+                        )
+                    store_module.write_atomic_yaml(target, target_payload)
+                intent_id, intent_path = (
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=card_id,
+                        target_uri=store_module.continuum_uri(root, target),
+                        expected_state_hash=expected_state_hash,
+                        mode="history_transition",
+                    )
+                )
+
+                reconciled = store_module.reconcile_card_sidecar_write_intents(
+                    root
+                )
+
+                self.assertFalse(reconciled["ok"], reconciled)
+                self.assertEqual(
+                    reconciled["results"][0]["status"],
+                    expected_status,
+                )
+                self.assertTrue(intent_path.is_file())
+                self.assertFalse(
+                    (
+                        root
+                        / "exports"
+                        / "card_sidecar_recovery_receipts"
+                        / f"{intent_id}.json"
+                    ).exists()
+                )
+                recovery_audit = (
+                    store_module._card_sidecar_recovery_evidence_audit(root)
+                )
+                self.assertEqual(
+                    recovery_audit[
+                        "malformed_card_sidecar_recovery_receipts"
+                    ],
+                    0,
+                )
+
+    def test_interrupted_history_transition_recovers_selected_legacy_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="legacy-current-hash-transition",
+                    summary="This hash generation predates transition receipts.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+            conn = connect(root)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                default_path = resolve_stored_uri(root, row["location_uri"])
+                legacy_hash_path = default_path.with_name(
+                    f"{card_id}.live-{payload['state_hash']}.yaml"
+                )
+                os.replace(default_path, legacy_hash_path)
+                conn.execute(
+                    "UPDATE cards SET location_uri = ? WHERE id = ?",
+                    (
+                        store_module.continuum_uri(root, legacy_hash_path),
+                        card_id,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=store_module.continuum_uri(
+                        root,
+                        legacy_hash_path,
+                    ),
+                    expected_state_hash=str(payload["state_hash"]),
+                    mode="history_transition",
+                )
+            )
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(
+                reconciled["results"][0]["status"],
+                "transition_prepared",
+            )
+            self.assertFalse(intent_path.exists())
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The next state detaches the receipted legacy hash.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="legacy_hash_transition_recovered",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            updated = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(updated["ok"], updated)
+            self.assertTrue(legacy_hash_path.is_file())
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_prune_compensation_quarantines_new_unbound_sidecar_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="copy-on-write-cleanup",
+                    summary="The original immutable versions must survive compensation.",
+                    source_refs=[],
+                    topics=["copy-on-write-cleanup"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            first_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(first_sync["ok"], first_sync)
+
+            conn = connect(root)
+            try:
+                default_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="prune_cow_default",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The live immutable version becomes the rollback authority.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="prune_cow_live_version",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            second_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(second_sync["ok"], second_sync)
+
+            conn = connect(root)
+            try:
+                live_uri = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()["location_uri"]
+                live_path = resolve_stored_uri(root, live_uri)
+                live_bytes = live_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=live_uri,
+                    sha256=hashlib.sha256(live_bytes).hexdigest(),
+                    size_bytes=len(live_bytes),
+                    source_type="prune_cow_live",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.commit()
+                original = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at, location_uri "
+                        "FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            real_report = worker_module.semantic_integrity_report
+            report_calls = 0
+
+            def fail_normal_postflight(*args, **kwargs):
+                nonlocal report_calls
+                report_calls += 1
+                if report_calls == 3:
+                    return {"ok": False, "failing": {"simulated_postflight": 1}}
+                return real_report(*args, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "semantic_integrity_report",
+                side_effect=fail_normal_postflight,
+            ), self.assertRaisesRegex(RuntimeError, "Card mutations were rolled back"):
+                prune_memory(
+                    root,
+                    topic="copy-on-write-cleanup",
+                    action="forget",
+                )
+
+            conn = connect_existing(root)
+            try:
+                restored = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at, location_uri "
+                        "FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(restored, original)
+            self.assertEqual(default_path.read_bytes(), default_bytes)
+            self.assertEqual(live_path.read_bytes(), live_bytes)
+            self.assertEqual(audit(root)["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            recovery_files = list((root / "catalog" / "cards").glob(".*.uncommitted"))
+            self.assertEqual(len(recovery_files), 1)
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (root / "exports" / "card_sidecar_recovery_receipts").glob("*.json")
+            ]
+            self.assertTrue(
+                any(receipt.get("status") == "quarantined" for receipt in receipts),
+                receipts,
+            )
+            recovery_bytes = recovery_files[0].read_bytes()
+            recovery_files[0].write_bytes(b"TAMPERED")
+            tampered_recovery = semantic_integrity_report(root)
+            self.assertFalse(tampered_recovery["ok"], tampered_recovery)
+            self.assertEqual(
+                tampered_recovery["checks"]["mismatched_card_sidecar_recoveries"],
+                1,
+            )
+            recovery_files[0].write_bytes(recovery_bytes)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            recovery_files[0].unlink()
+            missing_recovery = semantic_integrity_report(root)
+            self.assertFalse(missing_recovery["ok"], missing_recovery)
+            self.assertEqual(
+                missing_recovery["checks"]["missing_card_sidecar_recoveries"],
+                1,
+            )
+            recovery_files[0].write_bytes(recovery_bytes)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            snap = store_module.snapshot(root, reason="bind quarantined Card sidecar bytes")
+            snapshot_path = Path(str(snap["snapshot_uri"]))
+            snapshot_recovery = Path(str(snap["card_sidecars_uri"])) / recovery_files[0].name
+            self.assertFalse(snapshot_recovery.exists())
+            self.assertTrue(store_module.verify_snapshot_manifest(snapshot_path)["ok"])
+
+    def test_prune_compensates_crash_completed_adopted_sidecar_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="adopt-rollback",
+                    summary="The default immutable state precedes a live immutable state.",
+                    source_refs=[],
+                    topics=["adopt-rollback"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="adopt_rollback_default",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The live immutable state is the rollback authority.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="adopt_rollback_live",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+            conn = connect(root)
+            try:
+                live_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                live_path = resolve_stored_uri(root, live_uri)
+                live_bytes = live_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=live_uri,
+                    sha256=hashlib.sha256(live_bytes).hexdigest(),
+                    size_bytes=len(live_bytes),
+                    source_type="adopt_rollback_live",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.commit()
+                original = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at, location_uri "
+                        "FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            real_sync = worker_module.sync_card_sidecars_after_commit
+            seeded_target: Path | None = None
+            adopted_sync: dict[str, object] | None = None
+
+            def seed_crash_completed_target(sync_root, card_ids):
+                nonlocal seeded_target, adopted_sync
+                if seeded_target is None:
+                    seed_conn = connect(sync_root)
+                    try:
+                        row = seed_conn.execute(
+                            "SELECT * FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()
+                        payload = store_module._card_sidecar_payload_for_row(row)
+                        artifact_index = store_module._immutable_artifact_path_index(
+                            sync_root,
+                            seed_conn,
+                        )
+                        target = store_module._card_sidecar_write_target(
+                            sync_root,
+                            seed_conn,
+                            row,
+                            payload,
+                            artifact_index=artifact_index,
+                        )
+                        self.assertIsNotNone(target)
+                        seeded_target = Path(target)
+                        target_uri = store_module.continuum_uri(sync_root, seeded_target)
+                        store_module._write_card_sidecar_write_intent(
+                            sync_root,
+                            card_id=card_id,
+                            target_uri=target_uri,
+                            expected_state_hash=str(payload["state_hash"]),
+                        )
+                        store_module.write_atomic_yaml(seeded_target, payload)
+                    finally:
+                        seed_conn.close()
+                sync_result = real_sync(sync_root, card_ids)
+                if adopted_sync is None:
+                    adopted_sync = sync_result
+                return sync_result
+
+            real_report = worker_module.semantic_integrity_report
+            report_calls = 0
+
+            def fail_normal_postflight(*args, **kwargs):
+                nonlocal report_calls
+                report_calls += 1
+                if report_calls == 3:
+                    return {"ok": False, "failing": {"simulated_postflight": 1}}
+                return real_report(*args, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "sync_card_sidecars_after_commit",
+                side_effect=seed_crash_completed_target,
+            ), patch.object(
+                worker_module,
+                "semantic_integrity_report",
+                side_effect=fail_normal_postflight,
+            ), self.assertRaisesRegex(RuntimeError, "Card mutations were rolled back"):
+                prune_memory(root, topic="adopt-rollback", action="forget")
+
+            self.assertIsNotNone(seeded_target)
+            self.assertIsNotNone(adopted_sync)
+            self.assertTrue(
+                any(
+                    candidate["uri"]
+                    == store_module.continuum_uri(root, Path(seeded_target))
+                    for candidate in adopted_sync["generated_sidecar_candidates"]
+                ),
+                adopted_sync,
+            )
+            conn = connect_existing(root)
+            try:
+                restored = dict(
+                    conn.execute(
+                        "SELECT status, metadata_json, updated_at, location_uri "
+                        "FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(restored, original)
+            self.assertFalse(Path(seeded_target).exists())
+            self.assertEqual(audit(root)["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+            self.assertEqual(
+                len(list((root / "catalog" / "cards").glob(".*.uncommitted"))),
+                1,
+            )
+
+    def test_prune_compensation_uses_post_reconciliation_outbox_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="prune-reconciliation-generation",
+                    summary="The original Card row must survive receipt finalization failure.",
+                    source_refs=[],
+                    topics=["prune-reconciliation-generation"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+
+            conn = connect(root)
+            try:
+                original = dict(
+                    conn.execute(
+                        """
+                        SELECT status, metadata_json, updated_at, location_uri
+                        FROM cards WHERE id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+                sidecar_path = resolve_stored_uri(root, str(original["location_uri"]))
+                sidecar_bytes = sidecar_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=str(original["location_uri"]),
+                    sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
+                    size_bytes=len(sidecar_bytes),
+                    source_type="prune_reconciliation_generation",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            real_finish = store_module._finish_card_sidecar_write_intent
+            finish_calls = 0
+
+            def fail_first_receipt_finalization(*args, **kwargs):
+                nonlocal finish_calls
+                finish_calls += 1
+                if finish_calls == 1:
+                    raise OSError("forced first receipt finalization failure")
+                return real_finish(*args, **kwargs)
+
+            with (
+                patch.object(
+                    store_module,
+                    "_finish_card_sidecar_write_intent",
+                    side_effect=fail_first_receipt_finalization,
+                ),
+                self.assertRaisesRegex(RuntimeError, "Card mutations were rolled back"),
+            ):
+                prune_memory(
+                    root,
+                    topic="prune-reconciliation-generation",
+                    action="archive",
+                )
+
+            conn = connect_existing(root)
+            try:
+                restored = dict(
+                    conn.execute(
+                        """
+                        SELECT status, metadata_json, updated_at, location_uri
+                        FROM cards WHERE id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertGreaterEqual(finish_calls, 2)
+            self.assertEqual(restored, original)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_prune_compensation_rejects_writer_after_sync_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="prune-post-sync-writer",
+                    summary="A later outbox writer must survive failed prune compensation.",
+                    source_refs=[],
+                    topics=["prune-post-sync-writer"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+
+            real_sync = worker_module.sync_card_sidecars_after_commit
+            injected_generation: str | None = None
+
+            def sync_then_intervene(sync_root, card_ids):
+                nonlocal injected_generation
+                result = real_sync(sync_root, card_ids)
+                if injected_generation is None:
+                    writer = connect(sync_root)
+                    try:
+                        store_module.mark_card_sidecar_outbox(
+                            writer,
+                            [card_id],
+                            reason="independent_intervening_writer",
+                        )
+                        injected_generation = str(
+                            writer.execute(
+                                """
+                                SELECT generation FROM card_sidecar_outbox
+                                WHERE card_id = ?
+                                """,
+                                (card_id,),
+                            ).fetchone()[0]
+                        )
+                        writer.commit()
+                    finally:
+                        writer.close()
+                return result
+
+            real_report = worker_module.semantic_integrity_report
+            report_calls = 0
+
+            def fail_postflight(*args, **kwargs):
+                nonlocal report_calls
+                report_calls += 1
+                if report_calls == 3:
+                    return {"ok": False, "failing": {"simulated_postflight": 1}}
+                return real_report(*args, **kwargs)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "sync_card_sidecars_after_commit",
+                    side_effect=sync_then_intervene,
+                ),
+                patch.object(
+                    worker_module,
+                    "semantic_integrity_report",
+                    side_effect=fail_postflight,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "were not rolled back because their committed state changed",
+                ),
+            ):
+                prune_memory(
+                    root,
+                    topic="prune-post-sync-writer",
+                    action="archive",
+                )
+
+            self.assertIsNotNone(injected_generation)
+            conn = connect_existing(root)
+            try:
+                card_status = str(
+                    conn.execute(
+                        "SELECT status FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()[0]
+                )
+                outbox = conn.execute(
+                    """
+                    SELECT reason, generation FROM card_sidecar_outbox
+                    WHERE card_id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(card_status, "archived")
+            self.assertIsNotNone(outbox)
+            self.assertEqual(outbox["reason"], "independent_intervening_writer")
+            self.assertEqual(outbox["generation"], injected_generation)
+
+    def test_prune_compensation_rejects_writer_during_sync_failure_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="prune-sync-failure-gap-writer",
+                    summary="A writer between failure transactions must survive.",
+                    source_refs=[],
+                    topics=["prune-sync-failure-gap-writer"],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+            injected_generation: str | None = None
+
+            class FailureGapError(RuntimeError):
+                def __str__(self) -> str:
+                    nonlocal injected_generation
+                    if injected_generation is None:
+                        writer = connect(root)
+                        try:
+                            store_module.mark_card_sidecar_outbox(
+                                writer,
+                                [card_id],
+                                reason="independent_failure_gap_writer",
+                            )
+                            injected_generation = str(
+                                writer.execute(
+                                    """
+                                    SELECT generation FROM card_sidecar_outbox
+                                    WHERE card_id = ?
+                                    """,
+                                    (card_id,),
+                                ).fetchone()[0]
+                            )
+                            writer.commit()
+                        finally:
+                            writer.close()
+                    return "forced sync failure after rollback"
+
+            with (
+                patch.object(
+                    store_module,
+                    "sync_card_sidecar",
+                    side_effect=FailureGapError(),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "sidecar compensation evidence was unavailable",
+                ),
+            ):
+                prune_memory(
+                    root,
+                    topic="prune-sync-failure-gap-writer",
+                    action="archive",
+                )
+
+            self.assertIsNotNone(injected_generation)
+            conn = connect_existing(root)
+            try:
+                status = str(
+                    conn.execute(
+                        "SELECT status FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()[0]
+                )
+                outbox = conn.execute(
+                    """
+                    SELECT reason, generation FROM card_sidecar_outbox
+                    WHERE card_id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(status, "archived")
+            self.assertIsNotNone(outbox)
+            self.assertEqual(outbox["reason"], "independent_failure_gap_writer")
+            self.assertEqual(outbox["generation"], injected_generation)
+
+    def test_sidecar_failure_evidence_rejects_null_outbox_gap_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-null-outbox-gap-writer",
+                    summary="An absent outbox cannot authorize a later row.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+            injected_generation: str | None = None
+
+            class NullOutboxGapError(RuntimeError):
+                def __str__(self) -> str:
+                    nonlocal injected_generation
+                    if injected_generation is None:
+                        writer = connect(root)
+                        try:
+                            store_module.mark_card_sidecar_outbox(
+                                writer,
+                                [card_id],
+                                reason="independent_null_outbox_writer",
+                            )
+                            injected_generation = str(
+                                writer.execute(
+                                    """
+                                    SELECT generation FROM card_sidecar_outbox
+                                    WHERE card_id = ?
+                                    """,
+                                    (card_id,),
+                                ).fetchone()[0]
+                            )
+                            writer.commit()
+                        finally:
+                            writer.close()
+                    return "forced null-outbox sync failure"
+
+            with patch.object(
+                store_module,
+                "sync_card_sidecar",
+                side_effect=NullOutboxGapError(),
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["compensation_cas_complete"], result)
+            self.assertEqual(result["compensation_cas_rows"], [])
+            conn = connect_existing(root)
+            try:
+                outbox = conn.execute(
+                    """
+                    SELECT reason, generation FROM card_sidecar_outbox
+                    WHERE card_id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(outbox)
+            self.assertEqual(outbox["reason"], "independent_null_outbox_writer")
+            self.assertEqual(outbox["generation"], injected_generation)
+
+    def test_sidecar_failure_evidence_rejects_location_gap_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar-location-gap-writer",
+                    summary="A changed location cannot be adopted as sync evidence.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+            independent_uri = "continuum://catalog/cards/independent-gap-writer.yaml"
+            location_changed = False
+
+            class LocationGapError(RuntimeError):
+                def __str__(self) -> str:
+                    nonlocal location_changed
+                    if not location_changed:
+                        writer = connect(root)
+                        try:
+                            writer.execute(
+                                "UPDATE cards SET location_uri = ? WHERE id = ?",
+                                (independent_uri, card_id),
+                            )
+                            writer.commit()
+                            location_changed = True
+                        finally:
+                            writer.close()
+                    return "forced location-gap sync failure"
+
+            with patch.object(
+                store_module,
+                "sync_card_sidecar",
+                side_effect=LocationGapError(),
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["compensation_cas_complete"], result)
+            self.assertEqual(result["compensation_cas_rows"], [])
+            conn = connect_existing(root)
+            try:
+                location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertTrue(location_changed)
+            self.assertEqual(location_uri, independent_uri)
 
     def test_prune_memory_compensation_does_not_overwrite_an_intervening_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

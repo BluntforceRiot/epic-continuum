@@ -22,7 +22,11 @@ from urllib.parse import urlencode
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
 from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
 from .permissions import (
+    flush_directory_strict,
+    flush_file_strict,
+    flush_tree_strict,
     fsync_parent,
+    replace_durable,
     secure_copy_file,
     secure_copytree,
     secure_mkdir,
@@ -20545,18 +20549,21 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 "snapshot preflight failed: copied snapshot semantic integrity is not clean: "
                 f"{snapshot_semantic_integrity.get('failing')}"
             )
-        os.replace(staged_db, out_path)
+        flush_tree_strict(staged_root, include_parent=True)
+        replace_durable(staged_db, out_path)
         secure_sqlite_files(out_path)
+        flush_file_strict(out_path)
         if staged_cards_out.exists():
-            staged_cards_out.rename(cards_out)
-        staged_sidecar_receipts.rename(sidecar_receipts_out)
-        staged_review_jobs.rename(review_jobs_out)
+            replace_durable(staged_cards_out, cards_out)
+        replace_durable(staged_sidecar_receipts, sidecar_receipts_out)
+        replace_durable(staged_review_jobs, review_jobs_out)
         if staged_alias_key.exists():
-            os.replace(staged_alias_key, alias_key_out)
+            replace_durable(staged_alias_key, alias_key_out)
             try:
                 os.chmod(alias_key_out, 0o600)
             except OSError:
                 pass
+            flush_file_strict(alias_key_out)
             copied_alias_key_path = alias_key_out
         manifest_path = write_snapshot_manifest(
             root,
@@ -20571,6 +20578,8 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
             review_bridge_jobs_source_path=review_jobs_source,
             semantic_integrity=snapshot_semantic_integrity,
         )
+        flush_file_strict(manifest_path)
+        flush_directory_strict(manifest_path.parent)
         written_manifest = load_snapshot_manifest(out_path)
         review_jobs_binding = dict(written_manifest["review_bridge_jobs"])
         sidecar_receipts_binding = dict(

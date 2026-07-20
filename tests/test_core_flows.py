@@ -1252,6 +1252,120 @@ print(json.dumps(result, sort_keys=True))
             self.assertFalse(destination.exists())
             self.assertEqual(list(destination.parent.glob(".receipt.json.*.tmp")), [])
 
+    def test_secure_copy_file_flushes_data_before_parent_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.bin"
+            destination = root / "copy" / "destination.bin"
+            source.write_bytes(b"snapshot member")
+            events: list[tuple[str, Path]] = []
+
+            with patch.object(
+                permissions_module,
+                "flush_file_strict",
+                side_effect=lambda path: events.append(("file", Path(path))),
+            ), patch.object(
+                permissions_module,
+                "fsync_parent",
+                side_effect=lambda path: events.append(("parent", Path(path))),
+            ):
+                permissions_module.secure_copy_file(source, destination)
+
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(
+                events,
+                [("file", destination), ("parent", destination)],
+            )
+
+    def test_strict_tree_flushes_files_then_deepest_directories_and_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "staging"
+            nested = root / "one" / "two"
+            nested.mkdir(parents=True)
+            (root / "top.txt").write_bytes(b"top")
+            (nested / "deep.txt").write_bytes(b"deep")
+            events: list[tuple[str, Path]] = []
+
+            with patch.object(
+                permissions_module,
+                "flush_file_strict",
+                side_effect=lambda path: events.append(("file", Path(path))),
+            ), patch.object(
+                permissions_module,
+                "flush_directory_strict",
+                side_effect=lambda path: events.append(("directory", Path(path))),
+            ):
+                permissions_module.flush_tree_strict(root, include_parent=True)
+
+            file_events = [path for kind, path in events if kind == "file"]
+            directory_events = [path for kind, path in events if kind == "directory"]
+            self.assertEqual(
+                file_events,
+                sorted([root / "top.txt", nested / "deep.txt"], key=lambda path: path.as_posix()),
+            )
+            self.assertEqual(directory_events, [nested, root / "one", root, base])
+            self.assertLess(
+                max(index for index, event in enumerate(events) if event[0] == "file"),
+                min(index for index, event in enumerate(events) if event[0] == "directory"),
+            )
+
+    def test_current_platform_strict_file_and_directory_flush_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            member = root / "member.bin"
+            member.write_bytes(b"strict durability")
+
+            permissions_module.flush_file_strict(member)
+            permissions_module.flush_directory_strict(root)
+
+    def test_current_platform_strict_flush_failure_is_not_swallowed(self) -> None:
+        implementation = (
+            "_flush_windows_path_strict"
+            if os.name == "nt"
+            else "_flush_posix_path_strict"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            member = root / "member.bin"
+            member.write_bytes(b"strict durability failure")
+            with patch.object(
+                permissions_module,
+                implementation,
+                side_effect=OSError("synthetic strict flush failure"),
+            ), self.assertRaisesRegex(OSError, "synthetic strict flush failure"):
+                permissions_module.flush_file_strict(member)
+
+    def test_durable_replace_surfaces_each_parent_flush_boundary(self) -> None:
+        for failure_index in (1, 2):
+            with self.subTest(failure_index=failure_index), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source" / "member.bin"
+                destination = root / "destination" / "member.bin"
+                source.parent.mkdir()
+                destination.parent.mkdir()
+                source.write_bytes(b"published before namespace flush")
+                flushed: list[Path] = []
+
+                def fail_at_boundary(path: Path) -> None:
+                    flushed.append(Path(path))
+                    if len(flushed) == failure_index:
+                        raise OSError(f"synthetic parent flush failure {failure_index}")
+
+                with patch.object(
+                    permissions_module,
+                    "flush_directory_strict",
+                    side_effect=fail_at_boundary,
+                ), self.assertRaisesRegex(OSError, "synthetic parent flush failure"):
+                    permissions_module.replace_durable(source, destination)
+
+                self.assertFalse(source.exists())
+                self.assertEqual(destination.read_bytes(), b"published before namespace flush")
+                self.assertEqual(
+                    flushed,
+                    [destination.parent, source.parent][:failure_index],
+                )
+
     def test_sidecar_quarantine_postcommit_replacement_is_audited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

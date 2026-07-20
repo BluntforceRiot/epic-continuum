@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import continuum.core.store as store_module
 import continuum.core.operations as operations_module
+import continuum.core.permissions as permissions_module
 import continuum.core.review_bridge as review_bridge_module
 from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
@@ -124,6 +125,39 @@ def make_link_like_dir(testcase: unittest.TestCase, link: Path, target: Path) ->
         link.symlink_to(target, target_is_directory=True)
     except (OSError, NotImplementedError) as exc:
         testcase.skipTest(f"symlinks unavailable: {exc}")
+
+
+def seed_snapshot_durability_root(root: Path) -> None:
+    init_db(root)
+    conn = connect(root)
+    try:
+        card_id = create_card(
+            conn,
+            root=root,
+            card_type="note",
+            title="Snapshot durability member",
+            summary="Every copied snapshot member must be durable before authority.",
+            source_refs=[],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    sync_result = sync_card_sidecars_after_commit(root, [card_id])
+    if not sync_result.get("ok"):
+        raise AssertionError(sync_result)
+    store_module._partition_alias_key(root)
+    review_subject = root.parent / "durability-subject.txt"
+    secure_write_text(review_subject, "durable review subject\n")
+    create_review_job(
+        root,
+        subject_path=review_subject,
+        prompt="Review the durable snapshot fixture.",
+        transport="manual",
+    )
+
+
+class SimulatedSnapshotPowerLoss(BaseException):
+    pass
 
 
 class OperationLedgerTest(unittest.TestCase):
@@ -3774,6 +3808,265 @@ class OperationLedgerTest(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT count(*) FROM snapshots").fetchone()[0], 0)
             finally:
                 conn.close()
+
+    def test_snapshot_durability_barriers_precede_catalog_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            seed_snapshot_durability_root(root)
+            events: list[tuple[str, str]] = []
+            flushed_files: list[Path] = []
+            real_permission_file_flush = permissions_module.flush_file_strict
+            real_stage_flush = store_module.flush_tree_strict
+            real_replace = store_module.replace_durable
+            real_manifest_write = store_module.write_snapshot_manifest
+            real_manifest_file_flush = store_module.flush_file_strict
+            real_manifest_directory_flush = store_module.flush_directory_strict
+            real_audit_event = store_module.audit_event
+
+            def trace_permission_file_flush(path: Path) -> None:
+                flushed_files.append(Path(path))
+                real_permission_file_flush(path)
+
+            def trace_stage_flush(path: Path, *, include_parent: bool = False) -> None:
+                events.append(("stage_flush_start", Path(path).name))
+                real_stage_flush(path, include_parent=include_parent)
+                events.append(("stage_flush_complete", Path(path).name))
+
+            def trace_replace(source: Path, destination: Path) -> None:
+                events.append(("rename_start", Path(destination).name))
+                real_replace(source, destination)
+                events.append(("rename_complete", Path(destination).name))
+
+            def trace_manifest_write(*args: object, **kwargs: object) -> Path:
+                events.append(("manifest_write", "start"))
+                result = real_manifest_write(*args, **kwargs)
+                events.append(("manifest_write", "complete"))
+                return result
+
+            def trace_manifest_file_flush(path: Path) -> None:
+                label = (
+                    "manifest_file_flush"
+                    if Path(path).name.endswith(".manifest.json")
+                    else "published_file_flush"
+                )
+                events.append((label, Path(path).name))
+                real_manifest_file_flush(path)
+
+            def trace_manifest_directory_flush(path: Path) -> None:
+                events.append(("manifest_directory_flush", Path(path).name))
+                real_manifest_directory_flush(path)
+
+            def trace_audit_event(*args: object, **kwargs: object) -> str:
+                if kwargs.get("action") == "snapshot":
+                    events.append(("snapshot_audit", "catalog"))
+                return real_audit_event(*args, **kwargs)
+
+            with patch.object(
+                permissions_module,
+                "flush_file_strict",
+                side_effect=trace_permission_file_flush,
+            ), patch.object(
+                store_module,
+                "flush_tree_strict",
+                side_effect=trace_stage_flush,
+            ), patch.object(
+                store_module,
+                "replace_durable",
+                side_effect=trace_replace,
+            ), patch.object(
+                store_module,
+                "write_snapshot_manifest",
+                side_effect=trace_manifest_write,
+            ), patch.object(
+                store_module,
+                "flush_file_strict",
+                side_effect=trace_manifest_file_flush,
+            ), patch.object(
+                store_module,
+                "flush_directory_strict",
+                side_effect=trace_manifest_directory_flush,
+            ), patch.object(
+                store_module,
+                "audit_event",
+                side_effect=trace_audit_event,
+            ):
+                created = snapshot(root, reason="durability ordering")
+
+            event_names = [event[0] for event in events]
+            self.assertLess(
+                event_names.index("stage_flush_complete"),
+                event_names.index("rename_start"),
+            )
+            self.assertEqual(event_names.count("rename_complete"), 5)
+            self.assertLess(
+                max(index for index, name in enumerate(event_names) if name == "rename_complete"),
+                event_names.index("manifest_write"),
+            )
+            self.assertLess(
+                event_names.index("manifest_file_flush"),
+                event_names.index("manifest_directory_flush"),
+            )
+            self.assertLess(
+                event_names.index("manifest_directory_flush"),
+                event_names.index("snapshot_audit"),
+            )
+            flushed_names = {path.name for path in flushed_files}
+            self.assertIn("catalog.sqlite3", flushed_names)
+            self.assertIn("continuum.config.json", flushed_names)
+            self.assertIn("partition_alias.key", flushed_names)
+            self.assertIn("request.json", flushed_names)
+            self.assertTrue(any(name.endswith(".yaml") for name in flushed_names))
+            self.assertTrue(
+                any(
+                    name.startswith("card_sidecar_write_intent_")
+                    and name.endswith(".json")
+                    for name in flushed_names
+                )
+            )
+            verification = store_module.verify_snapshot_manifest_for_root(
+                Path(str(created["snapshot_uri"])),
+                root=root,
+                require_catalog_binding=True,
+            )
+            self.assertTrue(verification["ok"], verification)
+
+    def test_snapshot_ordinary_durability_failures_leave_no_authority_or_outputs(self) -> None:
+        failure_cases = ("stage_tree", "manifest_file", "manifest_directory")
+        for failure_case in failure_cases:
+            with self.subTest(failure_case=failure_case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                seed_snapshot_durability_root(root)
+                if failure_case == "stage_tree":
+                    failure_patch = patch.object(
+                        store_module,
+                        "flush_tree_strict",
+                        side_effect=OSError("synthetic stage durability failure"),
+                    )
+                elif failure_case == "manifest_file":
+                    real_file_flush = store_module.flush_file_strict
+
+                    def fail_manifest_file(path: Path) -> None:
+                        if Path(path).name.endswith(".manifest.json"):
+                            raise OSError("synthetic manifest file durability failure")
+                        real_file_flush(path)
+
+                    failure_patch = patch.object(
+                        store_module,
+                        "flush_file_strict",
+                        side_effect=fail_manifest_file,
+                    )
+                else:
+                    failure_patch = patch.object(
+                        store_module,
+                        "flush_directory_strict",
+                        side_effect=OSError("synthetic manifest directory durability failure"),
+                    )
+                with failure_patch, self.assertRaises(OSError):
+                    snapshot(root, reason=failure_case)
+
+                conn = connect(root)
+                try:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM snapshots").fetchone()[0], 0)
+                finally:
+                    conn.close()
+                snapshots_dir = root / "snapshots"
+                self.assertEqual(list(snapshots_dir.glob("continuum_*")), [])
+                self.assertEqual(list(snapshots_dir.glob(".staging_*")), [])
+
+    def test_snapshot_each_final_rename_failure_cleans_uncommitted_outputs(self) -> None:
+        for failure_index in range(1, 6):
+            with self.subTest(failure_index=failure_index), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                seed_snapshot_durability_root(root)
+                real_replace = store_module.replace_durable
+                rename_count = 0
+
+                def fail_after_rename(source: Path, destination: Path) -> None:
+                    nonlocal rename_count
+                    real_replace(source, destination)
+                    rename_count += 1
+                    if rename_count == failure_index:
+                        raise OSError(f"synthetic rename durability failure {failure_index}")
+
+                with patch.object(
+                    store_module,
+                    "replace_durable",
+                    side_effect=fail_after_rename,
+                ), self.assertRaisesRegex(OSError, "synthetic rename durability failure"):
+                    snapshot(root, reason=f"rename failure {failure_index}")
+
+                self.assertEqual(rename_count, failure_index)
+                conn = connect(root)
+                try:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM snapshots").fetchone()[0], 0)
+                finally:
+                    conn.close()
+                snapshots_dir = root / "snapshots"
+                self.assertEqual(list(snapshots_dir.glob("continuum_*")), [])
+                self.assertEqual(list(snapshots_dir.glob(".staging_*")), [])
+
+    def test_snapshot_power_loss_at_rename_or_manifest_never_creates_authority(self) -> None:
+        for crash_boundary in ("first_rename", "manifest_directory"):
+            with self.subTest(crash_boundary=crash_boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                seed_snapshot_durability_root(root)
+                if crash_boundary == "first_rename":
+                    real_replace = store_module.replace_durable
+
+                    def crash_after_rename(source: Path, destination: Path) -> None:
+                        real_replace(source, destination)
+                        raise SimulatedSnapshotPowerLoss("after first durable rename")
+
+                    boundary_patch = patch.object(
+                        store_module,
+                        "replace_durable",
+                        side_effect=crash_after_rename,
+                    )
+                else:
+                    real_directory_flush = store_module.flush_directory_strict
+
+                    def crash_after_manifest_directory(path: Path) -> None:
+                        real_directory_flush(path)
+                        raise SimulatedSnapshotPowerLoss("after manifest directory flush")
+
+                    boundary_patch = patch.object(
+                        store_module,
+                        "flush_directory_strict",
+                        side_effect=crash_after_manifest_directory,
+                    )
+                with boundary_patch, self.assertRaises(SimulatedSnapshotPowerLoss):
+                    snapshot(root, reason=crash_boundary)
+
+                conn = connect(root)
+                try:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM snapshots").fetchone()[0], 0)
+                finally:
+                    conn.close()
+
+    def test_snapshot_power_loss_after_catalog_commit_leaves_verifiable_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            seed_snapshot_durability_root(root)
+            with patch.object(
+                store_module,
+                "enforce_snapshot_retention",
+                side_effect=SimulatedSnapshotPowerLoss("after catalog commit"),
+            ), self.assertRaises(SimulatedSnapshotPowerLoss):
+                snapshot(root, reason="postcommit power loss")
+
+            conn = connect(root)
+            try:
+                rows = conn.execute("SELECT snapshot_uri FROM snapshots").fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(rows), 1)
+            snapshot_path = store_module.resolve_stored_uri(root, str(rows[0]["snapshot_uri"]))
+            verification = store_module.verify_snapshot_manifest_for_root(
+                snapshot_path,
+                root=root,
+                require_catalog_binding=True,
+            )
+            self.assertTrue(verification["ok"], verification)
 
     def test_snapshot_retention_removes_catalog_rows_for_deleted_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

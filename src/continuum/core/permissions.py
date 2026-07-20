@@ -108,6 +108,254 @@ def fsync_parent(path: Path) -> None:
                 pass
 
 
+def _durability_stat(path: Path, *, require_directory: bool) -> os.stat_result:
+    """Return one plain file/directory stat suitable for a strict flush."""
+
+    metadata = os.lstat(path)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if stat.S_ISLNK(metadata.st_mode) or bool(
+        reparse_flag and attributes & reparse_flag
+    ):
+        raise OSError(errno.ELOOP, "durability target is link-like", str(path))
+    expected_type = stat.S_ISDIR if require_directory else stat.S_ISREG
+    if not expected_type(metadata.st_mode):
+        label = "directory" if require_directory else "regular file"
+        raise OSError(errno.EINVAL, f"durability target is not a {label}", str(path))
+    return metadata
+
+
+def _durability_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _flush_windows_path_strict(
+    path: Path,
+    *,
+    expected: os.stat_result,
+    require_directory: bool,
+) -> None:
+    """Flush one identity-checked Windows file or directory handle."""
+
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    generic_write = 0x40000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    backup_semantics = 0x02000000 if require_directory else 0
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_write,
+        share_read_write_delete,
+        None,
+        open_existing,
+        backup_semantics | open_reparse_point,
+        None,
+    )
+    handle_value = int(getattr(handle, "value", handle) or 0)
+    if handle_value in {0, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+
+    primary: BaseException | None = None
+    try:
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            wintypes.HANDLE(handle_value),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        attributes = int(information.file_attributes)
+        handle_is_directory = bool(attributes & 0x10)
+        handle_file_index = (
+            int(information.file_index_high) << 32
+        ) | int(information.file_index_low)
+        if (
+            handle_is_directory != require_directory
+            or bool(attributes & 0x400)
+            or handle_file_index != int(expected.st_ino)
+        ):
+            raise OSError(errno.ESTALE, "durability target identity changed", str(path))
+        if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle_value)):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        if not kernel32.CloseHandle(wintypes.HANDLE(handle_value)):
+            close_error = ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+            if primary is None:
+                raise close_error
+            primary.add_note(
+                "Closing the strict durability handle also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+
+
+def _flush_posix_path_strict(
+    path: Path,
+    *,
+    expected: os.stat_result,
+    require_directory: bool,
+) -> None:
+    flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0))
+    if require_directory:
+        flags |= int(getattr(os, "O_DIRECTORY", 0))
+    descriptor = os.open(str(path), flags)
+    primary: BaseException | None = None
+    try:
+        opened = os.fstat(descriptor)
+        expected_type = stat.S_ISDIR if require_directory else stat.S_ISREG
+        if (
+            not expected_type(opened.st_mode)
+            or _durability_identity(opened) != _durability_identity(expected)
+        ):
+            raise OSError(errno.ESTALE, "durability target identity changed", str(path))
+        os.fsync(descriptor)
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            if primary is None:
+                raise
+            primary.add_note(
+                "Closing the strict durability descriptor also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+
+
+def _flush_path_strict(path: Path, *, require_directory: bool) -> None:
+    absolute = path.absolute()
+    expected = _durability_stat(absolute, require_directory=require_directory)
+    if os.name == "nt":
+        _flush_windows_path_strict(
+            absolute,
+            expected=expected,
+            require_directory=require_directory,
+        )
+    elif os.name == "posix":
+        _flush_posix_path_strict(
+            absolute,
+            expected=expected,
+            require_directory=require_directory,
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "strict durability flush is unsupported on this platform",
+            str(absolute),
+        )
+    current = _durability_stat(absolute, require_directory=require_directory)
+    if _durability_identity(current) != _durability_identity(expected):
+        raise OSError(errno.ESTALE, "durability target changed after flush", str(absolute))
+    if not require_directory and int(current.st_size) != int(expected.st_size):
+        raise OSError(errno.ESTALE, "durability target size changed after flush", str(absolute))
+
+
+def flush_file_strict(path: Path) -> None:
+    """Fail unless one plain regular file is durably flushed."""
+
+    _flush_path_strict(Path(path), require_directory=False)
+
+
+def flush_directory_strict(path: Path) -> None:
+    """Fail unless one plain directory namespace is durably flushed."""
+
+    _flush_path_strict(Path(path), require_directory=True)
+
+
+def flush_tree_strict(path: Path, *, include_parent: bool = False) -> None:
+    """Flush all regular files, then directories from deepest to shallowest."""
+
+    root = Path(path).absolute()
+    _durability_stat(root, require_directory=True)
+    files: list[Path] = []
+    directories = [root]
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+        for entry in entries:
+            candidate = Path(entry.path)
+            metadata = _durability_stat(
+                candidate,
+                require_directory=entry.is_dir(follow_symlinks=False),
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.append(candidate)
+                pending.append(candidate)
+            elif stat.S_ISREG(metadata.st_mode):
+                files.append(candidate)
+            else:  # pragma: no cover - _durability_stat rejects other types
+                raise OSError(
+                    errno.EINVAL,
+                    "durability tree contains an unsupported entry",
+                    str(candidate),
+                )
+    for candidate in sorted(files, key=lambda item: item.as_posix()):
+        flush_file_strict(candidate)
+    for directory in sorted(
+        directories,
+        key=lambda item: (-len(item.parts), item.as_posix()),
+    ):
+        flush_directory_strict(directory)
+    if include_parent:
+        flush_directory_strict(root.parent)
+
+
+def replace_durable(source: Path, destination: Path) -> None:
+    """Atomically replace a path and strictly flush both affected namespaces."""
+
+    source = Path(source)
+    destination = Path(destination)
+    source_parent = source.parent.absolute()
+    destination_parent = destination.parent.absolute()
+    os.replace(source, destination)
+    flush_directory_strict(destination_parent)
+    if source_parent != destination_parent:
+        flush_directory_strict(source_parent)
+
+
 def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     secure_mkdir(path.parent)
     data = text.encode(encoding)
@@ -307,6 +555,7 @@ def secure_copy_file(source: Path, destination: Path) -> None:
     secure_mkdir(destination.parent)
     shutil.copyfile(source, destination)
     secure_file(destination)
+    flush_file_strict(destination)
     fsync_parent(destination)
 
 
@@ -344,6 +593,7 @@ def secure_copytree(source: Path, destination: Path, *, dirs_exist_ok: bool = Fa
     secure_mkdir(destination.parent)
     shutil.copytree(source, destination, dirs_exist_ok=dirs_exist_ok, symlinks=symlinks)
     secure_tree(destination)
+    flush_tree_strict(destination, include_parent=True)
 
 
 def secure_sqlite_files(db_path: Path) -> None:

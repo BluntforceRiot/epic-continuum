@@ -1732,7 +1732,7 @@ class OperationLedgerTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "short physical restore roots require Windows")
     def test_restore_drill_shortens_only_the_physical_windows_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp) / "epic-continuum"
             append_scroll_event(
                 root,
@@ -1746,15 +1746,15 @@ class OperationLedgerTest(unittest.TestCase):
             physical_root = operations_module._restore_drill_root_path(root, drill_id)
             hypothetical_full_root = root / "run" / "restore_drills" / drill_id
             source_dir = root / "archive"
-            target_length = 262
-            filename_length = target_length - len(str(hypothetical_full_root / "archive")) - 1
+            target_length = 272
+            filename_length = target_length - len(str(physical_root / "archive")) - 1
             source_file = source_dir / ("p" * (filename_length - 4) + ".txt")
             source_file.parent.mkdir(parents=True, exist_ok=True)
             source_file.write_text("long restore path evidence\n", encoding="utf-8")
             hypothetical_target = hypothetical_full_root / "archive" / source_file.name
             physical_target = physical_root / "archive" / source_file.name
             self.assertGreaterEqual(len(str(hypothetical_target)), 260)
-            self.assertLess(len(str(physical_target)), 260)
+            self.assertGreaterEqual(len(str(physical_target)), 260)
             real_unique_id = operations_module.unique_id
 
             def fixed_restore_id(prefix: str) -> str:
@@ -1773,12 +1773,39 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(result["ok"], result["checks"])
             self.assertEqual(result["drill_id"], drill_id)
             self.assertEqual(Path(result["drill_root"]), physical_root)
-            self.assertEqual(physical_root.name, "restore_717cb5a0bbb74424")
+            self.assertEqual(physical_root.name, "r_cXy1oLu3RCQ")
             self.assertEqual(
-                physical_target.read_text(encoding="utf-8"),
+                operations_module._restore_io_path(physical_target).read_text(encoding="utf-8"),
                 "long restore path evidence\n",
             )
             self.assertEqual(Path(result["receipt_uri"]).stem, drill_id)
+            shutil.rmtree(operations_module._restore_io_path(physical_root))
+
+            disposable_id = "restore_20260720T070017Z_abcdef0123456789"
+
+            def fixed_disposable_id(prefix: str) -> str:
+                return disposable_id if prefix == "restore" else real_unique_id(prefix)
+
+            with patch(
+                "continuum.core.operations.unique_id",
+                side_effect=fixed_disposable_id,
+            ):
+                disposable = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                    retain_drill_root=False,
+                )
+
+            self.assertTrue(disposable["ok"], disposable["checks"])
+            self.assertEqual(disposable["drill_root_cleanup_status"], "cleaned")
+            self.assertFalse(
+                operations_module._restore_path_exists(Path(disposable["drill_root"]))
+            )
+            shutil.rmtree(
+                operations_module._restore_io_path(root),
+                ignore_errors=True,
+            )
 
     @unittest.skipUnless(os.name == "nt", "identity-bound restore cleanup requires Windows")
     def test_disposable_restore_drill_cleans_root_after_late_copy_exception(self) -> None:
@@ -1814,7 +1841,7 @@ class OperationLedgerTest(unittest.TestCase):
                 )
 
             drill_parent = root / "run" / "restore_drills"
-            self.assertEqual(list(drill_parent.glob("restore_*")), [])
+            self.assertEqual(list(drill_parent.iterdir()), [])
 
     def test_retained_restore_drill_keeps_root_after_late_copy_exception(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1849,7 +1876,7 @@ class OperationLedgerTest(unittest.TestCase):
                 )
 
             drill_parent = root / "run" / "restore_drills"
-            retained = list(drill_parent.glob("restore_*"))
+            retained = [candidate for candidate in drill_parent.iterdir() if candidate.is_dir()]
             self.assertEqual(len(retained), 1)
             self.assertTrue((retained[0] / "catalog" / "catalog.sqlite3").exists())
 
@@ -1881,7 +1908,7 @@ class OperationLedgerTest(unittest.TestCase):
                 )
 
             drill_parent = root / "run" / "restore_drills"
-            self.assertEqual(list(drill_parent.glob("restore_*")), [])
+            self.assertEqual(list(drill_parent.iterdir()), [])
 
     def test_cleanup_refusal_does_not_replace_restore_drill_exception(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import errno
@@ -3191,6 +3192,46 @@ def _verify_recent_proof_packs(
     return {"ok": all(result["ok"] for result in results), "checked": len(results), "results": results}
 
 
+def _restore_io_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    value = str(path)
+    if value.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(value)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+def _restore_path_exists(path: Path) -> bool:
+    try:
+        os.lstat(_restore_io_path(path))
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _restore_link_like_reason(path: Path) -> str | None:
+    io_path = _restore_io_path(path)
+    try:
+        metadata = os.lstat(io_path)
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink"
+        is_junction = getattr(io_path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return "junction"
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"stat_failed:{exc}"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if reparse_flag and attributes & reparse_flag:
+        return "reparse_point"
+    return None
+
+
 def _link_like_reason(path: Path) -> str | None:
     try:
         if path.is_symlink():
@@ -3307,7 +3348,7 @@ def _audit_relative_tree_components(
         candidate = candidate / part
         cumulative = cumulative / part
         checked.append(cumulative.as_posix())
-        reason = _link_like_reason(candidate)
+        reason = _restore_link_like_reason(candidate)
         if reason is not None:
             _append_link_like_finding(
                 findings,
@@ -3317,7 +3358,7 @@ def _audit_relative_tree_components(
                 max_findings=max_findings,
             )
             return False
-        if not candidate.exists():
+        if not _restore_path_exists(candidate):
             return False
     return True
 
@@ -3451,15 +3492,16 @@ def _restore_copy_file(root: Path, source: Path, destination: Path) -> None:
     if not stat.S_ISREG(source_stat.st_mode):
         raise ValueError(f"unsafe_restore_drill_source_paths: non-regular file: {_display_relative(root, source)}")
     _ensure_restore_output_safe(root, destination)
-    secure_copy_file(source, destination)
+    io_destination = _restore_io_path(destination)
+    secure_copy_file(source, io_destination)
     try:
         timestamps = (int(source_stat.st_atime_ns), int(source_stat.st_mtime_ns))
         try:
-            os.utime(destination, ns=timestamps, follow_symlinks=False)
+            os.utime(io_destination, ns=timestamps, follow_symlinks=False)
         except NotImplementedError:
             # Windows does not expose follow_symlinks for utime. The source and
             # destination were both link-checked immediately above.
-            os.utime(destination, ns=timestamps)
+            os.utime(io_destination, ns=timestamps)
     except OSError as exc:
         raise ValueError(
             f"restore drill could not preserve source timestamps for {_display_relative(root, source)}: {exc}"
@@ -3470,7 +3512,7 @@ def _restore_copy_file(root: Path, source: Path, destination: Path) -> None:
 def _restore_copytree(root: Path, source: Path, destination: Path, *, dirs_exist_ok: bool = True) -> None:
     _ensure_restore_source_safe(root, source, subtree=True)
     _ensure_restore_output_safe(root, destination)
-    if destination.exists() and not dirs_exist_ok:
+    if _restore_path_exists(destination) and not dirs_exist_ok:
         raise FileExistsError(str(destination))
     stack: list[tuple[Path, Path]] = [(source, destination)]
     while stack:
@@ -3490,7 +3532,10 @@ def _restore_copytree(root: Path, source: Path, destination: Path, *, dirs_exist
                 f"unsafe_restore_drill_source_paths: non-directory: {_display_relative(root, current_source)}"
             )
         _ensure_restore_output_safe(root, current_destination)
-        secure_mkdir(current_destination, secure_existing=True)
+        secure_mkdir(
+            _restore_io_path(current_destination),
+            secure_existing=True,
+        )
         with os.scandir(current_source) as entries:
             for entry in entries:
                 child_source = Path(entry.path)
@@ -3669,7 +3714,8 @@ def _restore_drill_root_path(root: Path, drill_id: str) -> Path:
         suffix = drill_id.rsplit("_", 1)[-1]
         if re.fullmatch(r"[0-9a-f]{16}", suffix) is None:
             raise ValueError(f"invalid restore-drill identity: {drill_id}")
-        directory_name = f"restore_{suffix}"
+        token = base64.urlsafe_b64encode(bytes.fromhex(suffix)).decode("ascii").rstrip("=")
+        directory_name = f"r_{token}"
     return root / "run" / "restore_drills" / directory_name
 
 
@@ -3792,10 +3838,10 @@ def _delete_windows_restore_tree(
     native = reservation.native
     if native is None:
         raise OSError("Windows identity-bound restore cleanup is unavailable")
-    for entry in list(os.scandir(path)):
+    for entry in list(os.scandir(_restore_io_path(path))):
         child_path = path / entry.name
-        path_metadata = os.lstat(child_path)
-        reason = _link_like_reason(child_path)
+        path_metadata = os.lstat(_restore_io_path(child_path))
+        reason = _restore_link_like_reason(child_path)
         if reason is not None:
             raise ValueError(f"refusing {reason} restore-drill cleanup child: {child_path}")
         is_directory = stat.S_ISDIR(path_metadata.st_mode)
@@ -3814,7 +3860,7 @@ def _delete_windows_restore_tree(
         try:
             handle_metadata = native.fstat(child_handle)
             if _restore_drill_root_identity(handle_metadata) != _restore_drill_root_identity(
-                os.lstat(child_path)
+                os.lstat(_restore_io_path(child_path))
             ):
                 raise ValueError(
                     f"restore-drill cleanup child path changed after native open: {child_path}"
@@ -3832,7 +3878,7 @@ def _delete_windows_restore_tree(
             raise
         else:
             native.close(child_handle)
-        if not _strict_path_absent(child_path):
+        if _restore_path_exists(child_path):
             raise OSError(f"restore-drill cleanup child was repopulated: {child_path}")
 
 
@@ -4000,7 +4046,7 @@ def _cleanup_restore_drill_root_impl(
     reserved_candidate = Path(os.path.abspath(reservation.path))
     if (
         candidate.parent != parent
-        or not candidate.name.startswith("restore_")
+        or not candidate.name.startswith(("restore_", "r_"))
         or reserved_candidate != candidate
     ):
         raise ValueError(f"refusing unsafe restore-drill cleanup target: {drill_root}")

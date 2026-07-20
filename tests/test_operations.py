@@ -4140,9 +4140,10 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(
                 (
                     snapshots_dir
-                    / ".orphans"
-                    / interrupted_id.rsplit("_", 1)[-1]
-                    / "catalog.sqlite3"
+                    / (
+                        f".orphan_{interrupted_id.rsplit('_', 1)[-1]}_"
+                        "catalog.sqlite3"
+                    )
                 ).is_file()
             )
             self.assertTrue(all(path.is_file() for path in history_paths))
@@ -4164,6 +4165,102 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertEqual(restarted["deleted"], 0)
             self.assertEqual(restarted["unbound_retained"], 1)
             self.assertTrue(all(path.is_file() for path in history_paths))
+
+    def test_snapshot_orphan_quarantine_recovers_every_move_boundary(self) -> None:
+        for crash_after_move in range(1, 9):
+            with self.subTest(crash_after_move=crash_after_move), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                init_db(root)
+                snapshot_id = "snapshot_20260720T000000Z_1234567890abcdef"
+                outputs = store_module._snapshot_publication_output_paths(
+                    root,
+                    snapshot_id,
+                )
+                directory_indexes = {1, 2, 3, 6}
+                for index, output in enumerate(outputs):
+                    if index in directory_indexes:
+                        output.mkdir(parents=True)
+                        (output / "evidence.txt").write_text(
+                            f"output-{index}",
+                            encoding="utf-8",
+                        )
+                    else:
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        output.write_text(f"output-{index}", encoding="utf-8")
+                intent_path = store_module._write_snapshot_publication_intent(
+                    root,
+                    snapshot_id,
+                )
+
+                history_paths: list[Path] = []
+                conn = connect(root)
+                try:
+                    for index in range(20):
+                        retained_id = (
+                            f"snapshot_20260101T0000{index:02d}Z_{index:016x}"
+                        )
+                        retained = (
+                            root
+                            / "snapshots"
+                            / f"continuum_catalog_{retained_id}.sqlite3"
+                        )
+                        retained.write_text(
+                            f"retained-{index}",
+                            encoding="utf-8",
+                        )
+                        history_paths.append(retained)
+                        conn.execute(
+                            """
+                            INSERT INTO snapshots(
+                                id, snapshot_uri, reason, source_db_uri, created_at
+                            )
+                            VALUES(?, ?, 'retained', 'catalog/catalog.sqlite3', ?)
+                            """,
+                            (
+                                retained_id,
+                                f"snapshots/{retained.name}",
+                                f"2026-01-01T00:00:{index:02d}+00:00",
+                            ),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                real_move = store_module._move_snapshot_publication_output_noclobber
+                move_count = 0
+
+                def crash_after_durable_move(source: Path, destination: Path) -> None:
+                    nonlocal move_count
+                    real_move(source, destination)
+                    move_count += 1
+                    if move_count == crash_after_move:
+                        raise SimulatedSnapshotPowerLoss(
+                            f"after quarantine move {crash_after_move}"
+                        )
+
+                with patch.object(
+                    store_module,
+                    "_move_snapshot_publication_output_noclobber",
+                    side_effect=crash_after_durable_move,
+                ), self.assertRaises(SimulatedSnapshotPowerLoss):
+                    enforce_snapshot_retention(root)
+
+                enforce_snapshot_retention(root)
+                orphan_paths = store_module._snapshot_orphan_evidence_paths(
+                    root,
+                    snapshot_id,
+                )
+                self.assertTrue(all(os.path.lexists(path) for path in orphan_paths))
+                self.assertFalse(any(os.path.lexists(path) for path in outputs))
+                self.assertFalse(intent_path.exists())
+                self.assertTrue(
+                    (
+                        root
+                        / "snapshots"
+                        / ".orphan_1234567890abcdef_intent.json"
+                    ).is_file()
+                )
+                self.assertTrue(all(path.is_file() for path in history_paths))
 
     def test_snapshot_retention_removes_catalog_rows_for_deleted_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

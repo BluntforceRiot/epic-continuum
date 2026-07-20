@@ -20097,15 +20097,11 @@ def _write_snapshot_publication_intent(root: Path, snapshot_id: str) -> Path:
     return intent_path
 
 
-def _snapshot_orphan_evidence_dir(root: Path, snapshot_id: str) -> Path:
-    suffix = snapshot_id.rsplit("_", 1)[-1]
-    return root / "snapshots" / ".orphans" / suffix
-
-
 def _snapshot_orphan_evidence_paths(root: Path, snapshot_id: str) -> tuple[Path, ...]:
-    evidence_dir = _snapshot_orphan_evidence_dir(root, snapshot_id)
+    snapshots_dir = root / "snapshots"
+    suffix = snapshot_id.rsplit("_", 1)[-1]
     return tuple(
-        evidence_dir / name
+        snapshots_dir / f".orphan_{suffix}_{name}"
         for name in (
             "catalog.sqlite3",
             "cards",
@@ -20118,16 +20114,14 @@ def _snapshot_orphan_evidence_paths(root: Path, snapshot_id: str) -> tuple[Path,
     )
 
 
-def _ensure_snapshot_orphan_evidence_dir(root: Path, snapshot_id: str) -> Path:
-    evidence_dir = _snapshot_orphan_evidence_dir(root, snapshot_id)
-    secure_mkdir(evidence_dir, secure_existing=True)
-    for directory in (evidence_dir.parent, evidence_dir):
-        if not _plain_snapshot_publication_output(directory) or not directory.is_dir():
-            raise ValueError(
-                f"snapshot orphan evidence directory is link-like or unsupported: {directory}"
-            )
-    flush_directory_strict(evidence_dir.parent)
-    return evidence_dir
+def _move_snapshot_publication_output_noclobber(
+    source: Path,
+    destination: Path,
+) -> None:
+    replace_file_noclobber(source, destination)
+    flush_directory_strict(destination.parent)
+    if source.parent.absolute() != destination.parent.absolute():
+        flush_directory_strict(source.parent)
 
 
 def _read_snapshot_publication_intent(
@@ -20230,7 +20224,6 @@ def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
                 result["committed_publication_intents_retired"] += 1
                 continue
 
-            evidence_dir = _ensure_snapshot_orphan_evidence_dir(root, snapshot_id)
             for output_path, orphan_path in zip(
                 _snapshot_publication_output_paths(root, snapshot_id),
                 _snapshot_orphan_evidence_paths(root, snapshot_id),
@@ -20248,7 +20241,10 @@ def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
                         raise ValueError(
                             f"snapshot publication output is link-like or unsupported: {output_path}"
                         )
-                    replace_file_noclobber(output_path, orphan_path)
+                    _move_snapshot_publication_output_noclobber(
+                        output_path,
+                        orphan_path,
+                    )
                     result["orphan_outputs_quarantined"] += 1
                 elif orphan_exists and not _plain_snapshot_publication_output(orphan_path):
                     raise ValueError(
@@ -20259,14 +20255,17 @@ def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
                 raise ValueError(
                     f"snapshot publication intent changed during reconciliation: {intent_path}"
                 )
-            orphan_intent_path = evidence_dir / "intent.json"
+            suffix = snapshot_id.rsplit("_", 1)[-1]
+            orphan_intent_path = snapshots_dir / f".orphan_{suffix}_intent.json"
             if os.path.lexists(orphan_intent_path):
                 raise ValueError(
                     "snapshot publication orphan intent already exists: "
                     f"{orphan_intent_path}"
                 )
-            replace_file_noclobber(intent_path, orphan_intent_path)
-            flush_directory_strict(snapshots_dir)
+            _move_snapshot_publication_output_noclobber(
+                intent_path,
+                orphan_intent_path,
+            )
             result["orphan_publications_quarantined"] += 1
     finally:
         if conn is not None:
@@ -20304,7 +20303,13 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     if is_initialized(root):
         conn = connect_existing(root)
         try:
-            for row in conn.execute("SELECT snapshot_uri FROM snapshots"):
+            snapshot_rows = conn.execute(
+                "SELECT snapshot_uri FROM snapshots LIMIT ?",
+                (MAX_SNAPSHOT_PUBLICATION_DIRECTORY_ENTRIES + 1,),
+            ).fetchall()
+            if len(snapshot_rows) > MAX_SNAPSHOT_PUBLICATION_DIRECTORY_ENTRIES:
+                raise ValueError("snapshot retention catalog row limit exceeded")
+            for row in snapshot_rows:
                 candidate = resolve_stored_uri(root, str(row["snapshot_uri"]))
                 catalog_snapshot_uris.add(lexical_continuum_uri(root, candidate))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").fetchone():

@@ -4068,6 +4068,98 @@ class OperationLedgerTest(unittest.TestCase):
             )
             self.assertTrue(verification["ok"], verification)
 
+    def test_snapshot_restart_quarantines_precommit_outputs_before_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            seed_snapshot_durability_root(root)
+
+            with patch.object(
+                store_module,
+                "audit_event",
+                side_effect=SimulatedSnapshotPowerLoss("before catalog commit"),
+            ), self.assertRaises(SimulatedSnapshotPowerLoss):
+                snapshot(root, reason="precommit power loss")
+
+            snapshots_dir = root / "snapshots"
+            intent_paths = list(snapshots_dir.glob(".snapshot_publication_*.json"))
+            self.assertEqual(len(intent_paths), 1)
+            intent = json.loads(intent_paths[0].read_text(encoding="utf-8"))
+            interrupted_id = str(intent["snapshot_id"])
+            interrupted_catalog = (
+                snapshots_dir / f"continuum_catalog_{interrupted_id}.sqlite3"
+            )
+            self.assertTrue(interrupted_catalog.is_file())
+
+            history_paths: list[Path] = []
+            legacy_orphan = (
+                snapshots_dir
+                / "continuum_catalog_snapshot_20260720T000000Z_ffffffffffffffff.sqlite3"
+            )
+            legacy_orphan.write_bytes(b"legacy pre-protocol orphan")
+            conn = connect(root)
+            try:
+                for index in range(20):
+                    snapshot_id = (
+                        f"snapshot_20260101T0000{index:02d}Z_{index:016x}"
+                    )
+                    path = snapshots_dir / f"continuum_catalog_{snapshot_id}.sqlite3"
+                    path.write_bytes(f"valid-history-{index}".encode("utf-8"))
+                    timestamp = 1_700_000_000 + index
+                    os.utime(path, (timestamp, timestamp))
+                    history_paths.append(path)
+                    conn.execute(
+                        """
+                        INSERT INTO snapshots(
+                            id, snapshot_uri, reason, source_db_uri, created_at
+                        )
+                        VALUES(?, ?, ?, 'catalog/catalog.sqlite3', ?)
+                        """,
+                        (
+                            snapshot_id,
+                            f"snapshots/{path.name}",
+                            "valid retained history",
+                            f"2026-01-01T00:00:{index:02d}+00:00",
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = enforce_snapshot_retention(root)
+
+            self.assertEqual(result["orphan_publications_quarantined"], 1)
+            self.assertGreaterEqual(result["orphan_outputs_quarantined"], 2)
+            self.assertEqual(result["deleted"], 0)
+            self.assertEqual(result["unbound_retained"], 1)
+            self.assertFalse(interrupted_catalog.exists())
+            self.assertTrue(
+                (
+                    snapshots_dir
+                    / ".orphans"
+                    / interrupted_id.rsplit("_", 1)[-1]
+                    / "catalog.sqlite3"
+                ).is_file()
+            )
+            self.assertTrue(all(path.is_file() for path in history_paths))
+            self.assertTrue(legacy_orphan.is_file())
+            self.assertEqual(
+                len(list(snapshots_dir.glob("continuum_catalog_*.sqlite3"))),
+                21,
+            )
+            conn = connect(root)
+            try:
+                rows = conn.execute("SELECT id FROM snapshots").fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(rows), 20)
+
+            restarted = enforce_snapshot_retention(root)
+            self.assertEqual(restarted["orphan_publications_quarantined"], 0)
+            self.assertEqual(restarted["orphan_outputs_quarantined"], 0)
+            self.assertEqual(restarted["deleted"], 0)
+            self.assertEqual(restarted["unbound_retained"], 1)
+            self.assertTrue(all(path.is_file() for path in history_paths))
+
     def test_snapshot_retention_removes_catalog_rows_for_deleted_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -4141,9 +4233,10 @@ class OperationLedgerTest(unittest.TestCase):
 
             result = enforce_snapshot_retention(root)
 
-            self.assertEqual(result["protected"], 1)
+            self.assertEqual(result["protected"], 0)
+            self.assertEqual(result["unbound_retained"], 22)
             self.assertTrue(protected.exists())
-            self.assertEqual(len(list(snapshots_dir.glob("continuum_catalog_*.sqlite3"))), 21)
+            self.assertEqual(len(list(snapshots_dir.glob("continuum_catalog_*.sqlite3"))), 22)
 
     def test_snapshot_restore_preserves_alias_key_for_original_external_identifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

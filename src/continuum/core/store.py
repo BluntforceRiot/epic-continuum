@@ -168,6 +168,13 @@ ASSOCIATION_DAMPED_TERMS = {
 EXACT_MEMORY_RE = re.compile(r"\bremember\s+this\s+exactly\b\s*:?", re.IGNORECASE)
 SQLITE_WRITE_RETRY_ATTEMPTS = 10
 SQLITE_WRITE_RETRY_BASE_SECONDS = 0.025
+SNAPSHOT_PUBLICATION_INTENT_SCHEMA = "continuum.snapshot_publication_intent.v1"
+MAX_SNAPSHOT_PUBLICATION_DIRECTORY_ENTRIES = 100_000
+MAX_SNAPSHOT_PUBLICATION_INTENTS = 1_000
+MAX_SNAPSHOT_PUBLICATION_INTENT_BYTES = 16 * 1024
+SNAPSHOT_PUBLICATION_INTENT_RE = re.compile(
+    r"^\.snapshot_publication_(snapshot_\d{8}T\d{6}Z_[0-9a-f]{16})\.json$"
+)
 
 JSON_PARTITION_KEY_KINDS = {
     "session_id": "session_id",
@@ -20010,7 +20017,226 @@ def semantic_integrity_report(
             conn.close()
 
 
+def _snapshot_publication_intent_path(root: Path, snapshot_id: str) -> Path:
+    return root / "snapshots" / f".snapshot_publication_{snapshot_id}.json"
+
+
+def _snapshot_publication_output_paths(root: Path, snapshot_id: str) -> tuple[Path, ...]:
+    snapshots_dir = root / "snapshots"
+    snapshot_path = snapshots_dir / f"continuum_catalog_{snapshot_id}.sqlite3"
+    return (
+        snapshot_path,
+        snapshots_dir / f"continuum_cards_{snapshot_id}",
+        snapshot_card_sidecar_receipts_path(snapshot_path),
+        snapshot_review_bridge_jobs_path(snapshot_path),
+        snapshot_alias_key_path(snapshot_path),
+        snapshot_manifest_path(snapshot_path),
+        snapshots_dir / f".staging_{snapshot_id}",
+    )
+
+
+def _snapshot_publication_intent_payload(root: Path, snapshot_id: str) -> dict[str, Any]:
+    snapshot_path = root / "snapshots" / f"continuum_catalog_{snapshot_id}.sqlite3"
+    return {
+        "schema": SNAPSHOT_PUBLICATION_INTENT_SCHEMA,
+        "snapshot_id": snapshot_id,
+        "snapshot_uri": continuum_uri(root, snapshot_path),
+        "output_names": [
+            path.name for path in _snapshot_publication_output_paths(root, snapshot_id)
+        ],
+    }
+
+
+def _write_snapshot_publication_intent(root: Path, snapshot_id: str) -> Path:
+    intent_path = _snapshot_publication_intent_path(root, snapshot_id)
+    payload = _snapshot_publication_intent_payload(root, snapshot_id)
+    secure_write_text_exclusive(
+        intent_path,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+    flush_directory_strict(intent_path.parent)
+    return intent_path
+
+
+def _snapshot_orphan_evidence_dir(root: Path, snapshot_id: str) -> Path:
+    suffix = snapshot_id.rsplit("_", 1)[-1]
+    return root / "snapshots" / ".orphans" / suffix
+
+
+def _snapshot_orphan_evidence_paths(root: Path, snapshot_id: str) -> tuple[Path, ...]:
+    evidence_dir = _snapshot_orphan_evidence_dir(root, snapshot_id)
+    return tuple(
+        evidence_dir / name
+        for name in (
+            "catalog.sqlite3",
+            "cards",
+            "card_sidecar_receipts",
+            "review_bridge_jobs",
+            "partition_alias.key",
+            "manifest.json",
+            "staging",
+        )
+    )
+
+
+def _ensure_snapshot_orphan_evidence_dir(root: Path, snapshot_id: str) -> Path:
+    evidence_dir = _snapshot_orphan_evidence_dir(root, snapshot_id)
+    secure_mkdir(evidence_dir, secure_existing=True)
+    for directory in (evidence_dir.parent, evidence_dir):
+        if not _plain_snapshot_publication_output(directory) or not directory.is_dir():
+            raise ValueError(
+                f"snapshot orphan evidence directory is link-like or unsupported: {directory}"
+            )
+    flush_directory_strict(evidence_dir.parent)
+    return evidence_dir
+
+
+def _read_snapshot_publication_intent(
+    root: Path,
+    intent_path: Path,
+    snapshot_id: str,
+) -> tuple[dict[str, Any], StableRegularFileEvidence]:
+    evidence, fd, captured = _open_stable_regular_file_hash_evidence(
+        intent_path,
+        max_bytes=MAX_SNAPSHOT_PUBLICATION_INTENT_BYTES,
+        capture_bytes=True,
+    )
+    try:
+        if captured is None:
+            raise ValueError("snapshot publication intent bytes were not captured")
+        payload = json.loads(captured.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid snapshot publication intent: {intent_path}") from exc
+    finally:
+        os.close(fd)
+    expected = _snapshot_publication_intent_payload(root, snapshot_id)
+    if payload != expected:
+        raise ValueError(f"snapshot publication intent binding mismatch: {intent_path}")
+    return payload, evidence
+
+
+def _plain_snapshot_publication_output(path: Path) -> bool:
+    try:
+        if _snapshot_link_like_reason(path):
+            return False
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
+
+
+def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
+    result = {
+        "orphan_publications_quarantined": 0,
+        "orphan_outputs_quarantined": 0,
+        "committed_publication_intents_retired": 0,
+    }
+    snapshots_dir = root / "snapshots"
+    if not snapshots_dir.exists():
+        return result
+    if _snapshot_link_like_reason(snapshots_dir) or not snapshots_dir.is_dir():
+        raise ValueError("snapshot publication reconciliation requires a plain snapshots directory")
+    intent_paths: list[tuple[Path, str]] = []
+    scanned_count = 0
+    with os.scandir(snapshots_dir) as entries:
+        for entry in entries:
+            scanned_count += 1
+            if scanned_count > MAX_SNAPSHOT_PUBLICATION_DIRECTORY_ENTRIES:
+                raise ValueError("snapshot publication reconciliation directory entry limit exceeded")
+            matched = SNAPSHOT_PUBLICATION_INTENT_RE.fullmatch(entry.name)
+            if matched is None:
+                continue
+            if len(intent_paths) >= MAX_SNAPSHOT_PUBLICATION_INTENTS:
+                raise ValueError("snapshot publication reconciliation intent limit exceeded")
+            if not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"snapshot publication intent is not a plain file: {entry.path}")
+            intent_paths.append((Path(entry.path), matched.group(1)))
+
+    conn = connect_existing(root) if is_initialized(root) else None
+    try:
+        for intent_path, snapshot_id in sorted(intent_paths):
+            payload, intent_evidence = _read_snapshot_publication_intent(
+                root,
+                intent_path,
+                snapshot_id,
+            )
+            row = (
+                conn.execute(
+                    "SELECT snapshot_uri FROM snapshots WHERE id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                if conn is not None
+                else None
+            )
+            expected_snapshot_uri = str(payload["snapshot_uri"])
+            if row is not None:
+                if str(row["snapshot_uri"]) != expected_snapshot_uri:
+                    raise ValueError(
+                        f"snapshot publication catalog binding mismatch: {snapshot_id}"
+                    )
+                snapshot_path = resolve_stored_uri(root, expected_snapshot_uri)
+                if not _plain_snapshot_publication_output(snapshot_path):
+                    raise ValueError(
+                        f"committed snapshot publication output is unavailable: {snapshot_path}"
+                    )
+                if not _stable_regular_file_evidence_is_current(
+                    intent_path,
+                    intent_evidence,
+                ):
+                    raise ValueError(
+                        f"snapshot publication intent changed during reconciliation: {intent_path}"
+                    )
+                intent_path.unlink()
+                flush_directory_strict(snapshots_dir)
+                result["committed_publication_intents_retired"] += 1
+                continue
+
+            evidence_dir = _ensure_snapshot_orphan_evidence_dir(root, snapshot_id)
+            for output_path, orphan_path in zip(
+                _snapshot_publication_output_paths(root, snapshot_id),
+                _snapshot_orphan_evidence_paths(root, snapshot_id),
+                strict=True,
+            ):
+                source_exists = os.path.lexists(output_path)
+                orphan_exists = os.path.lexists(orphan_path)
+                if source_exists and orphan_exists:
+                    raise ValueError(
+                        "snapshot publication reconciliation destination already exists: "
+                        f"{orphan_path}"
+                    )
+                if source_exists:
+                    if not _plain_snapshot_publication_output(output_path):
+                        raise ValueError(
+                            f"snapshot publication output is link-like or unsupported: {output_path}"
+                        )
+                    replace_file_noclobber(output_path, orphan_path)
+                    result["orphan_outputs_quarantined"] += 1
+                elif orphan_exists and not _plain_snapshot_publication_output(orphan_path):
+                    raise ValueError(
+                        f"snapshot orphan evidence is link-like or unsupported: {orphan_path}"
+                    )
+
+            if not _stable_regular_file_evidence_is_current(intent_path, intent_evidence):
+                raise ValueError(
+                    f"snapshot publication intent changed during reconciliation: {intent_path}"
+                )
+            orphan_intent_path = evidence_dir / "intent.json"
+            if os.path.lexists(orphan_intent_path):
+                raise ValueError(
+                    "snapshot publication orphan intent already exists: "
+                    f"{orphan_intent_path}"
+                )
+            replace_file_noclobber(intent_path, orphan_intent_path)
+            flush_directory_strict(snapshots_dir)
+            result["orphan_publications_quarantined"] += 1
+    finally:
+        if conn is not None:
+            conn.close()
+    return result
+
+
 def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
+    reconciliation = _reconcile_interrupted_snapshot_publications(root)
     policy = str(load_config(root).get("retention", {}).get("snapshot_retention", "last_20"))
     if policy == "keep_all":
         return {
@@ -20020,6 +20246,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             "paired_review_jobs_deleted": 0,
             "paired_card_sidecar_receipts_deleted": 0,
             "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
+            **reconciliation,
         }
     keep = 20
     snapshots_dir = root / "snapshots"
@@ -20031,16 +20258,16 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             "paired_review_jobs_deleted": 0,
             "paired_card_sidecar_receipts_deleted": 0,
             "catalog_rows_retired": _retire_missing_snapshot_catalog_rows(root),
+            **reconciliation,
         }
-    snapshots = sorted(
-        snapshots_dir.glob("continuum_catalog_*.sqlite3"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
     protected_snapshot_uris: set[str] = set()
+    catalog_snapshot_uris: set[str] = set()
     if is_initialized(root):
         conn = connect_existing(root)
         try:
+            for row in conn.execute("SELECT snapshot_uri FROM snapshots"):
+                candidate = resolve_stored_uri(root, str(row["snapshot_uri"]))
+                catalog_snapshot_uris.add(lexical_continuum_uri(root, candidate))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").fetchone():
                 rows = conn.execute("SELECT uri FROM artifacts WHERE immutable = 1").fetchall()
                 for row in rows:
@@ -20048,11 +20275,29 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                     if (
                         candidate.name.startswith("continuum_catalog_")
                         and candidate.suffix == ".sqlite3"
-                        and candidate.parent.resolve(strict=False) == snapshots_dir.resolve(strict=False)
+                        and candidate.absolute().parent == snapshots_dir.absolute()
                     ):
-                        protected_snapshot_uris.add(continuum_uri(root, candidate))
+                        protected_snapshot_uris.add(
+                            lexical_continuum_uri(root, candidate)
+                        )
         finally:
             conn.close()
+    snapshots: list[Path] = []
+    unbound_retained = 0
+    for candidate in snapshots_dir.glob("continuum_catalog_*.sqlite3"):
+        candidate_uri = lexical_continuum_uri(root, candidate)
+        if candidate_uri not in catalog_snapshot_uris:
+            unbound_retained += 1
+            continue
+        if not _plain_snapshot_publication_output(candidate):
+            raise ValueError(
+                f"catalog-bound snapshot retention candidate is link-like or unsupported: {candidate}"
+            )
+        snapshots.append(candidate)
+    snapshots.sort(
+        key=lambda item: os.lstat(item).st_mtime,
+        reverse=True,
+    )
     deleted = 0
     paired_review_jobs_deleted = 0
     paired_card_sidecar_receipts_deleted = 0
@@ -20060,7 +20305,7 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     retired_snapshot_uris: list[str] = []
     retired_snapshot_ids: list[str] = []
     for old_snapshot in snapshots[keep:]:
-        old_snapshot_uri = continuum_uri(root, old_snapshot)
+        old_snapshot_uri = lexical_continuum_uri(root, old_snapshot)
         if old_snapshot_uri in protected_snapshot_uris:
             protected += 1
             continue
@@ -20142,6 +20387,8 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
             paired_card_sidecar_receipts_deleted
         ),
         "catalog_rows_retired": catalog_rows_retired,
+        "unbound_retained": unbound_retained,
+        **reconciliation,
     }
 
 
@@ -20409,6 +20656,7 @@ def _serialize_review_publication(
 @_serialize_review_publication
 def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     init_db(root)
+    _reconcile_interrupted_snapshot_publications(root)
     reason = enforce_text_secret_policy(root, str(reason), scope="snapshot reason")
     sidecar_sync = sync_pending_card_sidecars(root)
     if not sidecar_sync.get("ok"):
@@ -20550,6 +20798,10 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
                 f"{snapshot_semantic_integrity.get('failing')}"
             )
         flush_tree_strict(staged_root, include_parent=True)
+        publication_intent_path = _write_snapshot_publication_intent(
+            root,
+            snapshot_id,
+        )
         replace_durable(staged_db, out_path)
         secure_sqlite_files(out_path)
         flush_file_strict(out_path)
@@ -20635,6 +20887,8 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
         )
         conn.commit()
         snapshot_catalog_committed = True
+        publication_intent_path.unlink()
+        flush_directory_strict(publication_intent_path.parent)
         retention = enforce_snapshot_retention(root)
         return {
             "snapshot_id": snapshot_id,

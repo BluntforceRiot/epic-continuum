@@ -3898,6 +3898,11 @@ class OperationLedgerTest(unittest.TestCase):
                 created = snapshot(root, reason="durability ordering")
 
             event_names = [event[0] for event in events]
+            stage_names = [
+                value for name, value in events if name == "stage_flush_start"
+            ]
+            self.assertEqual(len(stage_names), 1)
+            self.assertRegex(stage_names[0], r"^\.staging_[0-9a-f]{16}$")
             self.assertLess(
                 event_names.index("stage_flush_complete"),
                 event_names.index("rename_start"),

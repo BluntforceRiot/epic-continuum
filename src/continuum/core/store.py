@@ -20060,6 +20060,15 @@ def _snapshot_publication_intent_path(root: Path, snapshot_id: str) -> Path:
     return root / "snapshots" / f".snapshot_publication_{snapshot_id}.json"
 
 
+def _snapshot_staging_path(root: Path, snapshot_id: str) -> Path:
+    """Keep the private transaction path short enough for default Windows roots."""
+
+    suffix = snapshot_id.rsplit("_", 1)[-1]
+    if re.fullmatch(r"[0-9a-f]{16}", suffix) is None:
+        raise ValueError(f"invalid snapshot staging identity: {snapshot_id}")
+    return root / "snapshots" / f".staging_{suffix}"
+
+
 def _snapshot_publication_output_paths(root: Path, snapshot_id: str) -> tuple[Path, ...]:
     snapshots_dir = root / "snapshots"
     snapshot_path = snapshots_dir / f"continuum_catalog_{snapshot_id}.sqlite3"
@@ -20070,7 +20079,7 @@ def _snapshot_publication_output_paths(root: Path, snapshot_id: str) -> tuple[Pa
         snapshot_review_bridge_jobs_path(snapshot_path),
         snapshot_alias_key_path(snapshot_path),
         snapshot_manifest_path(snapshot_path),
-        snapshots_dir / f".staging_{snapshot_id}",
+        _snapshot_staging_path(root, snapshot_id),
     )
 
 
@@ -20725,7 +20734,7 @@ def snapshot(root: Path, *, reason: str = "manual_snapshot") -> dict[str, Any]:
     review_jobs_out = snapshot_review_bridge_jobs_path(out_path)
     alias_key_source = _partition_alias_key_path(root)
     alias_key_out = snapshot_alias_key_path(out_path)
-    staged_root = root / "snapshots" / f".staging_{snapshot_id}"
+    staged_root = _snapshot_staging_path(root, snapshot_id)
     staged_db = staged_root / "catalog" / "catalog.sqlite3"
     staged_cards_out = _snapshot_staged_sidecars_path(root, staged_root, cards_source)
     staged_sidecar_receipts = _card_sidecar_recovery_receipt_dir(staged_root)

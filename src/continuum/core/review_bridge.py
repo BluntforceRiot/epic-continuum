@@ -322,8 +322,30 @@ REVIEW_INGEST_RECEIPT_SCHEMA = "epic-continuum.review-ingest-receipt/1"
 REVIEW_PHASE_ENVELOPE_SCHEMA = "epic-continuum.review-phase-envelope/1"
 REVIEW_PHASE_ARTIFACT_KIND = "review_phase_envelope"
 REVIEW_LEGACY_QUARANTINE_SCHEMA = "epic-continuum.review-legacy-quarantine/1"
+REVIEW_EXACT_QUARANTINE_SCHEMA = "epic-continuum.review-legacy-quarantine/2"
 REVIEW_LEGACY_QUARANTINE_ARTIFACT_KIND = "review_legacy_quarantine_receipt"
 REVIEW_LEGACY_QUARANTINE_NAME = "legacy-quarantine.json"
+REVIEW_EXACT_QUARANTINE_AUTHORIZATION = "explicit_operator_exact_evidence"
+REVIEW_EXACT_QUARANTINE_SUBJECT_FIELDS = (
+    "subject_archive_sha256",
+    "package_sha256",
+    "subject_sha256",
+)
+REVIEW_EXACT_QUARANTINE_MAX_FINDINGS = 1_000
+REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES = REVIEW_INTEGRITY_MAX_RECORD_BYTES
+REVIEW_EXACT_QUARANTINE_ALLOWED_REASONS = {
+    "review_bridge_malformed_records": {
+        "invalid_status_lifecycle",
+        "job_artifact_binding_invalid",
+        "subject_manifest_member_set_mismatch",
+        "unexpected_job_tree_directory",
+        "unexpected_job_tree_file",
+    },
+    "review_bridge_invalid_attempt_records": {
+        "attempt_job_binding_mismatch",
+        "attempt_receipt_sequence_mismatch",
+    },
+}
 REVIEW_PHASE_NAMES = {
     "automated_reservation",
     "browser_reservation",
@@ -4242,27 +4264,42 @@ def _validated_legacy_quarantine_receipt(
         receipt = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ReviewBridgeError("legacy review quarantine receipt is malformed") from exc
+    common_fields = {
+        "schema",
+        "job_id",
+        "quarantined_at",
+        "reason",
+        "replacement_job_id",
+        "operation_id",
+        "tree_entry_count",
+        "tree_inventory_sha256",
+        "artifact_binding_count",
+        "artifact_bindings_sha256",
+        "accepted_integrity_finding_count",
+        "accepted_integrity_findings_sha256",
+        "accepted_integrity_counter",
+    }
+    receipt_schema = receipt.get("schema") if isinstance(receipt, dict) else None
+    expected_fields = (
+        common_fields | {"authorization", "subject_binding"}
+        if receipt_schema == REVIEW_EXACT_QUARANTINE_SCHEMA
+        else common_fields
+    )
+    reason_is_valid = (
+        receipt_schema == REVIEW_LEGACY_QUARANTINE_SCHEMA
+        and receipt.get("reason") == "unupgradable_legacy_attempt_history"
+    ) or (
+        receipt_schema == REVIEW_EXACT_QUARANTINE_SCHEMA
+        and receipt.get("reason") == "operator_authorized_exact_malformed_evidence"
+        and receipt.get("authorization") == REVIEW_EXACT_QUARANTINE_AUTHORIZATION
+    )
     if (
         not isinstance(receipt, dict)
-        or set(receipt)
-        != {
-            "schema",
-            "job_id",
-            "quarantined_at",
-            "reason",
-            "replacement_job_id",
-            "operation_id",
-            "tree_entry_count",
-            "tree_inventory_sha256",
-            "artifact_binding_count",
-            "artifact_bindings_sha256",
-            "accepted_integrity_finding_count",
-            "accepted_integrity_findings_sha256",
-            "accepted_integrity_counter",
-        }
-        or receipt.get("schema") != REVIEW_LEGACY_QUARANTINE_SCHEMA
+        or set(receipt) != expected_fields
+        or receipt_schema
+        not in {REVIEW_LEGACY_QUARANTINE_SCHEMA, REVIEW_EXACT_QUARANTINE_SCHEMA}
+        or not reason_is_valid
         or receipt.get("job_id") != job_id
-        or receipt.get("reason") != "unupgradable_legacy_attempt_history"
         or not isinstance(receipt.get("replacement_job_id"), str)
         or receipt.get("replacement_job_id") == job_id
         or receipt.get("operation_id") != row["operation_id"]
@@ -4289,6 +4326,37 @@ def _validated_legacy_quarantine_receipt(
         raise ReviewBridgeError(
             "legacy review quarantine receipt coordinates are invalid"
         ) from exc
+    if receipt_schema == REVIEW_EXACT_QUARANTINE_SCHEMA:
+        subject_binding = receipt.get("subject_binding")
+        if (
+            not isinstance(subject_binding, dict)
+            or set(subject_binding) != set(REVIEW_EXACT_QUARANTINE_SUBJECT_FIELDS)
+            or any(
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in subject_binding.values()
+            )
+        ):
+            raise ReviewBridgeError(
+                "exact review quarantine subject binding is malformed"
+            )
+        try:
+            source_subject_binding = _exact_quarantine_subject_binding(root, job_id)
+            replacement_subject_binding = _exact_quarantine_subject_binding(
+                root,
+                replacement_job_id,
+            )
+        except ReviewBridgeError as exc:
+            raise ReviewBridgeError(
+                "exact review quarantine subject binding cannot be verified"
+            ) from exc
+        if (
+            subject_binding != source_subject_binding
+            or subject_binding != replacement_subject_binding
+        ):
+            raise ReviewBridgeError(
+                "exact review quarantine subject binding drifted"
+            )
     counter_rows = receipt["accepted_integrity_counter"]
     if (
         quarantined_at.tzinfo is None
@@ -5080,10 +5148,20 @@ def review_bridge_integrity_report(
     root: Path,
     *,
     max_samples: int = 20,
+    max_sample_bytes: int | None = None,
     job_id: str | None = None,
     artifact_conn: Any | None = None,
 ) -> dict[str, Any]:
     """Audit Review Relay references without following links or changing state."""
+    if (
+        max_sample_bytes is not None
+        and (
+            isinstance(max_sample_bytes, bool)
+            or not isinstance(max_sample_bytes, int)
+            or max_sample_bytes < 0
+        )
+    ):
+        raise ReviewBridgeError("review integrity sample byte limit is invalid")
     checks = {
         "review_bridge_link_like_paths": 0,
         "review_bridge_malformed_records": 0,
@@ -5093,10 +5171,12 @@ def review_bridge_integrity_report(
         "review_bridge_attempt_hash_mismatches": 0,
     }
     samples: dict[str, list[dict[str, Any]]] = {key: [] for key in checks}
+    sample_bytes = 0
     captured_job_id: str | None = None
     captured_job_findings: list[dict[str, Any]] | None = None
 
     def add(check: str, **detail: Any) -> None:
+        nonlocal sample_bytes
         checks[check] += 1
         if (
             captured_job_findings is not None
@@ -5105,7 +5185,10 @@ def review_bridge_integrity_report(
         ):
             captured_job_findings.append({"check": check, **detail})
         if len(samples[check]) < max(0, int(max_samples)):
-            samples[check].append(detail)
+            detail_bytes = len(json_dumps(detail).encode("utf-8"))
+            if max_sample_bytes is None or sample_bytes + detail_bytes <= max_sample_bytes:
+                samples[check].append(detail)
+                sample_bytes += detail_bytes
 
     root_path = Path(root)
     requested_job_id = _safe_job_id(job_id) if job_id is not None else None
@@ -6884,6 +6967,112 @@ def _legacy_quarantine_exact_findings(
     return actual_findings
 
 
+def _operator_authorized_exact_quarantine_findings(
+    job_id: str,
+    report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return one bounded, exact multiset of explicitly authorized legacy findings."""
+
+    checks = dict(report.get("checks") or {})
+    samples = dict(report.get("samples") or {})
+    finding_total = 0
+    for check, raw_count in checks.items():
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 0:
+            raise ReviewBridgeError(
+                "exact review quarantine integrity counts are malformed"
+            )
+        if raw_count and check not in REVIEW_EXACT_QUARANTINE_ALLOWED_REASONS:
+            raise ReviewBridgeError(
+                "exact review quarantine refuses integrity findings outside its scoped classes"
+            )
+        finding_total += raw_count
+    if finding_total < 1:
+        raise ReviewBridgeError(
+            "review job already passes integrity and does not require quarantine"
+        )
+    if finding_total > REVIEW_EXACT_QUARANTINE_MAX_FINDINGS:
+        raise ReviewBridgeError(
+            "exact review quarantine finding count exceeds the bounded authorization limit"
+        )
+
+    findings: list[dict[str, Any]] = []
+    serialized_finding_bytes = 2  # JSON list brackets.
+    for check, raw_count in checks.items():
+        count = int(raw_count)
+        check_samples = list(samples.get(check) or [])
+        if count != len(check_samples):
+            raise ReviewBridgeError(
+                "exact review quarantine findings exceed the bounded evidence report"
+            )
+        allowed_reasons = REVIEW_EXACT_QUARANTINE_ALLOWED_REASONS.get(check, set())
+        for raw_finding in check_samples:
+            if not isinstance(raw_finding, dict):
+                raise ReviewBridgeError(
+                    "exact review quarantine finding evidence is malformed"
+                )
+            finding = {"check": check, **raw_finding}
+            if finding.get("job_id") != job_id:
+                raise ReviewBridgeError(
+                    "exact review quarantine refuses findings outside the requested job"
+                )
+            if str(finding.get("reason") or "") not in allowed_reasons:
+                raise ReviewBridgeError(
+                    "exact review quarantine refuses an unrecognized finding reason"
+                )
+            finding_bytes = len(json_dumps(finding).encode("utf-8"))
+            separator_bytes = 1 if findings else 0
+            if (
+                serialized_finding_bytes + separator_bytes + finding_bytes
+                > REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES
+            ):
+                raise ReviewBridgeError(
+                    "exact review quarantine finding evidence exceeds the byte limit"
+                )
+            serialized_finding_bytes += separator_bytes + finding_bytes
+            findings.append(finding)
+    findings.sort(key=json_dumps)
+    if len(json_dumps(findings).encode("utf-8")) > REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES:
+        raise ReviewBridgeError(
+            "exact review quarantine finding evidence exceeds the byte limit"
+        )
+    return findings
+
+
+def _validated_expected_quarantine_sha256(
+    value: str | None,
+    *,
+    label: str,
+    required: bool,
+) -> str | None:
+    if value is None:
+        if required:
+            raise ReviewBridgeError(
+                f"exact review quarantine apply requires {label}"
+            )
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ReviewBridgeError(f"exact review quarantine {label} is invalid")
+    return value
+
+
+def _exact_quarantine_subject_binding(root: Path, job_id: str) -> dict[str, str]:
+    try:
+        request = _load_request(root, job_id)
+    except ReviewBridgeError as exc:
+        raise ReviewBridgeError(
+            "exact review quarantine cannot bind the review subject"
+        ) from exc
+    binding = {
+        field: str(request.get(field) or "")
+        for field in REVIEW_EXACT_QUARANTINE_SUBJECT_FIELDS
+    }
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in binding.values()):
+        raise ReviewBridgeError(
+            "exact review quarantine subject authority is malformed"
+        )
+    return binding
+
+
 def quarantine_legacy_review_job(
     root: Path,
     *,
@@ -6891,10 +7080,49 @@ def quarantine_legacy_review_job(
     replacement_job_id: str,
     dry_run: bool = True,
     operation_id: str | None = None,
+    authorize_exact_malformed_evidence: bool = False,
+    expected_tree_inventory_sha256: str | None = None,
+    expected_artifact_bindings_sha256: str | None = None,
+    expected_integrity_findings_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Freeze one unupgradable legacy job without deleting its evidence."""
 
     _validate_operation_id(operation_id)
+    expected_tree_inventory_sha256 = _validated_expected_quarantine_sha256(
+        expected_tree_inventory_sha256,
+        label="expected tree inventory SHA-256",
+        required=False,
+    )
+    expected_artifact_bindings_sha256 = _validated_expected_quarantine_sha256(
+        expected_artifact_bindings_sha256,
+        label="expected artifact bindings SHA-256",
+        required=False,
+    )
+    expected_integrity_findings_sha256 = _validated_expected_quarantine_sha256(
+        expected_integrity_findings_sha256,
+        label="expected integrity findings SHA-256",
+        required=False,
+    )
+    if authorize_exact_malformed_evidence and not dry_run:
+        if operation_id is None:
+            raise ReviewBridgeError(
+                "exact review quarantine apply requires a bound operation id"
+            )
+        expected_tree_inventory_sha256 = _validated_expected_quarantine_sha256(
+            expected_tree_inventory_sha256,
+            label="expected tree inventory SHA-256",
+            required=True,
+        )
+        expected_artifact_bindings_sha256 = _validated_expected_quarantine_sha256(
+            expected_artifact_bindings_sha256,
+            label="expected artifact bindings SHA-256",
+            required=True,
+        )
+        expected_integrity_findings_sha256 = _validated_expected_quarantine_sha256(
+            expected_integrity_findings_sha256,
+            label="expected integrity findings SHA-256",
+            required=True,
+        )
     safe_job_id = _safe_job_id(job_id)
     safe_replacement_job_id = _safe_job_id(replacement_job_id)
     if safe_replacement_job_id == safe_job_id:
@@ -6934,6 +7162,43 @@ def quarantine_legacy_review_job(
             == _root_uri(root, _legacy_quarantine_path(root, safe_job_id))
         ]
         if existing_quarantine_rows:
+            try:
+                existing_metadata = json.loads(
+                    str(existing_quarantine_rows[0]["metadata_json"])
+                )
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ReviewBridgeError(
+                    "legacy review quarantine catalog authority is malformed"
+                ) from exc
+            exact_authority_receipt = bool(
+                isinstance(existing_metadata, dict)
+                and existing_metadata.get("schema") == REVIEW_EXACT_QUARANTINE_SCHEMA
+            )
+            if exact_authority_receipt and not dry_run and not authorize_exact_malformed_evidence:
+                raise ReviewBridgeError(
+                    "exact review quarantine recovery requires explicit operator authorization"
+                )
+            for label, expected, receipt_key in (
+                (
+                    "expected tree inventory SHA-256",
+                    expected_tree_inventory_sha256,
+                    "tree_inventory_sha256",
+                ),
+                (
+                    "expected artifact bindings SHA-256",
+                    expected_artifact_bindings_sha256,
+                    "artifact_bindings_sha256",
+                ),
+                (
+                    "expected integrity findings SHA-256",
+                    expected_integrity_findings_sha256,
+                    "accepted_integrity_findings_sha256",
+                ),
+            ):
+                if expected is not None and expected != existing_metadata.get(receipt_key):
+                    raise ReviewBridgeError(
+                        f"exact review quarantine {label} does not match committed evidence"
+                    )
             receipt = _validated_legacy_quarantine_receipt(
                 root,
                 safe_job_id,
@@ -6959,23 +7224,59 @@ def quarantine_legacy_review_job(
                 "artifact_bindings_sha256": receipt[
                     "artifact_bindings_sha256"
                 ],
+                "accepted_integrity_findings_sha256": receipt[
+                    "accepted_integrity_findings_sha256"
+                ],
+                "authorization": receipt.get("authorization"),
             }
 
+        report_sample_limit = (
+            REVIEW_EXACT_QUARANTINE_MAX_FINDINGS + 1
+            if authorize_exact_malformed_evidence
+            else REVIEW_INTEGRITY_MAX_ARTIFACTS_PER_JOB
+        )
         report = review_bridge_integrity_report(
             root,
             job_id=safe_job_id,
-            max_samples=REVIEW_INTEGRITY_MAX_ARTIFACTS_PER_JOB,
+            max_samples=report_sample_limit,
+            max_sample_bytes=(
+                REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES
+                if authorize_exact_malformed_evidence
+                else None
+            ),
         )
         if report.get("ok"):
             raise ReviewBridgeError(
                 "review job already passes integrity and does not require quarantine"
             )
-        accepted_findings = _legacy_quarantine_exact_findings(
-            root,
-            safe_job_id,
-            artifact_rows,
-            report,
-        )
+        if authorize_exact_malformed_evidence:
+            accepted_findings = _operator_authorized_exact_quarantine_findings(
+                safe_job_id,
+                report,
+            )
+            subject_binding = _exact_quarantine_subject_binding(root, safe_job_id)
+            replacement_subject_binding = _exact_quarantine_subject_binding(
+                root,
+                safe_replacement_job_id,
+            )
+            if subject_binding != replacement_subject_binding:
+                raise ReviewBridgeError(
+                    "exact review quarantine requires a same-subject clean replacement"
+                )
+            receipt_schema = REVIEW_EXACT_QUARANTINE_SCHEMA
+            receipt_reason = "operator_authorized_exact_malformed_evidence"
+            authorization = REVIEW_EXACT_QUARANTINE_AUTHORIZATION
+        else:
+            accepted_findings = _legacy_quarantine_exact_findings(
+                root,
+                safe_job_id,
+                artifact_rows,
+                report,
+            )
+            receipt_schema = REVIEW_LEGACY_QUARANTINE_SCHEMA
+            receipt_reason = "unupgradable_legacy_attempt_history"
+            authorization = None
+            subject_binding = None
         accepted_findings_sha256 = content_hash(json_dumps(accepted_findings))
         accepted_counter = Counter(
             (str(item["check"]), str(item.get("reason") or ""))
@@ -6991,6 +7292,28 @@ def quarantine_legacy_review_job(
         artifact_bindings, artifact_bindings_sha256 = (
             _legacy_quarantine_artifact_bindings(artifact_rows)
         )
+        expected_digests = (
+            (
+                "expected tree inventory SHA-256",
+                expected_tree_inventory_sha256,
+                tree_inventory_sha256,
+            ),
+            (
+                "expected artifact bindings SHA-256",
+                expected_artifact_bindings_sha256,
+                artifact_bindings_sha256,
+            ),
+            (
+                "expected integrity findings SHA-256",
+                expected_integrity_findings_sha256,
+                accepted_findings_sha256,
+            ),
+        )
+        for label, expected, actual in expected_digests:
+            if expected is not None and expected != actual:
+                raise ReviewBridgeError(
+                    f"exact review quarantine {label} does not match current evidence"
+                )
         if dry_run:
             return {
                 "ok": True,
@@ -7004,15 +7327,19 @@ def quarantine_legacy_review_job(
                 "artifact_binding_count": len(artifact_bindings),
                 "artifact_bindings_sha256": artifact_bindings_sha256,
                 "accepted_integrity_findings": accepted_findings,
+                "accepted_integrity_findings_sha256": accepted_findings_sha256,
                 "replacement_job_id": safe_replacement_job_id,
+                "authorization_required": bool(authorize_exact_malformed_evidence),
+                "authorization": authorization,
+                "subject_binding": subject_binding,
             }
 
         quarantined_at = utc_now()
         receipt = {
-            "schema": REVIEW_LEGACY_QUARANTINE_SCHEMA,
+            "schema": receipt_schema,
             "job_id": safe_job_id,
             "quarantined_at": quarantined_at,
-            "reason": "unupgradable_legacy_attempt_history",
+            "reason": receipt_reason,
             "replacement_job_id": safe_replacement_job_id,
             "operation_id": operation_id,
             "tree_entry_count": len(tree_inventory),
@@ -7023,6 +7350,9 @@ def quarantine_legacy_review_job(
             "accepted_integrity_findings_sha256": accepted_findings_sha256,
             "accepted_integrity_counter": accepted_counter_rows,
         }
+        if authorization is not None:
+            receipt["authorization"] = authorization
+            receipt["subject_binding"] = subject_binding
         receipt_text = json_dumps(receipt)
         receipt_bytes = receipt_text.encode("utf-8")
         if len(receipt_bytes) > REVIEW_INTEGRITY_MAX_RECORD_BYTES:
@@ -7063,18 +7393,41 @@ def quarantine_legacy_review_job(
                 current_report = review_bridge_integrity_report(
                     root,
                     job_id=safe_job_id,
-                    max_samples=REVIEW_INTEGRITY_MAX_ARTIFACTS_PER_JOB,
+                    max_samples=report_sample_limit,
+                    max_sample_bytes=(
+                        REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES
+                        if authorize_exact_malformed_evidence
+                        else None
+                    ),
                     artifact_conn=conn,
                 )
-                current_findings = _legacy_quarantine_exact_findings(
-                    root,
-                    safe_job_id,
-                    current_rows,
-                    current_report,
-                )
+                if authorize_exact_malformed_evidence:
+                    current_findings = _operator_authorized_exact_quarantine_findings(
+                        safe_job_id,
+                        current_report,
+                    )
+                else:
+                    current_findings = _legacy_quarantine_exact_findings(
+                        root,
+                        safe_job_id,
+                        current_rows,
+                        current_report,
+                    )
                 if current_findings != accepted_findings:
                     raise ReviewBridgeError(
                         "legacy review quarantine findings changed before commit"
+                    )
+                if authorize_exact_malformed_evidence and (
+                    _exact_quarantine_subject_binding(root, safe_job_id)
+                    != subject_binding
+                    or _exact_quarantine_subject_binding(
+                        root,
+                        safe_replacement_job_id,
+                    )
+                    != subject_binding
+                ):
+                    raise ReviewBridgeError(
+                        "exact review quarantine subject binding changed before commit"
                     )
                 replacement_report = review_bridge_integrity_report(
                     root,
@@ -7164,6 +7517,8 @@ def quarantine_legacy_review_job(
             "artifact_bindings_sha256": artifact_bindings_sha256,
             "accepted_integrity_finding_count": len(accepted_findings),
             "accepted_integrity_findings_sha256": accepted_findings_sha256,
+            "authorization": authorization,
+            "subject_binding": subject_binding,
         }
 
 

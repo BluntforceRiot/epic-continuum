@@ -538,6 +538,43 @@ the clean replacement. Upgradeable jobs, contradictory histories, partial
 bindings, or additional unexplained defects are refused rather than generalized
 into quarantine.
 
+For a preserved development root whose legacy job has only the separately
+scoped malformed-record or attempt-record reasons reported by the integrity
+auditor, an operator can request an exact-evidence preview. This path is not an
+automatic repair and does not rewrite, delete, or validate the malformed bytes:
+
+```bash
+continuum review-quarantine-legacy \
+  --root ./.continuum-demo \
+  --job-id review_legacy_exact \
+  --replacement-job-id review_clean_replacement \
+  --authorize-exact-malformed-evidence
+```
+
+The preview returns three independent SHA-256 bindings: the complete legacy job
+tree, its catalog artifact rows, and the exact integrity-finding multiset. Apply
+requires the operator to repeat all three values explicitly:
+
+```bash
+continuum review-quarantine-legacy \
+  --root ./.continuum-demo \
+  --job-id review_legacy_exact \
+  --replacement-job-id review_clean_replacement \
+  --authorize-exact-malformed-evidence \
+  --expected-tree-inventory-sha256 <preview-tree-sha256> \
+  --expected-artifact-bindings-sha256 <preview-artifacts-sha256> \
+  --expected-integrity-findings-sha256 <preview-findings-sha256> \
+  --apply
+```
+
+Apply also requires the distinct clean replacement to bind the same subject
+archive/package bytes. It fails if any byte, catalog binding, finding, subject
+binding, or the replacement's integrity changes. The bounded receipt records the
+explicit authorization and digests, while the original evidence stays
+byte-for-byte in its original job tree and becomes immutable historical
+evidence. Verification suppresses only the exact receipt-bound finding
+multiset; later drift makes the root fail again.
+
 Before applying findings from a long-running external review, check that the active subject still matches
 the frozen review snapshot:
 

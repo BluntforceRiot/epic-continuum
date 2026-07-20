@@ -60,6 +60,12 @@
   materializing its file, so interruption recovery reconstructs the same
   receipt. The upgrader itself still refuses active and multi-attempt histories,
   while contradictory or otherwise unknown legacy shapes remain fail-closed.
+  Preserved roots with separately scoped malformed-record or attempt-record
+  findings now have an explicit operator-only extension: preview publishes exact
+  tree, catalog, and finding-multiset hashes, and apply requires all three hashes
+  plus a clean same-subject replacement before recording the authorization.
+  Original evidence remains byte-identical, finding or subject drift reopens
+  integrity failure, and bounded/unrecognized evidence is refused.
   Accepted ingests also bind their response, output paths, operation identity,
   and exact browser, automated, or untracked context in an immutable receipt.
   Interrupted retries certify that durable receipt before writing, so mutable

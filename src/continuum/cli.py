@@ -867,6 +867,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Commit the immutable quarantine receipt; without this flag only inspect eligibility",
     )
+    p_review_quarantine.add_argument(
+        "--authorize-exact-malformed-evidence",
+        action="store_true",
+        help=(
+            "Explicitly authorize the separately digest-bound quarantine path for scoped "
+            "malformed legacy evidence"
+        ),
+    )
+    p_review_quarantine.add_argument("--expected-tree-inventory-sha256")
+    p_review_quarantine.add_argument("--expected-artifact-bindings-sha256")
+    p_review_quarantine.add_argument("--expected-integrity-findings-sha256")
 
     p_review_check_current = sub.add_parser("review-check-current", help="Check whether the reviewed subject still matches the frozen review snapshot")
     p_review_check_current.add_argument("--root", required=True)
@@ -2342,6 +2353,18 @@ def _main(argv: list[str] | None = None) -> int:
                     job_id=args.job_id,
                     replacement_job_id=args.replacement_job_id,
                     dry_run=True,
+                    authorize_exact_malformed_evidence=(
+                        args.authorize_exact_malformed_evidence
+                    ),
+                    expected_tree_inventory_sha256=(
+                        args.expected_tree_inventory_sha256
+                    ),
+                    expected_artifact_bindings_sha256=(
+                        args.expected_artifact_bindings_sha256
+                    ),
+                    expected_integrity_findings_sha256=(
+                        args.expected_integrity_findings_sha256
+                    ),
                 )
             )
 
@@ -2352,6 +2375,18 @@ def _main(argv: list[str] | None = None) -> int:
                 replacement_job_id=args.replacement_job_id,
                 dry_run=False,
                 operation_id=operation.operation_id,
+                authorize_exact_malformed_evidence=(
+                    args.authorize_exact_malformed_evidence
+                ),
+                expected_tree_inventory_sha256=(
+                    args.expected_tree_inventory_sha256
+                ),
+                expected_artifact_bindings_sha256=(
+                    args.expected_artifact_bindings_sha256
+                ),
+                expected_integrity_findings_sha256=(
+                    args.expected_integrity_findings_sha256
+                ),
             )
             operation.cursor(
                 {
@@ -2370,6 +2405,18 @@ def _main(argv: list[str] | None = None) -> int:
                 intent={
                     "job_id": args.job_id,
                     "replacement_job_id": args.replacement_job_id,
+                    "authorize_exact_malformed_evidence": (
+                        args.authorize_exact_malformed_evidence
+                    ),
+                    "expected_tree_inventory_sha256": (
+                        args.expected_tree_inventory_sha256
+                    ),
+                    "expected_artifact_bindings_sha256": (
+                        args.expected_artifact_bindings_sha256
+                    ),
+                    "expected_integrity_findings_sha256": (
+                        args.expected_integrity_findings_sha256
+                    ),
                 },
                 snapshot_policy="none",
                 snapshot_reason=(

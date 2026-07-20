@@ -371,6 +371,30 @@ def strip_phase_authority_for_legacy_fixture(root: Path, job_dir: Path) -> None:
         path.unlink()
 
 
+def exact_quarantine_fixture(base: Path) -> tuple[Path, dict, dict, Path]:
+    root = base / "continuum"
+    subject = base / "subject"
+    subject.mkdir()
+    (subject / "README.md").write_text("# Exact quarantine\n", encoding="utf-8")
+    malformed = create_review_job(
+        root,
+        subject_path=subject,
+        prompt="Legacy evidence with retained operator scratch output.",
+        transport="manual",
+    )
+    replacement = create_review_job(
+        root,
+        subject_path=subject,
+        prompt="Clean replacement review.",
+        transport="manual",
+    )
+    retained = Path(malformed["job_dir"]) / "capsule_extract" / "subject"
+    retained.mkdir(parents=True)
+    retained_file = retained / "retained.patch"
+    retained_file.write_bytes(b"historical operator evidence\n")
+    return root, malformed, replacement, retained_file
+
+
 def make_link_like_directory(testcase: unittest.TestCase, link: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
@@ -4082,6 +4106,314 @@ class ReviewBridgeTest(unittest.TestCase):
                         if path.is_file() and not path.is_symlink()
                     },
                 )
+
+    def test_operator_authorized_exact_quarantine_is_preview_bound_and_preserves_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, malformed, replacement, retained_file = exact_quarantine_fixture(Path(tmp))
+            job_dir = Path(malformed["job_dir"])
+            original_files = {
+                path.relative_to(job_dir).as_posix(): path.read_bytes()
+                for path in job_dir.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            original_rows = artifact_rows(root)
+
+            with self.assertRaisesRegex(ValueError, "exact failed multi-attempt"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                )
+            unrelated_subject = Path(tmp) / "unrelated-subject"
+            unrelated_subject.mkdir()
+            (unrelated_subject / "README.md").write_text(
+                "# Unrelated\n",
+                encoding="utf-8",
+            )
+            unrelated = create_review_job(
+                root,
+                subject_path=unrelated_subject,
+                prompt="Unrelated clean review.",
+                transport="manual",
+            )
+            with self.assertRaisesRegex(ValueError, "same-subject clean replacement"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=unrelated["job_id"],
+                    authorize_exact_malformed_evidence=True,
+                )
+            original_rows = artifact_rows(root)
+            preview = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                authorize_exact_malformed_evidence=True,
+            )
+            self.assertTrue(preview["would_quarantine"])
+            self.assertTrue(preview["authorization_required"])
+            self.assertEqual(
+                preview["authorization"],
+                review_bridge_module.REVIEW_EXACT_QUARANTINE_AUTHORIZATION,
+            )
+            for key in (
+                "tree_inventory_sha256",
+                "artifact_bindings_sha256",
+                "accepted_integrity_findings_sha256",
+            ):
+                self.assertRegex(preview[key], r"^[0-9a-f]{64}$")
+            self.assertEqual(original_rows, artifact_rows(root))
+            self.assertEqual(
+                original_files,
+                {
+                    path.relative_to(job_dir).as_posix(): path.read_bytes()
+                    for path in job_dir.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires expected tree inventory"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    dry_run=False,
+                    operation_id="op-exact-missing-authority",
+                    authorize_exact_malformed_evidence=True,
+                )
+            with self.assertRaisesRegex(ValueError, "does not match current evidence"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    dry_run=False,
+                    operation_id="op-exact-wrong-authority",
+                    authorize_exact_malformed_evidence=True,
+                    expected_tree_inventory_sha256="0" * 64,
+                    expected_artifact_bindings_sha256=preview[
+                        "artifact_bindings_sha256"
+                    ],
+                    expected_integrity_findings_sha256=preview[
+                        "accepted_integrity_findings_sha256"
+                    ],
+                )
+            self.assertEqual(original_rows, artifact_rows(root))
+
+            applied = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                dry_run=False,
+                operation_id="op-exact-authorized",
+                authorize_exact_malformed_evidence=True,
+                expected_tree_inventory_sha256=preview["tree_inventory_sha256"],
+                expected_artifact_bindings_sha256=preview[
+                    "artifact_bindings_sha256"
+                ],
+                expected_integrity_findings_sha256=preview[
+                    "accepted_integrity_findings_sha256"
+                ],
+            )
+            self.assertTrue(applied["quarantined"])
+            receipt_path = Path(applied["receipt_uri"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["schema"],
+                review_bridge_module.REVIEW_EXACT_QUARANTINE_SCHEMA,
+            )
+            self.assertEqual(
+                receipt["authorization"],
+                review_bridge_module.REVIEW_EXACT_QUARANTINE_AUTHORIZATION,
+            )
+            self.assertNotIn("tree_inventory", receipt)
+            self.assertNotIn("accepted_integrity_findings", receipt)
+            self.assertEqual(retained_file.read_bytes(), b"historical operator evidence\n")
+            self.assertEqual(
+                original_files,
+                {
+                    path.relative_to(job_dir).as_posix(): path.read_bytes()
+                    for path in job_dir.rglob("*")
+                    if path.is_file()
+                    and not path.is_symlink()
+                    and path != receipt_path
+                },
+            )
+            self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            retained_file.write_bytes(retained_file.read_bytes() + b"drift")
+            drifted = review_bridge_module.review_bridge_integrity_report(root)
+            self.assertFalse(drifted["ok"])
+            self.assertTrue(
+                any(
+                    sample.get("reason") == "legacy_quarantine_binding_invalid"
+                    for sample in drifted["samples"]["review_bridge_malformed_records"]
+                )
+            )
+
+    def test_operator_authorized_exact_quarantine_rechecks_preview_and_recovers_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, malformed, replacement, retained_file = exact_quarantine_fixture(Path(tmp))
+            preview = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                authorize_exact_malformed_evidence=True,
+            )
+            retained_file.write_bytes(b"changed after preview\n")
+            with self.assertRaisesRegex(ValueError, "does not match current evidence"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    dry_run=False,
+                    operation_id="op-exact-drift",
+                    authorize_exact_malformed_evidence=True,
+                    expected_tree_inventory_sha256=preview["tree_inventory_sha256"],
+                    expected_artifact_bindings_sha256=preview[
+                        "artifact_bindings_sha256"
+                    ],
+                    expected_integrity_findings_sha256=preview[
+                        "accepted_integrity_findings_sha256"
+                    ],
+                )
+
+            rebound = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                authorize_exact_malformed_evidence=True,
+            )
+            real_write = review_bridge_module._confined_write_text
+
+            def interrupt_receipt_materialization(*args: object, **kwargs: object) -> None:
+                path = Path(args[2])
+                if path.name == review_bridge_module.REVIEW_LEGACY_QUARANTINE_NAME:
+                    raise KeyboardInterrupt
+                real_write(*args, **kwargs)
+
+            authority = {
+                "expected_tree_inventory_sha256": rebound["tree_inventory_sha256"],
+                "expected_artifact_bindings_sha256": rebound[
+                    "artifact_bindings_sha256"
+                ],
+                "expected_integrity_findings_sha256": rebound[
+                    "accepted_integrity_findings_sha256"
+                ],
+            }
+            with patch.object(
+                review_bridge_module,
+                "_confined_write_text",
+                side_effect=interrupt_receipt_materialization,
+            ), self.assertRaises(KeyboardInterrupt):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    dry_run=False,
+                    operation_id="op-exact-restart",
+                    authorize_exact_malformed_evidence=True,
+                    **authority,
+                )
+            receipt_path = (
+                Path(malformed["job_dir"])
+                / "receipts"
+                / review_bridge_module.REVIEW_LEGACY_QUARANTINE_NAME
+            )
+            self.assertFalse(receipt_path.exists())
+            with self.assertRaisesRegex(ValueError, "explicit operator authorization"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    dry_run=False,
+                    operation_id="op-exact-restart-no-authority",
+                )
+            recovered = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                dry_run=False,
+                operation_id="op-exact-restart-recovery",
+                authorize_exact_malformed_evidence=True,
+                **authority,
+            )
+            self.assertTrue(recovered["already_quarantined"])
+            self.assertEqual(recovered["operation_id"], "op-exact-restart")
+            self.assertTrue(receipt_path.is_file())
+            self.assertEqual(retained_file.read_bytes(), b"changed after preview\n")
+            self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])
+
+    def test_operator_authorized_exact_quarantine_bounds_findings_and_cli_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, malformed, replacement, _retained_file = exact_quarantine_fixture(Path(tmp))
+            with patch.object(
+                review_bridge_module,
+                "REVIEW_EXACT_QUARANTINE_MAX_FINDINGS",
+                1,
+            ), self.assertRaisesRegex(ValueError, "finding count exceeds"):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    authorize_exact_malformed_evidence=True,
+                )
+            with patch.object(
+                review_bridge_module,
+                "REVIEW_EXACT_QUARANTINE_MAX_FINDINGS_BYTES",
+                32,
+            ), self.assertRaisesRegex(
+                ValueError,
+                "bounded evidence report|evidence exceeds the byte limit",
+            ):
+                review_bridge_module.quarantine_legacy_review_job(
+                    root,
+                    job_id=malformed["job_id"],
+                    replacement_job_id=replacement["job_id"],
+                    authorize_exact_malformed_evidence=True,
+                )
+
+        digest = "a" * 64
+        with patch.object(
+            cli_module,
+            "quarantine_legacy_review_job",
+            return_value={"ok": True},
+        ) as quarantine, patch.object(cli_module, "emit_result", return_value=0):
+            self.assertEqual(
+                cli_module._main(
+                    [
+                        "review-quarantine-legacy",
+                        "--root",
+                        "fixture-root",
+                        "--job-id",
+                        "review_malformed",
+                        "--replacement-job-id",
+                        "review_replacement",
+                        "--authorize-exact-malformed-evidence",
+                        "--expected-tree-inventory-sha256",
+                        digest,
+                        "--expected-artifact-bindings-sha256",
+                        digest,
+                        "--expected-integrity-findings-sha256",
+                        digest,
+                    ]
+                ),
+                0,
+            )
+        self.assertTrue(quarantine.call_args.kwargs["dry_run"])
+        self.assertTrue(
+            quarantine.call_args.kwargs["authorize_exact_malformed_evidence"]
+        )
+        self.assertEqual(
+            quarantine.call_args.kwargs["expected_tree_inventory_sha256"],
+            digest,
+        )
 
     def test_review_job_tree_and_catalog_authority_block_snapshot_drift(self) -> None:
         scenarios = (

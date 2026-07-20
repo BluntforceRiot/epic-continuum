@@ -543,6 +543,15 @@ scoped malformed-record or attempt-record reasons reported by the integrity
 auditor, an operator can request an exact-evidence preview. This path is not an
 automatic repair and does not rewrite, delete, or validate the malformed bytes:
 
+- `review_bridge_malformed_records`: only `invalid_status_lifecycle`,
+  `job_artifact_binding_invalid`, `subject_manifest_member_set_mismatch`,
+  `unexpected_job_tree_directory`, or `unexpected_job_tree_file`;
+- `review_bridge_invalid_attempt_records`: only
+  `attempt_job_binding_mismatch` or `attempt_receipt_sequence_mismatch`.
+
+Every other reason or integrity class, including link, reference, or content-hash
+failure, is refused even when the operator supplies the authorization flag.
+
 ```bash
 continuum review-quarantine-legacy \
   --root ./.continuum-demo \

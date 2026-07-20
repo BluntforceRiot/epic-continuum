@@ -4348,6 +4348,105 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertEqual(retained_file.read_bytes(), b"changed after preview\n")
             self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])
 
+    def test_operator_authorized_exact_quarantine_binds_mixed_attempt_and_tree_findings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Mixed legacy\n", encoding="utf-8")
+            malformed = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Mixed legacy evidence.",
+                transport="manual",
+            )
+            reserved = review_browser_attempt_start(root, job_id=malformed["job_id"])
+            Path(reserved["response_uri"]).write_text("not json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ingest_review_result(
+                    root,
+                    job_id=malformed["job_id"],
+                    result_path=Path(reserved["response_uri"]),
+                )
+            job_dir = Path(malformed["job_dir"])
+            strip_phase_authority_for_legacy_fixture(root, job_dir)
+            for receipt_path in (job_dir / "attempt-receipts").glob("attempt-*.json"):
+                receipt_path.unlink()
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM artifacts WHERE kind = 'review_attempt_receipt'")
+                conn.commit()
+            finally:
+                conn.close()
+            attempt_path = job_dir / "attempts" / "attempt-001.json"
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            attempt.pop("schema")
+            attempt.pop("job_id")
+            attempt_path.write_text(json.dumps(attempt), encoding="utf-8")
+            status_path = Path(malformed["status_uri"])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status.pop("last_attempt_sha256")
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            retained = job_dir / "capsule_extract" / "retained.txt"
+            retained.parent.mkdir()
+            retained.write_text("preserve mixed evidence\n", encoding="utf-8")
+            replacement = create_review_job(
+                root,
+                subject_path=subject,
+                prompt="Clean same-subject replacement.",
+                transport="manual",
+            )
+
+            before = review_bridge_module.review_bridge_integrity_report(
+                root,
+                job_id=malformed["job_id"],
+                max_samples=20,
+            )
+            self.assertGreater(before["checks"]["review_bridge_malformed_records"], 0)
+            self.assertGreater(
+                before["checks"]["review_bridge_invalid_attempt_records"],
+                0,
+            )
+            preview = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                authorize_exact_malformed_evidence=True,
+            )
+            finding_checks = {
+                finding["check"]
+                for finding in preview["accepted_integrity_findings"]
+            }
+            self.assertEqual(
+                finding_checks,
+                {
+                    "review_bridge_malformed_records",
+                    "review_bridge_invalid_attempt_records",
+                },
+            )
+            applied = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                dry_run=False,
+                operation_id="op-exact-mixed-findings",
+                authorize_exact_malformed_evidence=True,
+                expected_tree_inventory_sha256=preview["tree_inventory_sha256"],
+                expected_artifact_bindings_sha256=preview[
+                    "artifact_bindings_sha256"
+                ],
+                expected_integrity_findings_sha256=preview[
+                    "accepted_integrity_findings_sha256"
+                ],
+            )
+            self.assertTrue(applied["quarantined"])
+            self.assertEqual(retained.read_text(encoding="utf-8"), "preserve mixed evidence\n")
+            self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
     def test_operator_authorized_exact_quarantine_bounds_findings_and_cli_authority(
         self,
     ) -> None:
@@ -4414,6 +4513,86 @@ class ReviewBridgeTest(unittest.TestCase):
             quarantine.call_args.kwargs["expected_tree_inventory_sha256"],
             digest,
         )
+
+    def test_operator_authorized_exact_quarantine_cli_apply_uses_all_preview_bindings(
+        self,
+    ) -> None:
+        class StubOperation:
+            operation_id = "op-exact-cli-apply"
+
+            def cursor(self, _value: dict) -> None:
+                return None
+
+        captured_guard: dict[str, object] = {}
+
+        def run_guarded(_root: Path, **kwargs: object) -> dict:
+            captured_guard.update(kwargs)
+            action = kwargs["action"]
+            assert callable(action)
+            return action(StubOperation())
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, malformed, replacement, retained_file = exact_quarantine_fixture(Path(tmp))
+            retained_bytes = retained_file.read_bytes()
+            preview = review_bridge_module.quarantine_legacy_review_job(
+                root,
+                job_id=malformed["job_id"],
+                replacement_job_id=replacement["job_id"],
+                authorize_exact_malformed_evidence=True,
+            )
+            with patch.object(
+                cli_module,
+                "guarded_result",
+                side_effect=run_guarded,
+            ), patch.object(cli_module, "emit_result", return_value=0):
+                self.assertEqual(
+                    cli_module._main(
+                        [
+                            "review-quarantine-legacy",
+                            "--root",
+                            str(root),
+                            "--job-id",
+                            malformed["job_id"],
+                            "--replacement-job-id",
+                            replacement["job_id"],
+                            "--authorize-exact-malformed-evidence",
+                            "--expected-tree-inventory-sha256",
+                            preview["tree_inventory_sha256"],
+                            "--expected-artifact-bindings-sha256",
+                            preview["artifact_bindings_sha256"],
+                            "--expected-integrity-findings-sha256",
+                            preview["accepted_integrity_findings_sha256"],
+                            "--apply",
+                        ]
+                    ),
+                    0,
+                )
+            intent = captured_guard["intent"]
+            self.assertIsInstance(intent, dict)
+            assert isinstance(intent, dict)
+            self.assertTrue(intent["authorize_exact_malformed_evidence"])
+            self.assertEqual(
+                intent["expected_tree_inventory_sha256"],
+                preview["tree_inventory_sha256"],
+            )
+            self.assertEqual(
+                intent["expected_artifact_bindings_sha256"],
+                preview["artifact_bindings_sha256"],
+            )
+            self.assertEqual(
+                intent["expected_integrity_findings_sha256"],
+                preview["accepted_integrity_findings_sha256"],
+            )
+            self.assertEqual(retained_file.read_bytes(), retained_bytes)
+            self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])
+            receipt = json.loads(
+                (
+                    Path(malformed["job_dir"])
+                    / "receipts"
+                    / review_bridge_module.REVIEW_LEGACY_QUARANTINE_NAME
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["operation_id"], StubOperation.operation_id)
 
     def test_review_job_tree_and_catalog_authority_block_snapshot_drift(self) -> None:
         scenarios = (

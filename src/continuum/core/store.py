@@ -25,7 +25,6 @@ from .permissions import (
     flush_directory_strict,
     flush_file_strict,
     flush_tree_strict,
-    fsync_parent,
     replace_durable,
     secure_copy_file,
     secure_copytree,
@@ -3704,7 +3703,11 @@ def _validated_card_sidecar_state_dir(
                 os.mkdir(current, 0o700)
             except FileExistsError:
                 pass
-            fsync_parent(current)
+            # The state namespace is recovery authority. A best-effort parent
+            # fsync is insufficient here: after power loss the database may
+            # survive while a newly created intent/receipt ancestor does not.
+            flush_directory_strict(current)
+            flush_directory_strict(current.parent)
             if _plain_card_sidecar_state_path_identity(
                 current.parent,
                 directory=True,
@@ -3767,6 +3770,8 @@ def _write_card_sidecar_write_intent(
     secure_write_text(intent_path, json_dumps(payload) + "\n")
     _assert_card_sidecar_state_dir_unchanged(intent_state)
     _plain_card_sidecar_state_path_identity(intent_path, directory=False)
+    flush_file_strict(intent_path)
+    flush_directory_strict(intent_state[0])
     return intent_id, intent_path
 
 
@@ -3941,8 +3946,27 @@ def _finish_intent_from_committed_receipt(
     )
     if opened is None:
         return None
-    receipt, _receipt_evidence, receipt_fd = opened
+    receipt, receipt_evidence, receipt_fd = opened
     try:
+        # Windows cannot always open a write-capable flush handle while the
+        # validation descriptor is held. Close, establish strict durability,
+        # then reopen and require the exact same evidence before adoption.
+        initially_opened_receipt_fd = receipt_fd
+        receipt_fd = -1
+        os.close(initially_opened_receipt_fd)
+        flush_file_strict(receipt_path)
+        flush_directory_strict(receipt_state[0])
+        reopened = _open_valid_card_sidecar_recovery_receipt(
+            root,
+            intent=intent,
+            receipt_path=receipt_path,
+            expected_status=expected_status,
+        )
+        if reopened is None:
+            raise ValueError("Card sidecar recovery receipt disappeared during flush")
+        reopened_receipt, reopened_evidence, receipt_fd = reopened
+        if reopened_receipt != receipt or reopened_evidence != receipt_evidence:
+            raise ValueError("Card sidecar recovery receipt changed during flush")
         _assert_card_sidecar_state_dir_unchanged(receipt_state)
         if (
             _plain_card_sidecar_state_path_identity(intent_path, directory=False)
@@ -3952,10 +3976,11 @@ def _finish_intent_from_committed_receipt(
                 "Card sidecar write intent changed before committed receipt adoption"
             )
         intent_path.unlink()
-        fsync_parent(intent_path)
+        flush_directory_strict(intent_path.parent)
         return {**receipt, "receipt_uri": continuum_uri(root, receipt_path)}
     finally:
-        os.close(receipt_fd)
+        if receipt_fd >= 0:
+            os.close(receipt_fd)
 
 
 def _finish_card_sidecar_write_intent(
@@ -4077,6 +4102,8 @@ def _finish_card_sidecar_write_intent(
     receipt_text = json_dumps(receipt) + "\n"
     secure_write_text_exclusive(receipt_path, receipt_text)
     _assert_card_sidecar_state_dir_unchanged(receipt_state)
+    flush_file_strict(receipt_path)
+    flush_directory_strict(receipt_state[0])
     committed = _finish_intent_from_committed_receipt(
         root,
         intent_path=intent_path,
@@ -4172,6 +4199,8 @@ def _resolve_card_sidecar_write_intent(
             }
         recovery_fd = -1
         try:
+            flush_file_strict(recovery_path)
+            flush_directory_strict(recovery_path.parent)
             _recovery_payload, recovery_evidence, recovery_fd = (
                 _open_validated_card_sidecar_payload(
                     recovery_path,
@@ -4260,6 +4289,8 @@ def _resolve_card_sidecar_write_intent(
     ) -> dict[str, Any]:
         held_fd = -1
         try:
+            flush_file_strict(target_path)
+            flush_directory_strict(target_path.parent)
             _current_payload, current_evidence, held_fd = (
                 _open_validated_card_sidecar_payload(
                     target_path,
@@ -4379,6 +4410,8 @@ def _resolve_card_sidecar_write_intent(
         }
     try:
         replace_file_noclobber(target_path, recovery_path)
+        flush_file_strict(recovery_path)
+        flush_directory_strict(recovery_path.parent)
         recovery_identity = _sidecar_nofollow_path_identity(recovery_path)
         if (
             recovery_identity is None
@@ -4487,6 +4520,10 @@ def reconcile_card_sidecar_write_intents(
                 != intent_entry_identity
             ):
                 raise ValueError("Card sidecar write intent changed during bounded read")
+            # A visible intent left by a prior strict-flush failure becomes
+            # authority only after its bytes and namespace are strict again.
+            flush_file_strict(intent_path)
+            flush_directory_strict(intent_dir)
         except (OSError, UnicodeError, ValueError) as exc:
             failures.append(
                 {
@@ -4894,6 +4931,8 @@ def write_card_sidecar_from_values(
         ),
         exclusive=exclusive_create,
     )
+    flush_file_strict(sidecar_path)
+    flush_directory_strict(sidecar_path.parent)
     return continuum_uri(root, sidecar_path)
 
 

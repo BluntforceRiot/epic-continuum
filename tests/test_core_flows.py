@@ -1366,6 +1366,249 @@ print(json.dumps(result, sort_keys=True))
                     [destination.parent, source.parent][:failure_index],
                 )
 
+    def test_sidecar_state_creation_strictly_flushes_new_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="strict intent ancestry",
+                    summary="Recovery authority needs a durable namespace.",
+                    source_refs=[],
+                )
+                payload = store_module._card_sidecar_payload_for_row(
+                    conn.execute(
+                        "SELECT * FROM cards WHERE id = ?", (card_id,)
+                    ).fetchone()
+                )
+                conn.commit()
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            if intent_dir.exists():
+                self.assertFalse(any(intent_dir.iterdir()))
+                intent_dir.rmdir()
+            flushed: list[Path] = []
+            real_flush = store_module.flush_directory_strict
+
+            def trace_flush(path: Path) -> None:
+                flushed.append(Path(path))
+                real_flush(path)
+
+            with patch.object(
+                store_module, "flush_directory_strict", side_effect=trace_flush
+            ):
+                _intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=continuum_uri(
+                        root,
+                        store_module._configured_card_sidecar_path(root, card_id),
+                    ),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            self.assertTrue(intent_path.is_file())
+            self.assertIn(intent_dir, flushed)
+            self.assertIn(intent_dir.parent, flushed)
+            self.assertLess(flushed.index(intent_dir), flushed.index(intent_dir.parent))
+
+    def test_sidecar_strict_namespace_failures_remain_recoverable(self) -> None:
+        def seed_unbound(
+            root: Path, *, recovery_only: bool
+        ) -> tuple[str, Path, Path, Path]:
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="strict namespace recovery",
+                    summary="Every visible boundary remains replayable.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?", (card_id,)
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "UPDATE cards SET location_uri = NULL WHERE id = ?", (card_id,)
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,)
+                )
+                conn.commit()
+            target = store_module._configured_card_sidecar_path(root, card_id)
+            intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=continuum_uri(root, target),
+                expected_state_hash=str(payload["state_hash"]),
+            )
+            recovery = target.with_name(f".{target.name}.{intent_id}.uncommitted")
+            store_module.write_atomic_yaml(recovery if recovery_only else target, payload)
+            return intent_id, intent_path, target, recovery
+
+        with self.subTest(boundary="intent_publish"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="intent strict failure",
+                    summary="The visible intent can be re-adopted.",
+                    source_refs=[],
+                )
+                payload = store_module._card_sidecar_payload_for_row(
+                    conn.execute(
+                        "SELECT * FROM cards WHERE id = ?", (card_id,)
+                    ).fetchone()
+                )
+                conn.commit()
+            real_flush = store_module.flush_file_strict
+
+            def fail_intent(path: Path) -> None:
+                if Path(path).parent.name == "card_sidecar_write_intents":
+                    raise OSError("synthetic intent publication flush failure")
+                real_flush(path)
+
+            with patch.object(
+                store_module, "flush_file_strict", side_effect=fail_intent
+            ), self.assertRaisesRegex(OSError, "intent publication"):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=continuum_uri(
+                        root,
+                        store_module._configured_card_sidecar_path(root, card_id),
+                    ),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            intents = list(
+                (root / "run" / "card_sidecar_write_intents").glob("*.json")
+            )
+            self.assertEqual(len(intents), 1)
+            self.assertTrue(store_module.reconcile_card_sidecar_write_intents(root)["ok"])
+            self.assertFalse(intents[0].exists())
+
+        with self.subTest(boundary="sidecar_publish"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="sidecar strict failure",
+                    summary="The intent survives a sidecar flush failure.",
+                    source_refs=[],
+                )
+                conn.commit()
+            real_flush = store_module.flush_file_strict
+
+            def fail_sidecar(path: Path) -> None:
+                if Path(path).suffix == ".yaml":
+                    raise OSError("synthetic sidecar publication flush failure")
+                real_flush(path)
+
+            with closing(connect_catalog(root)) as conn, patch.object(
+                store_module, "flush_file_strict", side_effect=fail_sidecar
+            ), self.assertRaisesRegex(OSError, "sidecar publication"):
+                store_module.sync_card_sidecar(
+                    root, conn, card_id, write_observation={}
+                )
+            self.assertEqual(
+                len(list((root / "run" / "card_sidecar_write_intents").glob("*.json"))),
+                1,
+            )
+            self.assertTrue(sync_card_sidecars_after_commit(root, [card_id])["ok"])
+
+        with self.subTest(boundary="quarantine_rename"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            _intent_id, intent_path, target, recovery = seed_unbound(
+                root, recovery_only=False
+            )
+            real_flush = store_module.flush_directory_strict
+
+            def fail_quarantine(path: Path) -> None:
+                if Path(path) == target.parent and recovery.exists():
+                    raise OSError("synthetic quarantine namespace flush failure")
+                real_flush(path)
+
+            with patch.object(
+                store_module, "flush_directory_strict", side_effect=fail_quarantine
+            ):
+                interrupted = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(recovery.is_file())
+            self.assertTrue(store_module.reconcile_card_sidecar_write_intents(root)["ok"])
+            self.assertFalse(intent_path.exists())
+
+        with self.subTest(boundary="receipt_publish"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            intent_id, intent_path, _target, _recovery = seed_unbound(
+                root, recovery_only=True
+            )
+            receipt = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_flush = store_module.flush_file_strict
+
+            def fail_receipt(path: Path) -> None:
+                if Path(path) == receipt:
+                    raise OSError("synthetic receipt publication flush failure")
+                real_flush(path)
+
+            with patch.object(
+                store_module, "flush_file_strict", side_effect=fail_receipt
+            ):
+                interrupted = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(receipt.is_file())
+            self.assertTrue(store_module.reconcile_card_sidecar_write_intents(root)["ok"])
+            self.assertFalse(intent_path.exists())
+
+        with self.subTest(boundary="intent_unlink"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            intent_id, intent_path, _target, _recovery = seed_unbound(
+                root, recovery_only=True
+            )
+            intent_bytes = intent_path.read_bytes()
+            receipt = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_flush = store_module.flush_directory_strict
+
+            def fail_unlink(path: Path) -> None:
+                if (
+                    Path(path) == intent_path.parent
+                    and not intent_path.exists()
+                    and receipt.exists()
+                ):
+                    raise OSError("synthetic intent unlink flush failure")
+                real_flush(path)
+
+            with patch.object(
+                store_module, "flush_directory_strict", side_effect=fail_unlink
+            ):
+                interrupted = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertFalse(intent_path.exists())
+            self.assertTrue(receipt.is_file())
+            intent_path.write_bytes(intent_bytes)
+            self.assertTrue(store_module.reconcile_card_sidecar_write_intents(root)["ok"])
+            self.assertFalse(intent_path.exists())
+
     def test_sidecar_quarantine_postcommit_replacement_is_audited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

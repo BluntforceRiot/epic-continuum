@@ -3853,7 +3853,12 @@ class OperationLedgerTest(unittest.TestCase):
                 real_manifest_file_flush(path)
 
             def trace_manifest_directory_flush(path: Path) -> None:
-                events.append(("manifest_directory_flush", Path(path).name))
+                label = (
+                    "manifest_directory_flush"
+                    if any(event[0] == "manifest_file_flush" for event in events)
+                    else "directory_flush"
+                )
+                events.append((label, Path(path).name))
                 real_manifest_directory_flush(path)
 
             def trace_audit_event(*args: object, **kwargs: object) -> str:

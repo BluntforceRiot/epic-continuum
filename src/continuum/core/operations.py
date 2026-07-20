@@ -3663,6 +3663,16 @@ def _close_restore_drill_reservation(reservation: _RestoreDrillRootReservation) 
         raise errors[0]
 
 
+def _restore_drill_root_path(root: Path, drill_id: str) -> Path:
+    directory_name = drill_id
+    if os.name == "nt":
+        suffix = drill_id.rsplit("_", 1)[-1]
+        if re.fullmatch(r"[0-9a-f]{16}", suffix) is None:
+            raise ValueError(f"invalid restore-drill identity: {drill_id}")
+        directory_name = f"restore_{suffix}"
+    return root / "run" / "restore_drills" / directory_name
+
+
 def _reserve_restore_drill_root(root: Path, drill_root: Path) -> _RestoreDrillRootReservation:
     parent = root / "run" / "restore_drills"
     _ensure_restore_output_safe(root, parent)
@@ -4522,7 +4532,7 @@ def _restore_drill_impl(
         raise ValueError("snapshot Card sidecar receipt binding is malformed")
 
     drill_id = unique_id("restore")
-    drill_root = root / "run" / "restore_drills" / drill_id
+    drill_root = _restore_drill_root_path(root, drill_id)
     drill_root_reservation = _reserve_restore_drill_root(root, drill_root)
     if _on_drill_root_created is not None:
         _on_drill_root_created(drill_root, drill_root_reservation)

@@ -1730,6 +1730,56 @@ class OperationLedgerTest(unittest.TestCase):
                 Path(result["drill_root"]).resolve(strict=False),
             )
 
+    @unittest.skipUnless(os.name == "nt", "short physical restore roots require Windows")
+    def test_restore_drill_shortens_only_the_physical_windows_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            append_scroll_event(
+                root,
+                session_id="restore-path-budget",
+                event_type="message",
+                role="user",
+                content="preserve the full public restore identity",
+            )
+            snap = snapshot(root, reason="restore_path_budget")
+            drill_id = "restore_20260720T070016Z_717cb5a0bbb74424"
+            physical_root = operations_module._restore_drill_root_path(root, drill_id)
+            hypothetical_full_root = root / "run" / "restore_drills" / drill_id
+            source_dir = root / "archive"
+            target_length = 262
+            filename_length = target_length - len(str(hypothetical_full_root / "archive")) - 1
+            source_file = source_dir / ("p" * (filename_length - 4) + ".txt")
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_text("long restore path evidence\n", encoding="utf-8")
+            hypothetical_target = hypothetical_full_root / "archive" / source_file.name
+            physical_target = physical_root / "archive" / source_file.name
+            self.assertGreaterEqual(len(str(hypothetical_target)), 260)
+            self.assertLess(len(str(physical_target)), 260)
+            real_unique_id = operations_module.unique_id
+
+            def fixed_restore_id(prefix: str) -> str:
+                return drill_id if prefix == "restore" else real_unique_id(prefix)
+
+            with patch(
+                "continuum.core.operations.unique_id",
+                side_effect=fixed_restore_id,
+            ):
+                result = restore_drill(
+                    root,
+                    snapshot_uri=snap["snapshot_uri"],
+                    verify_recent_proof_packs=0,
+                )
+
+            self.assertTrue(result["ok"], result["checks"])
+            self.assertEqual(result["drill_id"], drill_id)
+            self.assertEqual(Path(result["drill_root"]), physical_root)
+            self.assertEqual(physical_root.name, "restore_717cb5a0bbb74424")
+            self.assertEqual(
+                physical_target.read_text(encoding="utf-8"),
+                "long restore path evidence\n",
+            )
+            self.assertEqual(Path(result["receipt_uri"]).stem, drill_id)
+
     @unittest.skipUnless(os.name == "nt", "identity-bound restore cleanup requires Windows")
     def test_disposable_restore_drill_cleans_root_after_late_copy_exception(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1885,8 +1935,8 @@ class OperationLedgerTest(unittest.TestCase):
                 content="collision",
             )
             snap = snapshot(root, reason="restore_collision")
-            drill_id = "restore_collision_fixture"
-            collision = root / "run" / "restore_drills" / drill_id
+            drill_id = "restore_20260720T070016Z_717cb5a0bbb74424"
+            collision = operations_module._restore_drill_root_path(root, drill_id)
             collision.mkdir(parents=True)
             marker = collision / "unrelated-marker.txt"
             marker.write_text("must remain", encoding="utf-8")
@@ -1917,8 +1967,8 @@ class OperationLedgerTest(unittest.TestCase):
                 content="reservation swap",
             )
             snap = snapshot(root, reason="restore_reservation_swap")
-            drill_id = "restore_atomic_reservation_fixture"
-            drill_root = root / "run" / "restore_drills" / drill_id
+            drill_id = "restore_20260720T070016Z_717cb5a0bbb74424"
+            drill_root = operations_module._restore_drill_root_path(root, drill_id)
             parked = drill_root.with_name(drill_root.name + ".parked")
             replacement = base / "unrelated-reservation-replacement"
             replacement.mkdir()

@@ -273,6 +273,272 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             self.assertEqual(state["missing_card_sidecars"], 0)
             self.assertEqual(state["orphan_card_sidecars"], 0)
 
+    def test_uncommitted_new_card_sidecar_rollback_requires_intent_and_quarantines(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="rollback",
+                    title="Direct rollback card",
+                    summary="An uncommitted Card cannot publish a sidecar without intent authority.",
+                    source_refs=[{"source": "test"}],
+                    visibility_scope="session",
+                    session_id="direct-rollback-session",
+                )
+                target_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                target_path = resolve_stored_uri(root, target_uri)
+
+                with self.assertRaisesRegex(RuntimeError, "durable write observation"):
+                    sync_card_sidecar(root, conn, card_id)
+
+                self.assertFalse(target_path.exists())
+                self.assertFalse(
+                    list(
+                        (root / "run" / "card_sidecar_write_intents").glob(
+                            "*.json"
+                        )
+                    )
+                )
+                observation: dict[str, object] = {}
+                written_uri = sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    write_observation=observation,
+                )
+                self.assertEqual(written_uri, target_uri)
+                self.assertTrue(observation.get("write_completed"))
+                self.assertTrue(target_path.is_file())
+                conn.rollback()
+
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["processed"], 1)
+            self.assertEqual(reconciled["pending"], 0)
+            self.assertEqual(reconciled["results"][0]["status"], "quarantined")
+            recovery_path = resolve_stored_uri(
+                root,
+                str(reconciled["results"][0]["recovery_uri"]),
+            )
+            self.assertFalse(target_path.exists())
+            self.assertTrue(recovery_path.is_file())
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            receipts = list(
+                (root / "exports" / "card_sidecar_recovery_receipts").glob("*.json")
+            )
+            self.assertEqual(len(receipts), 1)
+            state = audit(root)
+            self.assertEqual(state["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_new_card_sidecar_commit_failure_reconciles_without_orphan(self) -> None:
+        class FailFirstCommitConnection:
+            def __init__(self, delegate: sqlite3.Connection) -> None:
+                self._delegate = delegate
+                self.failed = False
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._delegate, name)
+
+            def commit(self) -> None:
+                if not self.failed:
+                    self.failed = True
+                    raise sqlite3.OperationalError("synthetic first sidecar commit failure")
+                self._delegate.commit()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            raw_connection = connect_catalog(root)
+            conn = FailFirstCommitConnection(raw_connection)
+            observation: dict[str, object] = {}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="commit-failure",
+                    title="Commit failure card",
+                    summary="The durable intent survives a failed catalog acknowledgement.",
+                    source_refs=[{"source": "test"}],
+                )
+                target_path = resolve_stored_uri(
+                    root,
+                    str(
+                        conn.execute(
+                            "SELECT location_uri FROM cards WHERE id = ?",
+                            (card_id,),
+                        ).fetchone()["location_uri"]
+                    ),
+                )
+                sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    write_observation=observation,
+                )
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "synthetic first sidecar commit failure",
+                ):
+                    conn.commit()
+                conn.rollback()
+            finally:
+                conn.close()
+
+            self.assertTrue(target_path.is_file())
+            with closing(store_module.connect_existing(root)) as catalog:
+                self.assertEqual(catalog.execute("SELECT count(*) FROM cards").fetchone()[0], 0)
+                self.assertEqual(
+                    catalog.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
+            reconciled = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["results"][0]["status"], "quarantined")
+            recovery_path = resolve_stored_uri(
+                root,
+                str(reconciled["results"][0]["recovery_uri"]),
+            )
+            self.assertFalse(target_path.exists())
+            self.assertTrue(recovery_path.is_file())
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (
+                    root / "exports" / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            ]
+            self.assertTrue(
+                any(receipt.get("status") == "quarantined" for receipt in receipts),
+                receipts,
+            )
+            self.assertEqual(audit(root)["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+    def test_new_card_sidecar_abrupt_death_reconciles_without_orphan(self) -> None:
+        worker_code = r"""
+import os
+import sys
+from pathlib import Path
+from continuum.core import store
+
+root = Path(sys.argv[1])
+card_id_path = Path(sys.argv[2])
+real_write = store.write_card_sidecar_from_values
+
+def write_then_die(*args, **kwargs):
+    real_write(*args, **kwargs)
+    os._exit(73)
+
+store.write_card_sidecar_from_values = write_then_die
+conn = store.connect(root)
+conn.execute("BEGIN IMMEDIATE")
+card_id = store.create_card(
+    conn,
+    root=root,
+    card_type="abrupt-death",
+    title="Abrupt death card",
+    summary="Restart reconciliation quarantines the exact uncommitted sidecar attempt.",
+    source_refs=[{"source": "test"}],
+)
+card_id_path.write_text(card_id, encoding="utf-8")
+store.sync_card_sidecar(root, conn, card_id, write_observation={})
+os._exit(74)
+"""
+        recovery_code = r"""
+import json
+import sys
+from pathlib import Path
+from continuum.core.store import reconcile_card_sidecar_write_intents
+
+result = reconcile_card_sidecar_write_intents(Path(sys.argv[1]))
+print(json.dumps(result, sort_keys=True))
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            card_id_path = Path(tmp) / "interrupted-card-id.txt"
+            env = os.environ.copy()
+            repo_src = str(Path(__file__).resolve().parents[1] / "src")
+            env["PYTHONPATH"] = repo_src + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+            )
+            interrupted = subprocess.run(
+                [sys.executable, "-c", worker_code, str(root), str(card_id_path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(interrupted.returncode, 73, interrupted.stderr)
+            card_id = card_id_path.read_text(encoding="utf-8")
+            target_path = root / "catalog" / "cards" / f"{card_id}.yaml"
+            self.assertTrue(target_path.is_file())
+            with closing(store_module.connect_existing(root)) as catalog:
+                self.assertEqual(catalog.execute("SELECT count(*) FROM cards").fetchone()[0], 0)
+                self.assertEqual(
+                    catalog.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertEqual(
+                len(
+                    list(
+                        (root / "run" / "card_sidecar_write_intents").glob(
+                            "*.json"
+                        )
+                    )
+                ),
+                1,
+            )
+
+            recovered = subprocess.run(
+                [sys.executable, "-c", recovery_code, str(root)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            recovery = json.loads(recovered.stdout)
+            self.assertTrue(recovery["ok"], recovery)
+            self.assertEqual(recovery["pending"], 0)
+            self.assertEqual(recovery["results"][0]["status"], "quarantined")
+            recovery_path = resolve_stored_uri(
+                root,
+                str(recovery["results"][0]["recovery_uri"]),
+            )
+            self.assertFalse(target_path.exists())
+            self.assertTrue(recovery_path.is_file())
+            self.assertFalse(
+                list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
+            )
+            self.assertEqual(audit(root)["orphan_card_sidecars"], 0)
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
     def test_card_identity_includes_visibility_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -382,9 +648,9 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
             missing = audit(root)
             self.assertEqual(missing["missing_card_sidecars"], 1)
 
+            first_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(first_sync["ok"], first_sync)
             with closing(connect_catalog(root)) as conn:
-                sync_card_sidecar(root, conn, card_id)
-                conn.commit()
                 sidecar_path = resolve_stored_uri(
                     root,
                     conn.execute("SELECT location_uri FROM cards WHERE id = ?", (card_id,)).fetchone()["location_uri"],
@@ -430,8 +696,8 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                     session_id="recall-session",
                 )
                 conn.commit()
-                sync_card_sidecar(root, conn, card_id)
-                conn.commit()
+                first_sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(first_sync["ok"], first_sync)
                 sidecar_path = resolve_stored_uri(
                     root,
                     conn.execute("SELECT location_uri FROM cards WHERE id = ?", (card_id,)).fetchone()["location_uri"],
@@ -462,8 +728,8 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                     session_id="recall-rollback-session",
                 )
                 conn.commit()
-                sync_card_sidecar(root, conn, card_id)
-                conn.commit()
+                first_sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(first_sync["ok"], first_sync)
                 sidecar_path = resolve_stored_uri(
                     root,
                     conn.execute("SELECT location_uri FROM cards WHERE id = ?", (card_id,)).fetchone()["location_uri"],
@@ -3489,7 +3755,6 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                     project_id=secret_project,
                     metadata={"session_id": secret_session, "project_id": secret_project},
                 )
-                sync_card_sidecar(root, conn, card_id)
                 conn.execute(
                     """
                     INSERT INTO books(
@@ -3519,6 +3784,8 @@ class EpicContinuumCoreFlowTest(unittest.TestCase):
                     ("legacy-chunk", "legacy-book", 1, chunk_text, content_hash(chunk_text), "2026-01-01T00:00:00Z"),
                 )
                 conn.commit()
+                initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+                self.assertTrue(initial_sync["ok"], initial_sync)
                 changed = _backfill_partition_aliases(root, conn)
                 conn.commit()
                 sync_pending_card_sidecars(root)

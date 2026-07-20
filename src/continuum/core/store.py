@@ -4926,15 +4926,13 @@ def sync_card_sidecar(
     intent_id: str | None = None
     intent_path: Path | None = None
     if sidecar_path is not None and create_only and write_observation is None:
-        prebound_path = current_card_sidecar_path(root, conn, card_id)
-        if prebound_path is None or not _paths_share_filesystem_identity(
-            prebound_path,
-            sidecar_path,
-        ):
-            raise RuntimeError(
-                "new Card sidecar targets require sync_card_sidecars_after_commit "
-                "or a durable write observation"
-            )
+        # A transaction-local location_uri is not proof that the Card row will
+        # commit.  Every new filesystem target must therefore use the durable
+        # intent path, even when create_card prebound the default location.
+        raise RuntimeError(
+            "new Card sidecar targets require sync_card_sidecars_after_commit "
+            "or a durable write observation"
+        )
     if (
         sidecar_path is not None
         and create_only

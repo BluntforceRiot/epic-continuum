@@ -29,6 +29,7 @@ from continuum.core.store import (
     snapshot_alias_key_path,
     snapshot_card_sidecar_receipts_path,
     sync_card_sidecar,
+    sync_card_sidecars_after_commit,
     write_snapshot_manifest,
 )
 from continuum.core.temporal_authority import conflict_boundary
@@ -1017,10 +1018,14 @@ class AuthoritySemanticIntegrityTest(unittest.TestCase):
                     "UPDATE cards SET superseded_by_card_id = ? WHERE id = ?",
                     (decision, state["card_id"]),
                 )
-                _sync_cards(root, conn, str(state["card_id"]), decision)
                 conn.commit()
             finally:
                 conn.close()
+            sidecar_sync = sync_card_sidecars_after_commit(
+                root,
+                [str(state["card_id"]), decision],
+            )
+            self.assertTrue(sidecar_sync["ok"], sidecar_sync)
 
             report = semantic_integrity_report(root)
 

@@ -3939,6 +3939,33 @@ class OperationLedgerTest(unittest.TestCase):
                 require_catalog_binding=True,
             )
             self.assertTrue(verification["ok"], verification)
+            self.assertTrue(
+                Path(str(created["review_bridge_jobs_uri"])).name.startswith(
+                    "continuum_rj_snapshot_"
+                )
+            )
+
+    def test_snapshot_review_jobs_path_preserves_legacy_and_refuses_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshots = Path(tmp) / "snapshots"
+            snapshots.mkdir()
+            snapshot_id = "snapshot_20260720T000000Z_0123456789abcdef"
+            catalog = snapshots / f"continuum_catalog_{snapshot_id}.sqlite3"
+            legacy = snapshots / f"continuum_review_bridge_jobs_{snapshot_id}"
+            current = snapshots / f"continuum_rj_{snapshot_id}"
+
+            self.assertEqual(
+                store_module.snapshot_review_bridge_jobs_path(catalog),
+                current,
+            )
+            legacy.mkdir()
+            self.assertEqual(
+                store_module.snapshot_review_bridge_jobs_path(catalog),
+                legacy,
+            )
+            current.mkdir()
+            with self.assertRaisesRegex(ValueError, "ambiguous Review Relay"):
+                store_module.snapshot_review_bridge_jobs_path(catalog)
 
     def test_snapshot_ordinary_durability_failures_leave_no_authority_or_outputs(self) -> None:
         failure_cases = ("stage_tree", "manifest_file", "manifest_directory")
@@ -4290,7 +4317,12 @@ class OperationLedgerTest(unittest.TestCase):
             snapshots = sorted((root / "snapshots").glob("continuum_catalog_*.sqlite3"))
             self.assertEqual(len(snapshots), 20)
             review_job_trees = sorted(
-                (root / "snapshots").glob("continuum_review_bridge_jobs_*")
+                list(
+                    (root / "snapshots").glob(
+                        "continuum_review_bridge_jobs_*"
+                    )
+                )
+                + list((root / "snapshots").glob("continuum_rj_*"))
             )
             self.assertEqual(len(review_job_trees), 20)
             sidecar_receipt_trees = sorted(

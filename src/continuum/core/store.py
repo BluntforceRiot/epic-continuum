@@ -735,7 +735,15 @@ def snapshot_sidecars_path(snapshot_path: Path) -> Path | None:
 
 def snapshot_review_bridge_jobs_path(snapshot_path: Path) -> Path:
     snapshot_id = snapshot_id_from_catalog_path(snapshot_path) or snapshot_path.stem
-    return snapshot_path.parent / f"continuum_review_bridge_jobs_{snapshot_id}"
+    legacy = snapshot_path.parent / f"continuum_review_bridge_jobs_{snapshot_id}"
+    current = snapshot_path.parent / f"continuum_rj_{snapshot_id}"
+    legacy_exists = os.path.lexists(legacy)
+    current_exists = os.path.lexists(current)
+    if legacy_exists and current_exists:
+        raise ValueError(
+            f"snapshot has ambiguous Review Relay job trees: {snapshot_path}"
+        )
+    return legacy if legacy_exists else current
 
 
 def snapshot_card_sidecar_receipts_path(snapshot_path: Path) -> Path:
@@ -20630,7 +20638,12 @@ def _cleanup_snapshot_staging(root: Path, staged_root: Path) -> None:
         shutil.rmtree(staged_root, ignore_errors=True)
 
 
-def _cleanup_snapshot_output_tree(root: Path, path: Path, *, name_prefix: str) -> None:
+def _cleanup_snapshot_output_tree(
+    root: Path,
+    path: Path,
+    *,
+    name_prefix: str | tuple[str, ...],
+) -> None:
     snapshots_dir = (root / "snapshots").absolute()
     candidate = path.absolute()
     if candidate.parent != snapshots_dir or not candidate.name.startswith(name_prefix):
@@ -20665,7 +20678,7 @@ def _cleanup_uncommitted_snapshot_outputs(
     _cleanup_snapshot_output_tree(
         root,
         review_bridge_jobs_path,
-        name_prefix="continuum_review_bridge_jobs_",
+        name_prefix=("continuum_review_bridge_jobs_", "continuum_rj_"),
     )
     _cleanup_snapshot_output_tree(
         root,

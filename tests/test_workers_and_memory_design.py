@@ -9,10 +9,12 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.atomic import load_atomic_yaml
+from continuum.core import permissions as permissions_module
 from continuum.core import store as store_module
 from continuum.core import workers as worker_module
 from continuum.core.config import default_config, write_config
@@ -628,6 +630,592 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.close()
             self.assertEqual(remaining, 1, result)
 
+    def test_worker_outbox_and_intent_maintenance_share_one_resolution_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="shared-worker-intent-budget",
+                    summary=(
+                        "Outbox materialization and crash recovery must share "
+                        "one bounded intent budget."
+                    ),
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                target_uri = str(row["location_uri"])
+                conn.commit()
+            finally:
+                conn.close()
+            for _index in range(51):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            reconciliation_calls: list[dict[str, object]] = []
+            real_reconcile = (
+                worker_module.reconcile_card_sidecar_write_intents
+            )
+
+            def capture_reconciliation(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = real_reconcile(*args, **kwargs)
+                reconciliation_calls.append(
+                    {
+                        "kwargs": dict(kwargs),
+                        "selected": int(result.get("selected", 0)),
+                        "processed": int(result.get("processed", 0)),
+                    }
+                )
+                return result
+
+            with patch.object(
+                worker_module,
+                "reconcile_card_sidecar_write_intents",
+                side_effect=capture_reconciliation,
+            ):
+                worker = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=True,
+                )
+
+            intent_result = worker["maintenance"]["sidecar_intents"]
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(
+                worker["maintenance"]["sidecars"]["synced"],
+                1,
+            )
+            self.assertEqual(len(reconciliation_calls), 1)
+            self.assertEqual(
+                reconciliation_calls[0]["kwargs"].get("limit"),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertNotIn(
+                "card_ids",
+                reconciliation_calls[0]["kwargs"],
+            )
+            self.assertLessEqual(
+                sum(
+                    int(call["selected"])
+                    for call in reconciliation_calls
+                ),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(
+                    int(call["processed"])
+                    for call in reconciliation_calls
+                ),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertEqual(intent_result["selected"], 50)
+            self.assertEqual(intent_result["processed"], 50)
+            self.assertEqual(intent_result["enumerated"], 51)
+            self.assertEqual(intent_result["remaining"], 1)
+            self.assertTrue(intent_result["remaining_is_lower_bound"])
+            self.assertFalse(intent_result["complete"])
+            self.assertTrue(intent_result["has_more"])
+
+    def test_card_filtered_scope_stays_incomplete_with_unrelated_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=2,
+                namespace="card-filtered-intent-limit",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            selected_card_id = card_ids[1]
+            with self.assertRaisesRegex(
+                ValueError,
+                "cannot use a global limit",
+            ):
+                store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    card_ids=[selected_card_id],
+                    limit=1,
+                )
+            reconciled = (
+                store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    card_ids=[selected_card_id],
+                )
+            )
+
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["selected"], 1)
+            self.assertEqual(reconciled["processed"], 1)
+            self.assertEqual(
+                reconciled["results"][0]["card_id"],
+                selected_card_id,
+            )
+            self.assertTrue(reconciled["scope_filtered"])
+            self.assertFalse(reconciled["scope_complete"])
+            self.assertEqual(reconciled["remaining"], 1)
+            self.assertFalse(reconciled["complete"])
+
+    def test_card_filtered_scope_rejects_concurrent_matching_arrival(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_ids = [
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"filtered-arrival-{index}",
+                        summary="A concurrent matching intent must retain retry.",
+                        source_refs=[],
+                    )
+                    for index in range(2)
+                ]
+                rows = {
+                    str(row["id"]): row
+                    for row in conn.execute(
+                        "SELECT * FROM cards WHERE id IN (?, ?)",
+                        card_ids,
+                    ).fetchall()
+                }
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            unrelated_card_id, selected_card_id = card_ids
+            unrelated_payload = store_module._card_sidecar_payload_for_row(
+                rows[unrelated_card_id]
+            )
+            selected_payload = store_module._card_sidecar_payload_for_row(
+                rows[selected_card_id]
+            )
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=unrelated_card_id,
+                target_uri=str(rows[unrelated_card_id]["location_uri"]),
+                expected_state_hash=str(
+                    unrelated_payload["state_hash"]
+                ),
+            )
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            injected = False
+
+            def inject_after_initial_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                nonlocal injected
+                inventory = real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                )
+                if not injected:
+                    injected = True
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=selected_card_id,
+                        target_uri=str(
+                            rows[selected_card_id]["location_uri"]
+                        ),
+                        expected_state_hash=str(
+                            selected_payload["state_hash"]
+                        ),
+                    )
+                return inventory
+
+            with patch.object(
+                store_module,
+                "_bounded_card_sidecar_intent_inventory",
+                side_effect=inject_after_initial_inventory,
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        card_ids=[selected_card_id],
+                    )
+                )
+
+            self.assertTrue(injected)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["selected"], 0)
+            self.assertEqual(reconciled["processed"], 0)
+            self.assertEqual(reconciled["remaining"], 2)
+            self.assertFalse(reconciled["complete"])
+            self.assertFalse(reconciled["scope_complete"])
+
+    def test_reconciliation_postflight_waits_for_db_bound_intent_publisher(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="postflight-db-publisher",
+                    summary="The final scan must wait for a publishing transaction.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+
+            initial_inventory_seen = threading.Event()
+            publisher_written = threading.Event()
+            allow_publisher_commit = threading.Event()
+            postflight_scan_started = threading.Event()
+            reconciliation_done = threading.Event()
+            errors: list[BaseException] = []
+            results: list[dict[str, object]] = []
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            inventory_calls = 0
+
+            def gate_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                nonlocal inventory_calls
+                inventory = real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                )
+                inventory_calls += 1
+                if inventory_calls == 1:
+                    initial_inventory_seen.set()
+                    if not publisher_written.wait(timeout=10.0):
+                        raise TimeoutError("publisher did not write its intent")
+                elif inventory_calls == 2:
+                    postflight_scan_started.set()
+                return inventory
+
+            def publish() -> None:
+                publisher_conn = connect(root)
+                try:
+                    if not initial_inventory_seen.wait(timeout=10.0):
+                        raise TimeoutError("initial inventory did not run")
+                    publisher_conn.execute("BEGIN IMMEDIATE")
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=card_id,
+                        target_uri=str(row["location_uri"]),
+                        expected_state_hash=str(payload["state_hash"]),
+                        conn=publisher_conn,
+                    )
+                    publisher_written.set()
+                    if not allow_publisher_commit.wait(timeout=10.0):
+                        raise TimeoutError("publisher commit was not released")
+                    publisher_conn.commit()
+                except BaseException as exc:
+                    if publisher_conn.in_transaction:
+                        publisher_conn.rollback()
+                    errors.append(exc)
+                finally:
+                    publisher_conn.close()
+
+            def reconcile() -> None:
+                try:
+                    results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=1,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    reconciliation_done.set()
+
+            publisher_thread = threading.Thread(target=publish, daemon=True)
+            reconciliation_thread = threading.Thread(
+                target=reconcile,
+                daemon=True,
+            )
+            with patch.object(
+                store_module,
+                "_bounded_card_sidecar_intent_inventory",
+                side_effect=gate_inventory,
+            ):
+                publisher_thread.start()
+                reconciliation_thread.start()
+                self.assertTrue(publisher_written.wait(timeout=10.0))
+                self.assertFalse(
+                    postflight_scan_started.wait(timeout=0.25),
+                    "postflight scan crossed an active publisher transaction",
+                )
+                self.assertFalse(reconciliation_done.is_set())
+                allow_publisher_commit.set()
+                publisher_thread.join(timeout=10.0)
+                reconciliation_thread.join(timeout=10.0)
+
+            self.assertFalse(publisher_thread.is_alive())
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(results), 1)
+            reconciled = results[0]
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["processed"], 0)
+            self.assertEqual(reconciled["remaining"], 1)
+            self.assertFalse(reconciled["complete"])
+            self.assertTrue(postflight_scan_started.is_set())
+
+    def test_private_intent_publisher_cannot_cross_reconciliation_scan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="private-publisher-fence",
+                    summary="Private publishers share the reconciler lock.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=str(row["location_uri"]),
+                expected_state_hash=str(payload["state_hash"]),
+            )
+
+            postflight_inventory_held = threading.Event()
+            release_postflight_inventory = threading.Event()
+            publisher_entered = threading.Event()
+            publisher_done = threading.Event()
+            errors: list[BaseException] = []
+            results: list[dict[str, object]] = []
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            inventory_calls = 0
+
+            def hold_postflight_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                nonlocal inventory_calls
+                inventory = real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                )
+                inventory_calls += 1
+                if inventory_calls == 2:
+                    postflight_inventory_held.set()
+                    if not release_postflight_inventory.wait(timeout=10.0):
+                        raise TimeoutError("postflight inventory was not released")
+                return inventory
+
+            def publish() -> None:
+                try:
+                    publisher_entered.set()
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=card_id,
+                        target_uri=str(row["location_uri"]),
+                        expected_state_hash=str(payload["state_hash"]),
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    publisher_done.set()
+
+            def reconcile() -> None:
+                try:
+                    results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=1,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            reconciliation_thread = threading.Thread(
+                target=reconcile,
+                daemon=True,
+            )
+            publisher_thread = threading.Thread(target=publish, daemon=True)
+            with patch.object(
+                store_module,
+                "_bounded_card_sidecar_intent_inventory",
+                side_effect=hold_postflight_inventory,
+            ):
+                reconciliation_thread.start()
+                self.assertTrue(postflight_inventory_held.wait(timeout=10.0))
+                publisher_thread.start()
+                self.assertTrue(publisher_entered.wait(timeout=10.0))
+                self.assertFalse(
+                    publisher_done.wait(timeout=0.25),
+                    "private publisher escaped the reconciler operation lock",
+                )
+                release_postflight_inventory.set()
+                reconciliation_thread.join(timeout=10.0)
+                publisher_thread.join(timeout=10.0)
+
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertFalse(publisher_thread.is_alive())
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]["ok"], results[0])
+            self.assertTrue(results[0]["complete"], results[0])
+            self.assertEqual(
+                len(
+                    list(
+                        (
+                            root / "run" / "card_sidecar_write_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                1,
+            )
+
+    def test_reconciliation_postflight_db_fence_failure_is_nonterminal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            real_connect = store_module.connect
+            connect_calls = 0
+
+            def fail_postflight_connect(path: Path) -> sqlite3.Connection:
+                nonlocal connect_calls
+                connect_calls += 1
+                if connect_calls == 2:
+                    raise sqlite3.OperationalError(
+                        "synthetic postflight writer fence failure"
+                    )
+                return real_connect(path)
+
+            with patch.object(
+                store_module,
+                "connect",
+                side_effect=fail_postflight_connect,
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertIsNone(reconciled["remaining"])
+            self.assertTrue(reconciled["remaining_is_lower_bound"])
+            self.assertFalse(reconciled["complete"])
+            self.assertTrue(reconciled["has_more"])
+
+    def test_uninitialized_reconciliation_does_not_cross_into_unlocked_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch.object(
+                    store_module,
+                    "is_initialized",
+                    side_effect=[False, True],
+                ),
+                patch.object(
+                    store_module,
+                    "_reconcile_card_sidecar_write_intents_unlocked",
+                    wraps=(
+                        store_module
+                        ._reconcile_card_sidecar_write_intents_unlocked
+                    ),
+                ) as unlocked,
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertTrue(reconciled["complete"], reconciled)
+            self.assertEqual(reconciled["processed"], 0)
+            self.assertEqual(reconciled["enumerated"], 0)
+            unlocked.assert_not_called()
+
     def test_failed_worker_sidecar_drain_is_not_retried_by_maintenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -677,6 +1265,1773 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(remaining, 51, result)
+
+    def test_worker_reconciles_bounded_orphan_intents_after_crash_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=51,
+                namespace="worker-orphan-intent-crash-window",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "before intent reconciliation",
+                ),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            self.assertEqual(len(list(intent_dir.glob("*.json"))), 51)
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM card_sidecar_outbox"
+                        ).fetchone()["n"]
+                    ),
+                    0,
+                )
+            finally:
+                conn.close()
+
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as generic_recovery:
+                first = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=True,
+                )
+
+            first_intents = first["maintenance"]["sidecar_intents"]
+            self.assertTrue(first["ok"], first)
+            self.assertTrue(first_intents["ok"], first)
+            self.assertEqual(first_intents["processed"], 50)
+            self.assertEqual(first_intents["pending"], 0)
+            self.assertEqual(first_intents["selected"], 50)
+            self.assertEqual(first_intents["remaining"], 1)
+            self.assertTrue(first_intents["remaining_is_lower_bound"])
+            self.assertFalse(first_intents["complete"])
+            self.assertTrue(first_intents["has_more"])
+            self.assertEqual(first_intents["remaining_lower_bound"], 1)
+            self.assertTrue(first_intents["batch_truncated"])
+            self.assertFalse(first_intents["overflow"])
+            self.assertEqual(first_intents["status_counts"], {"adopted": 50})
+            self.assertEqual(len(list(intent_dir.glob("*.json"))), 1)
+            generic_recovery.assert_not_called()
+
+            second = run_worker_pass(
+                root,
+                limit=1,
+                maintenance=True,
+            )
+
+            second_intents = second["maintenance"]["sidecar_intents"]
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(second_intents["processed"], 1)
+            self.assertEqual(second_intents["selected"], 1)
+            self.assertEqual(second_intents["remaining"], 0)
+            self.assertTrue(second_intents["complete"])
+            self.assertFalse(second_intents["has_more"])
+            self.assertEqual(second_intents["remaining_lower_bound"], 0)
+            self.assertFalse(second_intents["batch_truncated"])
+            self.assertFalse(second_intents["overflow"])
+            self.assertEqual(second_intents["status_counts"], {"adopted": 1})
+            self.assertFalse(list(intent_dir.glob("*.json")))
+
+    def test_concurrent_orphan_intent_reconciliation_is_idempotent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="concurrent-orphan-intent-reconciliation",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "before intent reconciliation",
+                ),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            self.assertEqual(len(list(intent_dir.glob("*.json"))), 1)
+            start_barrier = threading.Barrier(2)
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            result_lock = threading.Lock()
+
+            def reconcile() -> None:
+                try:
+                    start_barrier.wait(timeout=10.0)
+                    result = store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                    with result_lock:
+                        results.append(result)
+                except BaseException as exc:
+                    with result_lock:
+                        errors.append(exc)
+
+            threads = [
+                threading.Thread(target=reconcile, daemon=True)
+                for _index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15.0)
+
+            self.assertFalse(
+                any(thread.is_alive() for thread in threads),
+                "concurrent reconciliation threads did not finish",
+            )
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(results), 2, results)
+            self.assertTrue(all(result["ok"] for result in results), results)
+            self.assertEqual(
+                sorted(int(result["processed"]) for result in results),
+                [0, 1],
+            )
+            reconciliation_results = [
+                reconciliation_result
+                for result in results
+                for reconciliation_result in result["results"]
+            ]
+            self.assertEqual(
+                1,
+                len(reconciliation_results),
+            )
+            self.assertEqual(
+                reconciliation_results[0]["status"],
+                "adopted",
+            )
+            self.assertFalse(
+                reconciliation_results[0]["concurrent_completion"],
+            )
+            self.assertFalse(list(intent_dir.glob("*.json")))
+            self.assertEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "exports"
+                            / "card_sidecar_resolved_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                1,
+            )
+
+    def test_single_prepublication_flush_failure_preserves_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="single-retirement-directory-flush",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_path = next(intent_dir.glob("*.json"))
+            receipt_dir = (
+                root / "exports" / "card_sidecar_recovery_receipts"
+            )
+            real_flush_directory = store_module.flush_directory_strict
+            retirement_flush_calls = 0
+
+            def fail_first_retirement_flush(path: Path) -> None:
+                nonlocal retirement_flush_calls
+                if (
+                    Path(path) == intent_dir
+                    and receipt_dir.is_dir()
+                    and not intent_path.exists()
+                ):
+                    retirement_flush_calls += 1
+                    if retirement_flush_calls == 1:
+                        raise OSError(
+                            "synthetic first retirement flush failure"
+                        )
+                real_flush_directory(Path(path))
+
+            with patch.object(
+                store_module,
+                "flush_directory_strict",
+                side_effect=fail_first_retirement_flush,
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertFalse(interrupted["ok"], interrupted)
+            retirement_dir = (
+                root / "run" / "card_sidecar_retirement_intents"
+            )
+            self.assertFalse(intent_path.exists())
+            self.assertEqual(
+                len(list(retirement_dir.glob("*.json"))),
+                1,
+            )
+            self.assertFalse(
+                list(
+                    (
+                        root
+                        / "exports"
+                        / "card_sidecar_resolved_intents"
+                    ).glob("*.json")
+                )
+            )
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["processed"], 1)
+            self.assertFalse(intent_path.exists())
+            self.assertFalse(list(retirement_dir.glob("*.json")))
+            self.assertEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "exports"
+                            / "card_sidecar_resolved_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                1,
+            )
+
+    def test_concurrent_retirement_reproves_failed_directory_flush(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="concurrent-retirement-directory-flush",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_path = next(intent_dir.glob("*.json"))
+            receipt_dir = (
+                root / "exports" / "card_sidecar_recovery_receipts"
+            )
+            real_flush_directory = store_module.flush_directory_strict
+            start_barrier = threading.Barrier(2)
+            result_lock = threading.Lock()
+            flush_lock = threading.Lock()
+            retirement_flush_calls = 0
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def fail_first_retirement_flush(path: Path) -> None:
+                nonlocal retirement_flush_calls
+                if (
+                    Path(path) == intent_dir
+                    and receipt_dir.is_dir()
+                    and not intent_path.exists()
+                ):
+                    with flush_lock:
+                        retirement_flush_calls += 1
+                        if retirement_flush_calls == 1:
+                            raise OSError(
+                                "synthetic first retirement flush failure"
+                            )
+                real_flush_directory(Path(path))
+
+            def reconcile() -> None:
+                try:
+                    start_barrier.wait(timeout=10.0)
+                    result = (
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=1,
+                        )
+                    )
+                    with result_lock:
+                        results.append(result)
+                except BaseException as exc:
+                    with result_lock:
+                        errors.append(exc)
+
+            threads = [
+                threading.Thread(target=reconcile, daemon=True)
+                for _index in range(2)
+            ]
+            with patch.object(
+                store_module,
+                "flush_directory_strict",
+                side_effect=fail_first_retirement_flush,
+            ):
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=15.0)
+
+            self.assertFalse(
+                any(thread.is_alive() for thread in threads),
+                "concurrent reconciliation threads did not finish",
+            )
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(results), 2, results)
+            self.assertGreaterEqual(retirement_flush_calls, 1, results)
+            self.assertTrue(
+                any(not result["ok"] for result in results),
+                results,
+            )
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["remaining"], 0)
+            self.assertFalse(intent_path.exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "exports"
+                            / "card_sidecar_resolved_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                1,
+            )
+
+    def test_prepublication_failure_leaves_replayable_retirement_queue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="failed-retirement-restoration-queue",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_path = next(intent_dir.glob("*.json"))
+            receipt_dir = (
+                root / "exports" / "card_sidecar_recovery_receipts"
+            )
+            retirement_dir = (
+                root / "run" / "card_sidecar_retirement_intents"
+            )
+            real_flush_directory = store_module.flush_directory_strict
+            source_flush_failed = False
+
+            def fail_source_flush_once(path: Path) -> None:
+                nonlocal source_flush_failed
+                if (
+                    Path(path) == intent_dir
+                    and receipt_dir.is_dir()
+                    and not intent_path.exists()
+                    and not source_flush_failed
+                ):
+                    source_flush_failed = True
+                    raise OSError("synthetic source namespace flush failure")
+                real_flush_directory(Path(path))
+
+            with patch.object(
+                store_module,
+                "flush_directory_strict",
+                side_effect=fail_source_flush_once,
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(source_flush_failed)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertFalse(intent_path.exists())
+            pending_retirements = list(retirement_dir.glob("*.json"))
+            self.assertEqual(len(pending_retirements), 1)
+            pending_integrity = semantic_integrity_report(root)
+            self.assertFalse(pending_integrity["ok"], pending_integrity)
+            self.assertEqual(
+                pending_integrity["checks"][
+                    "unresolved_card_sidecar_retirement_intents"
+                ],
+                1,
+            )
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["processed"], 1)
+            self.assertEqual(resumed["remaining"], 0)
+            self.assertTrue(resumed["complete"])
+            self.assertFalse(pending_retirements[0].exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "exports"
+                            / "card_sidecar_resolved_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                1,
+            )
+
+    def test_terminal_retirement_flush_failures_restore_retry_authority(
+        self,
+    ) -> None:
+        for boundary in ("resolved_destination",):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                card_ids = self._create_pending_sidecar_cards(
+                    root,
+                    count=1,
+                    namespace=f"terminal-retirement-{boundary}",
+                )
+                with (
+                    patch.object(
+                        store_module,
+                        "reconcile_card_sidecar_write_intents",
+                        side_effect=SystemExit(
+                            "simulated process death before intent reconciliation"
+                        ),
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    sync_card_sidecars_after_commit(root, card_ids)
+
+                intent_dir = root / "run" / "card_sidecar_write_intents"
+                retirement_dir = (
+                    root / "run" / "card_sidecar_retirement_intents"
+                )
+                resolved_dir = (
+                    root / "exports" / "card_sidecar_resolved_intents"
+                )
+                real_flush_directory = store_module.flush_directory_strict
+                injected_failure = False
+
+                def fail_terminal_boundary_once(path: Path) -> None:
+                    nonlocal injected_failure
+                    requested_path = Path(path)
+                    boundary_path = (
+                        resolved_dir
+                        if boundary == "resolved_destination"
+                        else retirement_dir
+                    )
+                    if (
+                        requested_path == boundary_path
+                        and not injected_failure
+                        and any(resolved_dir.glob("*.json"))
+                        and (
+                            boundary == "resolved_destination"
+                            or not any(retirement_dir.glob("*.json"))
+                        )
+                    ):
+                        injected_failure = True
+                        raise OSError(
+                            f"synthetic {boundary} strict flush failure"
+                        )
+                    real_flush_directory(requested_path)
+
+                with patch.object(
+                    store_module,
+                    "flush_directory_strict",
+                    side_effect=fail_terminal_boundary_once,
+                ):
+                    interrupted = (
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=1,
+                        )
+                    )
+
+                self.assertTrue(injected_failure)
+                active_paths = list(intent_dir.glob("*.json"))
+                retirement_paths = list(retirement_dir.glob("*.json"))
+                self.assertFalse(interrupted["ok"], interrupted)
+                self.assertEqual(interrupted["remaining"], 1, interrupted)
+                self.assertFalse(interrupted["complete"], interrupted)
+                self.assertTrue(interrupted["has_more"], interrupted)
+                self.assertEqual(
+                    len(active_paths) + len(retirement_paths),
+                    1,
+                    (active_paths, retirement_paths),
+                )
+                self.assertTrue(retirement_paths)
+                resumed = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+                self.assertTrue(resumed["ok"], resumed)
+                self.assertEqual(resumed["processed"], 1)
+                self.assertEqual(resumed["remaining"], 0)
+                self.assertTrue(resumed["complete"])
+                self.assertFalse(list(intent_dir.glob("*.json")))
+                self.assertFalse(list(retirement_dir.glob("*.json")))
+                self.assertEqual(
+                    len(list(resolved_dir.glob("*.json"))),
+                    1,
+                )
+
+    def test_init_readiness_replays_pending_retirement_queue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="init-readiness-retirement-queue",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_path = next(intent_dir.glob("*.json"))
+            receipt_dir = (
+                root / "exports" / "card_sidecar_recovery_receipts"
+            )
+            retirement_dir = (
+                root / "run" / "card_sidecar_retirement_intents"
+            )
+            real_flush_directory = store_module.flush_directory_strict
+            source_flush_failed = False
+
+            def fail_source_flush_once(path: Path) -> None:
+                nonlocal source_flush_failed
+                if (
+                    Path(path) == intent_dir
+                    and receipt_dir.is_dir()
+                    and not intent_path.exists()
+                    and not source_flush_failed
+                ):
+                    source_flush_failed = True
+                    raise OSError("synthetic source namespace flush failure")
+                real_flush_directory(Path(path))
+
+            with patch.object(
+                store_module,
+                "flush_directory_strict",
+                side_effect=fail_source_flush_once,
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertEqual(len(list(retirement_dir.glob("*.json"))), 1)
+            cache_key = str(root.resolve(strict=False))
+            store_module._INIT_DB_CACHE.add(cache_key)
+            self.assertFalse(store_module._init_db_durable_ready(root))
+
+            with patch.object(
+                store_module,
+                "reconcile_card_sidecar_write_intents",
+                wraps=store_module.reconcile_card_sidecar_write_intents,
+            ) as recovery:
+                init_db(root)
+
+            self.assertGreaterEqual(recovery.call_count, 1)
+            self.assertFalse(list(intent_dir.glob("*.json")))
+            self.assertFalse(list(retirement_dir.glob("*.json")))
+            self.assertTrue(store_module._init_db_durable_ready(root))
+            self.assertIn(cache_key, store_module._INIT_DB_CACHE)
+
+    def test_resolved_intent_retirement_preserves_racing_replacements(
+        self,
+    ) -> None:
+        for boundary in ("leaf", "directory"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                init_db(root)
+                conn = connect(root)
+                try:
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"retirement-{boundary}-replacement",
+                        summary="A racing replacement must never be deleted.",
+                        source_refs=[],
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    payload = store_module._card_sidecar_payload_for_row(row)
+                    conn.commit()
+                finally:
+                    conn.close()
+                _intent_id, intent_path = (
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=card_id,
+                        target_uri=f"catalog/cards/{card_id}.yaml",
+                        expected_state_hash=str(payload["state_hash"]),
+                    )
+                )
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                intent_identity = (
+                    store_module._plain_card_sidecar_state_path_identity(
+                        intent_path,
+                        directory=False,
+                    )
+                )
+                original_bytes = intent_path.read_bytes()
+                replacement_bytes = (
+                    b'{"replacement":"must remain preserved"}\n'
+                )
+                real_replace = store_module.replace_file_noclobber
+                swapped = False
+                if boundary == "leaf":
+                    preserved_original = intent_path.with_suffix(
+                        ".original"
+                    )
+                else:
+                    original_intent_dir = intent_path.parent
+                    preserved_dir = original_intent_dir.with_name(
+                        f"{original_intent_dir.name}-original"
+                    )
+                    preserved_original = preserved_dir / intent_path.name
+
+                def swap_then_move(
+                    source: Path,
+                    destination: Path,
+                ) -> None:
+                    nonlocal swapped
+                    if Path(source) == intent_path and not swapped:
+                        swapped = True
+                        if boundary == "leaf":
+                            os.replace(intent_path, preserved_original)
+                        else:
+                            os.rename(intent_path.parent, preserved_dir)
+                            intent_path.parent.mkdir()
+                        intent_path.write_bytes(replacement_bytes)
+                    real_replace(Path(source), Path(destination))
+
+                with (
+                    patch.object(
+                        store_module,
+                        "replace_file_noclobber",
+                        side_effect=swap_then_move,
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    store_module._retire_card_sidecar_write_intent(
+                        root,
+                        intent_path=intent_path,
+                        intent=intent,
+                        intent_entry_identity=intent_identity,
+                    )
+
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    preserved_original.read_bytes(),
+                    original_bytes,
+                )
+                replacement_locations = [
+                    path
+                    for path in (
+                        intent_path,
+                        *(
+                            root
+                            / "run"
+                            / "card_sidecar_retirement_intents"
+                        ).glob("*.json"),
+                    )
+                    if path.is_file()
+                ]
+                self.assertIn(
+                    replacement_bytes,
+                    [path.read_bytes() for path in replacement_locations],
+                )
+
+    def test_portable_retirement_archives_final_racing_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="portable-final-retirement-race",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            active_dir = root / "run" / "card_sidecar_write_intents"
+            original_active = next(active_dir.glob("*.json"))
+            original_bytes = original_active.read_bytes()
+            original_metadata = os.lstat(original_active)
+            original_identity = (
+                int(original_metadata.st_dev),
+                int(original_metadata.st_ino),
+            )
+            detached_original = (
+                root / "exports" / "portable-detached-original.json"
+            )
+            real_replace = store_module.replace_file_noclobber
+            swapped = False
+            replacement_identity: tuple[int, int] | None = None
+            replacement_archive: Path | None = None
+
+            def swap_at_final_move(
+                source: Path,
+                destination: Path,
+            ) -> None:
+                nonlocal swapped
+                nonlocal replacement_identity
+                nonlocal replacement_archive
+                source = Path(source)
+                destination = Path(destination)
+                if destination.name.endswith(".retired") and not swapped:
+                    swapped = True
+                    os.replace(source, detached_original)
+                    source.write_bytes(original_bytes)
+                    replacement_metadata = os.lstat(source)
+                    replacement_identity = (
+                        int(replacement_metadata.st_dev),
+                        int(replacement_metadata.st_ino),
+                    )
+                    replacement_archive = destination
+                real_replace(source, destination)
+
+            with (
+                patch.object(
+                    store_module,
+                    "guard_windows_file_disposition",
+                    side_effect=lambda **_kwargs: nullcontext(None),
+                ),
+                patch.object(
+                    store_module,
+                    "replace_file_noclobber",
+                    side_effect=swap_at_final_move,
+                ),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(swapped)
+            self.assertNotEqual(replacement_identity, original_identity)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertFalse(interrupted["complete"], interrupted)
+            self.assertTrue(interrupted["has_more"], interrupted)
+            self.assertEqual(interrupted["remaining"], 1, interrupted)
+            self.assertEqual(detached_original.read_bytes(), original_bytes)
+            self.assertIsNotNone(replacement_archive)
+            assert replacement_archive is not None
+            self.assertEqual(
+                replacement_archive.read_bytes(),
+                original_bytes,
+            )
+            archived_metadata = os.lstat(replacement_archive)
+            self.assertEqual(
+                (
+                    int(archived_metadata.st_dev),
+                    int(archived_metadata.st_ino),
+                ),
+                replacement_identity,
+            )
+            fresh_intents = list(active_dir.glob("*.json"))
+            self.assertEqual(len(fresh_intents), 1, interrupted)
+            self.assertNotEqual(fresh_intents[0].name, original_active.name)
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertTrue(resumed["complete"], resumed)
+            self.assertEqual(resumed["remaining"], 0, resumed)
+            self.assertFalse(list(active_dir.glob("*.json")))
+            self.assertEqual(
+                replacement_archive.read_bytes(),
+                original_bytes,
+            )
+
+    def test_portable_final_move_disappearance_publishes_fresh_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="portable-final-move-disappearance",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            active_dir = root / "run" / "card_sidecar_write_intents"
+            original_active = next(active_dir.glob("*.json"))
+            original_bytes = original_active.read_bytes()
+            detached = root / "exports" / "portable-vanished-queue.json"
+            real_replace = store_module.replace_file_noclobber
+            disappeared = False
+
+            def disappear_at_final_move(
+                source: Path,
+                destination: Path,
+            ) -> None:
+                nonlocal disappeared
+                source = Path(source)
+                destination = Path(destination)
+                if destination.name.endswith(".retired") and not disappeared:
+                    disappeared = True
+                    os.replace(source, detached)
+                    raise FileNotFoundError(
+                        "synthetic final portable move disappearance"
+                    )
+                real_replace(source, destination)
+
+            with (
+                patch.object(
+                    store_module,
+                    "guard_windows_file_disposition",
+                    side_effect=lambda **_kwargs: nullcontext(None),
+                ),
+                patch.object(
+                    store_module,
+                    "replace_file_noclobber",
+                    side_effect=disappear_at_final_move,
+                ),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(disappeared)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertFalse(interrupted["complete"], interrupted)
+            self.assertEqual(interrupted["remaining"], 1, interrupted)
+            self.assertEqual(detached.read_bytes(), original_bytes)
+            fresh_intents = list(active_dir.glob("*.json"))
+            self.assertEqual(len(fresh_intents), 1, interrupted)
+            self.assertNotEqual(fresh_intents[0].name, original_active.name)
+
+    @unittest.skipUnless(
+        os.name == "nt",
+        "Windows exact-handle durability is required for this regression",
+    )
+    def test_windows_guard_flushes_byte_equal_terminal_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="windows-terminal-replacement-flush",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            real_guard = store_module.guard_windows_file_disposition
+            swapped = False
+            replacement_identity: tuple[int, int] | None = None
+
+            @contextmanager
+            def replace_terminal_then_guard(
+                **kwargs: object,
+            ):
+                nonlocal swapped
+                nonlocal replacement_identity
+                terminal_path = Path(str(kwargs["terminal_path"]))
+                terminal_bytes = terminal_path.read_bytes()
+                preserved = terminal_path.with_name(
+                    f"{terminal_path.name}.preflush"
+                )
+                os.replace(terminal_path, preserved)
+                terminal_path.write_bytes(terminal_bytes)
+                metadata = os.lstat(terminal_path)
+                replacement_identity = (
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                )
+                swapped = True
+                with real_guard(**kwargs) as guarded:
+                    yield guarded
+
+            with (
+                patch.object(
+                    store_module,
+                    "guard_windows_file_disposition",
+                    side_effect=replace_terminal_then_guard,
+                ),
+                patch.object(
+                    permissions_module,
+                    "_flush_windows_handle_strict",
+                    wraps=(
+                        permissions_module
+                        ._flush_windows_handle_strict
+                    ),
+                ) as exact_flush,
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(replacement_identity)
+            self.assertGreaterEqual(exact_flush.call_count, 2)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertTrue(reconciled["complete"], reconciled)
+            self.assertEqual(reconciled["remaining"], 0)
+            self.assertFalse(
+                list(
+                    (
+                        root
+                        / "run"
+                        / "card_sidecar_retirement_intents"
+                    ).glob("*.json")
+                )
+            )
+
+    @unittest.skipUnless(
+        os.name == "nt",
+        "Windows namespace guards are required for this regression",
+    )
+    def test_retirement_disposition_failure_preserves_guarded_retry_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="resolved-directory-swap-retry",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            active_intent_path = next(intent_dir.glob("*.json"))
+            active_intent_metadata = os.lstat(active_intent_path)
+            original_queue_identity = (
+                int(active_intent_metadata.st_dev),
+                int(active_intent_metadata.st_ino),
+            )
+            original_queue_bytes = active_intent_path.read_bytes()
+            retirement_dir = (
+                root / "run" / "card_sidecar_retirement_intents"
+            )
+            resolved_dir = (
+                root / "exports" / "card_sidecar_resolved_intents"
+            )
+            preserved_resolved_dir = resolved_dir.with_name(
+                f"{resolved_dir.name}-detached"
+            )
+            disposition_attempted = False
+            rename_blocked = False
+            observed_queue_identity: tuple[int, int] | None = None
+
+            def fail_guarded_disposition(_handle: int) -> None:
+                nonlocal disposition_attempted
+                nonlocal rename_blocked
+                nonlocal observed_queue_identity
+                disposition_attempted = True
+                queue_paths = list(retirement_dir.glob("*.json"))
+                if len(queue_paths) != 1:
+                    raise AssertionError(
+                        "guarded retirement queue is not singular"
+                    )
+                queue_path = queue_paths[0]
+                queue_metadata = os.lstat(queue_path)
+                observed_queue_identity = (
+                    int(queue_metadata.st_dev),
+                    int(queue_metadata.st_ino),
+                )
+                try:
+                    os.rename(resolved_dir, preserved_resolved_dir)
+                except OSError:
+                    rename_blocked = True
+                else:
+                    raise AssertionError(
+                        "resolved intent directory escaped its Windows guard"
+                    )
+                raise OSError("synthetic guarded disposition failure")
+
+            with patch.object(
+                store_module,
+                "set_windows_delete_disposition",
+                side_effect=fail_guarded_disposition,
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(disposition_attempted)
+            self.assertTrue(rename_blocked)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertEqual(interrupted["remaining"], 1, interrupted)
+            self.assertFalse(interrupted["complete"], interrupted)
+            self.assertTrue(interrupted["has_more"], interrupted)
+            queue_paths = list(retirement_dir.glob("*.json"))
+            self.assertEqual(len(queue_paths), 1)
+            queue_metadata = os.lstat(queue_paths[0])
+            self.assertEqual(
+                (
+                    int(queue_metadata.st_dev),
+                    int(queue_metadata.st_ino),
+                ),
+                observed_queue_identity,
+            )
+            self.assertEqual(observed_queue_identity, original_queue_identity)
+            self.assertEqual(queue_paths[0].read_bytes(), original_queue_bytes)
+            self.assertFalse(preserved_resolved_dir.exists())
+            self.assertEqual(len(list(resolved_dir.glob("*.json"))), 1)
+            self.assertFalse(list(resolved_dir.glob("*.retired")))
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["processed"], 1)
+            self.assertEqual(resumed["remaining"], 0)
+            self.assertTrue(resumed["complete"])
+            self.assertFalse(list(retirement_dir.glob("*.json")))
+            self.assertEqual(len(list(resolved_dir.glob("*.json"))), 1)
+
+    @unittest.skipUnless(
+        os.name == "nt",
+        "Windows handle disposition is required for this regression",
+    )
+    def test_successful_retirement_disposition_has_no_postcommit_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="retirement-one-way-commit",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+
+            retirement_dir = (
+                root / "run" / "card_sidecar_retirement_intents"
+            )
+            resolved_dir = (
+                root / "exports" / "card_sidecar_resolved_intents"
+            )
+            real_disposition = (
+                store_module.set_windows_delete_disposition
+            )
+            real_flush_directory = store_module.flush_directory_strict
+            committed = False
+
+            def commit_disposition(handle: int) -> None:
+                nonlocal committed
+                real_disposition(handle)
+                committed = True
+
+            def reject_postcommit_flush(path: Path) -> None:
+                if committed:
+                    raise AssertionError(
+                        "fallible directory proof ran after retirement commit"
+                    )
+                real_flush_directory(Path(path))
+
+            with (
+                patch.object(
+                    store_module,
+                    "set_windows_delete_disposition",
+                    side_effect=commit_disposition,
+                ),
+                patch.object(
+                    store_module,
+                    "flush_directory_strict",
+                    side_effect=reject_postcommit_flush,
+                ),
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+
+            self.assertTrue(committed)
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["remaining"], 0)
+            self.assertTrue(reconciled["complete"])
+            self.assertFalse(list(retirement_dir.glob("*.json")))
+            self.assertEqual(len(list(resolved_dir.glob("*.json"))), 1)
+
+    def test_intent_retirement_access_error_is_not_reported_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="retirement-access-error",
+                    summary="An inaccessible intent remains unresolved authority.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+            finally:
+                conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=f"catalog/cards/{card_id}.yaml",
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            intent_identity = (
+                store_module._plain_card_sidecar_state_path_identity(
+                    intent_path,
+                    directory=False,
+                )
+            )
+            real_lstat = store_module.os.lstat
+
+            def deny_intent_lstat(path: object) -> os.stat_result:
+                if Path(path) == intent_path:
+                    raise PermissionError("intent metadata unavailable")
+                return real_lstat(path)
+
+            with (
+                patch.object(
+                    store_module.os,
+                    "lstat",
+                    side_effect=deny_intent_lstat,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "absence check failed",
+                ),
+            ):
+                store_module._retire_card_sidecar_write_intent(
+                    root,
+                    intent_path=intent_path,
+                    intent=intent,
+                    intent_entry_identity=intent_identity,
+                )
+
+            self.assertTrue(intent_path.is_file())
+
+    def test_receipt_cannot_spoof_concurrent_completion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="receipt-concurrent-completion-spoof",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+            with patch.object(
+                store_module,
+                "_retire_card_sidecar_write_intent",
+                side_effect=OSError("stop after durable receipt publication"),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+            intent_paths = list(
+                (
+                    root / "run" / "card_sidecar_write_intents"
+                ).glob("*.json")
+            )
+            receipt_paths = list(
+                (
+                    root
+                    / "exports"
+                    / "card_sidecar_recovery_receipts"
+                ).glob("*.json")
+            )
+            self.assertEqual(len(intent_paths), 1)
+            self.assertEqual(len(receipt_paths), 1)
+            receipt = json.loads(
+                receipt_paths[0].read_text(encoding="utf-8")
+            )
+            receipt["concurrent_completion"] = True
+            receipt_paths[0].write_text(
+                json.dumps(receipt, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(
+                root,
+                limit=1,
+            )
+
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertFalse(
+                resumed["results"][0]["concurrent_completion"],
+                resumed,
+            )
+            self.assertFalse(intent_paths[0].exists())
+
+    def test_worker_reports_final_intent_state_after_outbox_recovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="worker-outbox-intent-ordering",
+                    summary="Initial sidecar state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="worker_outbox_intent_ordering",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "Outbox must resolve the durable write before final intent status.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="worker_outbox_intent_ordering",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            observation: dict[str, object] = {}
+            conn = connect(root)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                artifact_index = store_module._immutable_artifact_path_index(
+                    root,
+                    conn,
+                )
+                store_module.sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    artifact_index=artifact_index,
+                    write_observation=observation,
+                )
+                self.assertTrue(observation.get("write_completed"))
+                conn.rollback()
+            finally:
+                conn.close()
+
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            self.assertEqual(len(list(intent_dir.glob("*.json"))), 1)
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM card_sidecar_outbox "
+                            "WHERE card_id = ?",
+                            (card_id,),
+                        ).fetchone()["n"]
+                    ),
+                    1,
+                )
+            finally:
+                conn.close()
+
+            worker = run_worker_pass(
+                root,
+                limit=1,
+                maintenance=True,
+            )
+
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(worker["maintenance"]["sidecars"]["synced"], 1)
+            final_intents = worker["maintenance"]["sidecar_intents"]
+            self.assertTrue(final_intents["ok"], worker)
+            self.assertEqual(final_intents["pending"], 0)
+            self.assertEqual(final_intents["remaining"], 0)
+            self.assertTrue(final_intents["complete"])
+            self.assertFalse(final_intents["has_more"])
+            self.assertFalse(list(intent_dir.glob("*.json")))
+
+    def test_worker_continues_bounded_outbox_backed_intent_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._create_pending_sidecar_cards(
+                root,
+                count=50,
+                namespace="worker-bounded-outbox-intent-retry",
+            )
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="worker-bounded-outbox-intent-retry-tail",
+                    summary="Initial tail sidecar state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            initial_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(initial_sync["ok"], initial_sync)
+
+            conn = connect(root)
+            try:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                default_path = resolve_stored_uri(root, default_uri)
+                default_bytes = default_path.read_bytes()
+                store_module.record_artifact(
+                    conn,
+                    kind="proof_input",
+                    uri=default_uri,
+                    sha256=hashlib.sha256(default_bytes).hexdigest(),
+                    size_bytes=len(default_bytes),
+                    source_type="worker_bounded_outbox_intent_retry",
+                    trust_level="local_generated",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "The bounded tail remains durable continuation work.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="worker_bounded_outbox_intent_retry",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            observation: dict[str, object] = {}
+            conn = connect(root)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                store_module.sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    artifact_index=store_module._immutable_artifact_path_index(
+                        root,
+                        conn,
+                    ),
+                    write_observation=observation,
+                )
+                self.assertTrue(observation.get("write_completed"))
+                conn.rollback()
+            finally:
+                conn.close()
+
+            first = run_worker_pass(
+                root,
+                limit=1,
+                maintenance=True,
+            )
+
+            first_intents = first["maintenance"]["sidecar_intents"]
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["maintenance"]["sidecars"]["synced"], 50)
+            self.assertTrue(first_intents["ok"], first)
+            self.assertEqual(first_intents["selected"], 50)
+            self.assertEqual(first_intents["processed"], 50)
+            self.assertIn(first_intents["pending"], {0, 1})
+            self.assertEqual(
+                sum(first_intents["status_counts"].values()),
+                50,
+            )
+            self.assertEqual(
+                first_intents["status_counts"].get(
+                    "pending_retry",
+                    0,
+                ),
+                first_intents["pending"],
+            )
+            self.assertEqual(first_intents["remaining"], 1)
+            self.assertTrue(first_intents["remaining_is_lower_bound"])
+            self.assertFalse(first_intents["complete"])
+            self.assertTrue(first_intents["has_more"])
+
+            service = worker_module.serve_workers(
+                root,
+                limit=2,
+                interval_seconds=0.1,
+                maintenance_interval_seconds=1.0,
+                maintenance_on_start=True,
+            )
+
+            self.assertTrue(service["ok"], service)
+            conn = connect_existing(root)
+            try:
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM card_sidecar_outbox"
+                        ).fetchone()["n"]
+                    ),
+                    0,
+                )
+            finally:
+                conn.close()
+            self.assertFalse(
+                list(
+                    (
+                        root / "run" / "card_sidecar_write_intents"
+                    ).glob("*.json")
+                )
+            )
+
+    def test_malformed_orphan_intent_fails_worker_and_service_truthfully(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="malformed-worker-orphan-intent",
+                    summary="Malformed recovery evidence must fail closed.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                conn.commit()
+            finally:
+                conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=f"catalog/cards/{card_id}.yaml",
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+            intent_path.write_text("{", encoding="utf-8")
+
+            worker = run_worker_pass(
+                root,
+                limit=1,
+                maintenance=True,
+            )
+
+            intent_result = worker["maintenance"]["sidecar_intents"]
+            self.assertFalse(worker["ok"], worker)
+            self.assertFalse(intent_result["ok"], worker)
+            self.assertEqual(intent_result["failure_count"], 1)
+            self.assertTrue(intent_path.is_file())
+
+            service = worker_module.serve_workers(
+                root,
+                limit=3,
+                interval_seconds=0.1,
+            )
+
+            self.assertFalse(service["ok"], service)
+            self.assertEqual(service["reason"], "worker_pass_failed")
+            self.assertEqual(service["passes"], 1)
+            self.assertFalse(service["failed_pass"]["ok"])
+            self.assertTrue(intent_path.is_file())
+
+    def test_sidecar_intent_unknown_count_has_zero_lower_bound(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="unknown-intent-count",
+                    summary="An unavailable scan must not invent pending work.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+            finally:
+                conn.close()
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=f"catalog/cards/{card_id}.yaml",
+                expected_state_hash=str(payload["state_hash"]),
+            )
+
+            with patch.object(
+                store_module,
+                "_bounded_card_sidecar_intent_inventory",
+                side_effect=OSError("intent namespace unavailable"),
+            ):
+                result = store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    limit=50,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIsNone(result["remaining"])
+            self.assertTrue(result["remaining_is_lower_bound"])
+            self.assertEqual(result["remaining_lower_bound"], 0)
+            self.assertFalse(result["complete"])
+            self.assertTrue(result["has_more"])
+
+    def test_worker_intent_scan_exception_does_not_invent_pending_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+
+            with patch.object(
+                worker_module,
+                "reconcile_card_sidecar_write_intents",
+                side_effect=OSError("intent scan unavailable"),
+            ):
+                result = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=True,
+                )
+
+            intent_result = result["maintenance"]["sidecar_intents"]
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(intent_result["ok"], result)
+            self.assertEqual(intent_result["pending"], 0)
+            self.assertIsNone(intent_result["remaining"])
+            self.assertTrue(intent_result["remaining_is_lower_bound"])
+            self.assertEqual(intent_result["remaining_lower_bound"], 0)
+            self.assertFalse(intent_result["complete"])
+            self.assertTrue(intent_result["has_more"])
+            self.assertEqual(intent_result["failure_count"], 1)
+            self.assertEqual(intent_result["enumerated"], 0)
 
     def test_worker_card_review_does_not_recover_unrelated_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -740,6 +3095,494 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertFalse(
                 resolve_stored_uri(root, locations[unrelated_id]).exists()
             )
+
+    def test_worker_card_review_uses_global_intent_resolution_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="bounded-card-review-intents",
+                    summary="Every worker alias must honor the same budget.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                    dedupe_key=f"bounded-review-intents:{card_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            for _index in range(51):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            reconciliation_calls: list[dict[str, object]] = []
+            real_reconcile = (
+                store_module.reconcile_card_sidecar_write_intents
+            )
+
+            def capture_reconciliation(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = real_reconcile(*args, **kwargs)
+                reconciliation_calls.append(
+                    {
+                        "kwargs": dict(kwargs),
+                        "selected": int(result.get("selected", 0)),
+                        "processed": int(result.get("processed", 0)),
+                    }
+                )
+                return result
+
+            with patch.object(
+                store_module,
+                "reconcile_card_sidecar_write_intents",
+                side_effect=capture_reconciliation,
+            ):
+                worker = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(worker["ok"], worker)
+            self.assertEqual(worker["processed_count"], 1)
+            self.assertEqual(len(reconciliation_calls), 1)
+            for call in reconciliation_calls:
+                self.assertEqual(
+                    call["kwargs"].get("limit"),
+                    worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+                )
+                self.assertNotIn("card_ids", call["kwargs"])
+                self.assertLessEqual(
+                    int(call["selected"]),
+                    worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+                )
+                self.assertLessEqual(
+                    int(call["processed"]),
+                    worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+                )
+            self.assertGreaterEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "run"
+                            / "card_sidecar_write_intents"
+                        ).glob("*.json")
+                    )
+                )
+                + len(
+                    list(
+                        (
+                            root
+                            / "run"
+                            / "card_sidecar_retirement_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                2,
+            )
+
+    def test_worker_pass_caps_nested_review_and_conflict_reconciliation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                previous = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Nested Worker Budget",
+                    summary="Use the nested worker budget.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    project_id="continuum",
+                    session_id="budget-a",
+                )
+                current = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Nested Worker Budget",
+                    summary="Do not use the nested worker budget.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    project_id="continuum",
+                    session_id="budget-b",
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=1,
+                    payload={"card_id": current},
+                    related_card_ids=[current],
+                    dedupe_key=f"nested-worker-budget:{current}",
+                )
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            for _index in range(101):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=current,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            calls: list[dict[str, int]] = []
+            real_reconcile = (
+                store_module.reconcile_card_sidecar_write_intents
+            )
+
+            def capture_reconciliation(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = real_reconcile(*args, **kwargs)
+                calls.append(
+                    {
+                        "limit": int(kwargs.get("limit", 0)),
+                        "inspected": int(result.get("inspected", 0)),
+                        "selected": int(result.get("selected", 0)),
+                        "processed": int(result.get("processed", 0)),
+                    }
+                )
+                return result
+
+            with patch.object(
+                store_module,
+                "reconcile_card_sidecar_write_intents",
+                side_effect=capture_reconciliation,
+            ):
+                worker = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            budget = worker["sidecar_intent_budget"]
+            self.assertFalse(worker["ok"], worker)
+            self.assertEqual(worker["processed_count"], 1)
+            self.assertGreaterEqual(len(calls), 1)
+            self.assertLessEqual(
+                sum(call["inspected"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(call["selected"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(call["processed"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertTrue(
+                all(
+                    0 < call["limit"]
+                    <= worker_module.WORKER_SIDECAR_INTENT_LIMIT
+                    for call in calls
+                ),
+                calls,
+            )
+            self.assertEqual(
+                budget["limit"],
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                budget["used"],
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertEqual(budget["remaining"], 0)
+            conn = connect_existing(root)
+            try:
+                pending_outbox = {
+                    str(pending["card_id"])
+                    for pending in conn.execute(
+                        "SELECT card_id FROM card_sidecar_outbox"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIn(current, pending_outbox)
+            self.assertIn(previous, pending_outbox)
+            self.assertGreaterEqual(
+                len(
+                    list(
+                        (
+                            root
+                            / "run"
+                            / "card_sidecar_write_intents"
+                        ).glob("*.json")
+                    )
+                )
+                + len(
+                    list(
+                        (
+                            root
+                            / "run"
+                            / "card_sidecar_retirement_intents"
+                        ).glob("*.json")
+                    )
+                ),
+                51,
+            )
+
+    def test_worker_scribe_uses_shared_intent_budget_and_reports_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            unrelated_id = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="scribe-shared-intent-budget",
+            )[0]
+            conn = connect(root)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (unrelated_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            session_id = "scribe-shared-budget-session"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="Scribe must share the global recovery budget.",
+            )
+            for _index in range(101):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=unrelated_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            calls: list[dict[str, int]] = []
+            real_reconcile = (
+                store_module.reconcile_card_sidecar_write_intents
+            )
+
+            def capture_reconciliation(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = real_reconcile(*args, **kwargs)
+                calls.append(
+                    {
+                        "enumerated": int(result.get("enumerated", 0)),
+                        "inspected": int(result.get("inspected", 0)),
+                        "selected": int(result.get("selected", 0)),
+                        "processed": int(result.get("processed", 0)),
+                        "budget_charged": int(
+                            result.get("budget_charged", 0)
+                        ),
+                    }
+                )
+                return result
+
+            with patch.object(
+                store_module,
+                "reconcile_card_sidecar_write_intents",
+                side_effect=capture_reconciliation,
+            ):
+                worker = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(worker["ok"], worker)
+            self.assertEqual(worker["processed_count"], 1)
+            self.assertEqual(len(calls), 1, calls)
+            self.assertLessEqual(
+                sum(call["inspected"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(call["selected"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(call["processed"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertLessEqual(
+                sum(call["enumerated"] for call in calls),
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT + 1,
+            )
+            budget = worker["sidecar_intent_budget"]
+            self.assertEqual(
+                budget["used"],
+                sum(call["budget_charged"] for call in calls),
+            )
+            self.assertEqual(budget["remaining"], 0)
+            processed = worker["processed"][0]
+            self.assertEqual(processed["status"], "failed", processed)
+            self.assertFalse(processed["result"]["ok"], processed)
+            self.assertTrue(
+                processed["result"]["sidecar_failures"],
+                processed,
+            )
+            conn = connect_existing(root)
+            try:
+                segment_card_id = str(
+                    conn.execute(
+                        """
+                        SELECT summary_card_id
+                        FROM scroll_segments
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchone()["summary_card_id"]
+                )
+                retry_pending = (
+                    conn.execute(
+                        """
+                        SELECT 1
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (segment_card_id,),
+                    ).fetchone()
+                    is not None
+                )
+            finally:
+                conn.close()
+            self.assertTrue(retry_pending, worker)
+
+    def test_nested_conflict_budget_failure_propagates_after_exact_first_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                previous = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Exact Nested Budget",
+                    summary="Use the exact nested budget.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    project_id="continuum",
+                    session_id="exact-budget-a",
+                )
+                current = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Exact Nested Budget",
+                    summary="Do not use the exact nested budget.",
+                    source_refs=[],
+                    visibility_scope="project",
+                    project_id="continuum",
+                    session_id="exact-budget-b",
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=1,
+                    payload={"card_id": current},
+                    related_card_ids=[current],
+                    dedupe_key=f"exact-nested-budget:{current}",
+                )
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+            finally:
+                conn.close()
+            for _index in range(49):
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=current,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+
+            worker = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=1,
+                maintenance=False,
+            )
+
+            self.assertFalse(worker["ok"], worker)
+            self.assertEqual(worker["processed_count"], 1)
+            self.assertEqual(
+                worker["sidecar_intent_budget"]["used"],
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            processed = worker["processed"][0]
+            review = processed["result"]
+            self.assertEqual(processed["status"], "failed", processed)
+            self.assertTrue(review["sidecars"]["ok"], review)
+            self.assertFalse(review["conflicts"]["ok"], review)
+            self.assertFalse(review["ok"], review)
+            conn = connect_existing(root)
+            try:
+                pending_outbox = {
+                    str(pending["card_id"])
+                    for pending in conn.execute(
+                        "SELECT card_id FROM card_sidecar_outbox"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIn(previous, pending_outbox)
+            self.assertIn(current, pending_outbox)
 
     def test_worker_scribe_does_not_recover_unrelated_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1605,6 +4448,148 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 segment_id,
             )
 
+    def test_scribe_final_receipt_crash_replays_sidecar_failure_truthfully(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            session_id = "scribe-sidecar-failure-replay"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="A failed sidecar phase must remain failed after replay.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            sidecar_failure = {
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "forced bounded sidecar failure"}],
+            }
+            with (
+                patch.object(
+                    store_module,
+                    "sync_card_sidecars_after_commit",
+                    return_value=sidecar_failure,
+                ),
+                patch.object(
+                    worker_module,
+                    "_record_worker_effect",
+                    side_effect=RuntimeError(
+                        "forced final Scribe receipt failure"
+                    ),
+                ),
+            ):
+                interrupted = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+
+            conn = connect(root)
+            try:
+                receipt_counts = {
+                    str(row["action"]): int(row["n"])
+                    for row in conn.execute(
+                        """
+                        SELECT action, count(*) AS n
+                        FROM audit_events
+                        WHERE target_type = 'queue_job' AND target_id = ?
+                          AND action IN (
+                              'worker_scribe_segment_step_committed',
+                              'worker_scribe_segment_step_completed',
+                              'worker_job_effect_committed'
+                          )
+                        GROUP BY action
+                        """,
+                        (job_id,),
+                    ).fetchall()
+                }
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'pending', started_at = NULL,
+                        finished_at = NULL, lease_owner = NULL,
+                        lease_expires_at = NULL, heartbeat_at = NULL,
+                        error_json = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(
+                receipt_counts,
+                {
+                    "worker_scribe_segment_step_committed": 1,
+                    "worker_scribe_segment_step_completed": 1,
+                },
+            )
+
+            replayed = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+
+            self.assertFalse(replayed["ok"], replayed)
+            replay_result = replayed["processed"][0]["result"]
+            self.assertFalse(replay_result["ok"], replay_result)
+            self.assertTrue(
+                replay_result["sidecar_failures"],
+                replay_result,
+            )
+            self.assertFalse(
+                replay_result["rolled"][0]["sidecars"]["ok"],
+                replay_result,
+            )
+            self.assertEqual(
+                replayed["processed"][0]["status"],
+                "failed",
+                replayed,
+            )
+            conn = connect_existing(root)
+            try:
+                terminal_payload = json.loads(
+                    conn.execute(
+                        """
+                        SELECT payload_json
+                        FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_id = ?
+                        ORDER BY rowid DESC
+                        LIMIT 1
+                        """,
+                        (job_id,),
+                    ).fetchone()["payload_json"]
+                )
+            finally:
+                conn.close()
+            self.assertFalse(terminal_payload["result"]["ok"])
+
     def test_scribe_final_transaction_guard_rolls_back_step_and_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -2275,6 +5260,318 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     conn.close()
                 self.assertEqual(tables_after, tables_before)
                 self.assertIn("audit_events", tables_after)
+
+    def test_card_review_core_phase_replays_failure_before_terminal_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="decision",
+                    title="Placement phase replay",
+                    summary="Post-core failures must remain authoritative.",
+                    source_refs=[],
+                    topics=["placement-phase"],
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            sidecar_failure = {
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "forced sidecar failure"}],
+            }
+            conflict_failure = {
+                "ok": False,
+                "reason": "forced conflict failure",
+            }
+            with (
+                patch.object(
+                    worker_module,
+                    "_sync_worker_card_sidecars",
+                    return_value=sidecar_failure,
+                ),
+                patch.object(
+                    worker_module,
+                    "detect_conflicts",
+                    return_value=conflict_failure,
+                ),
+                patch.object(
+                    worker_module,
+                    "_commit_worker_effect_result",
+                    side_effect=RuntimeError(
+                        "forced placement terminal receipt failure"
+                    ),
+                ),
+            ):
+                interrupted = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+
+            conn = connect(root)
+            try:
+                phase_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM audit_events
+                        WHERE action = 'worker_job_phase_committed'
+                          AND target_id = ?
+                          AND json_extract(payload_json, '$.job_type')
+                              = 'review_card_placement'
+                          AND json_extract(payload_json, '$.phase') = 'core'
+                        """,
+                        (job_id,),
+                    ).fetchone()["n"]
+                )
+                terminal_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM audit_events
+                        WHERE action = 'worker_job_effect_committed'
+                          AND target_id = ?
+                        """,
+                        (job_id,),
+                    ).fetchone()["n"]
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'pending', started_at = NULL,
+                        finished_at = NULL, lease_owner = NULL,
+                        lease_expires_at = NULL, heartbeat_at = NULL,
+                        error_json = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(phase_count, 1)
+            self.assertEqual(terminal_count, 0)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "_sync_worker_card_sidecars",
+                    return_value=sidecar_failure,
+                ) as sidecar_sync,
+                patch.object(
+                    worker_module,
+                    "detect_conflicts",
+                    return_value=conflict_failure,
+                ),
+            ):
+                replayed = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(replayed["ok"], replayed)
+            self.assertEqual(
+                replayed["processed"][0]["status"],
+                "failed",
+                replayed,
+            )
+            self.assertFalse(
+                replayed["processed"][0]["result"]["ok"],
+                replayed,
+            )
+            sidecar_sync.assert_called_once_with(root, [card_id])
+            conn = connect_existing(root)
+            try:
+                final_counts = {
+                    str(row["action"]): int(row["n"])
+                    for row in conn.execute(
+                        """
+                        SELECT action, count(*) AS n
+                        FROM audit_events
+                        WHERE target_id = ?
+                          AND action IN (
+                              'worker_job_phase_committed',
+                              'worker_job_effect_committed'
+                          )
+                        GROUP BY action
+                        """,
+                        (job_id,),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                final_counts,
+                {
+                    "worker_job_effect_committed": 1,
+                    "worker_job_phase_committed": 1,
+                },
+            )
+
+    def test_mempalace_core_phase_replays_sidecar_failure_before_terminal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            import_id = "mempalace-phase-replay"
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="mempalace_drawer",
+                    title="MemPalace phase replay",
+                    summary="The imported Card keeps post-core failure truth.",
+                    source_refs=[],
+                    metadata={"import_id": import_id},
+                )
+                card_node = upsert_graph_node(
+                    conn,
+                    kind="card",
+                    label="MemPalace phase replay",
+                    card_id=card_id,
+                )
+                term_node = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="mempalace",
+                )
+                add_graph_edge(
+                    conn,
+                    source_node_id=card_node,
+                    relation="mentions",
+                    target_node_id=term_node,
+                    weight=0.5,
+                    confidence=0.8,
+                    source_refs=[{"card_id": card_id}],
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_mempalace_import",
+                    priority=1,
+                    payload={"import_id": import_id},
+                    related_card_ids=[card_id],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            sidecar_failure = {
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "forced imported sidecar failure"}],
+            }
+            with (
+                patch.object(
+                    worker_module,
+                    "_sync_worker_card_sidecars",
+                    return_value=sidecar_failure,
+                ),
+                patch.object(
+                    worker_module,
+                    "_commit_worker_effect_result",
+                    side_effect=RuntimeError(
+                        "forced MemPalace terminal receipt failure"
+                    ),
+                ),
+            ):
+                interrupted = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+
+            conn = connect(root)
+            try:
+                phase_payload = json.loads(
+                    conn.execute(
+                        """
+                        SELECT payload_json
+                        FROM audit_events
+                        WHERE action = 'worker_job_phase_committed'
+                          AND target_id = ?
+                          AND json_extract(payload_json, '$.job_type')
+                              = 'review_mempalace_import'
+                          AND json_extract(payload_json, '$.phase') = 'core'
+                        ORDER BY rowid DESC
+                        LIMIT 1
+                        """,
+                        (job_id,),
+                    ).fetchone()["payload_json"]
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'pending', started_at = NULL,
+                        finished_at = NULL, lease_owner = NULL,
+                        lease_expires_at = NULL, heartbeat_at = NULL,
+                        error_json = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(
+                phase_payload["result"]["changed_cards"],
+                [card_id],
+            )
+            self.assertEqual(
+                phase_payload["result"]["core_result"]["reviewed_cards"],
+                1,
+            )
+
+            with patch.object(
+                worker_module,
+                "_sync_worker_card_sidecars",
+                return_value=sidecar_failure,
+            ) as sidecar_sync:
+                replayed = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(replayed["ok"], replayed)
+            replay_result = replayed["processed"][0]["result"]
+            self.assertFalse(replay_result["ok"], replay_result)
+            self.assertEqual(replay_result["reviewed_cards"], 1)
+            self.assertEqual(
+                replayed["processed"][0]["status"],
+                "failed",
+                replayed,
+            )
+            sidecar_sync.assert_called_once_with(root, [card_id])
 
     def test_prune_memory_requires_topic_or_explicit_global_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5735,7 +9032,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 "MAX_CARD_SIDECAR_WRITE_INTENTS",
                 2,
             ):
-                bounded_paths, overflow = (
+                bounded_paths, overflow, enumerated = (
                     store_module._bounded_card_sidecar_intent_paths(intent_dir)
                 )
                 reconciled = store_module.reconcile_card_sidecar_write_intents(
@@ -5746,6 +9043,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
 
             self.assertTrue(overflow)
             self.assertEqual(len(bounded_paths), 2)
+            self.assertEqual(enumerated, 3)
             self.assertTrue(reconciled["overflow"], reconciled)
             self.assertEqual(reconciled["processed"], 0)
             self.assertEqual(
@@ -5756,6 +9054,216 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 integrity["checks"]["unresolved_card_sidecar_write_intents"],
                 2,
             )
+
+    def test_active_and_retirement_debris_share_one_enumeration_cap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            retirement_state = (
+                store_module._validated_card_sidecar_state_dir(
+                    root,
+                    purpose="retirement_intent",
+                    create=True,
+                )
+            )
+            self.assertIsNotNone(intent_state)
+            self.assertIsNotNone(retirement_state)
+            assert intent_state is not None
+            assert retirement_state is not None
+            for index in range(4):
+                (retirement_state[0] / f"retirement-debris-{index}").write_text(
+                    "debris",
+                    encoding="utf-8",
+                )
+                (intent_state[0] / f"intent-debris-{index}").write_text(
+                    "debris",
+                    encoding="utf-8",
+                )
+
+            with patch.object(
+                store_module,
+                "MAX_CARD_SIDECAR_WRITE_INTENTS",
+                2,
+            ):
+                (
+                    intent_paths,
+                    retirement_paths,
+                    truncated,
+                    enumerated,
+                ) = store_module._bounded_card_sidecar_intent_inventory(
+                    intent_state[0],
+                    retirement_state[0],
+                    entry_limit=2,
+                )
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=2,
+                    )
+                )
+
+            self.assertEqual(intent_paths, [])
+            self.assertEqual(retirement_paths, [])
+            self.assertTrue(truncated)
+            self.assertEqual(enumerated, 3)
+            self.assertEqual(reconciled["enumerated"], 3, reconciled)
+            self.assertTrue(reconciled["batch_truncated"], reconciled)
+            self.assertTrue(reconciled["overflow"], reconciled)
+            self.assertFalse(reconciled["complete"], reconciled)
+
+    def test_retirement_debris_cannot_starve_active_sidecar_intent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Active intent fairness",
+                    summary="Retirement debris cannot hide active authority.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+            retirement_state = (
+                store_module._validated_card_sidecar_state_dir(
+                    root,
+                    purpose="retirement_intent",
+                    create=True,
+                )
+            )
+            self.assertIsNotNone(retirement_state)
+            assert retirement_state is not None
+            debris_paths = [
+                retirement_state[0] / f"stable-retirement-debris-{index}"
+                for index in range(2)
+            ]
+            for debris_path in debris_paths:
+                debris_path.write_text("debris", encoding="utf-8")
+
+            reconciled = (
+                store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    limit=2,
+                )
+            )
+
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["enumerated"], 3, reconciled)
+            self.assertEqual(reconciled["inspected"], 1, reconciled)
+            self.assertEqual(reconciled["selected"], 1, reconciled)
+            self.assertEqual(reconciled["processed"], 1, reconciled)
+            self.assertTrue(reconciled["batch_truncated"], reconciled)
+            self.assertFalse(intent_path.exists())
+            self.assertTrue(all(path.is_file() for path in debris_paths))
+
+    def test_active_debris_reports_bounded_progress_blocked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            assert intent_state is not None
+            debris_paths = [
+                intent_state[0] / f"000-stable-active-debris-{index}"
+                for index in range(2)
+            ]
+            for debris_path in debris_paths:
+                debris_path.write_text("debris", encoding="utf-8")
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Active debris progress",
+                    summary="A blocked scan must never report false success.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+
+            attempts = [
+                store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    limit=2,
+                )
+                for _index in range(3)
+            ]
+
+            for reconciled in attempts:
+                self.assertFalse(reconciled["ok"], reconciled)
+                self.assertTrue(
+                    reconciled["progress_blocked"],
+                    reconciled,
+                )
+                self.assertEqual(reconciled["enumerated"], 3, reconciled)
+                self.assertEqual(reconciled["inspected"], 0, reconciled)
+                self.assertEqual(reconciled["selected"], 0, reconciled)
+                self.assertEqual(reconciled["processed"], 0, reconciled)
+                self.assertTrue(
+                    any(
+                        failure.get("reason")
+                        == "bounded_inventory_progress_blocked"
+                        for failure in reconciled["failures"]
+                    ),
+                    reconciled,
+                )
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(all(path.is_file() for path in debris_paths))
 
     def test_disabled_unmaterialized_card_review_does_not_block_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

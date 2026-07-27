@@ -21,6 +21,9 @@ from .temporal_authority import (
     valid_conflict_resolution_receipt,
 )
 from .store import (
+    _card_sidecar_intent_reconciliation_budget,
+    _card_sidecar_intent_reconciliation_limit,
+    _current_card_sidecar_intent_reconciliation_budget,
     _project_state_card_integrity_error,
     add_graph_edge,
     audit_event,
@@ -66,6 +69,8 @@ MAX_PRUNE_MEMORY_LIMIT = 1000
 PRUNE_MEMORY_LITERAL_MATCHING_MODE = "literal_substring"
 PRUNE_MEMORY_GLOBAL_MATCHING_MODE = "explicit_global"
 DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
+WORKER_SIDECAR_INTENT_LIMIT = 50
+WORKER_MAINTENANCE_FAILURE_LIMIT = 10
 # A single notification may represent an arbitrarily large per-session backlog
 # because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
 # than one window, but yield after a bounded amount of work and leave a durable
@@ -75,10 +80,14 @@ _WORKER_SERVICE_ROOTS: set[str] = set()
 _WORKER_SERVICE_ROOTS_GUARD = threading.Lock()
 _WORKER_EFFECT_ACTION = "worker_job_effect_committed"
 _WORKER_EFFECT_SCHEMA = "continuum.worker_job_effect.v1"
+_WORKER_POST_PHASE_COMPLETE_KEY = "_worker_post_phase_complete"
+_WORKER_PHASE_ACTION = "worker_job_phase_committed"
+_WORKER_PHASE_SCHEMA = "continuum.worker_job_phase.v1"
 _SIDECAR_WORKER_PHASE_ACTION = "worker_card_sidecar_phase_committed"
 _SIDECAR_WORKER_PHASE_SCHEMA = "continuum.worker_card_sidecar_phase.v1"
 _SCRIBE_STEP_ACTION = "worker_scribe_segment_step_intent"
 _SCRIBE_STEP_COMMITTED_ACTION = "worker_scribe_segment_step_committed"
+_SCRIBE_STEP_COMPLETED_ACTION = "worker_scribe_segment_step_completed"
 
 
 class _JobLease:
@@ -122,6 +131,189 @@ _CURRENT_JOB_LEASE: contextvars.ContextVar[_JobLease | None] = contextvars.Conte
     "continuum_current_job_lease",
     default=None,
 )
+
+
+def _worker_sidecar_intent_budget_snapshot(
+    budget: dict[str, int],
+) -> dict[str, int]:
+    return {
+        "limit": int(budget["limit"]),
+        "used": int(budget["used"]),
+        "remaining": int(budget["remaining"]),
+    }
+
+
+def _worker_sidecar_intent_budget_allowance(
+    requested_limit: int = WORKER_SIDECAR_INTENT_LIMIT,
+) -> tuple[dict[str, int], int, bool]:
+    bounded_request = max(
+        1,
+        min(int(requested_limit), WORKER_SIDECAR_INTENT_LIMIT),
+    )
+    shared_budget = (
+        _current_card_sidecar_intent_reconciliation_budget()
+    )
+    if shared_budget is None:
+        standalone_budget = {
+            "limit": bounded_request,
+            "used": 0,
+            "remaining": bounded_request,
+        }
+        return standalone_budget, bounded_request, False
+    return (
+        shared_budget,
+        min(bounded_request, max(0, int(shared_budget["remaining"]))),
+        True,
+    )
+
+
+def _charge_worker_sidecar_intent_budget(
+    budget: dict[str, int],
+    *,
+    allowance: int,
+    result: dict[str, Any] | None,
+) -> int:
+    if allowance <= 0:
+        return 0
+    if result is None or result.get("remaining") is None:
+        charge = allowance
+    else:
+        charge = max(
+            max(0, int(result.get("enumerated", 0))),
+            max(0, int(result.get("inspected", 0))),
+            max(0, int(result.get("selected", 0))),
+            max(0, int(result.get("processed", 0))),
+        )
+        if not result.get("ok") and not result.get("complete"):
+            charge = allowance
+    charge = min(allowance, charge)
+    budget["used"] = min(
+        int(budget["limit"]),
+        int(budget["used"]) + charge,
+    )
+    budget["remaining"] = max(
+        0,
+        int(budget["limit"]) - int(budget["used"]),
+    )
+    return charge
+
+
+def _worker_sidecar_intent_budget_exhausted_result(
+    budget: dict[str, int],
+    *,
+    card_id: str | None,
+    ok: bool,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "processed": 0,
+        "pending": 0 if ok else 1,
+        "failures": (
+            []
+            if ok
+            else [
+                {
+                    "card_id": card_id,
+                    "error": (
+                        "Worker Card sidecar intent reconciliation budget "
+                        "was exhausted"
+                    ),
+                }
+            ]
+        ),
+        "results": [],
+        "limit": 0,
+        "selected": 0,
+        "inspected": 0,
+        "enumerated": 0,
+        "remaining": None,
+        "remaining_is_lower_bound": True,
+        "complete": False,
+        "has_more": True,
+        "remaining_lower_bound": 0,
+        "batch_truncated": True,
+        "overflow": False,
+        "scope_filtered": False,
+        "scope_complete": False,
+        "deferred": True,
+        "budget_exhausted": True,
+        "worker_intent_budget": _worker_sidecar_intent_budget_snapshot(
+            budget
+        ),
+    }
+
+
+def _reconcile_worker_sidecar_intents_with_budget(
+    root: Path,
+    *,
+    card_id: str | None = None,
+    requested_limit: int = WORKER_SIDECAR_INTENT_LIMIT,
+    exhausted_ok: bool = False,
+) -> dict[str, Any]:
+    budget, allowance, shared = (
+        _worker_sidecar_intent_budget_allowance(requested_limit)
+    )
+    if allowance <= 0:
+        return _worker_sidecar_intent_budget_exhausted_result(
+            budget,
+            card_id=card_id,
+            ok=exhausted_ok,
+        )
+    try:
+        raw_result = reconcile_card_sidecar_write_intents(
+            root,
+            limit=allowance,
+        )
+    except Exception as exc:
+        if not shared:
+            _charge_worker_sidecar_intent_budget(
+                budget,
+                allowance=allowance,
+                result=None,
+            )
+        error = f"{type(exc).__name__}: {str(exc)[:512]}"
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 1 if card_id else 0,
+            "failures": [{"card_id": card_id, "error": error}],
+            "results": [],
+            "limit": allowance,
+            "selected": 0,
+            "inspected": 0,
+            "enumerated": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": True,
+            "overflow": False,
+            "raised": True,
+            "error": error,
+            "scope_filtered": False,
+            "scope_complete": False,
+            "budget_exhausted": budget["remaining"] == 0,
+            "worker_intent_budget": (
+                _worker_sidecar_intent_budget_snapshot(budget)
+            ),
+        }
+    result = dict(raw_result)
+    if not shared:
+        result["budget_charged"] = (
+            _charge_worker_sidecar_intent_budget(
+                budget,
+                allowance=allowance,
+                result=result,
+            )
+        )
+    result["budget_exhausted"] = bool(
+        budget["remaining"] == 0 and not result.get("complete")
+    )
+    result["worker_intent_budget"] = (
+        _worker_sidecar_intent_budget_snapshot(budget)
+    )
+    return result
 
 
 def _lease_renewal_interval(lease_seconds: int) -> float:
@@ -373,7 +565,7 @@ def _prior_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None
         SELECT payload_json
         FROM audit_events
         WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
-        ORDER BY created_at DESC, id DESC
+        ORDER BY rowid DESC
         LIMIT 1
         """,
         (_WORKER_EFFECT_ACTION, lease.job_id),
@@ -384,7 +576,10 @@ def _prior_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None
     result = payload.get("result") if isinstance(payload, dict) else None
     if not isinstance(result, dict):
         return None
-    return {**result, "idempotent_replay": True}
+    replayed = {**result, "idempotent_replay": True}
+    if payload.get("post_phase_complete") is True:
+        replayed[_WORKER_POST_PHASE_COMPLETE_KEY] = True
+    return replayed
 
 
 def _record_worker_effect(
@@ -393,6 +588,7 @@ def _record_worker_effect(
     *,
     job_type: str,
     result: dict[str, Any],
+    post_phase_complete: bool = False,
 ) -> None:
     if lease is None:
         return
@@ -405,6 +601,7 @@ def _record_worker_effect(
         payload={
             "schema": _WORKER_EFFECT_SCHEMA,
             "job_type": job_type,
+            "post_phase_complete": bool(post_phase_complete),
             "result": result,
         },
     )
@@ -415,6 +612,92 @@ def _begin_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None
         return None
     lease.assert_owned(conn)
     return _prior_worker_effect(conn, lease)
+
+
+def _prior_worker_phase(
+    conn,
+    lease: _JobLease | None,
+    *,
+    job_type: str,
+    phase: str,
+) -> dict[str, Any] | None:
+    if lease is None:
+        return None
+    lease.assert_owned(conn)
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.job_type') = ?
+          AND json_extract(payload_json, '$.phase') = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (_WORKER_PHASE_ACTION, lease.job_id, job_type, phase),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json_loads(row["payload_json"], {})
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"Committed {job_type} worker phase has an invalid result"
+        )
+    return result
+
+
+def _record_worker_phase(
+    conn,
+    lease: _JobLease | None,
+    *,
+    job_type: str,
+    phase: str,
+    result: dict[str, Any],
+) -> None:
+    if lease is None:
+        return
+    lease.assert_owned(conn)
+    audit_event(
+        conn,
+        action=_WORKER_PHASE_ACTION,
+        target_type="queue_job",
+        target_id=lease.job_id,
+        payload={
+            "schema": _WORKER_PHASE_SCHEMA,
+            "job_type": job_type,
+            "phase": phase,
+            "result": result,
+        },
+    )
+
+
+def _commit_worker_effect_result(
+    root: Path,
+    lease: _JobLease | None,
+    *,
+    job_type: str,
+    result: dict[str, Any],
+) -> None:
+    if lease is None:
+        return
+    receipt_conn = connect(root)
+    try:
+        receipt_conn.execute("BEGIN IMMEDIATE")
+        _record_worker_effect(
+            receipt_conn,
+            lease,
+            job_type=job_type,
+            result=result,
+            post_phase_complete=True,
+        )
+        receipt_conn.commit()
+    except Exception:
+        receipt_conn.rollback()
+        raise
+    finally:
+        receipt_conn.close()
 
 
 def _commit_sidecar_worker_phase(
@@ -457,22 +740,160 @@ def _commit_sidecar_worker_phase(
 def _reconcile_sidecar_worker_intents(root: Path, card_id: str) -> dict[str, Any]:
     """Convert transient reconciliation exceptions into durable retry state."""
 
-    try:
-        return reconcile_card_sidecar_write_intents(
-            root,
-            card_ids=[card_id],
-        )
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {str(exc)[:512]}"
+    return _reconcile_worker_sidecar_intents_with_budget(
+        root,
+        card_id=card_id,
+    )
+
+
+def _defer_worker_card_sidecars_for_intent_budget(
+    root: Path,
+    card_ids: list[str],
+    budget: dict[str, int],
+) -> dict[str, Any]:
+    unique_card_ids = [
+        card_id for card_id in dict.fromkeys(card_ids) if card_id
+    ]
+    if not unique_card_ids:
         return {
-            "ok": False,
-            "processed": 0,
-            "pending": 1,
-            "failures": [{"card_id": card_id, "error": error}],
-            "results": [],
-            "raised": True,
-            "error": error,
+            "ok": True,
+            "synced": 0,
+            "deferred": 0,
+            "failed": 0,
+            "failures": [],
+            "compensation_cas_complete": True,
+            "compensation_cas_rows": [],
+            "worker_intent_budget": (
+                _worker_sidecar_intent_budget_snapshot(budget)
+            ),
         }
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        mark_card_sidecar_outbox(
+            conn,
+            unique_card_ids,
+            reason="worker_intent_budget_exhausted",
+        )
+        audit_event(
+            conn,
+            action="worker_card_sidecar_intent_budget_exhausted",
+            target_type="cards",
+            target_id=None,
+            payload={"card_ids": unique_card_ids},
+        )
+        compensation_rows: list[dict[str, Any]] = []
+        for card_id in unique_card_ids:
+            row = conn.execute(
+                """
+                SELECT card.location_uri,
+                       outbox.generation AS sidecar_generation
+                FROM cards AS card
+                LEFT JOIN card_sidecar_outbox AS outbox
+                  ON outbox.card_id = card.id
+                WHERE card.id = ?
+                """,
+                (card_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            compensation_rows.append(
+                {
+                    "card_id": card_id,
+                    "location_uri": (
+                        str(row["location_uri"])
+                        if row["location_uri"] is not None
+                        else None
+                    ),
+                    "sidecar_generation": (
+                        str(row["sidecar_generation"])
+                        if row["sidecar_generation"] is not None
+                        else None
+                    ),
+                }
+            )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    reconciliation = _worker_sidecar_intent_budget_exhausted_result(
+        budget,
+        card_id=None,
+        ok=False,
+    )
+    failure = {
+        "card_id": None,
+        "error": "Worker Card sidecar intent budget exhausted; retry deferred",
+        "intent_reconciliation": reconciliation,
+    }
+    return {
+        "ok": False,
+        "synced": 0,
+        "deferred": len(unique_card_ids),
+        "failed": len(unique_card_ids),
+        "failures": [failure],
+        "generated_sidecar_candidates": [],
+        "intent_reconciliation_results": [],
+        "intent_reconciliation": reconciliation,
+        "compensation_cas_complete": (
+            len(compensation_rows) == len(unique_card_ids)
+        ),
+        "compensation_cas_rows": compensation_rows,
+        "worker_intent_budget": (
+            _worker_sidecar_intent_budget_snapshot(budget)
+        ),
+    }
+
+
+def _sync_worker_card_sidecars(
+    root: Path,
+    card_ids: list[str],
+) -> dict[str, Any]:
+    """Materialize worker-owned sidecars under the shared intent budget."""
+
+    budget, allowance, shared = (
+        _worker_sidecar_intent_budget_allowance()
+    )
+    if allowance <= 0:
+        return _defer_worker_card_sidecars_for_intent_budget(
+            root,
+            card_ids,
+            budget,
+        )
+    try:
+        with _card_sidecar_intent_reconciliation_limit(allowance):
+            raw_result = sync_card_sidecars_after_commit(
+                root,
+                card_ids,
+            )
+    except Exception:
+        if not shared:
+            _charge_worker_sidecar_intent_budget(
+                budget,
+                allowance=allowance,
+                result=None,
+            )
+        raise
+    result = dict(raw_result)
+    raw_reconciliation = result.get("intent_reconciliation")
+    reconciliation = (
+        raw_reconciliation
+        if isinstance(raw_reconciliation, dict)
+        else None
+    )
+    if not shared:
+        _charge_worker_sidecar_intent_budget(
+            budget,
+            allowance=allowance,
+            result=reconciliation,
+        )
+    result["worker_intent_budget"] = (
+        _worker_sidecar_intent_budget_snapshot(budget)
+    )
+    return result
 
 
 def _record_scribe_step_intent(
@@ -569,6 +990,60 @@ def _record_scribe_step_committed(
         )
 
 
+def _record_scribe_step_completed(
+    root: Path,
+    lease: _JobLease | None,
+    *,
+    session_id: str,
+    start_seq: int,
+    end_seq: int,
+    batch_number: int,
+    result: dict[str, Any],
+) -> None:
+    """Bind the post-sidecar Scribe result to its already committed step."""
+
+    if lease is None:
+        return
+    step_key = f"{session_id}:{int(start_seq)}:{int(end_seq)}"
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        lease.assert_owned(conn)
+        already_recorded = conn.execute(
+            """
+            SELECT 1
+            FROM audit_events
+            WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.step_key') = ?
+            LIMIT 1
+            """,
+            (_SCRIBE_STEP_COMPLETED_ACTION, lease.job_id, step_key),
+        ).fetchone()
+        if already_recorded is None:
+            audit_event(
+                conn,
+                action=_SCRIBE_STEP_COMPLETED_ACTION,
+                target_type="queue_job",
+                target_id=lease.job_id,
+                payload={
+                    "schema": "continuum.worker_scribe_segment_step_completed.v1",
+                    "step_key": step_key,
+                    "session_id": session_id,
+                    "start_seq": int(start_seq),
+                    "end_seq": int(end_seq),
+                    "batch_number": int(batch_number),
+                    "result": result,
+                },
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _committed_scribe_steps(
     root: Path,
     lease: _JobLease | None,
@@ -579,24 +1054,40 @@ def _committed_scribe_steps(
     try:
         rows = conn.execute(
             """
-            SELECT payload_json
+            SELECT action, payload_json
             FROM audit_events
-            WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+            WHERE action IN (?, ?)
+              AND target_type = 'queue_job' AND target_id = ?
             ORDER BY rowid
             """,
-            (_SCRIBE_STEP_COMMITTED_ACTION, lease.job_id),
+            (
+                _SCRIBE_STEP_COMMITTED_ACTION,
+                _SCRIBE_STEP_COMPLETED_ACTION,
+                lease.job_id,
+            ),
         ).fetchall()
     finally:
         conn.close()
+    committed_payloads: list[dict[str, Any]] = []
+    completed_by_step: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payload = json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            continue
+        step_key = str(payload.get("step_key") or "")
+        step_result = payload.get("result")
+        if not step_key or not isinstance(step_result, dict):
+            continue
+        if str(row["action"]) == _SCRIBE_STEP_COMPLETED_ACTION:
+            completed_by_step[step_key] = step_result
+        else:
+            committed_payloads.append(payload)
     committed: list[dict[str, Any]] = []
     seen_segments: set[str] = set()
     max_batch_number = 0
     location_conn = connect_existing(root)
     try:
-        for row in rows:
-            payload = json_loads(row["payload_json"], {})
-            if not isinstance(payload, dict):
-                continue
+        for payload in committed_payloads:
             step_result = payload.get("result")
             if not isinstance(step_result, dict):
                 continue
@@ -604,18 +1095,72 @@ def _committed_scribe_steps(
             if not segment_id or segment_id in seen_segments:
                 continue
             seen_segments.add(segment_id)
-            materialized = dict(step_result)
+            step_key = str(payload.get("step_key") or "")
+            completed_result = completed_by_step.get(step_key)
+            materialized = dict(completed_result or step_result)
             card_id = str(materialized.get("card_id") or "")
-            sidecar_path = (
-                current_card_sidecar_path(root, location_conn, card_id)
+            card_state = (
+                location_conn.execute(
+                    """
+                    SELECT c.location_uri,
+                           EXISTS(
+                               SELECT 1
+                               FROM card_sidecar_outbox AS outbox
+                               WHERE outbox.card_id = c.id
+                           ) AS sidecar_pending
+                    FROM cards AS c
+                    WHERE c.id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
                 if card_id
                 else None
             )
-            materialized["card_uri"] = (
-                str(sidecar_path)
-                if sidecar_path is not None and sidecar_path.exists()
+            sidecar_path = (
+                current_card_sidecar_path(root, location_conn, card_id)
+                if card_state is not None
                 else None
             )
+            sidecar_exists = bool(
+                sidecar_path is not None and sidecar_path.exists()
+            )
+            materialized["card_uri"] = (
+                str(sidecar_path)
+                if sidecar_exists
+                else None
+            )
+            if completed_result is None:
+                sidecar_pending = bool(
+                    card_state is not None and card_state["sidecar_pending"]
+                )
+                sidecar_expected = bool(
+                    card_state is not None and card_state["location_uri"]
+                )
+                sidecar_ok = bool(
+                    card_state is not None
+                    and not sidecar_pending
+                    and (not sidecar_expected or sidecar_exists)
+                )
+                sidecar_result: dict[str, Any] = {
+                    "ok": sidecar_ok,
+                    "synced": int(sidecar_ok and sidecar_expected),
+                    "failed": int(not sidecar_ok),
+                    "pending_outbox": sidecar_pending,
+                    "completion_receipt_missing": True,
+                    "replayed_from_committed_step": True,
+                }
+                if not sidecar_ok:
+                    sidecar_result["failures"] = [
+                        {
+                            "card_id": card_id or None,
+                            "error": (
+                                "Committed Scribe step has no durable "
+                                "post-sidecar success evidence"
+                            ),
+                        }
+                    ]
+                materialized["ok"] = sidecar_ok
+                materialized["sidecars"] = sidecar_result
             committed.append(materialized)
             try:
                 max_batch_number = max(
@@ -1126,7 +1671,7 @@ def reconcile_worker_backlog(
 
     sidecars: dict[str, Any] = {"ok": True, "synced": 0, "failed": 0, "skipped": dry_run}
     if changed_cards:
-        sidecars = sync_card_sidecars_after_commit(root, changed_cards)
+        sidecars = _sync_worker_card_sidecars(root, changed_cards)
     return {
         "ok": bool(sidecars.get("ok", True)),
         "initialized": True,
@@ -1179,87 +1724,197 @@ def review_mempalace_import(
     )
     conn = connect(root)
     changed_cards: list[str] = []
+    core_result: dict[str, Any]
     lease = _CURRENT_JOB_LEASE.get()
     try:
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
+        legacy_core_result: dict[str, Any] | None = None
         if prior is not None:
-            conn.commit()
-            return prior
-        candidate_window = _legacy_card_candidates(
-            conn,
-            limit=limit + 1,
-            import_id=import_id,
-        )
-        cards = candidate_window[:limit]
-        has_more = len(candidate_window) > limit
-        eligible_before = len(candidate_window)
-        changed_cards = _apply_graph_placed_card_reconciliation(
-            conn,
-            cards,
-            reason="reviewed_mempalace_import",
-            heartbeat=(lambda: lease.renew_in_transaction(conn)) if lease is not None else None,
-        )
-        remaining = max(0, len(candidate_window) - len(cards))
-        complete = not has_more
-        continuation_job_id: str | None = None
-        if not complete:
-            continuation_role = "librarian"
-            continuation_priority = 65
-            if lease is not None:
-                current_job = conn.execute(
-                    "SELECT role, priority FROM queue_jobs WHERE id = ?",
-                    (lease.job_id,),
-                ).fetchone()
-                if current_job is not None:
-                    continuation_role = str(current_job["role"] or continuation_role)
-                    continuation_priority = int(
-                        current_job["priority"]
-                        if current_job["priority"] is not None
-                        else continuation_priority
-                    )
-            continuation_job_id = enqueue_job(
-                conn,
-                role=continuation_role,
-                job_type="review_mempalace_import",
-                priority=continuation_priority,
-                payload={
-                    "import_id": import_id,
-                    "limit": limit,
-                    "reason": "bounded_mempalace_import_continuation",
-                },
-                dedupe_key=f"import:{import_id}",
-                replace_pending=True,
-            )
-        core_result = {
-            "ok": True,
-            "complete": complete,
-            "resumable": not complete,
-            "reviewed_import": import_id,
-            "eligible_before": eligible_before,
-            "eligible_before_is_lower_bound": has_more,
-            "reviewed_cards": len(changed_cards),
-            "remaining_eligible": remaining,
-            "remaining_eligible_is_lower_bound": has_more,
-            "limit": limit,
-            "continuation_job_id": continuation_job_id,
-        }
-        _record_worker_effect(
+            if prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False):
+                conn.commit()
+                return prior
+            legacy_core_result = dict(prior)
+            legacy_core_result.pop("idempotent_replay", None)
+        committed_phase = _prior_worker_phase(
             conn,
             lease,
             job_type="review_mempalace_import",
-            result=core_result,
+            phase="core",
         )
-        conn.commit()
+        if committed_phase is not None:
+            phase_core_result = committed_phase.get("core_result")
+            phase_changed_cards = committed_phase.get("changed_cards")
+            if (
+                not isinstance(phase_core_result, dict)
+                or str(phase_core_result.get("reviewed_import") or "")
+                != import_id
+                or not isinstance(phase_changed_cards, list)
+                or any(
+                    not isinstance(card_id, str) or not card_id
+                    for card_id in phase_changed_cards
+                )
+            ):
+                raise RuntimeError(
+                    "Committed review_mempalace_import core phase is invalid"
+                )
+            core_result = dict(phase_core_result)
+            changed_cards = list(dict.fromkeys(phase_changed_cards))
+            conn.commit()
+        elif legacy_core_result is not None:
+            if (
+                str(legacy_core_result.get("reviewed_import") or "")
+                != import_id
+            ):
+                raise RuntimeError(
+                    "Legacy review_mempalace_import receipt is invalid"
+                )
+            pending_outbox = (
+                conn.execute(
+                    """
+                    SELECT 1
+                    FROM cards AS card
+                    JOIN card_sidecar_outbox AS outbox
+                      ON outbox.card_id = card.id
+                    WHERE card.card_type LIKE 'mempalace_%'
+                      AND json_valid(card.metadata_json)
+                      AND json_extract(
+                          card.metadata_json,
+                          '$.import_id'
+                      ) = ?
+                    LIMIT 1
+                    """,
+                    (import_id,),
+                ).fetchone()
+                is not None
+            )
+            conn.commit()
+            legacy_sidecars: dict[str, Any] = {
+                "ok": not pending_outbox,
+                "synced": 0,
+                "failed": int(pending_outbox),
+                "pending_outbox": pending_outbox,
+                "legacy_core_receipt_revalidated": True,
+            }
+            if pending_outbox:
+                legacy_sidecars["failures"] = [
+                    {
+                        "error": (
+                            "Legacy MemPalace core receipt has pending "
+                            "sidecar authority"
+                        )
+                    }
+                ]
+            result = {
+                **legacy_core_result,
+                "ok": bool(legacy_core_result.get("ok"))
+                and not pending_outbox,
+                "sidecars": legacy_sidecars,
+            }
+            _commit_worker_effect_result(
+                root,
+                lease,
+                job_type="review_mempalace_import",
+                result=result,
+            )
+            return result
+        else:
+            candidate_window = _legacy_card_candidates(
+                conn,
+                limit=limit + 1,
+                import_id=import_id,
+            )
+            cards = candidate_window[:limit]
+            has_more = len(candidate_window) > limit
+            eligible_before = len(candidate_window)
+            changed_cards = _apply_graph_placed_card_reconciliation(
+                conn,
+                cards,
+                reason="reviewed_mempalace_import",
+                heartbeat=(
+                    lambda: lease.renew_in_transaction(conn)
+                )
+                if lease is not None
+                else None,
+            )
+            remaining = max(0, len(candidate_window) - len(cards))
+            complete = not has_more
+            continuation_job_id: str | None = None
+            if not complete:
+                continuation_role = "librarian"
+                continuation_priority = 65
+                if lease is not None:
+                    current_job = conn.execute(
+                        "SELECT role, priority FROM queue_jobs WHERE id = ?",
+                        (lease.job_id,),
+                    ).fetchone()
+                    if current_job is not None:
+                        continuation_role = str(
+                            current_job["role"] or continuation_role
+                        )
+                        continuation_priority = int(
+                            current_job["priority"]
+                            if current_job["priority"] is not None
+                            else continuation_priority
+                        )
+                continuation_job_id = enqueue_job(
+                    conn,
+                    role=continuation_role,
+                    job_type="review_mempalace_import",
+                    priority=continuation_priority,
+                    payload={
+                        "import_id": import_id,
+                        "limit": limit,
+                        "reason": "bounded_mempalace_import_continuation",
+                    },
+                    dedupe_key=f"import:{import_id}",
+                    replace_pending=True,
+                )
+            core_result = {
+                "ok": True,
+                "complete": complete,
+                "resumable": not complete,
+                "reviewed_import": import_id,
+                "eligible_before": eligible_before,
+                "eligible_before_is_lower_bound": has_more,
+                "reviewed_cards": len(changed_cards),
+                "remaining_eligible": remaining,
+                "remaining_eligible_is_lower_bound": has_more,
+                "limit": limit,
+                "continuation_job_id": continuation_job_id,
+            }
+            _record_worker_phase(
+                conn,
+                lease,
+                job_type="review_mempalace_import",
+                phase="core",
+                result={
+                    "core_result": core_result,
+                    "changed_cards": changed_cards,
+                },
+            )
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
         conn.close()
     sidecars: dict[str, Any] = {"ok": True, "synced": 0, "failed": 0}
     if changed_cards:
-        sidecars = sync_card_sidecars_after_commit(root, changed_cards)
-    return {**core_result, "ok": bool(core_result["ok"]) and bool(sidecars.get("ok", True)), "sidecars": sidecars}
+        sidecars = _sync_worker_card_sidecars(root, changed_cards)
+    result = {
+        **core_result,
+        "ok": bool(core_result["ok"]) and bool(sidecars.get("ok", True)),
+        "sidecars": sidecars,
+    }
+    _commit_worker_effect_result(
+        root,
+        lease,
+        job_type="review_mempalace_import",
+        result=result,
+    )
+    return result
 
 
 def _last_segment_end(conn, session_id: str) -> int:
@@ -1382,7 +2037,10 @@ def roll_due_scroll_segments(
             raise
         finally:
             receipt_conn.close()
-        if prior is not None:
+        if prior is not None and prior.pop(
+            _WORKER_POST_PHASE_COMPLETE_KEY,
+            False,
+        ):
             return prior
     config = load_config(root)
     threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
@@ -1392,6 +2050,8 @@ def roll_due_scroll_segments(
     batches_processed = 0
     concurrent_progress = 0
     continuations: list[dict[str, Any]] = []
+    runtime_roll_ok = True
+    sidecar_failures: list[dict[str, Any]] = []
     conn = connect(root)
     try:
         if session_id:
@@ -1488,6 +2148,15 @@ def roll_due_scroll_segments(
                     )
                     if heartbeat is not None and not heartbeat():
                         raise RuntimeError("worker lease lost during Scribe segmentation")
+                    _record_scribe_step_completed(
+                        root,
+                        lease,
+                        session_id=current_session,
+                        start_seq=run_start,
+                        end_seq=run_end,
+                        batch_number=batches_processed,
+                        result=result,
+                    )
                 except ValueError:
                     # Another valid Scribe can win between the backlog read and
                     # the idempotent segment write. Only absorb the error when the
@@ -1505,6 +2174,15 @@ def roll_due_scroll_segments(
                     break
                 else:
                     rolled.append(result)
+                    if not result.get("ok", True):
+                        runtime_roll_ok = False
+                        sidecar_failures.append(
+                            {
+                                "segment_id": result.get("segment_id"),
+                                "card_id": result.get("card_id"),
+                                "sidecars": result.get("sidecars"),
+                            }
+                        )
             if retry_from_fresh_frontier:
                 continue
 
@@ -1525,8 +2203,20 @@ def roll_due_scroll_segments(
         rolled = committed_rolled
         batches_processed = max(batches_processed, committed_batch_number)
 
+    sidecar_failures = [
+        {
+            "segment_id": item.get("segment_id"),
+            "card_id": item.get("card_id"),
+            "sidecars": item.get("sidecars"),
+        }
+        for item in rolled
+        if not item.get("ok", True)
+    ]
     result = {
-        "ok": True,
+        "ok": bool(
+            runtime_roll_ok
+            and all(item.get("ok", True) for item in rolled)
+        ),
         "rolled_count": len(rolled),
         "rolled": rolled,
         "batches_processed": batches_processed,
@@ -1534,6 +2224,7 @@ def roll_due_scroll_segments(
         "drain_limited": bool(continuations),
         "continuations": continuations,
         "concurrent_progress": concurrent_progress,
+        "sidecar_failures": sidecar_failures,
     }
     if lease is not None:
         receipt_conn = connect(root)
@@ -1544,6 +2235,7 @@ def roll_due_scroll_segments(
                 lease,
                 job_type="scroll_event_ingested",
                 result=result,
+                post_phase_complete=True,
             )
             receipt_conn.commit()
         except Exception:
@@ -1565,64 +2257,155 @@ def review_card_placement(
     try:
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
+        legacy_core_result: dict[str, Any] | None = None
         if prior is not None:
-            conn.commit()
-            return prior
-        row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-        if row is None:
-            return {"ok": False, "reason": "card_missing", "card_id": card_id}
-        topics = json_loads(row["topics_json"], [])
-        entities = json_loads(row["entities_json"], [])
-        terms = [str(term) for term in [*topics, *entities] if str(term).strip()]
-        shelf = str(terms[0] if terms else row["card_type"]).casefold()[:96]
-        now = utc_now()
-        card_node = upsert_graph_node(conn, kind="card", label=row["title"], card_id=card_id)
-        for term in terms[:16]:
-            term_node = upsert_graph_node(conn, kind="term", label=term)
-            add_graph_edge(
-                conn,
-                source_node_id=card_node,
-                relation="mentions",
-                target_node_id=term_node,
-                weight=0.5,
-                confidence=max(0.5, float(row["confidence"] or 0.7)),
-                source_refs=[{"card_id": card_id, "worker": "librarian"}],
-            )
-        conn.execute(
-            """
-            UPDATE cards
-            SET status = CASE WHEN status = 'pending_librarian_review' THEN 'active' ELSE status END,
-                placement_collection = coalesce(placement_collection, ?),
-                shelf = coalesce(shelf, ?),
-                storage_tier = coalesce(storage_tier, 'hot'),
-                updated_at = ?
-            WHERE id = ?
-            """,
-            ("library", shelf, now, card_id),
-        )
-        audit_event(conn, action="librarian_review_card", target_type="card", target_id=card_id, payload={"shelf": shelf})
-        mark_card_sidecar_outbox(conn, [card_id], reason="librarian_review_card")
-        core_result = {
-            "ok": True,
-            "card_id": card_id,
-            "shelf": shelf,
-            "term_edges": len(terms[:16]),
-        }
-        _record_worker_effect(
+            if prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False):
+                conn.commit()
+                return prior
+            legacy_core_result = dict(prior)
+            legacy_core_result.pop("idempotent_replay", None)
+        committed_phase = _prior_worker_phase(
             conn,
             lease,
             job_type="review_card_placement",
-            result=core_result,
+            phase="core",
         )
-        conn.commit()
-        sync_card_sidecars_after_commit(root, [card_id])
+        if committed_phase is not None:
+            phase_core_result = committed_phase.get("core_result")
+            if (
+                not isinstance(phase_core_result, dict)
+                or str(phase_core_result.get("card_id") or "") != card_id
+            ):
+                raise RuntimeError(
+                    "Committed review_card_placement core phase is invalid"
+                )
+            core_result = dict(phase_core_result)
+            conn.commit()
+        elif legacy_core_result is not None:
+            if str(legacy_core_result.get("card_id") or "") != card_id:
+                raise RuntimeError(
+                    "Legacy review_card_placement receipt is invalid"
+                )
+            core_result = legacy_core_result
+            _record_worker_phase(
+                conn,
+                lease,
+                job_type="review_card_placement",
+                phase="core",
+                result={"core_result": core_result},
+            )
+            conn.commit()
+        else:
+            row = conn.execute(
+                "SELECT * FROM cards WHERE id = ?",
+                (card_id,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return {
+                    "ok": False,
+                    "reason": "card_missing",
+                    "card_id": card_id,
+                }
+            topics = json_loads(row["topics_json"], [])
+            entities = json_loads(row["entities_json"], [])
+            terms = [
+                str(term)
+                for term in [*topics, *entities]
+                if str(term).strip()
+            ]
+            shelf = str(
+                terms[0] if terms else row["card_type"]
+            ).casefold()[:96]
+            now = utc_now()
+            card_node = upsert_graph_node(
+                conn,
+                kind="card",
+                label=row["title"],
+                card_id=card_id,
+            )
+            for term in terms[:16]:
+                term_node = upsert_graph_node(conn, kind="term", label=term)
+                add_graph_edge(
+                    conn,
+                    source_node_id=card_node,
+                    relation="mentions",
+                    target_node_id=term_node,
+                    weight=0.5,
+                    confidence=max(0.5, float(row["confidence"] or 0.7)),
+                    source_refs=[
+                        {"card_id": card_id, "worker": "librarian"}
+                    ],
+                )
+            conn.execute(
+                """
+                UPDATE cards
+                SET status = CASE
+                        WHEN status = 'pending_librarian_review'
+                        THEN 'active'
+                        ELSE status
+                    END,
+                    placement_collection = coalesce(
+                        placement_collection,
+                        ?
+                    ),
+                    shelf = coalesce(shelf, ?),
+                    storage_tier = coalesce(storage_tier, 'hot'),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                ("library", shelf, now, card_id),
+            )
+            audit_event(
+                conn,
+                action="librarian_review_card",
+                target_type="card",
+                target_id=card_id,
+                payload={"shelf": shelf},
+            )
+            mark_card_sidecar_outbox(
+                conn,
+                [card_id],
+                reason="librarian_review_card",
+            )
+            core_result = {
+                "ok": True,
+                "card_id": card_id,
+                "shelf": shelf,
+                "term_edges": len(terms[:16]),
+            }
+            _record_worker_phase(
+                conn,
+                lease,
+                job_type="review_card_placement",
+                phase="core",
+                result={"core_result": core_result},
+            )
+            conn.commit()
+        sidecars = _sync_worker_card_sidecars(root, [card_id])
         conflict = detect_conflicts(
             root,
             card_id=card_id,
             limit=10,
             recover_pending_card_sidecars=recover_pending_card_sidecars,
         )
-        return {**core_result, "conflicts": conflict}
+        result = {
+            **core_result,
+            "ok": bool(
+                core_result["ok"]
+                and sidecars.get("ok")
+                and conflict.get("ok")
+            ),
+            "sidecars": sidecars,
+            "conflicts": conflict,
+        }
+        _commit_worker_effect_result(
+            root,
+            lease,
+            job_type="review_card_placement",
+            result=result,
+        )
+        return result
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -3466,8 +4249,16 @@ def detect_conflicts(
             budget.finish_transaction()
         conn.close()
 
+    sidecars: dict[str, Any] = {
+        "ok": True,
+        "synced": 0,
+        "failed": 0,
+    }
     if touched_cards:
-        sync_card_sidecars_after_commit(root, sorted(touched_cards))
+        sidecars = _sync_worker_card_sidecars(
+            root,
+            sorted(touched_cards),
+        )
     selected_fingerprints = {
         str(record["fingerprint"])
         for record in selected_components
@@ -3528,7 +4319,7 @@ def detect_conflicts(
         if exhausted
     )
     return {
-        "ok": True,
+        "ok": bool(sidecars.get("ok")),
         "conflict_count": len(conflicts),
         "conflicts": conflicts,
         "changed_card_count": len(touched_cards),
@@ -3564,6 +4355,7 @@ def detect_conflicts(
             "outside_scan_budget": True,
             "seconds": index_setup_seconds,
         },
+        "sidecars": sidecars,
     }
 
 
@@ -3963,9 +4755,9 @@ def resolve_conflict(
     finally:
         conn.close()
 
-    sync_card_sidecars_after_commit(root, touched_cards)
+    sidecars = _sync_worker_card_sidecars(root, touched_cards)
     return {
-        "ok": True,
+        "ok": bool(sidecars.get("ok")),
         "action": action,
         "card_id": card_id,
         "conflict_group": conflict_group,
@@ -3976,6 +4768,7 @@ def resolve_conflict(
         "supersession_dag": True,
         "resolution_id": resolution_id,
         "component_fingerprint": component_fingerprint,
+        "sidecars": sidecars,
         **(
             {"dismissal_fingerprint": component_fingerprint}
             if action == "dismiss"
@@ -4259,6 +5052,7 @@ def _restore_prune_memory_rows(
         registered_cleanup_intents = register_card_sidecar_compensation_intents(
             root,
             cleanup_candidates or [],
+            conn=conn,
         )
 
         for card_id in card_ids:
@@ -4295,10 +5089,9 @@ def _restore_prune_memory_rows(
     finally:
         conn.close()
 
-    sidecar_sync = sync_card_sidecars_after_commit(root, card_ids)
-    cleanup_reconciliation = reconcile_card_sidecar_write_intents(
+    sidecar_sync = _sync_worker_card_sidecars(root, card_ids)
+    cleanup_reconciliation = _reconcile_worker_sidecar_intents_with_budget(
         root,
-        card_ids=card_ids,
     )
     semantic_integrity = semantic_integrity_report(root, create=False)
     return {
@@ -4489,7 +5282,7 @@ def prune_memory(
         conn.close()
 
     try:
-        sidecar_sync = sync_card_sidecars_after_commit(root, eligible_ids)
+        sidecar_sync = _sync_worker_card_sidecars(root, eligible_ids)
     except Exception as exc:
         sidecar_sync = {
             "ok": False,
@@ -4591,9 +5384,14 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
             conn.commit()
             reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
             prior["intent_reconciliation"] = reconciliation
-            reconciliation_clean = bool(reconciliation.get("ok")) and int(
-                reconciliation.get("pending", 0)
-            ) == 0
+            reconciliation_clean = bool(
+                reconciliation.get("ok")
+                and int(reconciliation.get("pending", 0)) == 0
+                and reconciliation.get(
+                    "scope_complete",
+                    reconciliation.get("complete"),
+                )
+            )
             if not reconciliation_clean:
                 prior["ok"] = False
                 conn.execute("BEGIN IMMEDIATE")
@@ -4699,9 +5497,14 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
         )
         reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
         result["intent_reconciliation"] = reconciliation
-        reconciliation_clean = bool(reconciliation.get("ok")) and int(
-            reconciliation.get("pending", 0)
-        ) == 0
+        reconciliation_clean = bool(
+            reconciliation.get("ok")
+            and int(reconciliation.get("pending", 0)) == 0
+            and reconciliation.get(
+                "scope_complete",
+                reconciliation.get("complete"),
+            )
+        )
         if not reconciliation_clean:
             result["ok"] = False
             result["reason"] = "intent_reconciliation_incomplete"
@@ -4747,7 +5550,12 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
         conn.close()
 
 
-def drain_card_sidecar_outbox(root: Path, *, limit: int = 50) -> dict[str, Any]:
+def drain_card_sidecar_outbox(
+    root: Path,
+    *,
+    limit: int = 50,
+    reconcile_intents: bool = True,
+) -> dict[str, Any]:
     init_db(root, recover_pending_card_sidecars=False)
     conn = connect(root)
     try:
@@ -4765,13 +5573,106 @@ def drain_card_sidecar_outbox(root: Path, *, limit: int = 50) -> dict[str, Any]:
     card_ids = [str(row["card_id"]) for row in rows]
     if not card_ids:
         return {"ok": True, "pending": 0, "synced": 0, "failed": 0, "failures": []}
-    result = sync_card_sidecars_after_commit(root, card_ids)
+    result = sync_card_sidecars_after_commit(
+        root,
+        card_ids,
+        reconcile_intents=reconcile_intents,
+    )
     return {
         "ok": bool(result.get("ok")),
         "pending": len(card_ids),
         "synced": int(result.get("synced", 0)),
         "failed": int(result.get("failed", 0)),
         "failures": result.get("failures", []),
+    }
+
+
+def _reconcile_card_sidecar_intent_maintenance(
+    root: Path,
+    *,
+    limit: int = WORKER_SIDECAR_INTENT_LIMIT,
+) -> dict[str, Any]:
+    """Resolve a bounded active-intent window without claiming outbox work."""
+
+    init_db(root, recover_pending_card_sidecars=False)
+    try:
+        result = _reconcile_worker_sidecar_intents_with_budget(
+            root,
+            requested_limit=limit,
+            exhausted_ok=True,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 0,
+            "limit": limit,
+            "selected": 0,
+            "inspected": 0,
+            "enumerated": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": False,
+            "overflow": False,
+            "progress_blocked": False,
+            "failure_count": 1,
+            "failures": [
+                {
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            ],
+            "status_counts": {},
+        }
+    raw_results = result.get("results")
+    reconciliation_results = (
+        raw_results
+        if isinstance(raw_results, list)
+        else []
+    )
+    status_counts: dict[str, int] = {}
+    for reconciliation_result in reconciliation_results:
+        if not isinstance(reconciliation_result, dict):
+            continue
+        status = str(reconciliation_result.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    raw_failures = result.get("failures")
+    failures = raw_failures if isinstance(raw_failures, list) else []
+    pending = max(0, int(result.get("pending", 0)))
+    raw_remaining = result.get("remaining")
+    remaining = (
+        max(0, int(raw_remaining))
+        if raw_remaining is not None
+        else None
+    )
+    return {
+        "ok": bool(result.get("ok")),
+        "processed": max(0, int(result.get("processed", 0))),
+        "pending": pending,
+        "limit": max(1, int(result.get("limit", limit))),
+        "selected": max(0, int(result.get("selected", 0))),
+        "inspected": max(0, int(result.get("inspected", 0))),
+        "enumerated": max(0, int(result.get("enumerated", 0))),
+        "remaining": remaining,
+        "remaining_is_lower_bound": bool(
+            result.get("remaining_is_lower_bound")
+        ),
+        "complete": bool(result.get("complete")),
+        "has_more": bool(result.get("has_more")),
+        "remaining_lower_bound": max(
+            0,
+            int(result.get("remaining_lower_bound", 0)),
+        ),
+        "batch_truncated": bool(result.get("batch_truncated")),
+        "overflow": bool(result.get("overflow")),
+        "progress_blocked": bool(result.get("progress_blocked")),
+        "budget_exhausted": bool(result.get("budget_exhausted")),
+        "worker_intent_budget": result.get("worker_intent_budget"),
+        "failure_count": len(failures),
+        "failures": failures[:WORKER_MAINTENANCE_FAILURE_LIMIT],
+        "status_counts": status_counts,
     }
 
 
@@ -4818,6 +5719,31 @@ def _process_job(
 
 
 def run_worker_pass(
+    root: Path,
+    *,
+    roles: list[str] | None = None,
+    limit: int = 50,
+    maintenance: bool = True,
+) -> dict[str, Any]:
+    budget = {
+        "limit": WORKER_SIDECAR_INTENT_LIMIT,
+        "used": 0,
+        "remaining": WORKER_SIDECAR_INTENT_LIMIT,
+    }
+    with _card_sidecar_intent_reconciliation_budget(budget):
+        result = _run_worker_pass_with_sidecar_intent_budget(
+            root,
+            roles=roles,
+            limit=limit,
+            maintenance=maintenance,
+        )
+        result["sidecar_intent_budget"] = (
+            _worker_sidecar_intent_budget_snapshot(budget)
+        )
+        return result
+
+
+def _run_worker_pass_with_sidecar_intent_budget(
     root: Path,
     *,
     roles: list[str] | None = None,
@@ -4905,7 +5831,14 @@ def run_worker_pass(
             _CURRENT_JOB_LEASE.reset(lease_token)
     maintenance_result: dict[str, Any] = {}
     if maintenance:
-        maintenance_result["sidecars"] = drain_card_sidecar_outbox(root, limit=50)
+        maintenance_result["sidecars"] = drain_card_sidecar_outbox(
+            root,
+            limit=50,
+            reconcile_intents=False,
+        )
+        maintenance_result["sidecar_intents"] = (
+            _reconcile_card_sidecar_intent_maintenance(root)
+        )
         maintenance_result["decay"] = decay_graph_routes(
             root,
             limit=50,

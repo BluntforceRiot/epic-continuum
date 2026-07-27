@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
 import ctypes
 import hashlib
@@ -14,6 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +27,7 @@ from .permissions import (
     flush_directory_strict,
     flush_file_strict,
     flush_tree_strict,
+    guard_windows_file_disposition,
     replace_durable,
     secure_copy_file,
     secure_copytree,
@@ -32,6 +35,7 @@ from .permissions import (
     secure_sqlite_files,
     secure_write_text,
     secure_write_text_exclusive,
+    set_windows_delete_disposition,
     replace_file_noclobber,
 )
 from .project_state import (
@@ -2629,8 +2633,6 @@ def _backfill_graph_edge_source_row(
             ),
         )
         changed += max(0, int(cursor.rowcount))
-    if not expected:
-        return changed, source_refs_valid
     actual = {
         str(source_row["source_ref_key"]): str(source_row["source_ref_json"])
         for source_row in conn.execute(
@@ -2680,6 +2682,12 @@ def _backfill_graph_edge_source_row(
             source_ref_key,
         )
         for source_ref_key, _source_ref_json in expected
+    ) and all(
+        _graph_source_ref_json_matches_identity(
+            source_ref_json,
+            source_ref_key,
+        )
+        for source_ref_key, source_ref_json in actual.items()
     )
     return changed, reconciled
 
@@ -3242,6 +3250,71 @@ def _open_stable_regular_file_hash_evidence(
         raise
 
 
+def _read_stable_regular_file_fd(
+    fd: int,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, tuple[int, int]]:
+    """Read bounded bytes from an already namespace-guarded descriptor."""
+
+    opened_before = os.fstat(fd)
+    reparse_flag = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    opened_is_reparse = bool(
+        int(getattr(opened_before, "st_file_attributes", 0))
+        & reparse_flag
+    )
+    if (
+        not stat.S_ISREG(opened_before.st_mode)
+        or opened_is_reparse
+        or int(opened_before.st_size) > max_bytes
+    ):
+        raise ValueError("guarded Card sidecar state file is invalid")
+    identity = (
+        int(opened_before.st_dev),
+        int(opened_before.st_ino),
+    )
+    fingerprint = (
+        int(opened_before.st_size),
+        int(opened_before.st_mtime_ns),
+        int(opened_before.st_ctime_ns),
+    )
+    os.lseek(fd, 0, os.SEEK_SET)
+    captured = bytearray()
+    while True:
+        chunk = os.read(
+            fd,
+            min(1024 * 1024, max_bytes + 1 - len(captured)),
+        )
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if len(captured) > max_bytes:
+            raise ValueError(
+                "guarded Card sidecar state file exceeds its byte limit"
+            )
+    opened_after = os.fstat(fd)
+    after_identity = (
+        int(opened_after.st_dev),
+        int(opened_after.st_ino),
+    )
+    after_fingerprint = (
+        int(opened_after.st_size),
+        int(opened_after.st_mtime_ns),
+        int(opened_after.st_ctime_ns),
+    )
+    if (
+        after_identity != identity
+        or after_fingerprint != fingerprint
+        or len(captured) != fingerprint[0]
+    ):
+        raise ValueError(
+            "guarded Card sidecar state file changed during read"
+        )
+    return bytes(captured), identity
+
+
 def _held_regular_file_evidence_is_current(
     path: Path,
     evidence: StableRegularFileEvidence,
@@ -3600,6 +3673,7 @@ def _resolved_managed_card_sidecar_path(
 def _ensure_content_addressed_sidecar_transition_receipt(
     root: Path,
     *,
+    conn: sqlite3.Connection,
     current_path: Path,
     card_id: str,
 ) -> None:
@@ -3653,6 +3727,7 @@ def _ensure_content_addressed_sidecar_transition_receipt(
             target_uri=target_uri,
             expected_state_hash=filename_state_hash,
             mode="history_transition",
+            conn=conn,
         )
         intent_entry_identity = _plain_card_sidecar_state_path_identity(
             intent_path,
@@ -3732,6 +3807,7 @@ def _card_sidecar_write_target_selection(
     if _card_sidecar_filename_state_hash(current_path, card_id) is not None:
         _ensure_content_addressed_sidecar_transition_receipt(
             root,
+            conn=conn,
             current_path=current_path,
             card_id=card_id,
         )
@@ -3802,8 +3878,110 @@ def _card_sidecar_write_target(
 
 CARD_SIDECAR_WRITE_INTENT_SCHEMA = "continuum.card_sidecar_write_intent.v2"
 CARD_SIDECAR_RECOVERY_RECEIPT_SCHEMA = "continuum.card_sidecar_recovery_receipt.v2"
+CARD_SIDECAR_RESOLVED_INTENT_SCHEMA = (
+    "continuum.card_sidecar_resolved_intent.v1"
+)
+CARD_SIDECAR_INTENT_OPERATION_LOCK_ID = (
+    "card-sidecar-intent-reconciliation"
+)
 MAX_CARD_SIDECAR_WRITE_INTENTS = 10000
 MAX_CARD_SIDECAR_WRITE_INTENT_BYTES = 64 * 1024
+MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES = (
+    MAX_CARD_SIDECAR_WRITE_INTENT_BYTES + 1024
+)
+_CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT: contextvars.ContextVar[
+    int | None
+] = contextvars.ContextVar(
+    "continuum_card_sidecar_intent_reconciliation_limit",
+    default=None,
+)
+_CARD_SIDECAR_INTENT_RECONCILIATION_BUDGET: contextvars.ContextVar[
+    dict[str, int] | None
+] = contextvars.ContextVar(
+    "continuum_card_sidecar_intent_reconciliation_budget",
+    default=None,
+)
+
+
+@contextmanager
+def _card_sidecar_intent_reconciliation_limit(
+    limit: int | None,
+) -> Iterator[None]:
+    """Override one caller's global reconciliation window."""
+
+    if limit is not None and (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > MAX_CARD_SIDECAR_WRITE_INTENTS
+    ):
+        raise ValueError(
+            "Card sidecar intent reconciliation limit must be between 1 and "
+            f"{MAX_CARD_SIDECAR_WRITE_INTENTS}"
+        )
+    reset_marker = _CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT.set(limit)
+    try:
+        yield
+    finally:
+        _CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT.reset(reset_marker)
+
+
+@contextmanager
+def _card_sidecar_intent_reconciliation_budget(
+    budget: dict[str, int],
+) -> Iterator[None]:
+    """Make one mutable reconciliation budget authoritative in this context."""
+
+    limit = int(budget.get("limit", 0))
+    used = int(budget.get("used", 0))
+    if limit < 1 or used < 0 or used > limit:
+        raise ValueError("Card sidecar intent reconciliation budget is invalid")
+    budget["limit"] = limit
+    budget["used"] = used
+    budget["remaining"] = limit - used
+    reset_marker = _CARD_SIDECAR_INTENT_RECONCILIATION_BUDGET.set(
+        budget
+    )
+    try:
+        yield
+    finally:
+        _CARD_SIDECAR_INTENT_RECONCILIATION_BUDGET.reset(reset_marker)
+
+
+def _current_card_sidecar_intent_reconciliation_budget(
+) -> dict[str, int] | None:
+    return _CARD_SIDECAR_INTENT_RECONCILIATION_BUDGET.get()
+
+
+def _charge_card_sidecar_intent_reconciliation_budget(
+    budget: dict[str, int],
+    *,
+    allowance: int,
+    result: dict[str, Any] | None,
+) -> int:
+    if allowance <= 0:
+        return 0
+    if result is None or result.get("remaining") is None:
+        charge = allowance
+    else:
+        charge = max(
+            max(0, int(result.get("enumerated", 0))),
+            max(0, int(result.get("inspected", 0))),
+            max(0, int(result.get("selected", 0))),
+            max(0, int(result.get("processed", 0))),
+        )
+        if not result.get("ok") and not result.get("complete"):
+            charge = allowance
+    charge = min(allowance, charge)
+    budget["used"] = min(
+        int(budget["limit"]),
+        int(budget["used"]) + charge,
+    )
+    budget["remaining"] = max(
+        0,
+        int(budget["limit"]) - int(budget["used"]),
+    )
+    return charge
 
 
 def _card_sidecar_write_intent_dir(root: Path) -> Path:
@@ -3814,22 +3992,114 @@ def _card_sidecar_recovery_receipt_dir(root: Path) -> Path:
     return root / "exports" / "card_sidecar_recovery_receipts"
 
 
+def _card_sidecar_resolved_intent_dir(root: Path) -> Path:
+    return root / "exports" / "card_sidecar_resolved_intents"
+
+
+def _card_sidecar_retirement_intent_dir(root: Path) -> Path:
+    return root / "run" / "card_sidecar_retirement_intents"
+
+
 def _bounded_card_sidecar_intent_paths(
     intent_dir: Path,
-) -> tuple[list[Path], bool]:
-    """Collect no more than the active-intent cap plus one overflow sentinel."""
+) -> tuple[list[Path], bool, int]:
+    """Collect JSON intents while counting every directory entry."""
+
+    return _bounded_card_sidecar_state_paths(intent_dir)
+
+
+def _bounded_card_sidecar_state_paths(
+    directory: Path,
+    *,
+    entry_limit: int | None = None,
+) -> tuple[list[Path], bool, int]:
+    """Collect bounded JSON paths with one all-entry truncation sentinel."""
+
+    bounded_entry_limit = (
+        MAX_CARD_SIDECAR_WRITE_INTENTS
+        if entry_limit is None
+        else int(entry_limit)
+    )
+    if bounded_entry_limit < 0:
+        raise ValueError("Card sidecar state entry limit cannot be negative")
     collected: list[Path] = []
-    with os.scandir(intent_dir) as entries:
+    enumerated = 0
+    truncated = False
+    with os.scandir(directory) as entries:
         for entry in entries:
+            enumerated += 1
+            if enumerated > bounded_entry_limit:
+                truncated = True
+                break
             if not entry.name.endswith(".json"):
                 continue
             collected.append(Path(entry.path))
-            if len(collected) > MAX_CARD_SIDECAR_WRITE_INTENTS:
-                break
-    overflow = len(collected) > MAX_CARD_SIDECAR_WRITE_INTENTS
-    collected = collected[:MAX_CARD_SIDECAR_WRITE_INTENTS]
     collected.sort(key=lambda path: path.name)
-    return collected, overflow
+    return collected, truncated, enumerated
+
+
+def _bounded_card_sidecar_retirement_paths(
+    retirement_dir: Path,
+) -> tuple[list[Path], bool, int]:
+    """Collect retirements while counting every directory entry."""
+
+    return _bounded_card_sidecar_state_paths(retirement_dir)
+
+
+def _bounded_card_sidecar_intent_inventory(
+    intent_dir: Path,
+    retirement_dir: Path | None,
+    *,
+    entry_limit: int,
+) -> tuple[list[Path], list[Path], bool, int]:
+    """Fairly inventory both queues under one shared all-entry allowance."""
+
+    bounded_entry_limit = max(0, int(entry_limit))
+    retirement_paths: list[Path] = []
+    intent_paths: list[Path] = []
+    enumerated = 0
+    truncated = False
+    scanners: list[tuple[str, Any]] = []
+    try:
+        # Active intents are the first turn, then retirement and active entries
+        # alternate. Stable debris in either namespace therefore cannot consume
+        # the whole shared allowance before the other namespace is observed.
+        scanners.append(("intent", os.scandir(intent_dir)))
+        if retirement_dir is not None:
+            scanners.append(("retirement", os.scandir(retirement_dir)))
+        turn = 0
+        while scanners:
+            scanner_index = turn % len(scanners)
+            namespace, scanner = scanners[scanner_index]
+            try:
+                entry = next(scanner)
+            except StopIteration:
+                scanner.close()
+                scanners.pop(scanner_index)
+                if scanners:
+                    turn %= len(scanners)
+                continue
+            enumerated += 1
+            if enumerated > bounded_entry_limit:
+                truncated = True
+                break
+            if entry.name.endswith(".json"):
+                if namespace == "intent":
+                    intent_paths.append(Path(entry.path))
+                else:
+                    retirement_paths.append(Path(entry.path))
+            turn = (scanner_index + 1) % len(scanners)
+    finally:
+        for _namespace, scanner in scanners:
+            scanner.close()
+    intent_paths.sort(key=lambda path: path.name)
+    retirement_paths.sort(key=lambda path: path.name)
+    return (
+        intent_paths,
+        retirement_paths,
+        truncated,
+        enumerated,
+    )
 
 
 CardSidecarStateDir = tuple[Path, tuple[int, int], str, Path]
@@ -3869,6 +4139,8 @@ def _validated_card_sidecar_state_dir(
     components_by_purpose = {
         "intent": ("run", "card_sidecar_write_intents"),
         "receipt": ("exports", "card_sidecar_recovery_receipts"),
+        "resolved_intent": ("exports", "card_sidecar_resolved_intents"),
+        "retirement_intent": ("run", "card_sidecar_retirement_intents"),
     }
     components = components_by_purpose.get(purpose)
     if components is None:
@@ -3914,6 +4186,41 @@ def _assert_card_sidecar_state_dir_unchanged(state: CardSidecarStateDir) -> None
 
 
 def _write_card_sidecar_write_intent(
+    root: Path,
+    *,
+    card_id: str,
+    target_uri: str,
+    expected_state_hash: str,
+    mode: str = "write",
+    conn: sqlite3.Connection | None = None,
+) -> tuple[str, Path]:
+    """Publish under either the caller's DB fence or the reconciler lock."""
+
+    if conn is not None and conn.in_transaction:
+        return _write_card_sidecar_write_intent_fenced(
+            root,
+            card_id=card_id,
+            target_uri=target_uri,
+            expected_state_hash=expected_state_hash,
+            mode=mode,
+        )
+    from .operations import operation_lock
+
+    with operation_lock(
+        root,
+        CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+        timeout_seconds=60.0,
+    ):
+        return _write_card_sidecar_write_intent_fenced(
+            root,
+            card_id=card_id,
+            target_uri=target_uri,
+            expected_state_hash=expected_state_hash,
+            mode=mode,
+        )
+
+
+def _write_card_sidecar_write_intent_fenced(
     root: Path,
     *,
     card_id: str,
@@ -4108,6 +4415,513 @@ def _open_valid_card_sidecar_recovery_receipt(
         raise
 
 
+def _card_sidecar_state_path_is_missing(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise ValueError(
+            f"Card sidecar state path absence check failed: {path}"
+        ) from exc
+    return False
+
+
+def _card_sidecar_intent_evidence_path(
+    evidence_state: CardSidecarStateDir,
+    *,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+) -> Path:
+    device_id, file_id = intent_entry_identity
+    return evidence_state[0] / (
+        f"{intent['intent_id']}.{device_id:x}.{file_id:x}.json"
+    )
+
+
+def _card_sidecar_resolved_intent_payload(
+    intent: dict[str, Any],
+    *,
+    intent_entry_identity: tuple[int, int],
+) -> dict[str, Any]:
+    return {
+        "schema": CARD_SIDECAR_RESOLVED_INTENT_SCHEMA,
+        "intent": intent,
+        "source_entry": {
+            "device_id": intent_entry_identity[0],
+            "file_id": intent_entry_identity[1],
+        },
+    }
+
+
+def _validate_card_sidecar_intent_evidence(
+    root: Path,
+    *,
+    purpose: str,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+) -> tuple[CardSidecarStateDir, Path] | None:
+    evidence_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose=purpose,
+        create=False,
+    )
+    if evidence_state is None:
+        return None
+    evidence_path = _card_sidecar_intent_evidence_path(
+        evidence_state,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+    )
+    if _card_sidecar_state_path_is_missing(evidence_path):
+        return None
+    evidence, resolved_fd, raw_bytes = (
+        _open_stable_regular_file_hash_evidence(
+            evidence_path,
+            max_bytes=(
+                MAX_CARD_SIDECAR_WRITE_INTENT_BYTES
+                if purpose == "retirement_intent"
+                else MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES
+            ),
+            capture_bytes=True,
+        )
+    )
+    try:
+        if raw_bytes is None:
+            raise ValueError(
+                "Resolved Card sidecar intent bytes are unavailable"
+            )
+        if (
+            purpose == "retirement_intent"
+            and evidence[0][1] != intent_entry_identity
+        ):
+            raise ValueError(
+                "Resolved Card sidecar intent identity does not match"
+            )
+        try:
+            resolved_intent = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(
+                "Resolved Card sidecar intent bytes are invalid"
+            ) from exc
+        expected_payload: dict[str, Any]
+        if purpose == "retirement_intent":
+            expected_payload = intent
+        elif purpose == "resolved_intent":
+            expected_payload = _card_sidecar_resolved_intent_payload(
+                intent,
+                intent_entry_identity=intent_entry_identity,
+            )
+        else:
+            raise ValueError(
+                "Unsupported Card sidecar intent evidence purpose"
+            )
+        if resolved_intent != expected_payload:
+            raise ValueError("Resolved Card sidecar intent payload does not match")
+        initially_opened_fd = resolved_fd
+        resolved_fd = -1
+        os.close(initially_opened_fd)
+        flush_file_strict(evidence_path)
+        flush_directory_strict(evidence_state[0])
+        reopened_evidence, resolved_fd, reopened_bytes = (
+            _open_stable_regular_file_hash_evidence(
+                evidence_path,
+                max_bytes=(
+                    MAX_CARD_SIDECAR_WRITE_INTENT_BYTES
+                    if purpose == "retirement_intent"
+                    else MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES
+                ),
+                capture_bytes=True,
+            )
+        )
+        _assert_card_sidecar_state_dir_unchanged(evidence_state)
+        if (
+            reopened_evidence != evidence
+            or reopened_bytes != raw_bytes
+            or not _held_regular_file_evidence_is_current(
+                evidence_path,
+                reopened_evidence,
+                resolved_fd,
+            )
+        ):
+            raise ValueError(
+                "Resolved Card sidecar intent changed during validation"
+            )
+        return evidence_state, evidence_path
+    finally:
+        if resolved_fd >= 0:
+            os.close(resolved_fd)
+
+
+def _card_sidecar_retired_intent_archive_path(
+    resolved_path: Path,
+) -> Path:
+    return resolved_path.with_name(f"{resolved_path.name}.retired")
+
+
+def _validate_card_sidecar_retired_intent_archive(
+    archive_path: Path,
+    *,
+    resolved_state: CardSidecarStateDir,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+) -> None:
+    """Strictly bind a portable archive to the exact retired queue inode."""
+
+    if archive_path.parent != resolved_state[0]:
+        raise ValueError("Retired Card sidecar intent archive escaped its namespace")
+    archive_evidence, archive_fd, archive_bytes = (
+        _open_stable_regular_file_hash_evidence(
+            archive_path,
+            max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+            capture_bytes=True,
+        )
+    )
+    try:
+        if (
+            archive_bytes is None
+            or archive_evidence[0][1] != intent_entry_identity
+            or json.loads(archive_bytes.decode("utf-8")) != intent
+            or not _held_regular_file_evidence_is_current(
+                archive_path,
+                archive_evidence,
+                archive_fd,
+            )
+        ):
+            raise ValueError(
+                "Retired Card sidecar intent archive does not bind the queue"
+            )
+        initially_opened_fd = archive_fd
+        archive_fd = -1
+        os.close(initially_opened_fd)
+        flush_file_strict(archive_path)
+        flush_directory_strict(resolved_state[0])
+        reopened_evidence, archive_fd, reopened_bytes = (
+            _open_stable_regular_file_hash_evidence(
+                archive_path,
+                max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                capture_bytes=True,
+            )
+        )
+        _assert_card_sidecar_state_dir_unchanged(resolved_state)
+        if (
+            reopened_evidence != archive_evidence
+            or reopened_bytes != archive_bytes
+            or not _held_regular_file_evidence_is_current(
+                archive_path,
+                reopened_evidence,
+                archive_fd,
+            )
+        ):
+            raise ValueError(
+                "Retired Card sidecar intent archive changed during flush"
+            )
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(
+            "Retired Card sidecar intent archive bytes are invalid"
+        ) from exc
+    finally:
+        if archive_fd >= 0:
+            os.close(archive_fd)
+
+
+def _retire_card_sidecar_write_intent(
+    root: Path,
+    *,
+    intent_path: Path,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+) -> bool:
+    """Retire one intent only after durable terminal authority is fenced."""
+
+    intent_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="intent",
+        create=False,
+    )
+    if intent_state is None or intent_path.parent != intent_state[0]:
+        raise ValueError("Card sidecar write intent directory is unavailable")
+
+    retirement_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="retirement_intent",
+        create=True,
+    )
+    if retirement_state is None:
+        raise ValueError("Card sidecar retirement queue is unavailable")
+    retirement_path = _card_sidecar_intent_evidence_path(
+        retirement_state,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+    )
+    resolved_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="resolved_intent",
+        create=True,
+    )
+    if resolved_state is None:
+        raise ValueError("Resolved Card sidecar intent directory is unavailable")
+    resolved_path = _card_sidecar_intent_evidence_path(
+        resolved_state,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+    )
+    retired_archive_path = _card_sidecar_retired_intent_archive_path(
+        resolved_path
+    )
+
+    def complete_retirement(*, concurrent_completion: bool) -> bool:
+        _assert_card_sidecar_state_dir_unchanged(intent_state)
+        if not _card_sidecar_state_path_is_missing(intent_path):
+            raise ValueError(
+                "Card sidecar write intent still exists during retirement"
+            )
+        pending = _validate_card_sidecar_intent_evidence(
+            root,
+            purpose="retirement_intent",
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+        )
+        if pending is not None:
+            flush_directory_strict(intent_state[0])
+            flush_directory_strict(retirement_state[0])
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            _assert_card_sidecar_state_dir_unchanged(retirement_state)
+            if not _card_sidecar_state_path_is_missing(intent_path):
+                raise ValueError(
+                    "Card sidecar write intent reappeared during retirement"
+                )
+            _validate_card_sidecar_intent_evidence(
+                root,
+                purpose="retirement_intent",
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+            )
+            terminal = _validate_card_sidecar_intent_evidence(
+                root,
+                purpose="resolved_intent",
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+            )
+            if terminal is None:
+                try:
+                    secure_write_text_exclusive(
+                        resolved_path,
+                        json_dumps(
+                            _card_sidecar_resolved_intent_payload(
+                                intent,
+                                intent_entry_identity=intent_entry_identity,
+                            )
+                        )
+                        + "\n",
+                    )
+                except FileExistsError:
+                    pass
+            terminal = _validate_card_sidecar_intent_evidence(
+                root,
+                purpose="resolved_intent",
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+            )
+            if terminal is None:
+                raise ValueError(
+                    "Resolved Card sidecar intent publication was not durable"
+                )
+            _assert_card_sidecar_state_dir_unchanged(resolved_state)
+            if not _card_sidecar_state_path_is_missing(intent_path):
+                raise ValueError(
+                    "Card sidecar write intent reappeared during terminal publication"
+                )
+            pending = _validate_card_sidecar_intent_evidence(
+                root,
+                purpose="retirement_intent",
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+            )
+            if pending is None:
+                raise ValueError(
+                    "Card sidecar retirement queue entry disappeared before "
+                    "terminal publication completed"
+                )
+            absolute_root = Path(os.path.abspath(root))
+            with guard_windows_file_disposition(
+                namespace_directories=[
+                    absolute_root,
+                    absolute_root / "exports",
+                    resolved_state[0],
+                    absolute_root / "run",
+                    retirement_state[0],
+                ],
+                terminal_path=resolved_path,
+                queue_path=retirement_path,
+            ) as guarded:
+                if guarded is not None:
+                    terminal_bytes, _terminal_identity = (
+                        _read_stable_regular_file_fd(
+                            guarded["terminal_fd"],
+                            max_bytes=MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES,
+                        )
+                    )
+                    queue_bytes, queue_identity = (
+                        _read_stable_regular_file_fd(
+                            guarded["queue_fd"],
+                            max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                        )
+                    )
+                    try:
+                        guarded_terminal = json.loads(
+                            terminal_bytes.decode("utf-8")
+                        )
+                        guarded_queue = json.loads(
+                            queue_bytes.decode("utf-8")
+                        )
+                    except (
+                        UnicodeError,
+                        json.JSONDecodeError,
+                        RecursionError,
+                    ) as exc:
+                        raise ValueError(
+                            "Guarded Card sidecar retirement evidence is invalid"
+                        ) from exc
+                    if (
+                        guarded_terminal
+                        != _card_sidecar_resolved_intent_payload(
+                            intent,
+                            intent_entry_identity=intent_entry_identity,
+                        )
+                        or queue_identity != intent_entry_identity
+                        or guarded_queue != intent
+                    ):
+                        raise ValueError(
+                            "Guarded Card sidecar retirement evidence changed"
+                        )
+                    # This is the one-way commit.  The terminal file and every
+                    # replaceable namespace ancestor remain kernel-guarded,
+                    # and no fallible proof step follows it.
+                    set_windows_delete_disposition(
+                        guarded["queue_handle"]
+                    )
+                    return concurrent_completion
+
+            # Portable fallback: move the queue inode to a unique terminal
+            # archive. Never unlink by pathname after validation; a racing
+            # replacement must survive and force a nonterminal result.
+            archived = False
+            try:
+                replace_file_noclobber(
+                    retirement_path,
+                    retired_archive_path,
+                )
+                archived = True
+                flush_directory_strict(retirement_state[0])
+                _validate_card_sidecar_retired_intent_archive(
+                    retired_archive_path,
+                    resolved_state=resolved_state,
+                    intent=intent,
+                    intent_entry_identity=intent_entry_identity,
+                )
+                _assert_card_sidecar_state_dir_unchanged(retirement_state)
+                if not _card_sidecar_state_path_is_missing(retirement_path):
+                    raise ValueError(
+                        "Card sidecar retirement queue was replaced during "
+                        "portable archival"
+                    )
+                terminal = _validate_card_sidecar_intent_evidence(
+                    root,
+                    purpose="resolved_intent",
+                    intent=intent,
+                    intent_entry_identity=intent_entry_identity,
+                )
+                if terminal is None:
+                    raise ValueError(
+                        "Resolved Card sidecar intent disappeared during "
+                        "portable archival"
+                    )
+            except Exception as archive_error:
+                replay_required = archived
+                if not replay_required:
+                    try:
+                        replay_required = (
+                            _card_sidecar_state_path_is_missing(
+                                retirement_path
+                            )
+                        )
+                    except ValueError:
+                        replay_required = True
+                if replay_required:
+                    try:
+                        _write_card_sidecar_write_intent_fenced(
+                            root,
+                            card_id=str(intent["card_id"]),
+                            target_uri=str(intent["target_uri"]),
+                            expected_state_hash=str(
+                                intent["expected_state_hash"]
+                            ),
+                            mode=str(intent.get("mode") or "write"),
+                        )
+                    except Exception as replay_error:
+                        archive_error.add_note(
+                            "Publishing replacement replay authority also "
+                            "failed: "
+                            f"{type(replay_error).__name__}: {replay_error}"
+                        )
+                raise
+            return concurrent_completion
+
+        terminal = _validate_card_sidecar_intent_evidence(
+            root,
+            purpose="resolved_intent",
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+        )
+        if terminal is None:
+            raise ValueError(
+                "Card sidecar write intent disappeared without retirement evidence"
+            )
+        flush_directory_strict(intent_state[0])
+        _assert_card_sidecar_state_dir_unchanged(intent_state)
+        if not _card_sidecar_state_path_is_missing(intent_path):
+            raise ValueError(
+                "Card sidecar write intent reappeared beside resolved evidence"
+            )
+        _validate_card_sidecar_intent_evidence(
+            root,
+            purpose="resolved_intent",
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+        )
+        return True
+
+    if _card_sidecar_state_path_is_missing(intent_path):
+        return complete_retirement(concurrent_completion=True)
+    try:
+        current_intent_identity = _plain_card_sidecar_state_path_identity(
+            intent_path,
+            directory=False,
+        )
+    except ValueError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return complete_retirement(concurrent_completion=True)
+        raise
+    if current_intent_identity != intent_entry_identity:
+        raise ValueError(
+            "Card sidecar write intent changed before committed receipt retirement"
+        )
+
+    if not _card_sidecar_state_path_is_missing(retirement_path):
+        raise ValueError(
+            "Card sidecar retirement queue entry already exists beside active intent"
+        )
+    try:
+        replace_file_noclobber(intent_path, retirement_path)
+    except FileNotFoundError:
+        return complete_retirement(concurrent_completion=True)
+
+    return complete_retirement(
+        concurrent_completion=False,
+    )
+
+
 def _finish_intent_from_committed_receipt(
     root: Path,
     *,
@@ -4154,16 +4968,17 @@ def _finish_intent_from_committed_receipt(
         if reopened_receipt != receipt or reopened_evidence != receipt_evidence:
             raise ValueError("Card sidecar recovery receipt changed during flush")
         _assert_card_sidecar_state_dir_unchanged(receipt_state)
-        if (
-            _plain_card_sidecar_state_path_identity(intent_path, directory=False)
-            != intent_entry_identity
-        ):
-            raise ValueError(
-                "Card sidecar write intent changed before committed receipt adoption"
-            )
-        intent_path.unlink()
-        flush_directory_strict(intent_path.parent)
-        return {**receipt, "receipt_uri": continuum_uri(root, receipt_path)}
+        concurrent_completion = _retire_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+        )
+        return {
+            **receipt,
+            "receipt_uri": continuum_uri(root, receipt_path),
+            "concurrent_completion": concurrent_completion,
+        }
     finally:
         if receipt_fd >= 0:
             os.close(receipt_fd)
@@ -4649,13 +5464,222 @@ def _resolve_card_sidecar_write_intent(
             os.close(recovery_fd)
 
 
+def _card_sidecar_retirement_entry_binding(
+    retirement_path: Path,
+) -> tuple[str, tuple[int, int]]:
+    try:
+        name_prefix, device_hex, file_hex = (
+            retirement_path.name.removesuffix(".json").rsplit(".", 2)
+        )
+        identity = int(device_hex, 16), int(file_hex, 16)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            "Card sidecar retirement queue filename is invalid"
+        ) from exc
+    if (
+        not name_prefix
+        or identity[0] < 0
+        or identity[1] < 0
+        or retirement_path.name
+        != f"{name_prefix}.{identity[0]:x}.{identity[1]:x}.json"
+    ):
+        raise ValueError(
+            "Card sidecar retirement queue filename is not canonical"
+        )
+    return name_prefix, identity
+
+
+def _bounded_card_sidecar_reconciliation_limit(
+    *,
+    card_ids: Iterable[str] | None,
+    limit: int | None,
+) -> int:
+    if card_ids is not None and limit is not None:
+        raise ValueError(
+            "Card-filtered sidecar intent reconciliation cannot use a global limit"
+        )
+    if limit is None:
+        return MAX_CARD_SIDECAR_WRITE_INTENTS
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError(
+            "Card sidecar intent reconciliation limit must be an integer"
+        )
+    if limit < 1 or limit > MAX_CARD_SIDECAR_WRITE_INTENTS:
+        raise ValueError(
+            "Card sidecar intent reconciliation limit must be between 1 and "
+            f"{MAX_CARD_SIDECAR_WRITE_INTENTS}"
+        )
+    return limit
+
+
+def _empty_card_sidecar_reconciliation_result(
+    *,
+    bounded_limit: int,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "processed": 0,
+        "pending": 0,
+        "failures": [],
+        "results": [],
+        "limit": bounded_limit,
+        "selected": 0,
+        "inspected": 0,
+        "enumerated": 0,
+        "remaining": 0,
+        "remaining_is_lower_bound": False,
+        "complete": True,
+        "has_more": False,
+        "remaining_lower_bound": 0,
+        "batch_truncated": False,
+        "overflow": False,
+        "scope_filtered": False,
+        "scope_complete": True,
+    }
+
+
+def _exhausted_card_sidecar_reconciliation_result(
+    *,
+    budget: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "processed": 0,
+        "pending": 1,
+        "failures": [
+            {
+                "card_id": None,
+                "error": (
+                    "Card sidecar intent reconciliation budget was exhausted"
+                ),
+            }
+        ],
+        "results": [],
+        "limit": 0,
+        "selected": 0,
+        "inspected": 0,
+        "enumerated": 0,
+        "remaining": None,
+        "remaining_is_lower_bound": True,
+        "complete": False,
+        "has_more": True,
+        "remaining_lower_bound": 0,
+        "batch_truncated": True,
+        "overflow": False,
+        "scope_filtered": False,
+        "scope_complete": False,
+        "deferred": True,
+        "budget_exhausted": True,
+        "budget_charged": 0,
+        "reconciliation_budget": {
+            "limit": int(budget["limit"]),
+            "used": int(budget["used"]),
+            "remaining": int(budget["remaining"]),
+        },
+    }
+
+
 def reconcile_card_sidecar_write_intents(
     root: Path,
     *,
     card_ids: Iterable[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    bounded_limit = _bounded_card_sidecar_reconciliation_limit(
+        card_ids=card_ids,
+        limit=limit,
+    )
+    budget = _current_card_sidecar_intent_reconciliation_budget()
+    if budget is not None:
+        allowance = min(
+            bounded_limit,
+            max(0, int(budget["remaining"])),
+        )
+        if allowance <= 0:
+            return _exhausted_card_sidecar_reconciliation_result(
+                budget=budget,
+            )
+        try:
+            result = _reconcile_card_sidecar_write_intents_serialized(
+                root,
+                card_ids=None,
+                limit=allowance,
+            )
+        except Exception:
+            _charge_card_sidecar_intent_reconciliation_budget(
+                budget,
+                allowance=allowance,
+                result=None,
+            )
+            raise
+        charged = _charge_card_sidecar_intent_reconciliation_budget(
+            budget,
+            allowance=allowance,
+            result=result,
+        )
+        result["budget_charged"] = charged
+        result["budget_exhausted"] = bool(
+            budget["remaining"] == 0 and not result.get("complete")
+        )
+        result["reconciliation_budget"] = {
+            "limit": int(budget["limit"]),
+            "used": int(budget["used"]),
+            "remaining": int(budget["remaining"]),
+        }
+        return result
+    return _reconcile_card_sidecar_write_intents_serialized(
+        root,
+        card_ids=card_ids,
+        limit=limit,
+    )
+
+
+def _reconcile_card_sidecar_write_intents_serialized(
+    root: Path,
+    *,
+    card_ids: Iterable[str] | None,
+    limit: int | None,
 ) -> dict[str, Any]:
     if not is_initialized(root):
-        return {"ok": True, "processed": 0, "pending": 0, "failures": [], "results": []}
+        return _empty_card_sidecar_reconciliation_result(
+            bounded_limit=_bounded_card_sidecar_reconciliation_limit(
+                card_ids=card_ids,
+                limit=limit,
+            ),
+        )
+    # Intent reconciliation changes filesystem authority across several
+    # namespaces.  Serialize the complete inventory/read/flush/retire cycle
+    # across both threads and MCP processes so Windows sharing rules and stale
+    # pre-lock inventories cannot turn an idempotent peer into a false failure.
+    from .operations import operation_lock
+
+    with operation_lock(
+        root,
+        CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+        timeout_seconds=60.0,
+    ):
+        return _reconcile_card_sidecar_write_intents_unlocked(
+            root,
+            card_ids=card_ids,
+            limit=limit,
+        )
+
+
+def _reconcile_card_sidecar_write_intents_unlocked(
+    root: Path,
+    *,
+    card_ids: Iterable[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    bounded_limit = _bounded_card_sidecar_reconciliation_limit(
+        card_ids=card_ids,
+        limit=limit,
+    )
+    selected_card_ids = {str(card_id) for card_id in card_ids or () if card_id}
+    if not is_initialized(root):
+        return _empty_card_sidecar_reconciliation_result(
+            bounded_limit=bounded_limit,
+        )
     try:
         intent_state = _validated_card_sidecar_state_dir(
             root,
@@ -4669,47 +5693,299 @@ def reconcile_card_sidecar_write_intents(
             "pending": 0,
             "failures": [{"intent_uri": str(_card_sidecar_write_intent_dir(root)), "error": str(exc)}],
             "results": [],
+            "limit": bounded_limit,
+            "selected": 0,
+            "inspected": 0,
+            "enumerated": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": False,
+            "overflow": False,
+        }
+    try:
+        retirement_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="retirement_intent",
+            create=False,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "processed": 0,
+            "pending": 0,
+            "failures": [
+                {
+                    "intent_uri": str(
+                        _card_sidecar_retirement_intent_dir(root)
+                    ),
+                    "error": str(exc),
+                }
+            ],
+            "results": [],
+            "limit": bounded_limit,
+            "selected": 0,
+            "inspected": 0,
+            "enumerated": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": False,
             "overflow": False,
         }
     if intent_state is None:
-        return {"ok": True, "processed": 0, "pending": 0, "failures": [], "results": []}
+        if retirement_state is not None:
+            return {
+                "ok": False,
+                "processed": 0,
+                "pending": 0,
+                "failures": [
+                    {
+                        "intent_uri": str(retirement_state[0]),
+                        "error": (
+                            "Card sidecar retirement queue exists without "
+                            "its active intent namespace"
+                        ),
+                    }
+                ],
+                "results": [],
+                "limit": bounded_limit,
+                "selected": 0,
+                "inspected": 0,
+                "enumerated": 0,
+                "remaining": None,
+                "remaining_is_lower_bound": True,
+                "complete": False,
+                "has_more": True,
+                "remaining_lower_bound": 0,
+                "batch_truncated": False,
+                "overflow": False,
+            }
+        return _empty_card_sidecar_reconciliation_result(
+            bounded_limit=bounded_limit,
+        )
     intent_dir = intent_state[0]
-    selected_card_ids = {str(card_id) for card_id in card_ids or () if card_id}
+    retirement_dir = retirement_state[0] if retirement_state is not None else None
+    inventory_entry_limit = (
+        MAX_CARD_SIDECAR_WRITE_INTENTS
+        if selected_card_ids
+        else bounded_limit
+    )
     try:
-        intent_paths, overflow = _bounded_card_sidecar_intent_paths(intent_dir)
-    except OSError as exc:
+        (
+            intent_paths,
+            retirement_paths,
+            initial_scan_truncated,
+            initial_enumerated,
+        ) = _bounded_card_sidecar_intent_inventory(
+            intent_dir,
+            retirement_dir,
+            entry_limit=inventory_entry_limit,
+        )
+    except (OSError, ValueError) as exc:
         return {
             "ok": False,
             "processed": 0,
             "pending": 0,
             "failures": [{"intent_uri": str(intent_dir), "error": str(exc)}],
             "results": [],
+            "limit": bounded_limit,
+            "selected": 0,
+            "inspected": 0,
+            "enumerated": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": False,
             "overflow": False,
         }
+    initial_overflow = bool(
+        initial_scan_truncated
+        and inventory_entry_limit >= MAX_CARD_SIDECAR_WRITE_INTENTS
+    )
+    if selected_card_ids:
+        selected_retirement_paths = retirement_paths
+        selected_intent_paths = intent_paths
+    else:
+        selected_retirement_paths = retirement_paths
+        selected_intent_paths = intent_paths
+    batch_truncated = bool(initial_scan_truncated)
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    parsed_intents: list[tuple[Path, dict[str, Any], tuple[int, int]]] = []
-    for intent_path in intent_paths:
+    selected_count = 0
+    inspected_count = 0
+    enumerated_count = initial_enumerated
+    scope_truncated = False
+    for retirement_path in selected_retirement_paths:
+        inspected_count += 1
+        retirement_fd = -1
         try:
-            intent_entry_identity = _plain_card_sidecar_state_path_identity(
-                intent_path,
-                directory=False,
+            name_prefix, expected_identity = (
+                _card_sidecar_retirement_entry_binding(retirement_path)
             )
-            if os.lstat(intent_path).st_size > MAX_CARD_SIDECAR_WRITE_INTENT_BYTES:
-                raise ValueError("Card sidecar write intent exceeds its byte limit")
-            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            retirement_evidence, retirement_fd, raw_bytes = (
+                _open_stable_regular_file_hash_evidence(
+                    retirement_path,
+                    max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                    capture_bytes=True,
+                )
+            )
+            if (
+                retirement_evidence[0][1] != expected_identity
+                or raw_bytes is None
+            ):
+                raise ValueError(
+                    "Card sidecar retirement queue identity does not match"
+                )
+            retirement_intent = json.loads(raw_bytes.decode("utf-8"))
+            if not isinstance(retirement_intent, dict):
+                raise ValueError(
+                    "Card sidecar retirement queue entry must be an object"
+                )
+            if str(retirement_intent.get("intent_id") or "") != name_prefix:
+                raise ValueError(
+                    "Card sidecar retirement queue filename does not bind its intent"
+                )
+            if retirement_state is None:
+                raise ValueError(
+                    "Card sidecar retirement queue state is unavailable"
+                )
+            _assert_card_sidecar_state_dir_unchanged(retirement_state)
+            if not _held_regular_file_evidence_is_current(
+                retirement_path,
+                retirement_evidence,
+                retirement_fd,
+            ):
+                raise ValueError(
+                    "Card sidecar retirement queue entry changed during read"
+                )
+            os.close(retirement_fd)
+            retirement_fd = -1
+            validated_retirement = _validate_card_sidecar_intent_evidence(
+                root,
+                purpose="retirement_intent",
+                intent=retirement_intent,
+                intent_entry_identity=expected_identity,
+            )
+            if (
+                validated_retirement is None
+                or validated_retirement[1] != retirement_path
+            ):
+                raise ValueError(
+                    "Card sidecar retirement queue entry disappeared during read"
+                )
+        except (OSError, UnicodeError, ValueError) as exc:
+            failures.append(
+                {
+                    "intent_uri": continuum_uri(root, retirement_path),
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            )
+            continue
+        finally:
+            if retirement_fd >= 0:
+                os.close(retirement_fd)
+        if (
+            selected_card_ids
+            and str(retirement_intent.get("card_id") or "")
+            not in selected_card_ids
+        ):
+            continue
+        if selected_count >= bounded_limit:
+            scope_truncated = True
+            continue
+        selected_count += 1
+        active_intent_path = intent_dir / (
+            f"{retirement_intent.get('intent_id')}.json"
+        )
+        try:
+            retirement_result = _finish_intent_from_committed_receipt(
+                root,
+                intent_path=active_intent_path,
+                intent=retirement_intent,
+                intent_entry_identity=expected_identity,
+            )
+            if retirement_result is None:
+                retirement_result = {
+                    "ok": False,
+                    "status": "retirement_receipt_missing",
+                    "intent_uri": continuum_uri(root, retirement_path),
+                }
+        except Exception as exc:
+            retirement_result = {
+                "ok": False,
+                "status": "retirement_reconciliation_exception",
+                "intent_uri": continuum_uri(root, retirement_path),
+                "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            }
+        results.append(retirement_result)
+        if not retirement_result.get("ok"):
+            failures.append(retirement_result)
+
+    parsed_intents: list[tuple[Path, dict[str, Any], tuple[int, int]]] = []
+    for intent_path in selected_intent_paths:
+        inspected_count += 1
+        intent_fd = -1
+        try:
+            intent_evidence, intent_fd, raw_bytes = (
+                _open_stable_regular_file_hash_evidence(
+                    intent_path,
+                    max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                    capture_bytes=True,
+                )
+            )
+            if raw_bytes is None:
+                raise ValueError(
+                    "Card sidecar write intent bytes are unavailable"
+                )
+            raw_intent_identity = intent_evidence[0][1]
+            if raw_intent_identity is None:
+                raise ValueError(
+                    "Card sidecar write intent identity is unavailable"
+                )
+            intent_entry_identity = raw_intent_identity
+            intent = json.loads(raw_bytes.decode("utf-8"))
             if not isinstance(intent, dict):
                 raise ValueError("Card sidecar write intent must be an object")
             _assert_card_sidecar_state_dir_unchanged(intent_state)
-            if (
-                _plain_card_sidecar_state_path_identity(intent_path, directory=False)
-                != intent_entry_identity
+            if not _held_regular_file_evidence_is_current(
+                intent_path,
+                intent_evidence,
+                intent_fd,
             ):
                 raise ValueError("Card sidecar write intent changed during bounded read")
+            os.close(intent_fd)
+            intent_fd = -1
             # A visible intent left by a prior strict-flush failure becomes
             # authority only after its bytes and namespace are strict again.
             flush_file_strict(intent_path)
             flush_directory_strict(intent_dir)
+            reopened_evidence, intent_fd, reopened_bytes = (
+                _open_stable_regular_file_hash_evidence(
+                    intent_path,
+                    max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+                    capture_bytes=True,
+                )
+            )
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            if (
+                reopened_evidence != intent_evidence
+                or reopened_bytes != raw_bytes
+                or not _held_regular_file_evidence_is_current(
+                    intent_path,
+                    reopened_evidence,
+                    intent_fd,
+                )
+            ):
+                raise ValueError(
+                    "Card sidecar write intent changed during strict flush"
+                )
         except (OSError, UnicodeError, ValueError) as exc:
             failures.append(
                 {
@@ -4718,8 +5994,15 @@ def reconcile_card_sidecar_write_intents(
                 }
             )
             continue
+        finally:
+            if intent_fd >= 0:
+                os.close(intent_fd)
         if selected_card_ids and str(intent.get("card_id") or "") not in selected_card_ids:
             continue
+        if selected_count >= bounded_limit:
+            scope_truncated = True
+            continue
+        selected_count += 1
         parsed_intents.append((intent_path, intent, intent_entry_identity))
 
     conn = connect(root)
@@ -4757,31 +6040,164 @@ def reconcile_card_sidecar_write_intents(
         raise
     finally:
         conn.close()
+    progress_blocked = bool(
+        initial_scan_truncated and selected_count == 0
+    )
+    if progress_blocked:
+        failures.append(
+            {
+                "intent_uri": continuum_uri(root, intent_dir),
+                "error": (
+                    "Card sidecar intent reconciliation made no progress "
+                    "before the bounded enumeration frontier"
+                ),
+                "reason": "bounded_inventory_progress_blocked",
+            }
+        )
     pending = sum(
         1
         for result in results
         if result.get("status") in {"pending_retry", "pending_compensation"}
     )
+    remaining: int | None
+    remaining_is_lower_bound = False
+    remaining_overflow = False
+    postflight_conn: sqlite3.Connection | None = None
+    if initial_scan_truncated:
+        # The bounded initial inventory already proves that more authority may
+        # exist. Avoid a second traversal and report a conservative lower
+        # bound instead of pretending to know the exact queue cardinality.
+        remaining = max(
+            1,
+            pending,
+            sum(1 for result in results if not result.get("ok")),
+        )
+        remaining_is_lower_bound = True
+        remaining_overflow = initial_overflow
+    else:
+        try:
+            # Every production publisher creates its durable intent while
+            # holding a SQLite writer transaction. Taking the same writer
+            # fence before the final namespace scan waits for earlier
+            # publishers and prevents later ones from starting until this
+            # completion result linearizes.
+            postflight_conn = connect(root)
+            postflight_conn.execute("BEGIN IMMEDIATE")
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            current_retirement_state = (
+                _validated_card_sidecar_state_dir(
+                    root,
+                    purpose="retirement_intent",
+                    create=False,
+                )
+            )
+            postflight_entry_limit = max(
+                0,
+                inventory_entry_limit - enumerated_count,
+            )
+            (
+                remaining_intent_paths,
+                remaining_retirement_paths,
+                remaining_scan_truncated,
+                remaining_enumerated,
+            ) = _bounded_card_sidecar_intent_inventory(
+                intent_dir,
+                (
+                    current_retirement_state[0]
+                    if current_retirement_state is not None
+                    else None
+                ),
+                entry_limit=postflight_entry_limit,
+            )
+            enumerated_count += remaining_enumerated
+            if current_retirement_state is not None:
+                _assert_card_sidecar_state_dir_unchanged(
+                    current_retirement_state
+                )
+            remaining = (
+                len(remaining_intent_paths)
+                + len(remaining_retirement_paths)
+                + (1 if remaining_scan_truncated else 0)
+            )
+            remaining_is_lower_bound = remaining_scan_truncated
+            remaining_overflow = bool(
+                remaining_scan_truncated
+                and inventory_entry_limit
+                >= MAX_CARD_SIDECAR_WRITE_INTENTS
+            )
+            batch_truncated = bool(
+                batch_truncated or remaining_scan_truncated
+            )
+            postflight_conn.commit()
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            if (
+                postflight_conn is not None
+                and postflight_conn.in_transaction
+            ):
+                postflight_conn.rollback()
+            remaining = None
+            remaining_is_lower_bound = True
+            failures.append(
+                {
+                    "intent_uri": continuum_uri(root, intent_dir),
+                    "error": (
+                        "Card sidecar intent postflight scan failed: "
+                        f"{type(exc).__name__}: {str(exc)[:512]}"
+                    ),
+                }
+            )
+        finally:
+            if postflight_conn is not None:
+                postflight_conn.close()
+    overflow = bool(initial_overflow or remaining_overflow)
     if overflow:
+        remaining_is_lower_bound = True
         failures.append(
             {
                 "intent_uri": continuum_uri(root, intent_dir),
                 "error": "Card sidecar write intent scan limit exceeded",
             }
         )
+    complete = bool(remaining == 0 and not overflow and not failures)
+    has_more = not complete
+    batch_truncated = bool(batch_truncated or scope_truncated)
+    # A filtered pass cannot prove that matching work did not arrive after
+    # its initial inventory while any intent authority remains globally.
+    # Conservatively require the postflight namespace to be empty before a
+    # worker may treat the selected scope as complete.
+    scope_complete = complete
     return {
         "ok": not failures,
         "processed": len(results),
         "pending": pending,
         "failures": failures,
         "results": results,
+        "limit": bounded_limit,
+        "selected": selected_count,
+        "inspected": inspected_count,
+        "enumerated": enumerated_count,
+        "remaining": remaining,
+        "remaining_is_lower_bound": remaining_is_lower_bound,
+        "complete": complete,
+        "has_more": has_more,
+        "remaining_lower_bound": (
+            0
+            if remaining is None
+            else remaining
+        ),
+        "batch_truncated": batch_truncated,
         "overflow": overflow,
+        "progress_blocked": progress_blocked,
+        "scope_filtered": bool(selected_card_ids),
+        "scope_complete": scope_complete,
     }
 
 
 def register_card_sidecar_compensation_intents(
     root: Path,
     candidates: Iterable[dict[str, Any]],
+    *,
+    conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, str]]:
     registered: list[dict[str, str]] = []
     for candidate in candidates:
@@ -4800,6 +6216,7 @@ def register_card_sidecar_compensation_intents(
             target_uri=target_uri,
             expected_state_hash=expected_state_hash,
             mode="compensation_cleanup",
+            conn=conn,
         )
         registered.append(
             {
@@ -5179,6 +6596,7 @@ def sync_card_sidecar(
             card_id=card_id,
             target_uri=target_uri,
             expected_state_hash=expected_state_hash,
+            conn=conn,
         )
     if write_observation is not None and sidecar_path is not None:
         write_observation.update(
@@ -5505,15 +6923,37 @@ def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
             purpose="intent",
             create=False,
         )
+        retirement_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="retirement_intent",
+            create=False,
+        )
         if intent_state is None:
-            return False
-        intent_paths, overflow = _bounded_card_sidecar_intent_paths(
+            return retirement_state is not None
+        (
+            intent_paths,
+            retirement_paths,
+            inventory_truncated,
+            _enumerated,
+        ) = _bounded_card_sidecar_intent_inventory(
             intent_state[0],
+            (
+                retirement_state[0]
+                if retirement_state is not None
+                else None
+            ),
+            entry_limit=MAX_CARD_SIDECAR_WRITE_INTENTS,
         )
         _assert_card_sidecar_state_dir_unchanged(intent_state)
+        if retirement_state is not None:
+            _assert_card_sidecar_state_dir_unchanged(retirement_state)
     except (OSError, ValueError):
         return True
-    return bool(intent_paths) or overflow
+    return bool(
+        intent_paths
+        or retirement_paths
+        or inventory_truncated
+    )
 
 
 def _init_db_durable_ready(root: Path) -> bool:
@@ -7040,7 +8480,17 @@ def create_card(
     return card_id
 
 
-def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str, Any]:
+def sync_card_sidecars_after_commit(
+    root: Path,
+    card_ids: list[str],
+    *,
+    reconcile_intents: bool = True,
+    intent_reconciliation_limit: int | None = None,
+) -> dict[str, Any]:
+    if intent_reconciliation_limit is None:
+        intent_reconciliation_limit = (
+            _CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT.get()
+        )
     unique_card_ids = [card_id for card_id in dict.fromkeys(card_ids) if card_id]
     if not unique_card_ids:
         return {
@@ -7374,10 +8824,37 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
         }
     finally:
         conn.close()
-    reconciliation = reconcile_card_sidecar_write_intents(
-        root,
-        card_ids=unique_card_ids,
-    )
+    if reconcile_intents:
+        if intent_reconciliation_limit is None:
+            reconciliation = reconcile_card_sidecar_write_intents(
+                root,
+                card_ids=unique_card_ids,
+            )
+        else:
+            reconciliation = reconcile_card_sidecar_write_intents(
+                root,
+                limit=intent_reconciliation_limit,
+            )
+    else:
+        reconciliation = {
+            "ok": True,
+            "processed": 0,
+            "pending": 0,
+            "failures": [],
+            "results": [],
+            "limit": 0,
+            "selected": 0,
+            "remaining": None,
+            "remaining_is_lower_bound": True,
+            "complete": False,
+            "has_more": True,
+            "remaining_lower_bound": 0,
+            "batch_truncated": False,
+            "overflow": False,
+            "scope_filtered": True,
+            "scope_complete": False,
+            "deferred": True,
+        }
     reconciliation_results = list(reconciliation.get("results", []))
     intent_reconciliation_results.extend(reconciliation_results)
     for reconciliation_result in reconciliation_results:
@@ -7400,9 +8877,19 @@ def sync_card_sidecars_after_commit(root: Path, card_ids: list[str]) -> dict[str
             and candidate not in generated_sidecar_candidates
         ):
             generated_sidecar_candidates.append(candidate)
-    reconciliation_clean = bool(reconciliation.get("ok")) and int(
-        reconciliation.get("pending", 0)
-    ) == 0
+    reconciliation_clean = bool(
+        not reconcile_intents
+        or (
+            reconciliation.get("ok")
+            and int(reconciliation.get("pending", 0)) == 0
+            and bool(
+                reconciliation.get(
+                    "scope_complete",
+                    reconciliation.get("complete"),
+                )
+            )
+        )
+    )
     if not reconciliation_clean:
         failures.append(
             {
@@ -8496,10 +9983,12 @@ def roll_scroll_segment(
         if transaction_guard is not None:
             transaction_guard(conn)
         conn.commit()
-        sync_card_sidecars_after_commit(root, [card_id])
+        sidecars = sync_card_sidecars_after_commit(root, [card_id])
         sidecar_path = current_card_sidecar_path(root, conn, card_id)
         return {
             **committed_result,
+            "ok": bool(sidecars.get("ok")),
+            "sidecars": sidecars,
             "card_uri": str(sidecar_path) if sidecar_path and sidecar_path.exists() else None,
         }
     except Exception:
@@ -20147,6 +21636,7 @@ def semantic_integrity_report(
             }
         )
         unresolved_card_sidecar_write_intents = 0
+        unresolved_card_sidecar_retirement_intents = 0
         card_sidecar_write_intent_scan_overflow = 0
         unsafe_card_sidecar_write_intent_paths = 0
         if check_card_sidecars:
@@ -20159,29 +21649,68 @@ def semantic_integrity_report(
             except ValueError:
                 unsafe_card_sidecar_write_intent_paths += 1
                 intent_state = None
-            if intent_state is not None:
+            try:
+                retirement_state = _validated_card_sidecar_state_dir(
+                    root,
+                    purpose="retirement_intent",
+                    create=False,
+                )
+            except ValueError:
+                unsafe_card_sidecar_write_intent_paths += 1
+                retirement_state = None
+            intent_paths: list[Path] = []
+            retirement_paths: list[Path] = []
+            inventory_truncated = False
+            if intent_state is None and retirement_state is not None:
+                unsafe_card_sidecar_write_intent_paths += 1
                 try:
                     (
-                        intent_paths,
-                        intent_overflow,
-                    ) = _bounded_card_sidecar_intent_paths(
-                        intent_state[0]
+                        retirement_paths,
+                        inventory_truncated,
+                        _enumerated,
+                    ) = _bounded_card_sidecar_state_paths(
+                        retirement_state[0],
                     )
                 except OSError:
                     unsafe_card_sidecar_write_intent_paths += 1
-                    intent_paths = []
-                    intent_overflow = False
-                if intent_overflow:
-                    card_sidecar_write_intent_scan_overflow = 1
-                for intent_path in intent_paths:
-                    unresolved_card_sidecar_write_intents += 1
-                    try:
-                        _plain_card_sidecar_state_path_identity(
-                            intent_path,
-                            directory=False,
-                        )
-                    except ValueError:
-                        unsafe_card_sidecar_write_intent_paths += 1
+            elif intent_state is not None:
+                try:
+                    (
+                        intent_paths,
+                        retirement_paths,
+                        inventory_truncated,
+                        _enumerated,
+                    ) = _bounded_card_sidecar_intent_inventory(
+                        intent_state[0],
+                        (
+                            retirement_state[0]
+                            if retirement_state is not None
+                            else None
+                        ),
+                        entry_limit=MAX_CARD_SIDECAR_WRITE_INTENTS,
+                    )
+                except OSError:
+                    unsafe_card_sidecar_write_intent_paths += 1
+            if inventory_truncated:
+                card_sidecar_write_intent_scan_overflow = 1
+            for intent_path in intent_paths:
+                unresolved_card_sidecar_write_intents += 1
+                try:
+                    _plain_card_sidecar_state_path_identity(
+                        intent_path,
+                        directory=False,
+                    )
+                except ValueError:
+                    unsafe_card_sidecar_write_intent_paths += 1
+            for retirement_path in retirement_paths:
+                unresolved_card_sidecar_retirement_intents += 1
+                try:
+                    _plain_card_sidecar_state_path_identity(
+                        retirement_path,
+                        directory=False,
+                    )
+                except ValueError:
+                    unsafe_card_sidecar_write_intent_paths += 1
         malformed_graph_sources = 0
         graph_source_key_mismatches = 0
         graph_source_missing_references = 0
@@ -20444,6 +21973,9 @@ def semantic_integrity_report(
             **sidecar_audit,
             "unresolved_card_sidecar_write_intents": (
                 unresolved_card_sidecar_write_intents
+            ),
+            "unresolved_card_sidecar_retirement_intents": (
+                unresolved_card_sidecar_retirement_intents
             ),
             "card_sidecar_write_intent_scan_overflow": (
                 card_sidecar_write_intent_scan_overflow

@@ -7,6 +7,8 @@ import shutil
 import stat
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from functools import lru_cache
 from typing import Any
@@ -14,6 +16,352 @@ from typing import Any
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+
+
+def _flush_windows_handle_strict(
+    kernel32: Any,
+    wintypes: Any,
+    handle_value: int,
+) -> None:
+    """Flush one already-open Windows handle without reopening its path."""
+
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle_value)):
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+
+
+@contextmanager
+def guard_windows_file_disposition(
+    *,
+    namespace_directories: list[Path],
+    terminal_path: Path,
+    queue_path: Path,
+) -> Iterator[dict[str, int] | None]:
+    """Fence Windows namespaces and expose exact file handles for retirement.
+
+    Directory and terminal handles omit delete sharing, so their namespace
+    objects cannot be renamed or replaced while the caller validates and
+    retires the queue file.  The queue handle itself has DELETE access and is
+    shared for reads only.  On non-Windows platforms the caller receives
+    ``None`` and must use its portable fallback.
+    """
+
+    if os.name != "nt":
+        yield None
+        return
+
+    import msvcrt
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    file_read_attributes = 0x00000080
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    delete_access = 0x00010000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    raw_handles: list[int] = []
+    directory_records: list[
+        tuple[Path, int, tuple[int, int, bool, bool]]
+    ] = []
+    terminal_fd = -1
+    queue_fd = -1
+
+    def open_handle(
+        path: Path,
+        *,
+        desired_access: int,
+        share_mode: int,
+        directory: bool,
+    ) -> int:
+        handle = kernel32.CreateFileW(
+            str(path),
+            desired_access,
+            share_mode,
+            None,
+            open_existing,
+            (
+                (backup_semantics if directory else file_attribute_normal)
+                | open_reparse_point
+            ),
+            None,
+        )
+        handle_value = int(getattr(handle, "value", handle) or 0)
+        if handle_value in {0, invalid_handle}:
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        raw_handles.append(handle_value)
+        return handle_value
+
+    def handle_identity(
+        handle_value: int,
+    ) -> tuple[int, int, bool, bool]:
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            wintypes.HANDLE(handle_value),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        attributes = int(information.file_attributes)
+        return (
+            int(information.volume_serial_number),
+            (
+                int(information.file_index_high) << 32
+                | int(information.file_index_low)
+            ),
+            bool(attributes & 0x10),
+            bool(attributes & 0x400),
+        )
+
+    def verify_namespace_binding(
+        path: Path,
+        *,
+        expected: tuple[int, int, bool, bool],
+        directory: bool,
+    ) -> None:
+        metadata = os.lstat(path)
+        is_junction = getattr(path, "is_junction", None)
+        junction = bool(callable(is_junction) and is_junction())
+        reparse_flag = int(
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        reparse = bool(
+            int(getattr(metadata, "st_file_attributes", 0))
+            & reparse_flag
+        )
+        namespace_is_directory = stat.S_ISDIR(metadata.st_mode)
+        namespace_is_file = stat.S_ISREG(metadata.st_mode)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or junction
+            or reparse
+            or expected[2] != directory
+            or expected[3]
+            or namespace_is_directory != directory
+            or namespace_is_file == directory
+            or int(metadata.st_ino) != expected[1]
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "guarded Windows namespace identity changed",
+                str(path),
+            )
+
+    try:
+        for directory in namespace_directories:
+            handle_value = open_handle(
+                directory,
+                desired_access=file_read_attributes | generic_write,
+                share_mode=share_read | share_write,
+                directory=True,
+            )
+            directory_records.append(
+                (
+                    directory,
+                    handle_value,
+                    handle_identity(handle_value),
+                )
+            )
+        terminal_handle = open_handle(
+            terminal_path,
+            desired_access=generic_read | generic_write,
+            share_mode=share_read,
+            directory=False,
+        )
+        terminal_identity = handle_identity(terminal_handle)
+        queue_handle = open_handle(
+            queue_path,
+            desired_access=generic_read | delete_access,
+            share_mode=share_read,
+            directory=False,
+        )
+        queue_identity = handle_identity(queue_handle)
+
+        for path, handle_value, expected in directory_records:
+            if handle_identity(handle_value) != expected:
+                raise OSError(
+                    errno.ESTALE,
+                    "guarded Windows directory handle changed",
+                    str(path),
+                )
+            verify_namespace_binding(
+                path,
+                expected=expected,
+                directory=True,
+            )
+        if handle_identity(terminal_handle) != terminal_identity:
+            raise OSError(
+                errno.ESTALE,
+                "guarded Windows terminal handle changed",
+                str(terminal_path),
+            )
+        verify_namespace_binding(
+            terminal_path,
+            expected=terminal_identity,
+            directory=False,
+        )
+        if handle_identity(queue_handle) != queue_identity:
+            raise OSError(
+                errno.ESTALE,
+                "guarded Windows queue handle changed",
+                str(queue_path),
+            )
+        verify_namespace_binding(
+            queue_path,
+            expected=queue_identity,
+            directory=False,
+        )
+
+        # Strictly flush the exact terminal inode and the exact guarded
+        # namespace handles. Reopening by path here would accept a byte-equal
+        # replacement that was never made durable.
+        _flush_windows_handle_strict(
+            kernel32,
+            wintypes,
+            terminal_handle,
+        )
+        for _path, handle_value, _expected in directory_records:
+            _flush_windows_handle_strict(
+                kernel32,
+                wintypes,
+                handle_value,
+            )
+
+        for path, handle_value, expected in directory_records:
+            if handle_identity(handle_value) != expected:
+                raise OSError(
+                    errno.ESTALE,
+                    "guarded Windows directory handle changed during flush",
+                    str(path),
+                )
+            verify_namespace_binding(
+                path,
+                expected=expected,
+                directory=True,
+            )
+        if handle_identity(terminal_handle) != terminal_identity:
+            raise OSError(
+                errno.ESTALE,
+                "guarded Windows terminal handle changed during flush",
+                str(terminal_path),
+            )
+        verify_namespace_binding(
+            terminal_path,
+            expected=terminal_identity,
+            directory=False,
+        )
+        if handle_identity(queue_handle) != queue_identity:
+            raise OSError(
+                errno.ESTALE,
+                "guarded Windows queue handle changed during terminal flush",
+                str(queue_path),
+            )
+        verify_namespace_binding(
+            queue_path,
+            expected=queue_identity,
+            directory=False,
+        )
+
+        terminal_fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            terminal_handle,
+            os.O_RDWR | int(getattr(os, "O_BINARY", 0)),
+        )
+        raw_handles.remove(terminal_handle)
+        queue_fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            queue_handle,
+            os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
+        )
+        raw_handles.remove(queue_handle)
+        yield {
+            "terminal_fd": terminal_fd,
+            "queue_fd": queue_fd,
+            "queue_handle": queue_handle,
+        }
+    finally:
+        if queue_fd >= 0:
+            try:
+                os.close(queue_fd)
+            except OSError:
+                pass
+        if terminal_fd >= 0:
+            try:
+                os.close(terminal_fd)
+            except OSError:
+                pass
+        for handle_value in reversed(raw_handles):
+            try:
+                kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+            except Exception:
+                pass
+
+
+def set_windows_delete_disposition(handle: int) -> None:
+    """Mark one exact Windows file handle for deletion on close."""
+
+    if os.name != "nt":
+        raise OSError(
+            errno.ENOTSUP,
+            "Windows handle disposition is unavailable",
+        )
+
+    from ctypes import wintypes
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", wintypes.BOOLEAN)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    disposition = _FileDispositionInfo(True)
+    if not kernel32.SetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
 def _probe_directory(path: Path | None = None) -> Path | None:

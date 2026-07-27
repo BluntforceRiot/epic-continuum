@@ -1603,11 +1603,28 @@ print(json.dumps(result, sort_keys=True))
             ):
                 interrupted = store_module.reconcile_card_sidecar_write_intents(root)
             self.assertFalse(interrupted["ok"], interrupted)
-            self.assertFalse(intent_path.exists())
             self.assertTrue(receipt.is_file())
-            intent_path.write_bytes(intent_bytes)
+            retirement_paths = list(
+                (
+                    root / "run" / "card_sidecar_retirement_intents"
+                ).glob("*.json")
+            )
+            retry_paths = [
+                path
+                for path in (intent_path, *retirement_paths)
+                if path.is_file()
+            ]
+            self.assertEqual(len(retry_paths), 1)
+            self.assertEqual(retry_paths[0].read_bytes(), intent_bytes)
             self.assertTrue(store_module.reconcile_card_sidecar_write_intents(root)["ok"])
             self.assertFalse(intent_path.exists())
+            self.assertFalse(
+                list(
+                    (
+                        root / "run" / "card_sidecar_retirement_intents"
+                    ).glob("*.json")
+                )
+            )
 
     def test_sidecar_quarantine_postcommit_replacement_is_audited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4231,6 +4248,159 @@ print(json.dumps(result, sort_keys=True))
                     ).fetchone()[0],
                     1,
                 )
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+
+    def test_graph_source_queue_retains_mismatched_extra_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            source_ref = {
+                "card_id": "card_mismatched_extra_identity",
+                "event_id": "event_mismatched_extra_identity",
+            }
+            source_ref_key = store_module._source_ref_identity(source_ref)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="mismatched-extra-source",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="mismatched-extra-target",
+                )
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[source_ref],
+                )
+                conn.execute(
+                    """
+                    UPDATE graph_edge_sources
+                    SET source_ref_key = 'bogus-source-ref-key'
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (edge_id, source_ref_key),
+                )
+                conn.commit()
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_sources "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    2,
+                )
+            integrity = semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertEqual(
+                integrity["checks"]["graph_source_key_mismatches"],
+                1,
+            )
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+
+    def test_graph_source_queue_validates_normalized_rows_for_empty_legacy_refs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            source_ref = {
+                "card_id": "card_empty_legacy_mismatch",
+                "event_id": "event_empty_legacy_mismatch",
+            }
+            source_ref_key = store_module._source_ref_identity(source_ref)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="empty-legacy-source",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="empty-legacy-target",
+                )
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[source_ref],
+                )
+                conn.execute(
+                    "UPDATE graph_edges SET source_refs_json = '[]' WHERE id = ?",
+                    (edge_id,),
+                )
+                conn.execute(
+                    """
+                    UPDATE graph_edge_sources
+                    SET source_ref_key = 'bogus-empty-legacy-source-ref-key'
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (edge_id, source_ref_key),
+                )
+                conn.commit()
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+            integrity = semantic_integrity_report(root)
+            self.assertFalse(integrity["ok"], integrity)
+            self.assertEqual(
+                integrity["checks"]["graph_source_key_mismatches"],
+                1,
+            )
             self.assertNotIn(cache_key, _INIT_DB_CACHE)
 
     def test_graph_source_queue_query_plan_is_queue_first(self) -> None:

@@ -176,10 +176,27 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                         ).hexdigest(),
                         source_refs=[],
                     )
+                intent_row = conn.execute(
+                    "SELECT * FROM cards ORDER BY id LIMIT 1"
+                ).fetchone()
+                intent_card_id = str(intent_row["id"])
+                intent_state_hash = str(
+                    store_module._card_sidecar_payload_for_row(intent_row)[
+                        "state_hash"
+                    ]
+                )
                 conn.execute("DELETE FROM queue_jobs")
                 conn.commit()
             finally:
                 conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=intent_card_id,
+                    target_uri=f"catalog/cards/{intent_card_id}.yaml",
+                    expected_state_hash=intent_state_hash,
+                )
+            )
 
             with (
                 patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
@@ -188,6 +205,11 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     "sync_pending_card_sidecars",
                     wraps=store_module.sync_pending_card_sidecars,
                 ) as generic_recovery,
+                patch.object(
+                    worker_module,
+                    "reconcile_card_sidecar_write_intents",
+                    wraps=store_module.reconcile_card_sidecar_write_intents,
+                ) as generic_intent_recovery,
             ):
                 deferred = call_tool(
                     "continuum_run_workers",
@@ -206,6 +228,8 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                     )
                 finally:
                     conn.close()
+                generic_intent_recovery.assert_not_called()
+                self.assertTrue(intent_path.is_file())
                 bounded = call_tool(
                     "continuum_run_workers",
                     {"root": str(root), "limit": 1},

@@ -172,6 +172,34 @@ class TestEricMemoryBenchSmoke(unittest.TestCase):
             self.assertIn("superseded_error_rate", groups[("openclaw_qmd_notes", 512)])
             self.assertEqual(groups[("openclaw_qmd_notes", 512)]["superseded_error_rate"], 0.0)
 
+    def test_corpus_build_rejects_failed_fixture_sidecars(self) -> None:
+        case = {
+            "id": "sidecar-failure",
+            "session_id": "sidecar-failure-session",
+            "project_id": "epic-continuum",
+            "events": [],
+            "cards": ["A benchmark Card must have durable sidecar evidence."],
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            eric_memory_bench,
+            "sync_card_sidecars_after_commit",
+            return_value={
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "forced fixture sidecar failure"}],
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Benchmark fixture Card sidecars did not materialize cleanly",
+            ):
+                eric_memory_bench.build_corpus(
+                    Path(tmp) / "continuum",
+                    [case],
+                    include_fixture_cards=True,
+                )
+
     def test_superseded_scoring_requires_explicit_supersession_and_does_not_double_count(self) -> None:
         base_case = {
             "id": "historical",

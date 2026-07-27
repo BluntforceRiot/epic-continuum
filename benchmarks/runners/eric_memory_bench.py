@@ -31,7 +31,7 @@ from continuum.core.store import (  # noqa: E402
     estimate_tokens,
     init_db,
     record_project_state,
-    sync_card_sidecar,
+    sync_card_sidecars_after_commit,
 )
 
 try:  # noqa: E402
@@ -190,9 +190,12 @@ def build_corpus(root: Path, cases: list[dict[str, Any]], *, include_fixture_car
                 )
             conn.commit()
             if created_cards:
-                for card_id in created_cards:
-                    sync_card_sidecar(root, conn, card_id)
-                conn.commit()
+                sidecars = sync_card_sidecars_after_commit(root, created_cards)
+                if not sidecars.get("ok"):
+                    raise RuntimeError(
+                        "Benchmark fixture Card sidecars did not materialize "
+                        f"cleanly: {sidecars}"
+                    )
         finally:
             conn.close()
 

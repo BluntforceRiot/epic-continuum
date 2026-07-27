@@ -43,10 +43,27 @@ class ResumeCliTests(unittest.TestCase):
                     summary="CLI proof generation must leave this queued sidecar alone.",
                     source_refs=[],
                 )
+                card_row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                intent_state_hash = str(
+                    store_module._card_sidecar_payload_for_row(card_row)[
+                        "state_hash"
+                    ]
+                )
                 conn.execute("DELETE FROM queue_jobs")
                 conn.commit()
             finally:
                 conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=f"catalog/cards/{card_id}.yaml",
+                    expected_state_hash=intent_state_hash,
+                )
+            )
 
             deferred_output = io.StringIO()
             with (
@@ -56,6 +73,11 @@ class ResumeCliTests(unittest.TestCase):
                     "sync_pending_card_sidecars",
                     wraps=store_module.sync_pending_card_sidecars,
                 ) as deferred_generic_recovery,
+                patch.object(
+                    worker_module,
+                    "reconcile_card_sidecar_write_intents",
+                    wraps=store_module.reconcile_card_sidecar_write_intents,
+                ) as deferred_intent_recovery,
                 redirect_stdout(deferred_output),
             ):
                 deferred_code = cli_main(
@@ -74,6 +96,8 @@ class ResumeCliTests(unittest.TestCase):
             self.assertTrue(deferred["ok"], deferred)
             self.assertEqual(deferred["_operation"]["status"], "succeeded")
             deferred_generic_recovery.assert_not_called()
+            deferred_intent_recovery.assert_not_called()
+            self.assertTrue(intent_path.is_file())
             conn = connect(root)
             try:
                 pending_after_deferred = (

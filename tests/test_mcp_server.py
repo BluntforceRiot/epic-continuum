@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import continuum.core.store as store_module
 from continuum.core.config import default_config, write_config
 from continuum.core.operations import _proof_pack_hash, list_operations
 from continuum.core.store import (
@@ -148,6 +149,65 @@ def stdio_handshake_requests(*, initialize_id: int = 900) -> list[dict[str, Any]
 
 
 class EpicContinuumMcpServerTest(unittest.TestCase):
+    def test_mcp_resume_migrates_authority_indexes_before_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="mcp-upgrade-session",
+                agent_id="codex-sol",
+                project_id="mcp-upgrade-project",
+                objective="Migrate before MCP resume discovery.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "DROP INDEX idx_graph_edge_sources_card_id_authority"
+                )
+                conn.execute(
+                    "DROP INDEX "
+                    "idx_graph_edge_sources_source_ref_key_authority"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            store_module._INIT_DB_CACHE.discard(
+                str(root.resolve(strict=False))
+            )
+
+            with patch.dict(
+                "os.environ",
+                {"CONTINUUM_ALLOWED_ROOTS": tmp},
+            ):
+                result = call_tool(
+                    "continuum_resume_latest",
+                    {
+                        "root": str(root),
+                        "project_id": "mcp-upgrade-project",
+                        "model_assist": False,
+                    },
+                )
+
+            self.assertTrue(result["ok"], result)
+            conn = connect(root)
+            try:
+                indexes = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertTrue(
+                store_module.RESUME_AUTHORITY_INDEX_NAMES.issubset(
+                    indexes
+                ),
+                indexes,
+            )
+
     def test_stdio_allows_ping_before_and_during_initialize(self) -> None:
         requests = (
             {"jsonrpc": "2.0", "id": 1, "method": "ping"},

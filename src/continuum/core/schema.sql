@@ -161,6 +161,11 @@ CREATE TABLE IF NOT EXISTS graph_edge_sources (
     PRIMARY KEY(edge_id, source_ref_key)
 );
 
+CREATE TABLE IF NOT EXISTS graph_edge_source_backfill_queue (
+    edge_id TEXT PRIMARY KEY REFERENCES graph_edges(id) ON DELETE CASCADE,
+    queued_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS partition_aliases (
     kind TEXT NOT NULL,
     external_digest TEXT NOT NULL,
@@ -314,3 +319,55 @@ CREATE INDEX IF NOT EXISTS idx_conflict_resolution_receipts_fingerprint ON confl
 CREATE INDEX IF NOT EXISTS idx_conflict_resolution_members_card ON conflict_resolution_members(card_id, receipt_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_operation ON artifacts(operation_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_graph_edges_source_refs_backfill_insert
+AFTER INSERT ON graph_edges
+BEGIN
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    VALUES(NEW.id, CURRENT_TIMESTAMP)
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_graph_edges_source_refs_backfill_update
+AFTER UPDATE OF source_refs_json ON graph_edges
+BEGIN
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    VALUES(NEW.id, CURRENT_TIMESTAMP)
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_graph_edge_sources_backfill_insert
+AFTER INSERT ON graph_edge_sources
+BEGIN
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    VALUES(NEW.edge_id, CURRENT_TIMESTAMP)
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_graph_edge_sources_backfill_update
+AFTER UPDATE OF edge_id, source_ref_key, source_ref_json ON graph_edge_sources
+BEGIN
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    SELECT OLD.edge_id, CURRENT_TIMESTAMP
+    WHERE EXISTS (
+        SELECT 1 FROM graph_edges WHERE id = OLD.edge_id
+    )
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    SELECT NEW.edge_id, CURRENT_TIMESTAMP
+    WHERE EXISTS (
+        SELECT 1 FROM graph_edges WHERE id = NEW.edge_id
+    )
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_graph_edge_sources_backfill_delete
+AFTER DELETE ON graph_edge_sources
+BEGIN
+    INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+    SELECT OLD.edge_id, CURRENT_TIMESTAMP
+    WHERE EXISTS (
+        SELECT 1 FROM graph_edges WHERE id = OLD.edge_id
+    )
+    ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at;
+END;

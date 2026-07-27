@@ -104,6 +104,7 @@ from .core.store import (
     cue_recall,
     ingest_file,
     init_db,
+    is_initialized,
     recover_thread,
     record_project_state,
     repair_invalid_project_state_checkpoints,
@@ -1156,6 +1157,8 @@ def _main(argv: list[str] | None = None) -> int:
         safe_project_id = prevalidate_cli_partition(root, "project_id", args.project_id)
 
         def action(operation: OperationGuard) -> dict[str, Any]:
+            if is_initialized(root):
+                init_db(root)
             result = resume_latest(
                 root,
                 session_id=args.session_id,

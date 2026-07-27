@@ -37,6 +37,62 @@ from continuum.core.workers import (
 
 
 class ResumeLatestTests(unittest.TestCase):
+    def test_resume_fails_fast_when_authority_indexes_require_migration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="migration-required-session",
+                agent_id="codex-sol",
+                project_id="migration-required-project",
+                objective="Require a schema-ready resume.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "DROP INDEX idx_graph_edge_sources_card_id_authority"
+                )
+                conn.execute(
+                    "DROP INDEX "
+                    "idx_graph_edge_sources_source_ref_key_authority"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = resume_latest(
+                root,
+                project_id="migration-required-project",
+                model_assist=False,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(
+                result["reason"],
+                "schema_migration_required",
+            )
+            self.assertTrue(result["migration_required"])
+            conn = connect(root)
+            try:
+                indexes = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertNotIn(
+                "idx_graph_edge_sources_card_id_authority",
+                indexes,
+            )
+            self.assertNotIn(
+                "idx_graph_edge_sources_source_ref_key_authority",
+                indexes,
+            )
+
     def test_resume_discovers_latest_project_state_without_thread_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

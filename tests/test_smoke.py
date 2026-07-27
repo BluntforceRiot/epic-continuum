@@ -98,6 +98,39 @@ class EpicContinuumSmokeTest(unittest.TestCase):
                     """,
                     (1024 * 1024, "card_performance_regression"),
                 ).fetchall()
+                graph_binding_lookup_plan = conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT source_ref_key, source_ref_json
+                    FROM graph_edge_sources
+                    WHERE source_ref_key = ?
+                      AND length(CAST(source_ref_json AS BLOB)) <= ?
+                      AND json_extract(
+                            CASE
+                                WHEN json_valid(source_ref_json)
+                                THEN source_ref_json
+                                ELSE '{}'
+                            END,
+                            '$.event_id'
+                          ) = ?
+                      AND json_extract(
+                            CASE
+                                WHEN json_valid(source_ref_json)
+                                THEN source_ref_json
+                                ELSE '{}'
+                            END,
+                            '$.card_id'
+                          ) = ?
+                    ORDER BY edge_id
+                    LIMIT 1
+                    """,
+                    (
+                        '{"card_id":"card_performance_regression","event_id":"event_performance_regression"}',
+                        1024 * 1024,
+                        "event_performance_regression",
+                        "card_performance_regression",
+                    ),
+                ).fetchall()
             finally:
                 conn.close()
 
@@ -118,6 +151,14 @@ class EpicContinuumSmokeTest(unittest.TestCase):
                     for row in graph_source_lookup_plan
                 ),
                 graph_source_lookup_plan,
+            )
+            self.assertTrue(
+                any(
+                    "idx_graph_edge_sources_source_ref_key_authority"
+                    in str(row[3])
+                    for row in graph_binding_lookup_plan
+                ),
+                graph_binding_lookup_plan,
             )
 
 

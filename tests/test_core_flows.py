@@ -4008,6 +4008,159 @@ print(json.dumps(result, sort_keys=True))
             self.assertGreaterEqual(changed, 1)
             self.assertEqual(source_count, 2)
 
+    def test_init_repairs_graph_sources_added_after_migration_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="post-marker-source",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="post-marker-target",
+                )
+                conn.execute(
+                    """
+                    INSERT INTO graph_edges(
+                        id, source_node_id, relation, target_node_id,
+                        weight, confidence, source_refs_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        'edge_post_marker_legacy', ?, 'mentions', ?,
+                        0.5, 0.9, ?,
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00'
+                    )
+                    """,
+                    (
+                        source,
+                        target,
+                        json_dumps(
+                            [
+                                {
+                                    "card_id": "card_post_marker",
+                                    "event_id": "event_post_marker",
+                                }
+                            ]
+                        ),
+                    ),
+                )
+                conn.commit()
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_sources "
+                        "WHERE edge_id = 'edge_post_marker_legacy'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM "
+                        "graph_edge_source_backfill_queue "
+                        "WHERE edge_id = 'edge_post_marker_legacy'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                source_row = conn.execute(
+                    """
+                    SELECT source_ref_json
+                    FROM graph_edge_sources
+                    WHERE edge_id = 'edge_post_marker_legacy'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(source_row)
+                self.assertEqual(
+                    json.loads(source_row["source_ref_json"]),
+                    {
+                        "card_id": "card_post_marker",
+                        "event_id": "event_post_marker",
+                    },
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM "
+                        "graph_edge_source_backfill_queue"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_init_repairs_partition_aliases_added_after_migration_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            event = append_scroll_event(
+                root,
+                session_id="post-marker-session",
+                event_type="message",
+                role="user",
+                content="Repair a legacy partition after the marker.",
+                metadata={"project_id": "post-marker-project"},
+            )
+            legacy_session = "api_key=post_marker_session_secret"
+            legacy_project = "token=post_marker_project_secret"
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(
+                    """
+                    UPDATE scroll_events
+                    SET session_id = ?,
+                        project_id = ?,
+                        metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        legacy_session,
+                        legacy_project,
+                        json_dumps(
+                            {
+                                "session_id": legacy_session,
+                                "project_id": legacy_project,
+                                "visibility_scope": "project",
+                            }
+                        ),
+                        event["event_id"],
+                    ),
+                )
+                conn.commit()
+
+            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT session_id, project_id, metadata_json
+                    FROM scroll_events
+                    WHERE id = ?
+                    """,
+                    (event["event_id"],),
+                ).fetchone()
+                metadata = json.loads(row["metadata_json"])
+                self.assertTrue(row["session_id"].startswith("ec_session_"))
+                self.assertTrue(row["project_id"].startswith("ec_project_"))
+                self.assertEqual(metadata["session_id"], row["session_id"])
+                self.assertEqual(metadata["project_id"], row["project_id"])
+                marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (store_module.PARTITION_ALIASES_BACKFILL_META_KEY,),
+                ).fetchone()
+                self.assertEqual(
+                    marker["value"],
+                    store_module.PARTITION_ALIASES_BACKFILL_META_VALUE,
+                )
+
     def test_init_skips_completed_legacy_backfills_after_restart(
         self,
     ) -> None:
@@ -4078,6 +4231,164 @@ print(json.dumps(result, sort_keys=True))
                 init_db(root)
 
             sidecar_sync.assert_called_once_with(root)
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
+
+    def test_init_does_not_cache_failed_sidecar_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="failed-sidecar-recovery",
+                agent_id="codex",
+                project_id="failed-sidecar-recovery",
+                objective="Retry failed sidecar recovery.",
+            )
+            with closing(connect_catalog(root)) as conn:
+                mark_card_sidecar_outbox(
+                    conn,
+                    [state["card_id"]],
+                    reason="failed_sidecar_recovery_test",
+                )
+                conn.commit()
+
+            cache_key = str(root.resolve(strict=False))
+            _INIT_DB_CACHE.discard(cache_key)
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                return_value={
+                    "ok": False,
+                    "synced": 0,
+                    "failed": 1,
+                    "failures": [{"error": "injected"}],
+                    "pending": 1,
+                },
+            ) as failed_sync:
+                init_db(root)
+
+            failed_sync.assert_called_once_with(root)
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as retry_sync:
+                init_db(root)
+
+            retry_sync.assert_called_once_with(root)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_init_does_not_cache_sidecar_recovery_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="exception-sidecar-recovery",
+                agent_id="codex",
+                project_id="exception-sidecar-recovery",
+                objective="Retry exceptional sidecar recovery.",
+            )
+            with closing(connect_catalog(root)) as conn:
+                mark_card_sidecar_outbox(
+                    conn,
+                    [state["card_id"]],
+                    reason="exception_sidecar_recovery_test",
+                )
+                conn.commit()
+
+            cache_key = str(root.resolve(strict=False))
+            _INIT_DB_CACHE.discard(cache_key)
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                side_effect=RuntimeError("injected sidecar failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "injected sidecar failure",
+                ):
+                    init_db(root)
+
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+            init_db(root)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_init_does_not_cache_when_bounded_sidecar_batch_leaves_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            states = [
+                record_project_state(
+                    root,
+                    session_id=f"bounded-sidecar-{index}",
+                    agent_id="codex",
+                    project_id=f"bounded-sidecar-{index}",
+                    objective="Drain bounded sidecar recovery batches.",
+                )
+                for index in range(2)
+            ]
+            with closing(connect_catalog(root)) as conn:
+                mark_card_sidecar_outbox(
+                    conn,
+                    [state["card_id"] for state in states],
+                    reason="bounded_sidecar_recovery_test",
+                )
+                conn.commit()
+
+            def sync_one(_root: Path) -> dict[str, object]:
+                with closing(connect_catalog(root)) as conn:
+                    row = conn.execute(
+                        """
+                        SELECT card_id
+                        FROM card_sidecar_outbox
+                        ORDER BY card_id
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if row is not None:
+                        conn.execute(
+                            "DELETE FROM card_sidecar_outbox "
+                            "WHERE card_id = ?",
+                            (row["card_id"],),
+                        )
+                        conn.commit()
+                return {
+                    "ok": True,
+                    "synced": 1 if row is not None else 0,
+                    "failed": 0,
+                    "failures": [],
+                    "pending": 1 if row is not None else 0,
+                }
+
+            cache_key = str(root.resolve(strict=False))
+            _INIT_DB_CACHE.discard(cache_key)
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                side_effect=sync_one,
+            ) as bounded_sync:
+                init_db(root)
+                self.assertNotIn(cache_key, _INIT_DB_CACHE)
+                init_db(root)
+
+            self.assertEqual(bounded_sync.call_count, 2)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
             with closing(connect_catalog(root)) as conn:
                 self.assertEqual(
                     conn.execute(

@@ -110,6 +110,7 @@ from .core.store import (
     cue_recall,
     ingest_file,
     init_db,
+    is_initialized,
     recover_thread,
     record_project_state,
     repair_invalid_project_state_checkpoints,
@@ -770,6 +771,8 @@ def tool_resume_latest(args: JSON) -> Any:
         model_assist = bool(args["model_assist"])
 
     def action(operation: OperationGuard) -> JSON:
+        if is_initialized(root):
+            init_db(root)
         result = resume_latest(
             root,
             session_id=session_id,

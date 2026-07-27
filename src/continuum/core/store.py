@@ -80,13 +80,28 @@ PARTITION_INTERNAL_PREFIXES = (
 )
 _INIT_DB_CACHE: set[str] = set()
 PARTITION_ALIASES_BACKFILL_META_KEY = (
-    "migration.partition_aliases_backfill.v1"
+    "migration.partition_aliases_backfill.v2"
 )
 PARTITION_ALIASES_BACKFILL_META_VALUE = "complete"
 GRAPH_EDGE_SOURCES_BACKFILL_META_KEY = (
-    "migration.graph_edge_sources_backfill.v1"
+    "migration.graph_edge_sources_backfill.v2"
 )
 GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE = "complete"
+RESUME_AUTHORITY_INDEX_NAMES = frozenset(
+    {
+        "idx_graph_edge_sources_card_id_authority",
+        "idx_graph_edge_sources_source_ref_key_authority",
+    }
+)
+GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES = frozenset(
+    {
+        "trg_graph_edges_source_refs_backfill_insert",
+        "trg_graph_edges_source_refs_backfill_update",
+        "trg_graph_edge_sources_backfill_insert",
+        "trg_graph_edge_sources_backfill_update",
+        "trg_graph_edge_sources_backfill_delete",
+    }
+)
 VALID_VISIBILITY_SCOPES = {"global", "session", "project", "private"}
 # One authority boundary for every Card consumer. A Card in any of these
 # lifecycle states remains durable evidence, but it is never current memory.
@@ -2408,7 +2423,12 @@ def _rewrite_text_columns_for_partition_aliases(
     ]
     for table in tables:
         columns = _table_columns(conn, table)
-        if table in {"graph_nodes", "graph_edge_sources", "partition_aliases"}:
+        if table in {
+            "graph_nodes",
+            "graph_edge_sources",
+            "graph_edge_source_backfill_queue",
+            "partition_aliases",
+        }:
             continue
         id_column = "id" if "id" in columns else "rowid"
         text_columns = [
@@ -2520,15 +2540,10 @@ def _backfill_partition_aliases(root: Path, conn: sqlite3.Connection) -> int:
     return changed
 
 
-def _backfill_graph_edge_sources(conn: sqlite3.Connection) -> int:
-    if not {"id", "source_refs_json", "weight", "confidence"}.issubset(_table_columns(conn, "graph_edges")):
-        return 0
-    rows = conn.execute(
-        """
-        SELECT id, source_refs_json, weight, confidence, created_at, updated_at
-        FROM graph_edges
-        """
-    ).fetchall()
+def _backfill_graph_edge_source_rows(
+    conn: sqlite3.Connection,
+    rows: Iterable[sqlite3.Row],
+) -> int:
     changed = 0
     now = utc_now()
     for row in rows:
@@ -2558,6 +2573,34 @@ def _backfill_graph_edge_sources(conn: sqlite3.Connection) -> int:
             )
             if conn.total_changes != before:
                 changed += 1
+    return changed
+
+
+def _backfill_graph_edge_sources(conn: sqlite3.Connection) -> int:
+    if not {"id", "source_refs_json", "weight", "confidence"}.issubset(_table_columns(conn, "graph_edges")):
+        return 0
+    rows = conn.execute(
+        """
+        SELECT id, source_refs_json, weight, confidence, created_at, updated_at
+        FROM graph_edges
+        """
+    ).fetchall()
+    return _backfill_graph_edge_source_rows(conn, rows)
+
+
+def _backfill_queued_graph_edge_sources(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        SELECT edge.id, edge.source_refs_json, edge.weight, edge.confidence,
+               edge.created_at, edge.updated_at
+        FROM graph_edges AS edge
+        INNER JOIN graph_edge_source_backfill_queue AS queued
+                ON queued.edge_id = edge.id
+        ORDER BY edge.id
+        """
+    ).fetchall()
+    changed = _backfill_graph_edge_source_rows(conn, rows)
+    conn.execute("DELETE FROM graph_edge_source_backfill_queue")
     return changed
 
 
@@ -5125,6 +5168,78 @@ def _schema_table_ddl() -> str:
     return schema if index_at < 0 else schema[:index_at]
 
 
+def _migration_marker_complete(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    value: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return row is not None and str(row["value"]) == value
+
+
+def _partition_alias_anomaly_exists(conn: sqlite3.Connection) -> bool:
+    for table, column, kind in (
+        ("scroll_events", "session_id", "session_id"),
+        ("scroll_events", "project_id", "project_id"),
+        ("scroll_segments", "session_id", "session_id"),
+        ("cards", "session_id", "session_id"),
+        ("cards", "project_id", "project_id"),
+    ):
+        if column not in _table_columns(conn, table):
+            continue
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT {column} AS value
+            FROM {table}
+            WHERE {column} IS NOT NULL
+              AND {column} != ''
+            """
+        ).fetchall()
+        if any(
+            _partition_value_needs_alias(kind, str(row["value"]))
+            for row in rows
+        ):
+            return True
+    return False
+
+
+def _graph_edge_source_backfill_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    installed = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+    }
+    return GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES.issubset(installed)
+
+
+def _graph_edge_source_backfill_queue_pending(
+    conn: sqlite3.Connection,
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM graph_edge_source_backfill_queue LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
+def _resume_authority_indexes_ready(conn: sqlite3.Connection) -> bool:
+    installed = {
+        str(row["name"])
+        for row in conn.execute(
+            "PRAGMA index_list(graph_edge_sources)"
+        ).fetchall()
+    }
+    return RESUME_AUTHORITY_INDEX_NAMES.issubset(installed)
+
+
 def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     """Apply additive SQLite migrations for catalogs created by earlier builds."""
     applied: list[str] = []
@@ -5168,15 +5283,15 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
         if _add_column_if_missing(conn, table, column, ddl):
             applied.append(f"{table}.{column}")
     _backfill_scroll_event_scope_columns(conn)
-    partition_alias_backfill_marker = conn.execute(
-        "SELECT value FROM meta WHERE key = ?",
-        (PARTITION_ALIASES_BACKFILL_META_KEY,),
-    ).fetchone()
-    if (
-        partition_alias_backfill_marker is None
-        or str(partition_alias_backfill_marker["value"])
-        != PARTITION_ALIASES_BACKFILL_META_VALUE
-    ):
+    partition_alias_backfill_required = (
+        not _migration_marker_complete(
+            conn,
+            key=PARTITION_ALIASES_BACKFILL_META_KEY,
+            value=PARTITION_ALIASES_BACKFILL_META_VALUE,
+        )
+        or _partition_alias_anomaly_exists(conn)
+    )
+    if partition_alias_backfill_required:
         if _backfill_partition_aliases(root, conn):
             applied.append("partition_aliases.backfill")
         conn.execute(
@@ -5186,17 +5301,18 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
                 PARTITION_ALIASES_BACKFILL_META_VALUE,
             ),
         )
-        applied.append("partition_aliases.backfill.v1")
-    graph_source_backfill_marker = conn.execute(
-        "SELECT value FROM meta WHERE key = ?",
-        (GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,),
-    ).fetchone()
-    if (
-        graph_source_backfill_marker is None
-        or str(graph_source_backfill_marker["value"])
-        != GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE
-    ):
+        applied.append("partition_aliases.backfill.v2")
+    graph_source_backfill_required = (
+        not _migration_marker_complete(
+            conn,
+            key=GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,
+            value=GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
+        )
+        or not _graph_edge_source_backfill_triggers_ready(conn)
+    )
+    if graph_source_backfill_required:
         _backfill_graph_edge_sources(conn)
+        conn.execute("DELETE FROM graph_edge_source_backfill_queue")
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
             (
@@ -5204,7 +5320,10 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
                 GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
             ),
         )
-        applied.append("graph_edge_sources.backfill.v1")
+        applied.append("graph_edge_sources.backfill.v2")
+    elif _graph_edge_source_backfill_queue_pending(conn):
+        _backfill_queued_graph_edge_sources(conn)
+        applied.append("graph_edge_sources.queued_backfill.v2")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at)")
@@ -5215,6 +5334,28 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     )
     conn.execute("PRAGMA user_version = 2")
     return applied
+
+
+def _card_sidecar_outbox_pending(root: Path) -> bool:
+    if not is_initialized(root):
+        return False
+    conn = connect_existing(root)
+    try:
+        if "card_sidecar_outbox" not in {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }:
+            return False
+        return (
+            conn.execute(
+                "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
 
 
 def init_db(root: Path) -> None:
@@ -5246,17 +5387,25 @@ def init_db(root: Path) -> None:
             is not None
         )
         conn.commit()
-        _INIT_DB_CACHE.add(cache_key)
     finally:
         conn.close()
     intent_recovery = reconcile_card_sidecar_write_intents(root)
+    final_intent_recovery = intent_recovery
+    sidecar_sync: dict[str, Any] | None = None
     if (
         sync_migrated_sidecars
         or pending_sidecar_outbox
         or intent_recovery.get("pending")
     ):
-        sync_pending_card_sidecars(root)
-        reconcile_card_sidecar_write_intents(root)
+        sidecar_sync = sync_pending_card_sidecars(root)
+        final_intent_recovery = reconcile_card_sidecar_write_intents(root)
+    recovery_clean = bool(
+        (sidecar_sync is None or sidecar_sync.get("ok"))
+        and not _card_sidecar_outbox_pending(root)
+        and not final_intent_recovery.get("pending")
+    )
+    if recovery_clean:
+        _INIT_DB_CACHE.add(cache_key)
 
 
 def record_artifact(
@@ -18784,6 +18933,24 @@ def resume_latest(
     recent_event_limit = validate_recent_event_limit(recent_event_limit)
     if not is_initialized(root):
         return {"ok": False, "initialized": False, "root": str(root), "reason": "catalog_missing"}
+    readiness_conn = connect_existing(root)
+    try:
+        resume_schema_ready = _resume_authority_indexes_ready(readiness_conn)
+    finally:
+        readiness_conn.close()
+    if not resume_schema_ready:
+        return {
+            "ok": False,
+            "initialized": True,
+            "root": str(root),
+            "reason": "schema_migration_required",
+            "migration_required": True,
+            "migration_action": "init_db",
+            "warning": (
+                "resume authority indexes are missing; initialize this "
+                "Continuum root with the current runtime before resuming"
+            ),
+        }
     config = load_config(root)
     personal_profile = dict(config.get("personal_profile", {}))
     resume_mode = str(personal_profile.get("resume_mode", "latest"))

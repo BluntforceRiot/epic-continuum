@@ -245,6 +245,73 @@ class ResumeCliTests(unittest.TestCase):
                 )
             )
 
+    def test_cli_resume_migrates_authority_indexes_before_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="cli-upgrade-session",
+                agent_id="codex-sol",
+                project_id="cli-upgrade-project",
+                objective="Migrate before CLI resume discovery.",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "DROP INDEX idx_graph_edge_sources_card_id_authority"
+                )
+                conn.execute(
+                    "DROP INDEX "
+                    "idx_graph_edge_sources_source_ref_key_authority"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            store_module._INIT_DB_CACHE.discard(
+                str(root.resolve(strict=False))
+            )
+
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"CONTINUUM_ALLOWED_ROOTS": tmp},
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli_main(
+                    [
+                        "resume",
+                        "--root",
+                        str(root),
+                        "--project-id",
+                        "cli-upgrade-project",
+                        "--no-model-assist",
+                    ]
+                )
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result["ok"], result)
+            conn = connect(root)
+            try:
+                indexes = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertTrue(
+                store_module.RESUME_AUTHORITY_INDEX_NAMES.issubset(
+                    indexes
+                ),
+                indexes,
+            )
+
     def test_checkpoint_repair_requires_explicit_scope_before_artifacts(self) -> None:
         cases = (
             ([], "requires --project-id, --session-id, or explicit --all"),

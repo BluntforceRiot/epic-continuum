@@ -4281,7 +4281,7 @@ def prune_memory(
     normalized_topic, matching_mode = validate_prune_memory_scope(topic, allow_global=allow_global)
     validated_limit = validate_prune_memory_limit(limit)
     match_sql, match_params = _prune_memory_match_sql(normalized_topic)
-    init_db(root)
+    init_db(root, recover_pending_card_sidecars=False)
     conn = connect(root)
     transaction_started = False
     original_rows: list[dict[str, Any]] = []
@@ -4698,7 +4698,7 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
 
 
 def drain_card_sidecar_outbox(root: Path, *, limit: int = 50) -> dict[str, Any]:
-    init_db(root)
+    init_db(root, recover_pending_card_sidecars=False)
     conn = connect(root)
     try:
         rows = conn.execute(
@@ -4764,7 +4764,7 @@ def run_worker_pass(
     limit: int = 50,
     maintenance: bool = True,
 ) -> dict[str, Any]:
-    init_db(root)
+    init_db(root, recover_pending_card_sidecars=False)
     config = load_config(root)
     lease_seconds = max(30, int(config.get("queues", {}).get("worker_lease_seconds", 3600)))
     worker_id = unique_id("worker")

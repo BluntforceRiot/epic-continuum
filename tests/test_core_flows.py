@@ -4506,6 +4506,82 @@ print(json.dumps(result, sort_keys=True))
                 )
             self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
 
+    def test_init_can_defer_sidecar_recovery_to_explicit_queue_consumer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="deferred-sidecar-recovery",
+                agent_id="codex",
+                project_id="deferred-sidecar-recovery",
+                objective="Leave pending sidecar work for its explicit consumer.",
+            )
+            with closing(connect_catalog(root)) as conn:
+                mark_card_sidecar_outbox(
+                    conn,
+                    [state["card_id"]],
+                    reason="deferred_sidecar_recovery_test",
+                )
+                index_name = sorted(store_module.RESUME_AUTHORITY_INDEX_NAMES)[0]
+                trigger_name = "trg_graph_edges_source_refs_backfill_insert"
+                conn.execute(f"DROP INDEX {index_name}")
+                conn.execute(f"DROP TRIGGER {trigger_name}")
+                conn.commit()
+
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    wraps=store_module.reconcile_card_sidecar_write_intents,
+                ) as intent_recovery,
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as sidecar_sync,
+            ):
+                init_db(root, recover_pending_card_sidecars=False)
+
+            intent_recovery.assert_not_called()
+            sidecar_sync.assert_not_called()
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    1,
+                )
+                installed_indexes = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    ).fetchall()
+                }
+                installed_triggers = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                    ).fetchall()
+                }
+            self.assertIn(index_name, installed_indexes)
+            self.assertIn(trigger_name, installed_triggers)
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
     def test_init_does_not_cache_failed_intent_recovery_without_pending(
         self,
     ) -> None:

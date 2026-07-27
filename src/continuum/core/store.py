@@ -5571,7 +5571,11 @@ def _init_db_durable_ready(root: Path) -> bool:
     return not _card_sidecar_write_intents_pending_or_unreadable(root)
 
 
-def init_db(root: Path) -> None:
+def init_db(
+    root: Path,
+    *,
+    recover_pending_card_sidecars: bool = True,
+) -> None:
     # Claim before creating layout/config files or running schema migrations.
     ensure_writer_claim(root)
     cache_key = str(root.resolve(strict=False))
@@ -5604,6 +5608,14 @@ def init_db(root: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+    if not recover_pending_card_sidecars:
+        # Queue-owning operations still need structural upgrades, but must
+        # observe or fence the pending sidecar work themselves.
+        if _init_db_durable_ready(root):
+            _INIT_DB_CACHE.add(cache_key)
+        else:
+            _INIT_DB_CACHE.discard(cache_key)
+        return
     intent_recovery = reconcile_card_sidecar_write_intents(root)
     final_intent_recovery = intent_recovery
     sidecar_sync: dict[str, Any] | None = None

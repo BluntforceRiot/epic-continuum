@@ -645,7 +645,7 @@ print(json.dumps(result, sort_keys=True))
                 )
                 conn.commit()
 
-            missing = audit(root)
+            missing = audit(root, create=False)
             self.assertEqual(missing["missing_card_sidecars"], 1)
 
             first_sync = sync_card_sidecars_after_commit(root, [card_id])
@@ -4008,6 +4008,258 @@ print(json.dumps(result, sort_keys=True))
             self.assertGreaterEqual(changed, 1)
             self.assertEqual(source_count, 2)
 
+    def test_graph_source_queue_repairs_conflicting_json_before_clearing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            source_ref = {
+                "card_id": "card_conflicting_source_json",
+                "event_id": "event_conflicting_source_json",
+            }
+            source_ref_key = store_module._source_ref_identity(source_ref)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="conflicting-source-json",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="conflicting-target-json",
+                )
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[source_ref],
+                )
+                conn.execute(
+                    """
+                    UPDATE graph_edge_sources
+                    SET source_ref_json = ?,
+                        weight = 0.42,
+                        confidence = 0.31,
+                        status = 'decayed',
+                        decay_count = 3,
+                        use_count = 4,
+                        last_used_at = '2026-01-02T00:00:00+00:00',
+                        last_decay_at = '2026-01-03T00:00:00+00:00'
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (
+                        json_dumps({"card_id": "corrupt"}),
+                        edge_id,
+                        source_ref_key,
+                    ),
+                )
+                conn.commit()
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                repaired = conn.execute(
+                    """
+                    SELECT source_ref_json, weight, confidence, status,
+                           decay_count, use_count, last_used_at, last_decay_at
+                    FROM graph_edge_sources
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (edge_id, source_ref_key),
+                ).fetchone()
+                self.assertEqual(repaired["source_ref_json"], json_dumps(source_ref))
+                self.assertEqual(repaired["weight"], 0.42)
+                self.assertEqual(repaired["confidence"], 0.31)
+                self.assertEqual(repaired["status"], "decayed")
+                self.assertEqual(repaired["decay_count"], 3)
+                self.assertEqual(repaired["use_count"], 4)
+                self.assertEqual(
+                    repaired["last_used_at"],
+                    "2026-01-02T00:00:00+00:00",
+                )
+                self.assertEqual(
+                    repaired["last_decay_at"],
+                    "2026-01-03T00:00:00+00:00",
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_graph_source_queue_preserves_valid_same_identity_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            aggregate_ref = {
+                "card_id": "card_valid_source_drift",
+                "event_id": "event_valid_source_drift",
+                "note": "aggregate evidence",
+            }
+            normalized_ref = {
+                **aggregate_ref,
+                "note": "normalized authority drift",
+            }
+            source_ref_key = store_module._source_ref_identity(aggregate_ref)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="valid-source-drift",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="valid-target-drift",
+                )
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[aggregate_ref],
+                )
+                conn.execute(
+                    """
+                    UPDATE graph_edge_sources
+                    SET source_ref_json = ?
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (json_dumps(normalized_ref), edge_id, source_ref_key),
+                )
+                conn.commit()
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                preserved = conn.execute(
+                    """
+                    SELECT source_ref_json
+                    FROM graph_edge_sources
+                    WHERE edge_id = ? AND source_ref_key = ?
+                    """,
+                    (edge_id, source_ref_key),
+                ).fetchone()
+                self.assertEqual(
+                    preserved["source_ref_json"],
+                    json_dumps(normalized_ref),
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_graph_source_queue_retains_unreconciled_malformed_edge(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            with closing(connect_catalog(root)) as conn:
+                source = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="malformed-source-json",
+                )
+                target = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="malformed-target-json",
+                )
+                edge_id = add_graph_edge(
+                    conn,
+                    source_node_id=source,
+                    relation="mentions",
+                    target_node_id=target,
+                    weight=0.5,
+                    confidence=0.9,
+                    source_refs=[
+                        {
+                            "card_id": "card_malformed_source_json",
+                            "event_id": "event_malformed_source_json",
+                        }
+                    ],
+                )
+                conn.execute(
+                    "UPDATE graph_edges SET source_refs_json = '{' WHERE id = ?",
+                    (edge_id,),
+                )
+                conn.commit()
+
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM graph_edge_source_backfill_queue "
+                        "WHERE edge_id = ?",
+                        (edge_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+
+    def test_graph_source_queue_query_plan_is_queue_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                plan = conn.execute(
+                    "EXPLAIN QUERY PLAN "
+                    + store_module.GRAPH_EDGE_SOURCE_BACKFILL_QUEUE_QUERY
+                ).fetchall()
+            details = [str(row["detail"]).lower() for row in plan]
+            self.assertTrue(
+                any("scan queued" in detail for detail in details),
+                details,
+            )
+            self.assertTrue(
+                any("search edge" in detail for detail in details),
+                details,
+            )
+            self.assertFalse(
+                any("scan edge" in detail for detail in details),
+                details,
+            )
+            self.assertFalse(
+                any("temp b-tree" in detail for detail in details),
+                details,
+            )
+
     def test_init_repairs_graph_sources_added_after_migration_marker(
         self,
     ) -> None:
@@ -4069,7 +4321,7 @@ print(json.dumps(result, sort_keys=True))
                     1,
                 )
 
-            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
             init_db(root)
 
             with closing(connect_catalog(root)) as conn:
@@ -4135,7 +4387,7 @@ print(json.dumps(result, sort_keys=True))
                 )
                 conn.commit()
 
-            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
             init_db(root)
 
             with closing(connect_catalog(root)) as conn:
@@ -4168,6 +4420,10 @@ print(json.dumps(result, sort_keys=True))
             root = Path(tmp) / "continuum"
             init_db(root)
             with closing(connect_catalog(root)) as conn:
+                scroll_scope_marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (store_module.SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,),
+                ).fetchone()
                 graph_source_marker = conn.execute(
                     "SELECT value FROM meta WHERE key = ?",
                     (store_module.GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,),
@@ -4176,6 +4432,11 @@ print(json.dumps(result, sort_keys=True))
                     "SELECT value FROM meta WHERE key = ?",
                     (store_module.PARTITION_ALIASES_BACKFILL_META_KEY,),
                 ).fetchone()
+            self.assertIsNotNone(scroll_scope_marker)
+            self.assertEqual(
+                scroll_scope_marker["value"],
+                store_module.SCROLL_EVENT_SCOPE_BACKFILL_META_VALUE,
+            )
             self.assertIsNotNone(graph_source_marker)
             self.assertEqual(
                 graph_source_marker["value"],
@@ -4190,6 +4451,10 @@ print(json.dumps(result, sort_keys=True))
             _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
             with patch.object(
                 store_module,
+                "_backfill_scroll_event_scope_columns",
+                wraps=store_module._backfill_scroll_event_scope_columns,
+            ) as scroll_scope_backfill, patch.object(
+                store_module,
                 "_backfill_graph_edge_sources",
                 wraps=store_module._backfill_graph_edge_sources,
             ) as graph_source_backfill, patch.object(
@@ -4199,6 +4464,7 @@ print(json.dumps(result, sort_keys=True))
             ) as partition_alias_backfill:
                 init_db(root)
 
+            scroll_scope_backfill.assert_not_called()
             graph_source_backfill.assert_not_called()
             partition_alias_backfill.assert_not_called()
 
@@ -4222,7 +4488,7 @@ print(json.dumps(result, sort_keys=True))
                 )
                 conn.commit()
 
-            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
             with patch.object(
                 store_module,
                 "sync_pending_card_sidecars",
@@ -4239,6 +4505,157 @@ print(json.dumps(result, sort_keys=True))
                     0,
                 )
             self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
+
+    def test_init_does_not_cache_failed_intent_recovery_without_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            _INIT_DB_CACHE.discard(cache_key)
+            failed_recovery = {
+                "ok": False,
+                "processed": 0,
+                "pending": 0,
+                "failures": [{"error": "injected intent scan failure"}],
+                "results": [],
+                "overflow": False,
+            }
+            with patch.object(
+                store_module,
+                "reconcile_card_sidecar_write_intents",
+                return_value=failed_recovery,
+            ) as reconcile:
+                init_db(root)
+
+            reconcile.assert_called_once_with(root)
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+            init_db(root)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_detects_malformed_sidecar_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_dir.mkdir(parents=True, exist_ok=True)
+            malformed_intent = intent_dir / "malformed.json"
+            malformed_intent.write_text("{", encoding="utf-8")
+
+            init_db(root)
+
+            self.assertTrue(malformed_intent.exists())
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+            malformed_intent.unlink()
+            init_db(root)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_restores_resume_authority_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            with closing(connect_catalog(root)) as conn:
+                for index_name in store_module.RESUME_AUTHORITY_INDEX_NAMES:
+                    conn.execute(f"DROP INDEX {index_name}")
+                conn.commit()
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                installed = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                store_module.RESUME_AUTHORITY_INDEX_NAMES.issubset(installed)
+            )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_restores_graph_backfill_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            trigger_name = "trg_graph_edges_source_refs_backfill_insert"
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(f"DROP TRIGGER {trigger_name}")
+                conn.commit()
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                installed = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                    ).fetchall()
+                }
+            self.assertIn(trigger_name, installed)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_preserves_session_event_project_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="session-boundary-init",
+                agent_id="codex",
+                project_id="session-boundary-project",
+                metadata={"visibility_scope": "session"},
+            )
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            with closing(connect_catalog(root)) as conn:
+                queued_before = conn.execute(
+                    "SELECT count(*) FROM graph_edge_source_backfill_queue"
+                ).fetchone()[0]
+                event_before = conn.execute(
+                    """
+                    SELECT visibility_scope, project_id, metadata_json
+                    FROM scroll_events
+                    WHERE id = ?
+                    """,
+                    (state["event_id"],),
+                ).fetchone()
+            self.assertGreater(queued_before, 0)
+            self.assertEqual(event_before["visibility_scope"], "session")
+            self.assertIsNone(event_before["project_id"])
+            self.assertEqual(
+                json.loads(event_before["metadata_json"])["project_id"],
+                "session-boundary-project",
+            )
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                event_after = conn.execute(
+                    """
+                    SELECT visibility_scope, project_id, metadata_json
+                    FROM scroll_events
+                    WHERE id = ?
+                    """,
+                    (state["event_id"],),
+                ).fetchone()
+            self.assertEqual(event_after["visibility_scope"], "session")
+            self.assertIsNone(event_after["project_id"])
+            self.assertEqual(
+                json.loads(event_after["metadata_json"])["project_id"],
+                "session-boundary-project",
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
 
     def test_init_does_not_cache_failed_sidecar_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

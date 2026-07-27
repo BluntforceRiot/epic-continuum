@@ -79,6 +79,10 @@ PARTITION_INTERNAL_PREFIXES = (
     "redacted_agent_",
 )
 _INIT_DB_CACHE: set[str] = set()
+SCROLL_EVENT_SCOPE_BACKFILL_META_KEY = (
+    "migration.scroll_event_scope_columns_backfill.v1"
+)
+SCROLL_EVENT_SCOPE_BACKFILL_META_VALUE = "complete"
 PARTITION_ALIASES_BACKFILL_META_KEY = (
     "migration.partition_aliases_backfill.v2"
 )
@@ -102,6 +106,14 @@ GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES = frozenset(
         "trg_graph_edge_sources_backfill_delete",
     }
 )
+GRAPH_EDGE_SOURCE_BACKFILL_QUEUE_QUERY = """
+    SELECT edge.id, edge.source_refs_json, edge.weight, edge.confidence,
+           edge.created_at, edge.updated_at
+    FROM graph_edge_source_backfill_queue AS queued
+    CROSS JOIN graph_edges AS edge
+    WHERE edge.id = queued.edge_id
+    ORDER BY queued.edge_id
+"""
 VALID_VISIBILITY_SCOPES = {"global", "session", "project", "private"}
 # One authority boundary for every Card consumer. A Card in any of these
 # lifecycle states remains durable evidence, but it is never current memory.
@@ -1884,12 +1896,16 @@ def _backfill_scroll_event_scope_columns(conn: sqlite3.Connection) -> int:
     for row in rows:
         metadata = json_loads(row["metadata_json"], {})
         scope, project_id = security_context_from_metadata(metadata)
+        column_project_id = project_id if scope == "project" else ""
         current_scope = str(row["visibility_scope"] or "")
         current_project_id = str(row["project_id"] or "")
-        if current_scope != scope or current_project_id != project_id:
+        if (
+            current_scope != scope
+            or current_project_id != column_project_id
+        ):
             conn.execute(
                 "UPDATE scroll_events SET visibility_scope = ?, project_id = ? WHERE id = ?",
-                (scope, project_id or None, row["id"]),
+                (scope, column_project_id or None, row["id"]),
             )
             changed += 1
     return changed
@@ -2540,39 +2556,161 @@ def _backfill_partition_aliases(root: Path, conn: sqlite3.Connection) -> int:
     return changed
 
 
+def _expected_graph_edge_source_refs(
+    source_refs_json: str,
+) -> tuple[list[tuple[str, str]], bool]:
+    try:
+        payload = json.loads(source_refs_json)
+    except (json.JSONDecodeError, RecursionError, TypeError):
+        return [], False
+    if not isinstance(payload, list):
+        return [], False
+    expected: dict[str, str] = {}
+    valid = True
+    for ref in payload:
+        if not isinstance(ref, dict):
+            valid = False
+            continue
+        try:
+            key = _source_ref_identity(ref)
+            expected.setdefault(key, json_dumps(ref))
+        except (RecursionError, TypeError, ValueError):
+            valid = False
+    return list(expected.items()), valid
+
+
+def _graph_source_ref_json_matches_identity(
+    source_ref_json: str,
+    source_ref_key: str,
+) -> bool:
+    try:
+        source_ref = json.loads(source_ref_json)
+    except (json.JSONDecodeError, RecursionError, TypeError):
+        return False
+    if not isinstance(source_ref, dict):
+        return False
+    try:
+        return _source_ref_identity(source_ref) == source_ref_key
+    except (RecursionError, TypeError, ValueError):
+        return False
+
+
+def _backfill_graph_edge_source_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> tuple[int, bool]:
+    expected, source_refs_valid = _expected_graph_edge_source_refs(
+        str(row["source_refs_json"])
+    )
+    changed = 0
+    now = utc_now()
+    per_ref_weight = max(0.0, min(1.0, float(row["weight"] or 0.0))) / max(
+        1,
+        len(expected),
+    )
+    for source_ref_key, source_ref_json in expected:
+        cursor = conn.execute(
+            """
+            INSERT INTO graph_edge_sources(
+                edge_id, source_ref_key, source_ref_json, weight, confidence, status,
+                created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(edge_id, source_ref_key) DO NOTHING
+            """,
+            (
+                row["id"],
+                source_ref_key,
+                source_ref_json,
+                per_ref_weight,
+                float(row["confidence"] or 0.7),
+                row["created_at"] or now,
+                row["updated_at"] or now,
+            ),
+        )
+        changed += max(0, int(cursor.rowcount))
+    if not expected:
+        return changed, source_refs_valid
+    actual = {
+        str(source_row["source_ref_key"]): str(source_row["source_ref_json"])
+        for source_row in conn.execute(
+            """
+            SELECT source_ref_key, source_ref_json
+            FROM graph_edge_sources
+            WHERE edge_id = ?
+            """,
+            (row["id"],),
+        ).fetchall()
+    }
+    repaired_identity = False
+    for source_ref_key, source_ref_json in expected:
+        if _graph_source_ref_json_matches_identity(
+            actual.get(source_ref_key, ""),
+            source_ref_key,
+        ):
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE graph_edge_sources
+            SET source_ref_json = ?
+            WHERE edge_id = ? AND source_ref_key = ?
+            """,
+            (source_ref_json, row["id"], source_ref_key),
+        )
+        if cursor.rowcount:
+            changed += 1
+            repaired_identity = True
+    if repaired_identity:
+        actual = {
+            str(source_row["source_ref_key"]): str(
+                source_row["source_ref_json"]
+            )
+            for source_row in conn.execute(
+                """
+                SELECT source_ref_key, source_ref_json
+                FROM graph_edge_sources
+                WHERE edge_id = ?
+                """,
+                (row["id"],),
+            ).fetchall()
+        }
+    reconciled = source_refs_valid and all(
+        _graph_source_ref_json_matches_identity(
+            actual.get(source_ref_key, ""),
+            source_ref_key,
+        )
+        for source_ref_key, _source_ref_json in expected
+    )
+    return changed, reconciled
+
+
 def _backfill_graph_edge_source_rows(
     conn: sqlite3.Connection,
     rows: Iterable[sqlite3.Row],
+    *,
+    reconcile_queue: bool = False,
 ) -> int:
     changed = 0
     now = utc_now()
     for row in rows:
-        refs = [ref for ref in json_loads(row["source_refs_json"], []) if isinstance(ref, dict)]
-        if not refs:
+        row_changed, reconciled = _backfill_graph_edge_source_row(conn, row)
+        changed += row_changed
+        if not reconcile_queue:
             continue
-        per_ref_weight = max(0.0, min(1.0, float(row["weight"] or 0.0))) / max(1, len(refs))
-        for ref in refs:
-            before = conn.total_changes
+        if reconciled:
+            conn.execute(
+                "DELETE FROM graph_edge_source_backfill_queue WHERE edge_id = ?",
+                (row["id"],),
+            )
+        else:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO graph_edge_sources(
-                    edge_id, source_ref_key, source_ref_json, weight, confidence, status,
-                    created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, 'active', ?, ?)
+                INSERT INTO graph_edge_source_backfill_queue(edge_id, queued_at)
+                VALUES(?, ?)
+                ON CONFLICT(edge_id) DO UPDATE SET queued_at = excluded.queued_at
                 """,
-                (
-                    row["id"],
-                    _source_ref_identity(ref),
-                    json_dumps(ref),
-                    per_ref_weight,
-                    float(row["confidence"] or 0.7),
-                    row["created_at"] or now,
-                    row["updated_at"] or now,
-                ),
+                (row["id"], now),
             )
-            if conn.total_changes != before:
-                changed += 1
     return changed
 
 
@@ -2585,23 +2723,12 @@ def _backfill_graph_edge_sources(conn: sqlite3.Connection) -> int:
         FROM graph_edges
         """
     ).fetchall()
-    return _backfill_graph_edge_source_rows(conn, rows)
+    return _backfill_graph_edge_source_rows(conn, rows, reconcile_queue=True)
 
 
 def _backfill_queued_graph_edge_sources(conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        """
-        SELECT edge.id, edge.source_refs_json, edge.weight, edge.confidence,
-               edge.created_at, edge.updated_at
-        FROM graph_edges AS edge
-        INNER JOIN graph_edge_source_backfill_queue AS queued
-                ON queued.edge_id = edge.id
-        ORDER BY edge.id
-        """
-    ).fetchall()
-    changed = _backfill_graph_edge_source_rows(conn, rows)
-    conn.execute("DELETE FROM graph_edge_source_backfill_queue")
-    return changed
+    rows = conn.execute(GRAPH_EDGE_SOURCE_BACKFILL_QUEUE_QUERY).fetchall()
+    return _backfill_graph_edge_source_rows(conn, rows, reconcile_queue=True)
 
 
 def fts_phrase(term: str) -> str:
@@ -5282,7 +5409,21 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     for table, column, ddl in migrations:
         if _add_column_if_missing(conn, table, column, ddl):
             applied.append(f"{table}.{column}")
-    _backfill_scroll_event_scope_columns(conn)
+    if not _migration_marker_complete(
+        conn,
+        key=SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,
+        value=SCROLL_EVENT_SCOPE_BACKFILL_META_VALUE,
+    ):
+        if _backfill_scroll_event_scope_columns(conn):
+            applied.append("scroll_event_scope_columns.backfill")
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,
+                SCROLL_EVENT_SCOPE_BACKFILL_META_VALUE,
+            ),
+        )
+        applied.append("scroll_event_scope_columns.backfill.v1")
     partition_alias_backfill_required = (
         not _migration_marker_complete(
             conn,
@@ -5312,7 +5453,6 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     )
     if graph_source_backfill_required:
         _backfill_graph_edge_sources(conn)
-        conn.execute("DELETE FROM graph_edge_source_backfill_queue")
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
             (
@@ -5358,12 +5498,87 @@ def _card_sidecar_outbox_pending(root: Path) -> bool:
         conn.close()
 
 
+def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
+    try:
+        intent_state = _validated_card_sidecar_state_dir(
+            root,
+            purpose="intent",
+            create=False,
+        )
+        if intent_state is None:
+            return False
+        intent_paths, overflow = _bounded_card_sidecar_intent_paths(
+            intent_state[0],
+        )
+        _assert_card_sidecar_state_dir_unchanged(intent_state)
+    except (OSError, ValueError):
+        return True
+    return bool(intent_paths) or overflow
+
+
+def _init_db_durable_ready(root: Path) -> bool:
+    if not is_initialized(root) or not config_path(root).exists():
+        return False
+    try:
+        conn = connect_existing(root)
+        try:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if not (
+                set(SNAPSHOT_DURABLE_TABLES)
+                | {"graph_edge_source_backfill_queue"}
+            ).issubset(tables):
+                return False
+            schema_version = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if (
+                schema_version is None
+                or str(schema_version["value"]) != SCHEMA_VERSION
+                or not _migration_marker_complete(
+                    conn,
+                    key=SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,
+                    value=SCROLL_EVENT_SCOPE_BACKFILL_META_VALUE,
+                )
+                or not _migration_marker_complete(
+                    conn,
+                    key=PARTITION_ALIASES_BACKFILL_META_KEY,
+                    value=PARTITION_ALIASES_BACKFILL_META_VALUE,
+                )
+                or not _migration_marker_complete(
+                    conn,
+                    key=GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,
+                    value=GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
+                )
+                or not _graph_edge_source_backfill_triggers_ready(conn)
+                or not _resume_authority_indexes_ready(conn)
+                or _graph_edge_source_backfill_queue_pending(conn)
+                or conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
+                ).fetchone()
+                is not None
+                or _partition_alias_anomaly_exists(conn)
+            ):
+                return False
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+    return not _card_sidecar_write_intents_pending_or_unreadable(root)
+
+
 def init_db(root: Path) -> None:
     # Claim before creating layout/config files or running schema migrations.
     ensure_writer_claim(root)
     cache_key = str(root.resolve(strict=False))
-    if cache_key in _INIT_DB_CACHE and is_initialized(root) and config_path(root).exists():
-        return
+    if cache_key in _INIT_DB_CACHE:
+        if _init_db_durable_ready(root):
+            return
+        _INIT_DB_CACHE.discard(cache_key)
     init_layout(root)
     write_default_config(root)
     conn = connect(root)
@@ -5400,12 +5615,16 @@ def init_db(root: Path) -> None:
         sidecar_sync = sync_pending_card_sidecars(root)
         final_intent_recovery = reconcile_card_sidecar_write_intents(root)
     recovery_clean = bool(
-        (sidecar_sync is None or sidecar_sync.get("ok"))
+        final_intent_recovery.get("ok") is True
+        and (sidecar_sync is None or sidecar_sync.get("ok") is True)
         and not _card_sidecar_outbox_pending(root)
         and not final_intent_recovery.get("pending")
+        and _init_db_durable_ready(root)
     )
     if recovery_clean:
         _INIT_DB_CACHE.add(cache_key)
+    else:
+        _INIT_DB_CACHE.discard(cache_key)
 
 
 def record_artifact(

@@ -1482,6 +1482,7 @@ def roll_due_scroll_segments(
                         session_id=current_session,
                         start_seq=run_start,
                         end_seq=run_end,
+                        recover_pending_card_sidecars=recover_pending_card_sidecars,
                         transaction_guard=(lease.assert_owned if lease is not None else None),
                         transaction_effect=transaction_effect,
                     )
@@ -1553,7 +1554,12 @@ def roll_due_scroll_segments(
     return result
 
 
-def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
+def review_card_placement(
+    root: Path,
+    *,
+    card_id: str,
+    recover_pending_card_sidecars: bool = True,
+) -> dict[str, Any]:
     conn = connect(root)
     lease = _CURRENT_JOB_LEASE.get()
     try:
@@ -1610,7 +1616,12 @@ def review_card_placement(root: Path, *, card_id: str) -> dict[str, Any]:
         )
         conn.commit()
         sync_card_sidecars_after_commit(root, [card_id])
-        conflict = detect_conflicts(root, card_id=card_id, limit=10)
+        conflict = detect_conflicts(
+            root,
+            card_id=card_id,
+            limit=10,
+            recover_pending_card_sidecars=recover_pending_card_sidecars,
+        )
         return {**core_result, "conflicts": conflict}
     except Exception:
         if conn.in_transaction:
@@ -1812,8 +1823,17 @@ def _graph_source_security_domain(conn, source_ref_json: str | None) -> str:
     return "global"
 
 
-def decay_graph_routes(root: Path, *, limit: int = 200, prune_threshold: int = 3) -> dict[str, Any]:
-    init_db(root)
+def decay_graph_routes(
+    root: Path,
+    *,
+    limit: int = 200,
+    prune_threshold: int = 3,
+    recover_pending_card_sidecars: bool = True,
+) -> dict[str, Any]:
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     learning = load_config(root).get("learning", {})
     min_interval = int(learning.get("route_decay_min_interval_seconds", 3600))
     weight_factor = float(learning.get("route_decay_weight_factor", 0.92))
@@ -3036,6 +3056,7 @@ def detect_conflicts(
     component_member_limit: int | None = None,
     mutation_limit: int | None = None,
     transaction_seconds: float | None = None,
+    recover_pending_card_sidecars: bool = True,
 ) -> dict[str, Any]:
     """Detect conflict components under one explicit, global work budget."""
 
@@ -3050,7 +3071,10 @@ def detect_conflicts(
         mutation_limit=mutation_limit,
         transaction_seconds=transaction_seconds,
     )
-    init_db(root)
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     index_setup_started = time.monotonic()
     _ensure_conflict_indexes(root)
     index_setup_seconds = round(time.monotonic() - index_setup_started, 6)
@@ -3631,10 +3655,18 @@ def _record_conflict_review_signal(
     }
 
 
-def _run_conflict_maintenance(root: Path) -> dict[str, Any]:
+def _run_conflict_maintenance(
+    root: Path,
+    *,
+    recover_pending_card_sidecars: bool = True,
+) -> dict[str, Any]:
     """Run one base pass, at most one hard-cap escalation, then quarantine."""
 
-    base = detect_conflicts(root, limit=25)
+    base = detect_conflicts(
+        root,
+        limit=25,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     result: dict[str, Any] = {"conflicts": base}
     if not _conflict_result_requires_larger_budget(base):
         return result
@@ -3652,6 +3684,7 @@ def _run_conflict_maintenance(root: Path) -> dict[str, Any]:
             component_member_limit=MAX_CONFLICT_COMPONENT_MEMBERS,
             mutation_limit=MAX_CONFLICT_CARD_MUTATIONS,
             transaction_seconds=MAX_CONFLICT_TRANSACTION_SECONDS,
+            recover_pending_card_sidecars=recover_pending_card_sidecars,
         )
         result["conflict_escalation"] = escalated
         final_result = escalated
@@ -3951,8 +3984,17 @@ def resolve_conflict(
     }
 
 
-def apply_storage_tiering(root: Path, *, dry_run: bool = False, limit: int = 100) -> dict[str, Any]:
-    init_db(root)
+def apply_storage_tiering(
+    root: Path,
+    *,
+    dry_run: bool = False,
+    limit: int = 100,
+    recover_pending_card_sidecars: bool = True,
+) -> dict[str, Any]:
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     policy = retention_policy(root)
     hot_days = int(policy.get("raw_scroll_hot_days", 30))
     warm_days = int(policy.get("raw_scroll_warm_days", 180))
@@ -4749,7 +4791,11 @@ def _process_job(
             recover_pending_card_sidecars=False,
         )
     if job_type == "review_card_placement":
-        return review_card_placement(root, card_id=str(payload["card_id"]))
+        return review_card_placement(
+            root,
+            card_id=str(payload["card_id"]),
+            recover_pending_card_sidecars=False,
+        )
     if job_type == "verify_book_integrity":
         return verify_book_integrity(root, book_id=str(payload["book_id"]), content_hash_value=payload.get("content_hash"))
     if job_type == "verify_segment_integrity":
@@ -4860,11 +4906,31 @@ def run_worker_pass(
     maintenance_result: dict[str, Any] = {}
     if maintenance:
         maintenance_result["sidecars"] = drain_card_sidecar_outbox(root, limit=50)
-        maintenance_result["decay"] = decay_graph_routes(root, limit=50)
-        maintenance_result["tiering"] = apply_storage_tiering(root, dry_run=False, limit=50)
-        maintenance_result.update(_run_conflict_maintenance(root))
+        maintenance_result["decay"] = decay_graph_routes(
+            root,
+            limit=50,
+            recover_pending_card_sidecars=False,
+        )
+        maintenance_result["tiering"] = apply_storage_tiering(
+            root,
+            dry_run=False,
+            limit=50,
+            recover_pending_card_sidecars=False,
+        )
+        maintenance_result.update(
+            _run_conflict_maintenance(
+                root,
+                recover_pending_card_sidecars=False,
+            )
+        )
+    processed_ok = all(item.get("ok", False) for item in processed)
+    maintenance_ok = all(
+        bool(value["ok"])
+        for value in maintenance_result.values()
+        if isinstance(value, dict) and "ok" in value
+    )
     return {
-        "ok": all(item.get("ok", False) for item in processed) if processed else True,
+        "ok": processed_ok and maintenance_ok,
         "worker_id": worker_id,
         "lease_seconds": lease_seconds,
         "reclaimed_expired_jobs": reclaimed_expired_jobs,
@@ -4916,6 +4982,16 @@ def serve_workers(
             if maintenance_due:
                 maintenance_passes += 1
                 next_maintenance_at = time.monotonic() + maintenance_interval
+            if result.get("ok") is False:
+                return {
+                    "ok": False,
+                    "reason": "worker_pass_failed",
+                    "passes": passes,
+                    "processed_count": processed,
+                    "maintenance_passes": maintenance_passes,
+                    "maintenance_interval_seconds": maintenance_interval,
+                    "failed_pass": result,
+                }
             if limit and passes >= limit:
                 return {
                     "ok": True,

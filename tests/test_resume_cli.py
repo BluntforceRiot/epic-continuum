@@ -9,12 +9,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import continuum.core.store as store_module
+import continuum.core.workers as worker_module
 from continuum.cli import main as cli_main
 from continuum.core.config import load_config, write_config
-from continuum.core.operations import list_operations
+from continuum.core.operations import list_operations, verify_proof_pack
 from continuum.core.store import (
     MAX_RECENT_EVENT_LIMIT,
     connect,
+    create_card,
+    init_db,
     recover_thread,
     record_project_state,
     resume_latest,
@@ -24,6 +27,131 @@ from continuum.core.store import (
 
 
 class ResumeCliTests(unittest.TestCase):
+    def test_run_workers_cli_preserves_queue_ownership_and_failure_receipts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="cli-worker-ownership",
+                    summary="CLI proof generation must leave this queued sidecar alone.",
+                    source_refs=[],
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                conn.commit()
+            finally:
+                conn.close()
+
+            deferred_output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as deferred_generic_recovery,
+                redirect_stdout(deferred_output),
+            ):
+                deferred_code = cli_main(
+                    [
+                        "run-workers",
+                        "--root",
+                        str(root),
+                        "--limit",
+                        "1",
+                        "--no-maintenance",
+                    ]
+                )
+
+            deferred = json.loads(deferred_output.getvalue())
+            self.assertEqual(deferred_code, 0, deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["_operation"]["status"], "succeeded")
+            deferred_generic_recovery.assert_not_called()
+            conn = connect(root)
+            try:
+                pending_after_deferred = (
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    is not None
+                )
+            finally:
+                conn.close()
+            self.assertTrue(pending_after_deferred, deferred)
+            deferred_proof = Path(deferred["_operation"]["proof_pack_uri"])
+            self.assertTrue(
+                verify_proof_pack(
+                    deferred_proof,
+                    root=root,
+                    allowed_roots=[root],
+                )["ok"]
+            )
+
+            failed_sync = {
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "simulated CLI worker drain failure"}],
+            }
+            failed_output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    worker_module,
+                    "sync_card_sidecars_after_commit",
+                    return_value=failed_sync,
+                ),
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as failed_generic_recovery,
+                redirect_stdout(failed_output),
+            ):
+                failed_code = cli_main(
+                    [
+                        "run-workers",
+                        "--root",
+                        str(root),
+                        "--limit",
+                        "1",
+                    ]
+                )
+
+            failed = json.loads(failed_output.getvalue())
+            self.assertEqual(failed_code, 1, failed)
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(failed["_operation"]["status"], "failed")
+            failed_generic_recovery.assert_not_called()
+            conn = connect(root)
+            try:
+                pending_after_failure = (
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    is not None
+                )
+            finally:
+                conn.close()
+            self.assertTrue(pending_after_failure, failed)
+            failed_proof = Path(failed["_operation"]["proof_pack_uri"])
+            self.assertTrue(
+                verify_proof_pack(
+                    failed_proof,
+                    root=root,
+                    allowed_roots=[root],
+                )["ok"]
+            )
+
     def test_yarn_configure_rejects_path_model_before_operation_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

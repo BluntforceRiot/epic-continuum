@@ -850,6 +850,41 @@ class WorkerBacklogRepairTest(unittest.TestCase):
             self.assertEqual(calls, [True, False, False])
             self.assertEqual(result["maintenance_passes"], 1)
 
+    def test_service_returns_failed_pass_instead_of_reporting_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            failed_pass = {
+                "ok": False,
+                "processed_count": 0,
+                "maintenance": {
+                    "sidecars": {
+                        "ok": False,
+                        "pending": 1,
+                        "synced": 0,
+                        "failed": 1,
+                    }
+                },
+            }
+            with (
+                patch(
+                    "continuum.core.workers.run_worker_pass",
+                    return_value=failed_pass,
+                ) as run_pass,
+                patch("continuum.core.workers.time.sleep") as sleep,
+            ):
+                result = serve_workers(
+                    root,
+                    limit=3,
+                    interval_seconds=0.1,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "worker_pass_failed")
+            self.assertEqual(result["passes"], 1)
+            self.assertEqual(result["failed_pass"], failed_pass)
+            run_pass.assert_called_once()
+            sleep.assert_not_called()
+
     def test_service_rejects_a_second_service_for_the_same_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

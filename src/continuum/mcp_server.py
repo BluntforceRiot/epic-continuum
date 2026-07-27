@@ -1149,6 +1149,15 @@ def tool_run_workers(args: JSON) -> Any:
     def action(operation: OperationGuard) -> JSON:
         result = run_worker_pass(root, roles=roles, limit=limit, maintenance=maintenance)
         operation.cursor({"phase": "workers_ran", "processed_count": result.get("processed_count"), "ok": result.get("ok")})
+        if result.get("ok") is False:
+            operation.fail_result(
+                result,
+                error={
+                    "type": "WorkerPassFailed",
+                    "component": "workers",
+                    "message": "worker pass reported failed jobs or maintenance",
+                },
+            )
         return result
 
     return guarded_tool(
@@ -1156,8 +1165,11 @@ def tool_run_workers(args: JSON) -> Any:
         operation_type="mcp_run_workers",
         title="Run Epic Continuum worker pass",
         intent={"roles": roles, "limit": limit, "maintenance": maintenance},
-        snapshot_policy="auto",
-        snapshot_reason="worker pass may mutate queue/catalog/cards/graph",
+        snapshot_policy="none",
+        snapshot_reason=(
+            "worker queues, leases, outbox rows, and effect receipts provide "
+            "bounded recovery"
+        ),
         touched_paths=[root / "catalog" / "catalog.sqlite3"],
         action=action,
     )

@@ -12,7 +12,9 @@ python -m continuum serve --root PATH --interval-seconds 5 --maintenance-interva
 
 `serve` holds a per-root process lock, so a second service fails closed instead
 of processing the same queue concurrently. Maintenance runs on startup and at
-the configured cadence rather than on every idle poll.
+the configured cadence rather than on every idle poll. A failed job or
+maintenance pass exits the service with a failed result so its supervisor can
+alert or restart it instead of masking the failure.
 
 Every claimed queue job has a background lease renewer. Durable processor
 transactions re-check the unexpired owner token before committing and write a

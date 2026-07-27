@@ -1483,15 +1483,28 @@ def _main(argv: list[str] | None = None) -> int:
             operation.cursor({"phase": "workers_ran", "processed_count": result.get("processed_count"), "ok": result.get("ok")})
             return result
 
+        def worker_failure(result: dict[str, Any]) -> dict[str, Any] | None:
+            if result.get("ok") is not False:
+                return None
+            return {
+                "type": "WorkerPassFailed",
+                "component": "workers",
+                "message": "worker pass reported failed jobs or maintenance",
+            }
+
         return emit_result(
             guarded_result(
                 root,
                 operation_type="cli_run_workers",
                 title="Run Epic Continuum worker pass",
                 intent={"roles": args.role, "limit": args.limit, "maintenance": not args.no_maintenance},
-                snapshot_policy="auto",
-                snapshot_reason="worker pass may mutate queue/catalog/cards/graph",
+                snapshot_policy="none",
+                snapshot_reason=(
+                    "worker queues, leases, outbox rows, and effect receipts provide "
+                    "bounded recovery"
+                ),
                 touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                result_failure=worker_failure,
                 action=action,
             )
         )

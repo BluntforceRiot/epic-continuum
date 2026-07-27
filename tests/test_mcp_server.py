@@ -15,8 +15,13 @@ from typing import Any
 from unittest.mock import patch
 
 import continuum.core.store as store_module
+import continuum.core.workers as worker_module
 from continuum.core.config import default_config, write_config
-from continuum.core.operations import _proof_pack_hash, list_operations
+from continuum.core.operations import (
+    _proof_pack_hash,
+    list_operations,
+    verify_proof_pack,
+)
 from continuum.core.store import (
     MAX_RECENT_EVENT_LIMIT,
     _backfill_partition_aliases,
@@ -149,6 +154,161 @@ def stdio_handshake_requests(*, initialize_id: int = 900) -> list[dict[str, Any]
 
 
 class EpicContinuumMcpServerTest(unittest.TestCase):
+    def test_run_workers_wrapper_preserves_bounded_sidecar_ownership_and_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                for index in range(60):
+                    token = hashlib.sha256(
+                        f"mcp-worker-sidecar:{index}".encode()
+                    ).hexdigest()
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=token,
+                        summary=hashlib.sha256(
+                            f"mcp-worker-summary:{index}".encode()
+                        ).hexdigest(),
+                        source_refs=[],
+                    )
+                conn.execute("DELETE FROM queue_jobs")
+                conn.commit()
+            finally:
+                conn.close()
+
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as generic_recovery,
+            ):
+                deferred = call_tool(
+                    "continuum_run_workers",
+                    {
+                        "root": str(root),
+                        "limit": 1,
+                        "no_maintenance": True,
+                    },
+                )
+                conn = connect(root)
+                try:
+                    deferred_pending = int(
+                        conn.execute(
+                            "SELECT count(*) AS n FROM card_sidecar_outbox"
+                        ).fetchone()["n"]
+                    )
+                finally:
+                    conn.close()
+                bounded = call_tool(
+                    "continuum_run_workers",
+                    {"root": str(root), "limit": 1},
+                )
+
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred_pending, 60, deferred)
+            self.assertTrue(bounded["ok"], bounded)
+            self.assertEqual(bounded["maintenance"]["sidecars"]["pending"], 50)
+            self.assertEqual(bounded["maintenance"]["sidecars"]["synced"], 50)
+            generic_recovery.assert_not_called()
+            conn = connect(root)
+            try:
+                remaining = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM card_sidecar_outbox"
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(remaining, 10, bounded)
+            for result in (deferred, bounded):
+                self.assertEqual(result["_operation"]["status"], "succeeded")
+                proof_path = Path(result["_operation"]["proof_pack_uri"])
+                self.assertTrue(proof_path.is_file())
+                self.assertTrue(
+                    verify_proof_pack(
+                        proof_path,
+                        root=root,
+                        allowed_roots=[root],
+                    )["ok"]
+                )
+
+    def test_run_workers_failure_keeps_sidecars_and_marks_operation_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="mcp-worker-failure",
+                    summary="The failed bounded drain must remain pending.",
+                    source_refs=[],
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                conn.commit()
+            finally:
+                conn.close()
+            failed_sync = {
+                "ok": False,
+                "synced": 0,
+                "failed": 1,
+                "failures": [{"error": "simulated MCP worker drain failure"}],
+            }
+
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": tmp}),
+                patch.object(
+                    worker_module,
+                    "sync_card_sidecars_after_commit",
+                    return_value=failed_sync,
+                ),
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as generic_recovery,
+            ):
+                result = call_tool(
+                    "continuum_run_workers",
+                    {"root": str(root), "limit": 1},
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["_operation"]["status"], "failed")
+            generic_recovery.assert_not_called()
+            conn = connect(root)
+            try:
+                pending = (
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    is not None
+                )
+            finally:
+                conn.close()
+            self.assertTrue(pending, result)
+            proof_path = Path(result["_operation"]["proof_pack_uri"])
+            self.assertTrue(proof_path.is_file())
+            self.assertTrue(
+                verify_proof_pack(
+                    proof_path,
+                    root=root,
+                    allowed_roots=[root],
+                )["ok"]
+            )
+
     def test_mcp_resume_migrates_authority_indexes_before_discovery(
         self,
     ) -> None:

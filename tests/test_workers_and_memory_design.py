@@ -53,6 +53,41 @@ from continuum.integrations.common import record_turn
 
 class EpicContinuumWorkerDesignTest(unittest.TestCase):
     @staticmethod
+    def _create_pending_sidecar_cards(
+        root: Path,
+        *,
+        count: int,
+        namespace: str,
+    ) -> list[str]:
+        init_db(root)
+        card_ids: list[str] = []
+        conn = connect(root)
+        try:
+            for index in range(count):
+                title_token = hashlib.sha256(
+                    f"{namespace}:title:{index}".encode()
+                ).hexdigest()
+                summary_token = hashlib.sha256(
+                    f"{namespace}:summary:{index}".encode()
+                ).hexdigest()
+                card_ids.append(
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=title_token,
+                        summary=summary_token,
+                        source_refs=[],
+                        metadata={"test_namespace": namespace, "index": index},
+                    )
+                )
+            conn.execute("DELETE FROM queue_jobs")
+            conn.commit()
+        finally:
+            conn.close()
+        return card_ids
+
+    @staticmethod
     def _running_sidecar_job_lease(
         root: Path,
         card_id: str,
@@ -559,6 +594,229 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(remaining, 0)
             self.assertTrue(resolve_stored_uri(root, location_uri).exists())
 
+    def test_worker_maintenance_sidecar_drain_keeps_its_declared_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._create_pending_sidecar_cards(
+                root,
+                count=51,
+                namespace="bounded-worker-maintenance",
+            )
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as generic_recovery:
+                result = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=True,
+                )
+
+            self.assertTrue(result["maintenance"]["sidecars"]["ok"], result)
+            self.assertEqual(result["maintenance"]["sidecars"]["pending"], 50)
+            self.assertEqual(result["maintenance"]["sidecars"]["synced"], 50)
+            generic_recovery.assert_not_called()
+            conn = connect_existing(root)
+            try:
+                remaining = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM card_sidecar_outbox"
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(remaining, 1, result)
+
+    def test_failed_worker_sidecar_drain_is_not_retried_by_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._create_pending_sidecar_cards(
+                root,
+                count=51,
+                namespace="failed-worker-maintenance",
+            )
+            failed_drain = {
+                "ok": False,
+                "synced": 0,
+                "failed": 50,
+                "failures": [{"error": "simulated bounded drain failure"}],
+            }
+            with (
+                patch.object(
+                    worker_module,
+                    "sync_card_sidecars_after_commit",
+                    return_value=failed_drain,
+                ) as explicit_sync,
+                patch.object(
+                    store_module,
+                    "sync_pending_card_sidecars",
+                    wraps=store_module.sync_pending_card_sidecars,
+                ) as generic_recovery,
+            ):
+                result = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=True,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["maintenance"]["sidecars"]["ok"], result)
+            self.assertEqual(result["maintenance"]["sidecars"]["pending"], 50)
+            self.assertEqual(result["maintenance"]["sidecars"]["synced"], 0)
+            self.assertEqual(result["maintenance"]["sidecars"]["failed"], 50)
+            explicit_sync.assert_called_once()
+            generic_recovery.assert_not_called()
+            conn = connect_existing(root)
+            try:
+                remaining = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM card_sidecar_outbox"
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(remaining, 51, result)
+
+    def test_worker_card_review_does_not_recover_unrelated_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=2,
+                namespace="bounded-librarian-review",
+            )
+            target_id, unrelated_id = card_ids
+            conn = connect(root)
+            try:
+                enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_card_placement",
+                    priority=1,
+                    payload={"card_id": target_id},
+                    related_card_ids=[target_id],
+                    dedupe_key=f"bounded-review:{target_id}",
+                )
+                locations = {
+                    str(row["id"]): str(row["location_uri"])
+                    for row in conn.execute(
+                        "SELECT id, location_uri FROM cards WHERE id IN (?, ?)",
+                        (target_id, unrelated_id),
+                    )
+                }
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as generic_recovery:
+                result = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["processed_count"], 1)
+            generic_recovery.assert_not_called()
+            conn = connect_existing(root)
+            try:
+                pending_ids = {
+                    str(row["card_id"])
+                    for row in conn.execute(
+                        "SELECT card_id FROM card_sidecar_outbox"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertNotIn(target_id, pending_ids)
+            self.assertIn(unrelated_id, pending_ids)
+            self.assertTrue(resolve_stored_uri(root, locations[target_id]).exists())
+            self.assertFalse(
+                resolve_stored_uri(root, locations[unrelated_id]).exists()
+            )
+
+    def test_worker_scribe_does_not_recover_unrelated_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["capture"]["roll_segments_every_events"] = 1
+            write_config(root, config)
+            session_id = "bounded-scribe-sidecar-recovery"
+            append_scroll_event(
+                root,
+                session_id=session_id,
+                event_type="message",
+                role="user",
+                content="Scribe must leave unrelated sidecar ownership alone.",
+            )
+            unrelated_id = self._create_pending_sidecar_cards(
+                root,
+                count=1,
+                namespace="bounded-scribe-unrelated",
+            )[0]
+            conn = connect(root)
+            try:
+                enqueue_job(
+                    conn,
+                    role="scribe",
+                    job_type="scroll_event_ingested",
+                    priority=1,
+                    payload={"session_id": session_id},
+                    related_card_ids=[],
+                    dedupe_key=f"bounded-scribe:{session_id}",
+                )
+                unrelated_location = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (unrelated_id,),
+                    ).fetchone()["location_uri"]
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as generic_recovery:
+                result = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["processed_count"], 1)
+            generic_recovery.assert_not_called()
+            conn = connect_existing(root)
+            try:
+                segment_count = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()["n"]
+                )
+                unrelated_pending = (
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (unrelated_id,),
+                    ).fetchone()
+                    is not None
+                )
+            finally:
+                conn.close()
+            self.assertEqual(segment_count, 1, result)
+            self.assertTrue(unrelated_pending, result)
+            self.assertFalse(resolve_stored_uri(root, unrelated_location).exists())
+
     def test_worker_pass_reviews_cards_and_verifies_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -813,6 +1071,16 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 first = run_worker_pass(root, limit=1, maintenance=True)
 
             self.assertEqual(detected.call_count, 2)
+            self.assertFalse(
+                detected.call_args_list[0].kwargs[
+                    "recover_pending_card_sidecars"
+                ]
+            )
+            self.assertFalse(
+                detected.call_args_list[1].kwargs[
+                    "recover_pending_card_sidecars"
+                ]
+            )
             escalation_kwargs = detected.call_args_list[1].kwargs
             self.assertEqual(
                 escalation_kwargs["candidate_card_limit"],
@@ -851,6 +1119,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 repeated = run_worker_pass(root, limit=1, maintenance=True)
 
             self.assertEqual(repeated_detection.call_count, 2)
+            self.assertTrue(
+                all(
+                    call.kwargs["recover_pending_card_sidecars"] is False
+                    for call in repeated_detection.call_args_list
+                )
+            )
             self.assertFalse(
                 repeated["maintenance"]["conflict_review_required"]["created"]
             )
@@ -890,6 +1164,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 recovered = run_worker_pass(root, limit=1, maintenance=True)
 
             self.assertEqual(recovered_detection.call_count, 2)
+            self.assertTrue(
+                all(
+                    call.kwargs["recover_pending_card_sidecars"] is False
+                    for call in recovered_detection.call_args_list
+                )
+            )
             self.assertIn("conflict_escalation", recovered["maintenance"])
             self.assertNotIn("conflict_review_required", recovered["maintenance"])
             conn = connect_existing(root)

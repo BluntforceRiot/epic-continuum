@@ -1524,7 +1524,9 @@ def _create_proof_pack_unlocked(
     catalog_proof_mode: str | None = None,
 ) -> dict[str, Any]:
     write_default_config(root)
-    init_db(root)
+    # Proof generation records the state produced by the owning operation. It
+    # must not perform unrelated queued sidecar recovery while doing so.
+    init_db(root, recover_pending_card_sidecars=False)
     resolved_catalog_proof_mode = _resolve_catalog_proof_mode(root, catalog_proof_mode)
     receipt = read_operation(root, operation_id)
     if receipt.get("status") not in TERMINAL_STATUSES:

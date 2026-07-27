@@ -8261,12 +8261,16 @@ def roll_scroll_segment(
     session_id: str,
     start_seq: int,
     end_seq: int,
+    recover_pending_card_sidecars: bool = True,
     transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
     transaction_effect: (
         Callable[[sqlite3.Connection, dict[str, Any]], None] | None
     ) = None,
 ) -> dict[str, Any]:
-    init_db(root)
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     session_id = str(canonical_partition_identifier(root, "session_id", session_id, lookup=True) or "")
     start_seq = int(start_seq)
     end_seq = int(end_seq)

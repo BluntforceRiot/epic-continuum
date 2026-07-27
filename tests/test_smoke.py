@@ -74,12 +74,51 @@ class EpicContinuumSmokeTest(unittest.TestCase):
             try:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(cards)")}
                 indexes = {row[1] for row in conn.execute("PRAGMA index_list(cards)")}
+                graph_source_indexes = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA index_list(graph_edge_sources)"
+                    )
+                }
+                graph_source_lookup_plan = conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT source_ref_json
+                    FROM graph_edge_sources
+                    WHERE length(CAST(source_ref_json AS BLOB)) <= ?
+                      AND json_extract(
+                            CASE
+                                WHEN json_valid(source_ref_json)
+                                THEN source_ref_json
+                                ELSE '{}'
+                            END,
+                            '$.card_id'
+                          ) = ?
+                    ORDER BY edge_id, source_ref_key
+                    """,
+                    (1024 * 1024, "card_performance_regression"),
+                ).fetchall()
             finally:
                 conn.close()
 
             self.assertIn("visibility_scope", columns)
             self.assertIn("session_id", columns)
             self.assertIn("idx_cards_visibility", indexes)
+            self.assertIn(
+                "idx_graph_edge_sources_card_id_authority",
+                graph_source_indexes,
+            )
+            self.assertIn(
+                "idx_graph_edge_sources_source_ref_key_authority",
+                graph_source_indexes,
+            )
+            self.assertTrue(
+                any(
+                    "idx_graph_edge_sources_card_id_authority" in str(row[3])
+                    for row in graph_source_lookup_plan
+                ),
+                graph_source_lookup_plan,
+            )
 
 
 if __name__ == "__main__":

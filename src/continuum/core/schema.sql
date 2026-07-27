@@ -270,6 +270,42 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_card_id ON graph_nodes(card_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_edge ON graph_edge_sources(edge_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_card_id_authority ON graph_edge_sources(
+    json_extract(
+        CASE
+            WHEN json_valid(source_ref_json) THEN source_ref_json
+            ELSE '{}'
+        END,
+        '$.card_id'
+    ),
+    edge_id,
+    source_ref_key
+)
+WHERE json_extract(
+    CASE
+        WHEN json_valid(source_ref_json) THEN source_ref_json
+        ELSE '{}'
+    END,
+    '$.card_id'
+) IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_graph_edge_sources_source_ref_key_authority ON graph_edge_sources(
+    source_ref_key,
+    edge_id
+)
+WHERE json_extract(
+    CASE
+        WHEN json_valid(source_ref_json) THEN source_ref_json
+        ELSE '{}'
+    END,
+    '$.card_id'
+) IS NOT NULL
+AND json_extract(
+    CASE
+        WHEN json_valid(source_ref_json) THEN source_ref_json
+        ELSE '{}'
+    END,
+    '$.event_id'
+) IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_partition_aliases_internal ON partition_aliases(kind, internal_id);
 CREATE INDEX IF NOT EXISTS idx_card_sidecar_outbox_updated ON card_sidecar_outbox(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at);

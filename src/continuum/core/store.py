@@ -79,6 +79,14 @@ PARTITION_INTERNAL_PREFIXES = (
     "redacted_agent_",
 )
 _INIT_DB_CACHE: set[str] = set()
+PARTITION_ALIASES_BACKFILL_META_KEY = (
+    "migration.partition_aliases_backfill.v1"
+)
+PARTITION_ALIASES_BACKFILL_META_VALUE = "complete"
+GRAPH_EDGE_SOURCES_BACKFILL_META_KEY = (
+    "migration.graph_edge_sources_backfill.v1"
+)
+GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE = "complete"
 VALID_VISIBILITY_SCOPES = {"global", "session", "project", "private"}
 # One authority boundary for every Card consumer. A Card in any of these
 # lifecycle states remains durable evidence, but it is never current memory.
@@ -5160,10 +5168,43 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
         if _add_column_if_missing(conn, table, column, ddl):
             applied.append(f"{table}.{column}")
     _backfill_scroll_event_scope_columns(conn)
-    if _backfill_partition_aliases(root, conn):
-        applied.append("partition_aliases.backfill")
-    if _backfill_graph_edge_sources(conn):
-        applied.append("graph_edge_sources.backfill")
+    partition_alias_backfill_marker = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (PARTITION_ALIASES_BACKFILL_META_KEY,),
+    ).fetchone()
+    if (
+        partition_alias_backfill_marker is None
+        or str(partition_alias_backfill_marker["value"])
+        != PARTITION_ALIASES_BACKFILL_META_VALUE
+    ):
+        if _backfill_partition_aliases(root, conn):
+            applied.append("partition_aliases.backfill")
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                PARTITION_ALIASES_BACKFILL_META_KEY,
+                PARTITION_ALIASES_BACKFILL_META_VALUE,
+            ),
+        )
+        applied.append("partition_aliases.backfill.v1")
+    graph_source_backfill_marker = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,),
+    ).fetchone()
+    if (
+        graph_source_backfill_marker is None
+        or str(graph_source_backfill_marker["value"])
+        != GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE
+    ):
+        _backfill_graph_edge_sources(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,
+                GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
+            ),
+        )
+        applied.append("graph_edge_sources.backfill.v1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at)")
@@ -5186,6 +5227,7 @@ def init_db(root: Path) -> None:
     write_default_config(root)
     conn = connect(root)
     sync_migrated_sidecars = False
+    pending_sidecar_outbox = False
     try:
         conn.executescript(_schema_table_ddl())
         applied = apply_schema_migrations(root, conn)
@@ -5197,12 +5239,22 @@ def init_db(root: Path) -> None:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_migration_at', ?)", (utc_now(),))
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('created_at', ?)", (utc_now(),))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('fts5_available', ?)", ("1" if ensure_fts(conn) else "0",))
+        pending_sidecar_outbox = (
+            conn.execute(
+                "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
+            ).fetchone()
+            is not None
+        )
         conn.commit()
         _INIT_DB_CACHE.add(cache_key)
     finally:
         conn.close()
     intent_recovery = reconcile_card_sidecar_write_intents(root)
-    if sync_migrated_sidecars or intent_recovery.get("pending"):
+    if (
+        sync_migrated_sidecars
+        or pending_sidecar_outbox
+        or intent_recovery.get("pending")
+    ):
         sync_pending_card_sidecars(root)
         reconcile_card_sidecar_write_intents(root)
 

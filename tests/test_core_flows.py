@@ -2450,6 +2450,11 @@ print(json.dumps(result, sort_keys=True))
                     immutable=True,
                 )
                 conn.commit()
+                conn.execute(
+                    "DELETE FROM meta WHERE key = ?",
+                    (store_module.PARTITION_ALIASES_BACKFILL_META_KEY,),
+                )
+                conn.commit()
 
             _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
             init_db(root)
@@ -4002,6 +4007,84 @@ print(json.dumps(result, sort_keys=True))
                 conn.close()
             self.assertGreaterEqual(changed, 1)
             self.assertEqual(source_count, 2)
+
+    def test_init_skips_completed_legacy_backfills_after_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                graph_source_marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (store_module.GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,),
+                ).fetchone()
+                partition_alias_marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (store_module.PARTITION_ALIASES_BACKFILL_META_KEY,),
+                ).fetchone()
+            self.assertIsNotNone(graph_source_marker)
+            self.assertEqual(
+                graph_source_marker["value"],
+                store_module.GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
+            )
+            self.assertIsNotNone(partition_alias_marker)
+            self.assertEqual(
+                partition_alias_marker["value"],
+                store_module.PARTITION_ALIASES_BACKFILL_META_VALUE,
+            )
+
+            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            with patch.object(
+                store_module,
+                "_backfill_graph_edge_sources",
+                wraps=store_module._backfill_graph_edge_sources,
+            ) as graph_source_backfill, patch.object(
+                store_module,
+                "_backfill_partition_aliases",
+                wraps=store_module._backfill_partition_aliases,
+            ) as partition_alias_backfill:
+                init_db(root)
+
+            graph_source_backfill.assert_not_called()
+            partition_alias_backfill.assert_not_called()
+
+    def test_init_resumes_pending_sidecar_outbox_after_completed_migrations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            state = record_project_state(
+                root,
+                session_id="migration-sidecar-retry",
+                agent_id="codex",
+                project_id="migration-sidecar-retry",
+                objective="Retry a sidecar left pending after migration.",
+            )
+            with closing(connect_catalog(root)) as conn:
+                mark_card_sidecar_outbox(
+                    conn,
+                    [state["card_id"]],
+                    reason="migration_sidecar_retry_test",
+                )
+                conn.commit()
+
+            _INIT_DB_CACHE.discard(str(root.resolve(strict=False)))
+            with patch.object(
+                store_module,
+                "sync_pending_card_sidecars",
+                wraps=store_module.sync_pending_card_sidecars,
+            ) as sidecar_sync:
+                init_db(root)
+
+            sidecar_sync.assert_called_once_with(root)
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM card_sidecar_outbox"
+                    ).fetchone()[0],
+                    0,
+                )
 
     def test_add_graph_edge_uses_existing_legacy_edge_id_for_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1166,13 +1166,17 @@ def review_mempalace_import(
     *,
     import_id: str,
     limit: int = MAX_BACKLOG_RECONCILE_LIMIT,
+    recover_pending_card_sidecars: bool = True,
 ) -> dict[str, Any]:
     """Complete Librarian placement for graph-linked cards from one MemPalace import."""
     import_id = str(import_id or "").strip()
     if not import_id:
         return {"ok": False, "reason": "import_id_missing", "reviewed_import": import_id}
     limit = _bounded_reconcile_limit(limit, field="limit")
-    init_db(root)
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     conn = connect(root)
     changed_cards: list[str] = []
     lease = _CURRENT_JOB_LEASE.get()
@@ -1359,9 +1363,13 @@ def roll_due_scroll_segments(
     session_id: str | None = None,
     force: bool = False,
     heartbeat: Callable[[], bool] | None = None,
+    recover_pending_card_sidecars: bool = True,
 ) -> dict[str, Any]:
     """Roll eligible Scroll windows, renewing an owning worker lease as needed."""
-    init_db(root)
+    init_db(
+        root,
+        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    )
     lease = _CURRENT_JOB_LEASE.get()
     if lease is not None:
         receipt_conn = connect(root)
@@ -4734,7 +4742,12 @@ def _process_job(
     payload = json_loads(job.get("payload_json"), {})
     job_type = job["job_type"]
     if job_type == "scroll_event_ingested":
-        return roll_due_scroll_segments(root, session_id=payload.get("session_id"), heartbeat=heartbeat)
+        return roll_due_scroll_segments(
+            root,
+            session_id=payload.get("session_id"),
+            heartbeat=heartbeat,
+            recover_pending_card_sidecars=False,
+        )
     if job_type == "review_card_placement":
         return review_card_placement(root, card_id=str(payload["card_id"]))
     if job_type == "verify_book_integrity":
@@ -4753,6 +4766,7 @@ def _process_job(
                 if raw_limit is None
                 else int(raw_limit)
             ),
+            recover_pending_card_sidecars=False,
         )
     return {"ok": True, "skipped": True, "reason": "unknown_job_type", "job_type": job_type}
 

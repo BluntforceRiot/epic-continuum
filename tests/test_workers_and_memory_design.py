@@ -1603,6 +1603,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
 
         def prepare_case(root: Path, job_type: str) -> dict[str, object]:
             init_db(root)
+            lease_sensitive_sidecar_card_id: str | None = None
             if job_type == "scroll_event_ingested":
                 config = default_config()
                 config["capture"]["roll_segments_every_events"] = 1
@@ -1615,6 +1616,19 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     role="user",
                     content="Forced expiry Scroll evidence.",
                 )
+                conn = connect(root)
+                try:
+                    lease_sensitive_sidecar_card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title="Forced expiry unrelated sidecar",
+                        summary="A lost Scribe lease must not recover unrelated sidecars.",
+                        source_refs=[],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
                 role = "scribe"
                 payload = {"session_id": session_id}
                 marker_sql = "SELECT count(*) AS n FROM scroll_segments WHERE session_id = ?"
@@ -1749,6 +1763,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     conn.commit()
                 finally:
                     conn.close()
+                lease_sensitive_sidecar_card_id = card_id
                 role = "archivist"
                 payload = {"import_id": import_id}
                 marker_sql = (
@@ -1775,6 +1790,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 "job_id": job_id,
                 "marker_sql": marker_sql,
                 "marker_params": marker_params,
+                "lease_sensitive_sidecar_card_id": lease_sensitive_sidecar_card_id,
             }
 
         def durable_counts(root: Path, case: dict[str, object]) -> tuple[int, int]:
@@ -1881,6 +1897,37 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     (0, before_markers),
                     expired_result,
                 )
+                lease_sensitive_sidecar_card_id = case[
+                    "lease_sensitive_sidecar_card_id"
+                ]
+                if lease_sensitive_sidecar_card_id is not None:
+                    conn = connect_existing(root)
+                    try:
+                        sidecar_sync_markers = int(
+                            conn.execute(
+                                """
+                                SELECT count(*) AS n
+                                FROM audit_events
+                                WHERE action = 'card_sidecar_synced'
+                                  AND target_id = ?
+                                """,
+                                (lease_sensitive_sidecar_card_id,),
+                            ).fetchone()["n"]
+                        )
+                        pending_sidecars = int(
+                            conn.execute(
+                                """
+                                SELECT count(*) AS n
+                                FROM card_sidecar_outbox
+                                WHERE card_id = ?
+                                """,
+                                (lease_sensitive_sidecar_card_id,),
+                            ).fetchone()["n"]
+                        )
+                    finally:
+                        conn.close()
+                    self.assertEqual(sidecar_sync_markers, 0, expired_result)
+                    self.assertEqual(pending_sidecars, 1, expired_result)
 
                 recovered = run_worker_pass(
                     root,

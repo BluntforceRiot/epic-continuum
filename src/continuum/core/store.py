@@ -101,6 +101,84 @@ RESUME_AUTHORITY_INDEX_NAMES = frozenset(
         "idx_graph_edge_sources_source_ref_key_authority",
     }
 )
+QUEUE_ROLE_PRIORITY_INDEX_NAME = "idx_queue_role_priority"
+QUEUE_ROLE_CREATED_INDEX_NAME = "idx_queue_role_created"
+QUEUE_STATUS_PRIORITY_INDEX_NAME = "idx_queue_status_priority"
+QUEUE_STATUS_CREATED_INDEX_NAME = "idx_queue_status_created"
+QUEUE_RUNNING_DEDUPE_INDEX_NAME = "idx_queue_running_dedupe"
+QUEUE_PENDING_DEDUPE_INDEX_NAME = "idx_queue_pending_dedupe_key"
+QUEUE_ROLE_PRIORITY_INDEX_SQL = """
+    CREATE INDEX idx_queue_role_priority
+    ON queue_jobs(role, status, priority, created_at)
+"""
+QUEUE_ROLE_CREATED_INDEX_SQL = """
+    CREATE INDEX idx_queue_role_created
+    ON queue_jobs(role, status, created_at)
+"""
+QUEUE_STATUS_PRIORITY_INDEX_SQL = """
+    CREATE INDEX idx_queue_status_priority
+    ON queue_jobs(status, priority, created_at)
+"""
+QUEUE_STATUS_CREATED_INDEX_SQL = """
+    CREATE INDEX idx_queue_status_created
+    ON queue_jobs(status, created_at)
+"""
+QUEUE_RUNNING_DEDUPE_INDEX_SQL = """
+    CREATE INDEX idx_queue_running_dedupe
+    ON queue_jobs(dedupe_key)
+    WHERE status = 'running' AND dedupe_key IS NOT NULL
+"""
+QUEUE_PENDING_DEDUPE_INDEX_SQL = """
+    CREATE UNIQUE INDEX idx_queue_pending_dedupe_key
+    ON queue_jobs(dedupe_key)
+    WHERE status = 'pending' AND dedupe_key IS NOT NULL
+"""
+QUEUE_CLAIM_INDEX_SQL = {
+    QUEUE_ROLE_PRIORITY_INDEX_NAME: QUEUE_ROLE_PRIORITY_INDEX_SQL,
+    QUEUE_ROLE_CREATED_INDEX_NAME: QUEUE_ROLE_CREATED_INDEX_SQL,
+    QUEUE_STATUS_PRIORITY_INDEX_NAME: QUEUE_STATUS_PRIORITY_INDEX_SQL,
+    QUEUE_STATUS_CREATED_INDEX_NAME: QUEUE_STATUS_CREATED_INDEX_SQL,
+    QUEUE_RUNNING_DEDUPE_INDEX_NAME: QUEUE_RUNNING_DEDUPE_INDEX_SQL,
+    QUEUE_PENDING_DEDUPE_INDEX_NAME: QUEUE_PENDING_DEDUPE_INDEX_SQL,
+}
+QUEUE_CLAIM_INDEX_COLUMNS = {
+    QUEUE_ROLE_PRIORITY_INDEX_NAME: (
+        "role",
+        "status",
+        "priority",
+        "created_at",
+    ),
+    QUEUE_ROLE_CREATED_INDEX_NAME: ("role", "status", "created_at"),
+    QUEUE_STATUS_PRIORITY_INDEX_NAME: ("status", "priority", "created_at"),
+    QUEUE_STATUS_CREATED_INDEX_NAME: ("status", "created_at"),
+    QUEUE_RUNNING_DEDUPE_INDEX_NAME: ("dedupe_key",),
+    QUEUE_PENDING_DEDUPE_INDEX_NAME: ("dedupe_key",),
+}
+QUEUE_CLAIM_INDEX_UNIQUE = {
+    index_name: index_name == QUEUE_PENDING_DEDUPE_INDEX_NAME
+    for index_name in QUEUE_CLAIM_INDEX_SQL
+}
+QUEUE_CLAIM_INDEX_PARTIAL = {
+    index_name: index_name
+    in {
+        QUEUE_RUNNING_DEDUPE_INDEX_NAME,
+        QUEUE_PENDING_DEDUPE_INDEX_NAME,
+    }
+    for index_name in QUEUE_CLAIM_INDEX_SQL
+}
+QUEUE_ORDER_INDEX_COLUMNS = {
+    index_name: QUEUE_CLAIM_INDEX_COLUMNS[index_name]
+    for index_name in (
+        QUEUE_ROLE_PRIORITY_INDEX_NAME,
+        QUEUE_ROLE_CREATED_INDEX_NAME,
+        QUEUE_STATUS_PRIORITY_INDEX_NAME,
+        QUEUE_STATUS_CREATED_INDEX_NAME,
+    )
+}
+QUEUE_ORDER_INDEX_NAMES = frozenset(QUEUE_ORDER_INDEX_COLUMNS)
+QUEUE_CLAIM_INDEX_NAMES = frozenset(QUEUE_CLAIM_INDEX_SQL)
+MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_GROUPS = 5
+MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_JOB_IDS = 5
 GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES = frozenset(
     {
         "trg_graph_edges_source_refs_backfill_insert",
@@ -3019,6 +3097,7 @@ def _card_sidecar_matches_payload(path: Path, payload: dict[str, Any]) -> bool:
 
 SidecarPathIdentity = tuple[frozenset[str], tuple[int, int] | None]
 ImmutableArtifactPathIndex = tuple[tuple[Path, SidecarPathIdentity], ...]
+ImmutableArtifactAuthorityToken = tuple[int, int]
 CardIntentBatchIndex = tuple[
     dict[str, sqlite3.Row],
     frozenset[str],
@@ -3026,6 +3105,13 @@ CardIntentBatchIndex = tuple[
     dict[tuple[int, int], frozenset[str]],
     dict[str, tuple[Path, SidecarPathIdentity]],
 ]
+CardSidecarDbAuthorityToken = tuple[int, int, int]
+CardSidecarReconciliationSnapshot = tuple[
+    CardSidecarDbAuthorityToken,
+    ImmutableArtifactPathIndex,
+    CardIntentBatchIndex,
+]
+CardSidecarTerminalPlan = dict[str, Any]
 
 
 def _filesystem_path_identity(
@@ -3412,18 +3498,39 @@ def _stable_regular_file_evidence_is_current(
 def _immutable_artifact_path_index(
     root: Path,
     conn: sqlite3.Connection,
+    *,
+    required_card_ids: Iterable[str] = (),
+    authority_artifact_rows: Iterable[sqlite3.Row] | None = None,
+    authority_card_ids: Iterable[str] | None = None,
 ) -> ImmutableArtifactPathIndex:
     entries: list[tuple[Path, SidecarPathIdentity]] = []
     try:
-        rows = conn.execute(
-            "SELECT uri FROM artifacts WHERE immutable = 1"
-        ).fetchall()
-        card_ids = {
-            str(row["id"])
-            for row in conn.execute("SELECT id FROM cards").fetchall()
-        }
-    except sqlite3.OperationalError:
-        return ()
+        rows = (
+            tuple(authority_artifact_rows)
+            if authority_artifact_rows is not None
+            else tuple(
+                conn.execute(
+                    "SELECT uri FROM artifacts WHERE immutable = 1"
+                ).fetchall()
+            )
+        )
+        card_ids = (
+            {str(card_id) for card_id in authority_card_ids}
+            if authority_card_ids is not None
+            else {
+                str(row["id"])
+                for row in conn.execute("SELECT id FROM cards").fetchall()
+            }
+        )
+        card_ids.update(
+            str(card_id)
+            for card_id in required_card_ids
+            if card_id
+        )
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "immutable artifact path authority query failed"
+        ) from exc
     card_id_lookup, _card_id_collisions = _portable_unique_casefold_lookup(
         card_ids
     )
@@ -3506,8 +3613,15 @@ def _path_identity_binds_index(
 def _card_intent_batch_index(
     root: Path,
     conn: sqlite3.Connection,
+    *,
+    authority_card_rows: Iterable[sqlite3.Row] | None = None,
+    authority_outbox_rows: Iterable[sqlite3.Row] | None = None,
 ) -> CardIntentBatchIndex:
-    rows = conn.execute("SELECT * FROM cards").fetchall()
+    rows = (
+        tuple(authority_card_rows)
+        if authority_card_rows is not None
+        else tuple(conn.execute("SELECT * FROM cards").fetchall())
+    )
     rows_by_id = {str(row["id"]): row for row in rows}
     card_ids_by_path_key: dict[str, set[str]] = {}
     card_ids_by_file_id: dict[tuple[int, int], set[str]] = {}
@@ -3536,7 +3650,15 @@ def _card_intent_batch_index(
             card_ids_by_file_id.setdefault(identity[1], set()).add(card_id)
     outbox_ids = frozenset(
         str(row["card_id"])
-        for row in conn.execute("SELECT card_id FROM card_sidecar_outbox").fetchall()
+        for row in (
+            tuple(authority_outbox_rows)
+            if authority_outbox_rows is not None
+            else tuple(
+                conn.execute(
+                    "SELECT card_id FROM card_sidecar_outbox"
+                ).fetchall()
+            )
+        )
     )
     return (
         rows_by_id,
@@ -3884,10 +4006,56 @@ CARD_SIDECAR_RESOLVED_INTENT_SCHEMA = (
 CARD_SIDECAR_INTENT_OPERATION_LOCK_ID = (
     "card-sidecar-intent-reconciliation"
 )
+CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_SCHEMA = (
+    "continuum.card_sidecar_artifact_write_reservation.v1"
+)
+CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY = (
+    "card_sidecar_artifact_write_reservation"
+)
+IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY = (
+    "immutable_artifact_path_index_epoch"
+)
+CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY = (
+    "card_sidecar_db_authority_epoch"
+)
+CARD_SIDECAR_DB_AUTHORITY_TRIGGER_NAMES = frozenset(
+    {
+        "advance_card_sidecar_db_authority_after_card_insert",
+        "advance_card_sidecar_db_authority_after_card_update",
+        "advance_card_sidecar_db_authority_after_card_delete",
+        "advance_card_sidecar_db_authority_after_outbox_insert",
+        "advance_card_sidecar_db_authority_after_outbox_update",
+        "advance_card_sidecar_db_authority_after_outbox_delete",
+    }
+)
+CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR = (
+    "immutable artifact registration blocked by active Card sidecar write "
+    "reservation"
+)
+
+
+class CardSidecarArtifactWriteReservationError(RuntimeError):
+    """An immutable artifact writer crossed an active sidecar reservation."""
+
+
+CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_NAMES = frozenset(
+    {
+        "fence_card_sidecar_artifact_write_immutable_insert",
+        "fence_card_sidecar_artifact_write_immutable_update",
+        "advance_immutable_artifact_path_index_epoch_after_insert",
+        "advance_immutable_artifact_path_index_epoch_after_update",
+        "advance_immutable_artifact_path_index_epoch_after_delete",
+    }
+)
+MAX_CARD_SIDECAR_ARTIFACT_INDEX_STABILITY_ATTEMPTS = 8
+MAX_CARD_SIDECAR_RECONCILIATION_SNAPSHOT_ATTEMPTS = 8
 MAX_CARD_SIDECAR_WRITE_INTENTS = 10000
 MAX_CARD_SIDECAR_WRITE_INTENT_BYTES = 64 * 1024
 MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES = (
     MAX_CARD_SIDECAR_WRITE_INTENT_BYTES + 1024
+)
+_CARD_SIDECAR_WRITE_INTENT_PUBLISHER_TEMP_RE = re.compile(
+    r"\.card_sidecar_write_intent_[0-9a-f]{24}\.json\.[a-z0-9_]{8}\.tmp"
 )
 _CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT: contextvars.ContextVar[
     int | None
@@ -3951,6 +4119,387 @@ def _card_sidecar_intent_reconciliation_budget(
 def _current_card_sidecar_intent_reconciliation_budget(
 ) -> dict[str, int] | None:
     return _CARD_SIDECAR_INTENT_RECONCILIATION_BUDGET.get()
+
+
+def _card_sidecar_artifact_write_reservation_value(
+    conn: sqlite3.Connection,
+) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,),
+    ).fetchone()
+    return str(row["value"]) if row is not None else None
+
+
+def _immutable_artifact_path_index_epoch(
+    conn: sqlite3.Connection,
+) -> int:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY,),
+    ).fetchone()
+    value = str(row["value"]) if row is not None else ""
+    if re.fullmatch(r"(?:0|[1-9][0-9]*)", value) is None:
+        raise RuntimeError(
+            "immutable artifact path index epoch is missing or malformed"
+        )
+    return int(value)
+
+
+def _immutable_artifact_path_index_epoch_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    try:
+        _immutable_artifact_path_index_epoch(conn)
+    except (RuntimeError, sqlite3.Error):
+        return False
+    return True
+
+
+def _card_sidecar_db_authority_epoch(
+    conn: sqlite3.Connection,
+) -> int:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,),
+    ).fetchone()
+    value = str(row["value"]) if row is not None else ""
+    if re.fullmatch(r"(?:0|[1-9][0-9]*)", value) is None:
+        raise RuntimeError(
+            "Card sidecar DB authority epoch is missing or malformed"
+        )
+    return int(value)
+
+
+def _card_sidecar_db_authority_epoch_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    try:
+        _card_sidecar_db_authority_epoch(conn)
+    except (RuntimeError, sqlite3.Error):
+        return False
+    return True
+
+
+def _card_sidecar_db_authority_rows(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[sqlite3.Row, ...], tuple[sqlite3.Row, ...]]:
+    """Capture rows used to build one reconciliation batch index."""
+
+    card_rows = tuple(
+        conn.execute(
+            "SELECT * FROM cards ORDER BY id COLLATE BINARY"
+        ).fetchall()
+    )
+    outbox_rows = tuple(
+        conn.execute(
+            """
+            SELECT *
+            FROM card_sidecar_outbox
+            ORDER BY card_id COLLATE BINARY
+            """
+        ).fetchall()
+    )
+    return card_rows, outbox_rows
+
+
+def _sqlite_schema_authority_version(
+    conn: sqlite3.Connection,
+) -> int:
+    row = conn.execute("PRAGMA schema_version").fetchone()
+    if row is None:
+        raise RuntimeError("SQLite schema authority version is unavailable")
+    value = row[0]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError("SQLite schema authority version is malformed")
+    return value
+
+
+def _immutable_artifact_authority_token(
+    conn: sqlite3.Connection,
+) -> ImmutableArtifactAuthorityToken:
+    if not _card_sidecar_artifact_write_reservation_triggers_ready(conn):
+        raise RuntimeError(
+            "immutable artifact authority triggers are not exact"
+        )
+    return (
+        _immutable_artifact_path_index_epoch(conn),
+        _sqlite_schema_authority_version(conn),
+    )
+
+
+def _card_sidecar_db_authority_token(
+    conn: sqlite3.Connection,
+) -> CardSidecarDbAuthorityToken:
+    return (
+        _immutable_artifact_path_index_epoch(conn),
+        _card_sidecar_db_authority_epoch(conn),
+        _sqlite_schema_authority_version(conn),
+    )
+
+
+def _capture_card_sidecar_reconciliation_snapshot(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> CardSidecarReconciliationSnapshot:
+    """Build one filesystem index set from one exact WAL read snapshot."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar reconciliation snapshot requires no active transaction"
+        )
+    try:
+        conn.execute("BEGIN")
+        if not _card_sidecar_db_authority_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar DB authority triggers are not exact"
+            )
+        if not _card_sidecar_artifact_write_reservation_triggers_ready(
+            conn
+        ):
+            raise RuntimeError(
+                "immutable artifact authority triggers are not exact"
+            )
+        artifact_epoch = _immutable_artifact_path_index_epoch(conn)
+        sidecar_epoch = _card_sidecar_db_authority_epoch(conn)
+        schema_version = _sqlite_schema_authority_version(conn)
+        card_rows, outbox_rows = _card_sidecar_db_authority_rows(conn)
+        try:
+            artifact_rows = tuple(
+                conn.execute(
+                    """
+                    SELECT uri
+                    FROM artifacts
+                    WHERE immutable = 1
+                    ORDER BY id COLLATE BINARY
+                    """
+                ).fetchall()
+            )
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                "immutable artifact path authority query failed"
+            ) from exc
+        artifact_index = _immutable_artifact_path_index(
+            root,
+            conn,
+            authority_artifact_rows=artifact_rows,
+            authority_card_ids=(
+                str(row["id"]) for row in card_rows
+            ),
+        )
+        batch_index = _card_intent_batch_index(
+            root,
+            conn,
+            authority_card_rows=card_rows,
+            authority_outbox_rows=outbox_rows,
+        )
+        conn.commit()
+        return (
+            (artifact_epoch, sidecar_epoch, schema_version),
+            artifact_index,
+            batch_index,
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _stable_immutable_artifact_path_index(
+    root: Path,
+    conn: sqlite3.Connection,
+    *,
+    required_card_ids: Iterable[str] = (),
+) -> tuple[ImmutableArtifactPathIndex, ImmutableArtifactAuthorityToken]:
+    """Bind a filesystem-heavy artifact index to exact DB/schema authority."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "immutable artifact path indexing requires no active transaction"
+        )
+    for _attempt in range(
+        MAX_CARD_SIDECAR_ARTIFACT_INDEX_STABILITY_ATTEMPTS
+    ):
+        before_authority = _immutable_artifact_authority_token(conn)
+        artifact_index = _immutable_artifact_path_index(
+            root,
+            conn,
+            required_card_ids=required_card_ids,
+        )
+        after_authority = _immutable_artifact_authority_token(conn)
+        if before_authority == after_authority:
+            return artifact_index, after_authority
+    raise RuntimeError(
+        "immutable artifact authority did not remain stable while selecting "
+        "a Card sidecar target"
+    )
+
+
+def _recover_stale_card_sidecar_artifact_write_reservation(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    """Retire a crash-left reservation while the caller owns the sidecar lock."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar reservation recovery requires no active transaction"
+        )
+    if _card_sidecar_artifact_write_reservation_value(conn) is None:
+        return None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation_value = (
+            _card_sidecar_artifact_write_reservation_value(conn)
+        )
+        if reservation_value is None:
+            conn.commit()
+            return None
+        try:
+            parsed = json.loads(reservation_value)
+        except (TypeError, ValueError):
+            parsed = None
+        reservation = parsed if isinstance(parsed, dict) else {}
+        reservation_card_id = (
+            str(reservation.get("card_id"))
+            if reservation.get("card_id")
+            else ""
+        )
+        card_exists = bool(
+            reservation_card_id
+            and conn.execute(
+                "SELECT 1 FROM cards WHERE id = ?",
+                (reservation_card_id,),
+            ).fetchone()
+            is not None
+        )
+        if card_exists:
+            # The reservation is itself crash authority. Convert it to the
+            # normal durable retry sink before releasing the immutable-artifact
+            # fence, including the pre-intent location-less backfill window.
+            mark_card_sidecar_outbox(
+                conn,
+                [reservation_card_id],
+                reason="sidecar_artifact_write_reservation_recovered",
+            )
+        deleted = conn.execute(
+            "DELETE FROM meta WHERE key = ? AND value = ?",
+            (
+                CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                reservation_value,
+            ),
+        ).rowcount
+        if deleted != 1:
+            raise RuntimeError(
+                "stale Card sidecar artifact write reservation changed during "
+                "operation-lock recovery"
+            )
+        audit_event(
+            conn,
+            action="card_sidecar_artifact_write_reservation_recovered",
+            target_type="card",
+            target_id=(
+                str(reservation.get("card_id"))
+                if reservation.get("card_id")
+                else None
+            ),
+            payload={
+                "reservation_id": reservation.get("reservation_id"),
+                "target_uri": reservation.get("target_uri"),
+                "created_at": reservation.get("created_at"),
+                "malformed": not isinstance(parsed, dict),
+                "recovery_authority": (
+                    "stale_reservation_converted_to_durable_outbox_under_"
+                    "sidecar_operation_lock"
+                    if card_exists
+                    else "sidecar_operation_lock_no_existing_card"
+                ),
+                "outbox_rearmed": card_exists,
+                "root": str(root),
+            },
+        )
+        conn.commit()
+        return reservation
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _reserve_card_sidecar_artifact_write(
+    conn: sqlite3.Connection,
+    *,
+    card_id: str,
+    target_uri: str,
+    expected_state_hash: str,
+    expected_artifact_authority: ImmutableArtifactAuthorityToken,
+) -> tuple[str, str] | None:
+    """Create a durable fence if indexed DB/schema authority is still exact."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar artifact write reservation requires no active "
+            "transaction"
+        )
+    reservation_id = unique_id("sidecar_artifact_write")
+    expected_artifact_epoch, expected_schema_version = (
+        expected_artifact_authority
+    )
+    reservation_value = json_dumps(
+        {
+            "schema": CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_SCHEMA,
+            "reservation_id": reservation_id,
+            "card_id": card_id,
+            "target_uri": target_uri,
+            "expected_state_hash": expected_state_hash,
+            "artifact_epoch": expected_artifact_epoch,
+            "sqlite_schema_version": expected_schema_version,
+            "created_at": utc_now(),
+        }
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            _immutable_artifact_authority_token(conn)
+            != expected_artifact_authority
+        ):
+            conn.rollback()
+            return None
+        if _card_sidecar_artifact_write_reservation_value(conn) is not None:
+            raise RuntimeError(
+                "Card sidecar artifact write reservation already exists while "
+                "the operation lock is held"
+            )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            (
+                CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                reservation_value,
+            ),
+        )
+        conn.commit()
+        return reservation_id, reservation_value
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _release_card_sidecar_artifact_write_reservation(
+    conn: sqlite3.Connection,
+    reservation_value: str,
+) -> None:
+    deleted = conn.execute(
+        "DELETE FROM meta WHERE key = ? AND value = ?",
+        (
+            CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+            reservation_value,
+        ),
+    ).rowcount
+    if deleted != 1:
+        raise RuntimeError(
+            "Card sidecar artifact write reservation changed before release"
+        )
 
 
 def _charge_card_sidecar_intent_reconciliation_budget(
@@ -4051,6 +4600,10 @@ def _bounded_card_sidecar_intent_inventory(
     retirement_dir: Path | None,
     *,
     entry_limit: int,
+    publisher_temp_candidates: (
+        list[tuple[Path, tuple[int, int]]] | None
+    ) = None,
+    publisher_temp_inventory_state: CardSidecarStateDir | None = None,
 ) -> tuple[list[Path], list[Path], bool, int]:
     """Fairly inventory both queues under one shared all-entry allowance."""
 
@@ -4083,6 +4636,27 @@ def _bounded_card_sidecar_intent_inventory(
             if enumerated > bounded_entry_limit:
                 truncated = True
                 break
+            if (
+                namespace == "intent"
+                and publisher_temp_candidates is not None
+                and _CARD_SIDECAR_WRITE_INTENT_PUBLISHER_TEMP_RE.fullmatch(
+                    entry.name
+                )
+            ):
+                temp_path = Path(entry.path)
+                if publisher_temp_inventory_state is None:
+                    raise ValueError(
+                        "Card sidecar publisher temporary retirement is unfenced"
+                    )
+                expected_identity = _plain_card_sidecar_state_path_identity(
+                    temp_path,
+                    directory=False,
+                )
+                publisher_temp_candidates.append(
+                    (temp_path, expected_identity)
+                )
+                turn = (scanner_index + 1) % len(scanners)
+                continue
             if entry.name.endswith(".json"):
                 if namespace == "intent":
                     intent_paths.append(Path(entry.path))
@@ -4141,6 +4715,10 @@ def _validated_card_sidecar_state_dir(
         "receipt": ("exports", "card_sidecar_recovery_receipts"),
         "resolved_intent": ("exports", "card_sidecar_resolved_intents"),
         "retirement_intent": ("run", "card_sidecar_retirement_intents"),
+        "publisher_temp_retirement": (
+            "run",
+            "card_sidecar_publisher_temp_retirements",
+        ),
     }
     components = components_by_purpose.get(purpose)
     if components is None:
@@ -4185,6 +4763,229 @@ def _assert_card_sidecar_state_dir_unchanged(state: CardSidecarStateDir) -> None
         raise ValueError(f"Card sidecar state directory changed during use: {path}")
 
 
+def _retire_card_sidecar_publisher_temp(
+    intent_state: CardSidecarStateDir,
+    temp_path: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> str:
+    """Retire one exact crash-left publisher temp without path-only deletion."""
+
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    intent_dir, _intent_identity, _purpose, root = intent_state
+    if temp_path.parent != intent_dir:
+        raise ValueError(
+            "Card sidecar publisher temporary escaped its intent namespace"
+        )
+    if (
+        _plain_card_sidecar_state_path_identity(
+            temp_path,
+            directory=False,
+        )
+        != expected_identity
+    ):
+        raise ValueError(
+            "Card sidecar publisher temporary identity changed before retirement"
+        )
+
+    if os.name == "nt":
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+            "kernel32",
+            use_last_error=True,
+        )
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        file_read_attributes = 0x00000080
+        delete_access = 0x00010000
+        share_read = 0x00000001
+        open_existing = 3
+        file_attribute_normal = 0x00000080
+        open_reparse_point = 0x00200000
+        invalid_handle = ctypes.c_void_p(-1).value
+        raw_handle = kernel32.CreateFileW(
+            str(temp_path),
+            file_read_attributes | delete_access,
+            share_read,
+            None,
+            open_existing,
+            file_attribute_normal | open_reparse_point,
+            None,
+        )
+        handle_value = int(getattr(raw_handle, "value", raw_handle) or 0)
+        if handle_value in {0, invalid_handle}:
+            raise ctypes.WinError(  # type: ignore[attr-defined]
+                ctypes.get_last_error()
+            )
+        fd = -1
+        try:
+            fd = msvcrt.open_osfhandle(
+                handle_value,
+                os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
+            )
+            handle_value = 0
+            opened = os.fstat(fd)
+            opened_identity = (int(opened.st_dev), int(opened.st_ino))
+            if (
+                opened_identity != expected_identity
+                or not stat.S_ISREG(opened.st_mode)
+                or bool(
+                    int(getattr(opened, "st_file_attributes", 0))
+                    & int(
+                        getattr(
+                            stat,
+                            "FILE_ATTRIBUTE_REPARSE_POINT",
+                            0x400,
+                        )
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Card sidecar publisher temporary handle identity changed"
+                )
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            if (
+                _plain_card_sidecar_state_path_identity(
+                    temp_path,
+                    directory=False,
+                )
+                != expected_identity
+            ):
+                raise ValueError(
+                    "Card sidecar publisher temporary namespace binding changed"
+                )
+            set_windows_delete_disposition(
+                int(msvcrt.get_osfhandle(fd))
+            )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            elif handle_value not in {0, invalid_handle}:
+                kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+        _assert_card_sidecar_state_dir_unchanged(intent_state)
+        if os.path.lexists(temp_path):
+            raise ValueError(
+                "Card sidecar publisher temporary remained after exact-handle "
+                "retirement"
+            )
+        return (
+            f"windows-delete:{temp_path.name}:"
+            f"{expected_identity[0]:x}:{expected_identity[1]:x}"
+        )
+
+    retirement_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="publisher_temp_retirement",
+        create=True,
+    )
+    if retirement_state is None:
+        raise ValueError(
+            "Card sidecar publisher temporary retirement directory is unavailable"
+        )
+    retirement_path = retirement_state[0] / (
+        stable_id(
+            "card_sidecar_publisher_temp_retirement",
+            temp_path.name,
+            str(expected_identity[0]),
+            str(expected_identity[1]),
+        )
+        + ".retired"
+    )
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    _assert_card_sidecar_state_dir_unchanged(retirement_state)
+    replace_file_noclobber(temp_path, retirement_path)
+    moved_identity = _plain_card_sidecar_state_path_identity(
+        retirement_path,
+        directory=False,
+    )
+    if moved_identity != expected_identity:
+        # Preserve a racing replacement in quarantine and fail nonterminal.
+        raise ValueError(
+            "Card sidecar publisher temporary changed during quarantine"
+        )
+    flush_file_strict(retirement_path)
+    flush_directory_strict(intent_dir)
+    flush_directory_strict(retirement_state[0])
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    _assert_card_sidecar_state_dir_unchanged(retirement_state)
+    if (
+        os.path.lexists(temp_path)
+        or _plain_card_sidecar_state_path_identity(
+            retirement_path,
+            directory=False,
+        )
+        != expected_identity
+    ):
+        raise ValueError(
+            "Card sidecar publisher temporary quarantine did not remain bound"
+        )
+    return continuum_uri(root, retirement_path)
+
+
+def _retire_captured_card_sidecar_publisher_temps(
+    intent_state: CardSidecarStateDir,
+    candidates: Iterable[tuple[Path, tuple[int, int]]],
+    retirements: list[str],
+) -> None:
+    """Retire DB-fenced identities after releasing SQLite's writer lock."""
+
+    retirement_start = len(retirements)
+    for temp_path, expected_identity in candidates:
+        retirements.append(
+            _retire_card_sidecar_publisher_temp(
+                intent_state,
+                temp_path,
+                expected_identity=expected_identity,
+            )
+        )
+    if len(retirements) > retirement_start:
+        # Windows delete disposition and POSIX quarantine both need the source
+        # namespace boundary durable before cleanup is reported. This flush is
+        # deliberately outside SQLite's writer transaction.
+        flush_directory_strict(intent_state[0])
+
+
+def _prove_card_sidecar_intent_writer_fence(
+    conn: sqlite3.Connection,
+) -> None:
+    """Upgrade a deferred transaction before it substitutes for the sidecar lock."""
+
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar intent publication requires an active transaction"
+        )
+    try:
+        proof = conn.execute(
+            """
+            UPDATE meta
+            SET value = value
+            WHERE key = 'schema_version'
+            """
+        )
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            "Card sidecar intent publication could not prove a SQLite writer "
+            "fence"
+        ) from exc
+    if proof.rowcount != 1:
+        raise RuntimeError(
+            "Card sidecar intent publication requires an initialized SQLite "
+            "writer fence"
+        )
+
+
 def _write_card_sidecar_write_intent(
     root: Path,
     *,
@@ -4197,6 +4998,7 @@ def _write_card_sidecar_write_intent(
     """Publish under either the caller's DB fence or the reconciler lock."""
 
     if conn is not None and conn.in_transaction:
+        _prove_card_sidecar_intent_writer_fence(conn)
         return _write_card_sidecar_write_intent_fenced(
             root,
             card_id=card_id,
@@ -5117,6 +5919,155 @@ def _finish_card_sidecar_write_intent(
     return committed
 
 
+def _deferred_card_sidecar_terminal_publication(
+    root: Path,
+    *,
+    intent_path: Path,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+    status: str,
+    recovery_path: Path | None = None,
+    recovery_evidence: StableRegularFileEvidence | None = None,
+    observed_path: Path | None = None,
+    observed_evidence: StableRegularFileEvidence | None = None,
+    missing_paths: Iterable[Path] = (),
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "terminal_publication_planned",
+        "intent_uri": continuum_uri(root, intent_path),
+        "_terminal_plan": {
+            "intent_path": intent_path,
+            "intent": intent,
+            "intent_entry_identity": intent_entry_identity,
+            "status": status,
+            "recovery_path": recovery_path,
+            "recovery_evidence": recovery_evidence,
+            "observed_path": observed_path,
+            "observed_evidence": observed_evidence,
+            "missing_paths": tuple(missing_paths),
+        },
+    }
+
+
+def _publish_deferred_card_sidecar_terminal(
+    root: Path,
+    planned: dict[str, Any],
+) -> dict[str, Any]:
+    """Revalidate held filesystem identities and publish after the DB CAS."""
+
+    raw_plan = planned.get("_terminal_plan")
+    if not isinstance(raw_plan, dict):
+        raise ValueError("Card sidecar terminal publication plan is unavailable")
+    plan: CardSidecarTerminalPlan = raw_plan
+    intent_path = Path(plan["intent_path"])
+    intent = plan["intent"]
+    intent_entry_identity = plan["intent_entry_identity"]
+    status = str(plan["status"])
+    intent_uri = continuum_uri(root, intent_path)
+    if (
+        not isinstance(intent, dict)
+        or not isinstance(intent_entry_identity, tuple)
+        or len(intent_entry_identity) != 2
+    ):
+        raise ValueError("Card sidecar terminal publication plan is malformed")
+    if (
+        _plain_card_sidecar_state_path_identity(
+            intent_path,
+            directory=False,
+        )
+        != intent_entry_identity
+    ):
+        return {
+            "ok": False,
+            "status": "intent_changed_before_receipt",
+            "intent_uri": intent_uri,
+        }
+    missing_paths = tuple(Path(path) for path in plan["missing_paths"])
+    if any(os.path.lexists(path) for path in missing_paths):
+        return {
+            "ok": False,
+            "status": "target_changed_before_receipt",
+            "intent_uri": intent_uri,
+        }
+
+    recovery_path_value = plan["recovery_path"]
+    observed_path_value = plan["observed_path"]
+    recovery_fd = -1
+    observed_fd = -1
+    try:
+        recovery_path: Path | None = None
+        recovery_evidence: StableRegularFileEvidence | None = None
+        if recovery_path_value is not None:
+            recovery_path = Path(recovery_path_value)
+            expected_recovery_evidence = plan["recovery_evidence"]
+            if expected_recovery_evidence is None:
+                raise ValueError(
+                    "Card sidecar recovery publication evidence is unavailable"
+                )
+            flush_file_strict(recovery_path)
+            flush_directory_strict(recovery_path.parent)
+            (
+                _recovery_payload,
+                recovery_evidence,
+                recovery_fd,
+            ) = _open_validated_card_sidecar_payload(
+                recovery_path,
+                card_id=str(intent["card_id"]),
+            )
+            if recovery_evidence != expected_recovery_evidence:
+                return {
+                    "ok": False,
+                    "status": "recovery_changed_before_receipt",
+                    "intent_uri": intent_uri,
+                }
+
+        observed_path: Path | None = None
+        observed_evidence: StableRegularFileEvidence | None = None
+        if observed_path_value is not None:
+            observed_path = Path(observed_path_value)
+            expected_observed_evidence = plan["observed_evidence"]
+            if expected_observed_evidence is None:
+                raise ValueError(
+                    "Card sidecar observed-file publication evidence is unavailable"
+                )
+            flush_file_strict(observed_path)
+            flush_directory_strict(observed_path.parent)
+            (
+                _observed_payload,
+                observed_evidence,
+                observed_fd,
+            ) = _open_validated_card_sidecar_payload(
+                observed_path,
+                card_id=str(intent["card_id"]),
+            )
+            if observed_evidence != expected_observed_evidence:
+                return {
+                    "ok": False,
+                    "status": "target_changed_before_receipt",
+                    "intent_uri": intent_uri,
+                }
+
+        return _finish_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+            status=status,
+            recovery_path=recovery_path,
+            recovery_evidence=recovery_evidence,
+            recovery_fd=(recovery_fd if recovery_fd >= 0 else None),
+            observed_path=observed_path,
+            observed_evidence=observed_evidence,
+            observed_fd=(observed_fd if observed_fd >= 0 else None),
+        )
+    finally:
+        if observed_fd >= 0:
+            os.close(observed_fd)
+        if recovery_fd >= 0:
+            os.close(recovery_fd)
+
+
 def _resolve_card_sidecar_write_intent(
     root: Path,
     conn: sqlite3.Connection,
@@ -5126,6 +6077,8 @@ def _resolve_card_sidecar_write_intent(
     intent_entry_identity: tuple[int, int],
     artifact_index: ImmutableArtifactPathIndex,
     batch_index: CardIntentBatchIndex,
+    defer_terminal_publication: bool = False,
+    allow_quarantine: bool = True,
 ) -> dict[str, Any]:
     card_id = str(intent.get("card_id") or "")
     target_uri = str(intent.get("target_uri") or "")
@@ -5169,6 +6122,44 @@ def _resolve_card_sidecar_write_intent(
     recovery_path = target_path.with_name(
         f".{target_path.name}.{intent_id}.uncommitted"
     )
+
+    def finish_terminal(
+        status: str,
+        *,
+        recovery_path_value: Path | None = None,
+        recovery_evidence: StableRegularFileEvidence | None = None,
+        recovery_fd: int | None = None,
+        observed_path: Path | None = None,
+        observed_evidence: StableRegularFileEvidence | None = None,
+        observed_fd: int | None = None,
+        missing_paths: Iterable[Path] = (),
+    ) -> dict[str, Any]:
+        if defer_terminal_publication:
+            return _deferred_card_sidecar_terminal_publication(
+                root,
+                intent_path=intent_path,
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+                status=status,
+                recovery_path=recovery_path_value,
+                recovery_evidence=recovery_evidence,
+                observed_path=observed_path,
+                observed_evidence=observed_evidence,
+                missing_paths=missing_paths,
+            )
+        return _finish_card_sidecar_write_intent(
+            root,
+            intent_path=intent_path,
+            intent=intent,
+            intent_entry_identity=intent_entry_identity,
+            status=status,
+            recovery_path=recovery_path_value,
+            recovery_evidence=recovery_evidence,
+            recovery_fd=recovery_fd,
+            observed_path=observed_path,
+            observed_evidence=observed_evidence,
+            observed_fd=observed_fd,
+        )
 
     # Receipt publication is the durable commit point.  A crash can occur
     # after the exclusive receipt write but before intent removal, so adopt a
@@ -5223,13 +6214,9 @@ def _resolve_card_sidecar_write_intent(
         # Receipt it before considering any target-side terminal branch; a
         # target may have been recreated after the move and is separate state.
         try:
-            return _finish_card_sidecar_write_intent(
-                root,
-                intent_path=intent_path,
-                intent=intent,
-                intent_entry_identity=intent_entry_identity,
+            return finish_terminal(
                 status="quarantined",
-                recovery_path=recovery_path,
+                recovery_path_value=recovery_path,
                 recovery_evidence=recovery_evidence,
                 recovery_fd=recovery_fd,
             )
@@ -5243,12 +6230,9 @@ def _resolve_card_sidecar_write_intent(
                 "status": "history_transition_target_missing",
                 "intent_uri": str(intent_path),
             }
-        return _finish_card_sidecar_write_intent(
-            root,
-            intent_path=intent_path,
-            intent=intent,
-            intent_entry_identity=intent_entry_identity,
+        return finish_terminal(
             status="no_file_created",
+            missing_paths=(target_path, recovery_path),
         )
     target_fd = -1
     try:
@@ -5311,11 +6295,7 @@ def _resolve_card_sidecar_write_intent(
                     "status": "target_changed_before_receipt",
                     "intent_uri": str(intent_path),
                 }
-            return _finish_card_sidecar_write_intent(
-                root,
-                intent_path=intent_path,
-                intent=intent,
-                intent_entry_identity=intent_entry_identity,
+            return finish_terminal(
                 status=status,
                 observed_path=target_path,
                 observed_evidence=current_evidence,
@@ -5385,6 +6365,14 @@ def _resolve_card_sidecar_write_intent(
                 "status": "pending_retry",
                 "intent_uri": continuum_uri(root, intent_path),
             }
+
+    if not allow_quarantine:
+        return {
+            "ok": True,
+            "status": "quarantine_requires_writer_fence",
+            "intent_uri": continuum_uri(root, intent_path),
+            "_quarantine_writer_fallback": True,
+        }
 
     quarantine_check_fd = -1
     try:
@@ -5464,6 +6452,76 @@ def _resolve_card_sidecar_write_intent(
             os.close(recovery_fd)
 
 
+def _commit_card_sidecar_reconciliation_authority(
+    conn: sqlite3.Connection,
+    expected_token: CardSidecarDbAuthorityToken,
+) -> bool:
+    """Linearize one terminal plan if its pure-DB authority is still exact."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar reconciliation CAS requires no active transaction"
+        )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _card_sidecar_db_authority_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar DB authority triggers are not exact at CAS"
+            )
+        if not _card_sidecar_artifact_write_reservation_triggers_ready(
+            conn
+        ):
+            raise RuntimeError(
+                "immutable artifact authority triggers are not exact at CAS"
+            )
+        if _card_sidecar_db_authority_token(conn) != expected_token:
+            conn.rollback()
+            return False
+        conn.commit()
+        return True
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _resolve_card_sidecar_quarantine_with_fresh_writer_fence(
+    root: Path,
+    *,
+    intent_path: Path,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+) -> dict[str, Any]:
+    """Rerun only a destructive quarantine decision under fresh authority."""
+
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        artifact_index = _immutable_artifact_path_index(root, conn)
+        batch_index = _card_intent_batch_index(root, conn)
+        result = _resolve_card_sidecar_write_intent(
+            root,
+            conn,
+            intent_path,
+            intent,
+            intent_entry_identity=intent_entry_identity,
+            artifact_index=artifact_index,
+            batch_index=batch_index,
+            defer_terminal_publication=True,
+            allow_quarantine=True,
+        )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if "_terminal_plan" in result:
+        return _publish_deferred_card_sidecar_terminal(root, result)
+    return result
+
+
 def _card_sidecar_retirement_entry_binding(
     retirement_path: Path,
 ) -> tuple[str, tuple[int, int]]:
@@ -5535,6 +6593,9 @@ def _empty_card_sidecar_reconciliation_result(
         "overflow": False,
         "scope_filtered": False,
         "scope_complete": True,
+        "publisher_temps_retired": 0,
+        "publisher_temp_retirement_evidence": [],
+        "publisher_temp_retirements_authoritative": False,
     }
 
 
@@ -5658,6 +6719,14 @@ def _reconcile_card_sidecar_write_intents_serialized(
         CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
         timeout_seconds=60.0,
     ):
+        recovery_conn = connect(root)
+        try:
+            _recover_stale_card_sidecar_artifact_write_reservation(
+                root,
+                recovery_conn,
+            )
+        finally:
+            recovery_conn.close()
         return _reconcile_card_sidecar_write_intents_unlocked(
             root,
             card_ids=card_ids,
@@ -5775,7 +6844,18 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         if selected_card_ids
         else bounded_limit
     )
+    publisher_temp_retirements: list[str] = []
+    publisher_temp_candidates: list[
+        tuple[Path, tuple[int, int]]
+    ] = []
+    inventory_conn: sqlite3.Connection | None = None
     try:
+        # Some intent publishers already hold SQLite's writer fence and
+        # deliberately bypass the operation lock.  Take the locks in the
+        # operation-lock -> DB order so no legitimate publisher can still own
+        # an exact private temp while bounded recovery retires crash debris.
+        inventory_conn = connect(root)
+        inventory_conn.execute("BEGIN IMMEDIATE")
         (
             intent_paths,
             retirement_paths,
@@ -5785,8 +6865,21 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             intent_dir,
             retirement_dir,
             entry_limit=inventory_entry_limit,
+            publisher_temp_candidates=publisher_temp_candidates,
+            publisher_temp_inventory_state=intent_state,
         )
-    except (OSError, ValueError) as exc:
+        _assert_card_sidecar_state_dir_unchanged(intent_state)
+        if retirement_state is not None:
+            _assert_card_sidecar_state_dir_unchanged(retirement_state)
+        inventory_conn.commit()
+        _retire_captured_card_sidecar_publisher_temps(
+            intent_state,
+            publisher_temp_candidates,
+            publisher_temp_retirements,
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        if inventory_conn is not None and inventory_conn.in_transaction:
+            inventory_conn.rollback()
         return {
             "ok": False,
             "processed": 0,
@@ -5804,7 +6897,15 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             "remaining_lower_bound": 0,
             "batch_truncated": False,
             "overflow": False,
+            "publisher_temps_retired": len(publisher_temp_retirements),
+            "publisher_temp_retirement_evidence": (
+                publisher_temp_retirements
+            ),
+            "publisher_temp_retirements_authoritative": False,
         }
+    finally:
+        if inventory_conn is not None:
+            inventory_conn.close()
     initial_overflow = bool(
         initial_scan_truncated
         and inventory_entry_limit >= MAX_CARD_SIDECAR_WRITE_INTENTS
@@ -6007,33 +7108,92 @@ def _reconcile_card_sidecar_write_intents_unlocked(
 
     conn = connect(root)
     try:
-        if parsed_intents:
-            conn.execute("BEGIN IMMEDIATE")
-            artifact_index = _immutable_artifact_path_index(root, conn)
-            batch_index = _card_intent_batch_index(root, conn)
+        snapshot = (
+            _capture_card_sidecar_reconciliation_snapshot(root, conn)
+            if parsed_intents
+            else None
+        )
         for intent_path, intent, intent_entry_identity in parsed_intents:
-            try:
-                result = _resolve_card_sidecar_write_intent(
-                    root,
-                    conn,
-                    intent_path,
-                    intent,
-                    intent_entry_identity=intent_entry_identity,
-                    artifact_index=artifact_index,
-                    batch_index=batch_index,
+            if snapshot is None:
+                raise RuntimeError(
+                    "Card sidecar reconciliation snapshot is unavailable"
                 )
-            except Exception as exc:
+            result: dict[str, Any] | None = None
+            for attempt in range(
+                MAX_CARD_SIDECAR_RECONCILIATION_SNAPSHOT_ATTEMPTS
+            ):
+                authority_token, artifact_index, batch_index = snapshot
+                try:
+                    planned = _resolve_card_sidecar_write_intent(
+                        root,
+                        conn,
+                        intent_path,
+                        intent,
+                        intent_entry_identity=intent_entry_identity,
+                        artifact_index=artifact_index,
+                        batch_index=batch_index,
+                        defer_terminal_publication=True,
+                        allow_quarantine=False,
+                    )
+                    if planned.get("_quarantine_writer_fallback"):
+                        result = (
+                            _resolve_card_sidecar_quarantine_with_fresh_writer_fence(
+                                root,
+                                intent_path=intent_path,
+                                intent=intent,
+                                intent_entry_identity=intent_entry_identity,
+                            )
+                        )
+                        break
+                    if "_terminal_plan" not in planned:
+                        result = planned
+                        break
+                    if not _commit_card_sidecar_reconciliation_authority(
+                        conn,
+                        authority_token,
+                    ):
+                        if (
+                            attempt + 1
+                            >= MAX_CARD_SIDECAR_RECONCILIATION_SNAPSHOT_ATTEMPTS
+                        ):
+                            result = {
+                                "ok": False,
+                                "status": "authority_snapshot_unstable",
+                                "intent_uri": continuum_uri(
+                                    root,
+                                    intent_path,
+                                ),
+                            }
+                            break
+                        snapshot = (
+                            _capture_card_sidecar_reconciliation_snapshot(
+                                root,
+                                conn,
+                            )
+                        )
+                        continue
+                    result = _publish_deferred_card_sidecar_terminal(
+                        root,
+                        planned,
+                    )
+                    break
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "status": "reconciliation_exception",
+                        "intent_uri": continuum_uri(root, intent_path),
+                        "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                    }
+                    break
+            if result is None:
                 result = {
                     "ok": False,
-                    "status": "reconciliation_exception",
+                    "status": "authority_snapshot_unstable",
                     "intent_uri": continuum_uri(root, intent_path),
-                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
                 }
             results.append(result)
             if not result.get("ok"):
                 failures.append(result)
-        if conn.in_transaction:
-            conn.commit()
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -6041,7 +7201,9 @@ def _reconcile_card_sidecar_write_intents_unlocked(
     finally:
         conn.close()
     progress_blocked = bool(
-        initial_scan_truncated and selected_count == 0
+        initial_scan_truncated
+        and selected_count == 0
+        and not publisher_temp_retirements
     )
     if progress_blocked:
         failures.append(
@@ -6075,12 +7237,13 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         remaining_is_lower_bound = True
         remaining_overflow = initial_overflow
     else:
+        postflight_publisher_temp_candidates: list[
+            tuple[Path, tuple[int, int]]
+        ] = []
         try:
-            # Every production publisher creates its durable intent while
-            # holding a SQLite writer transaction. Taking the same writer
-            # fence before the final namespace scan waits for earlier
-            # publishers and prevents later ones from starting until this
-            # completion result linearizes.
+            # The operation lock already excludes filesystem-first publishers.
+            # The writer fence waits for any transaction-bound legacy publisher
+            # and prevents another from starting until completion linearizes.
             postflight_conn = connect(root)
             postflight_conn.execute("BEGIN IMMEDIATE")
             _assert_card_sidecar_state_dir_unchanged(intent_state)
@@ -6108,6 +7271,10 @@ def _reconcile_card_sidecar_write_intents_unlocked(
                     else None
                 ),
                 entry_limit=postflight_entry_limit,
+                publisher_temp_candidates=(
+                    postflight_publisher_temp_candidates
+                ),
+                publisher_temp_inventory_state=intent_state,
             )
             enumerated_count += remaining_enumerated
             if current_retirement_state is not None:
@@ -6129,6 +7296,11 @@ def _reconcile_card_sidecar_write_intents_unlocked(
                 batch_truncated or remaining_scan_truncated
             )
             postflight_conn.commit()
+            _retire_captured_card_sidecar_publisher_temps(
+                intent_state,
+                postflight_publisher_temp_candidates,
+                publisher_temp_retirements,
+            )
         except (OSError, ValueError, sqlite3.Error) as exc:
             if (
                 postflight_conn is not None
@@ -6190,6 +7362,12 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         "progress_blocked": progress_blocked,
         "scope_filtered": bool(selected_card_ids),
         "scope_complete": scope_complete,
+        "publisher_temps_retired": len(publisher_temp_retirements),
+        "publisher_temp_retirement_evidence": publisher_temp_retirements,
+        # These paths/names prove bounded maintenance only. The retired bytes
+        # were never published as intents and are never consulted for recovery;
+        # losing the portable quarantine cannot lose sidecar authority.
+        "publisher_temp_retirements_authoritative": False,
     }
 
 
@@ -6546,21 +7724,35 @@ def sync_card_sidecar(
     *,
     artifact_index: ImmutableArtifactPathIndex | None = None,
     write_observation: dict[str, Any] | None = None,
+    row_snapshot: sqlite3.Row | None = None,
+    update_location: bool = True,
+    target_selection: tuple[Path | None, bool] | None = None,
 ) -> str | None:
-    row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+    row = (
+        row_snapshot
+        if row_snapshot is not None
+        else conn.execute(
+            "SELECT * FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+    )
     if row is None:
         return None
     payload = _card_sidecar_payload_for_row(row)
-    sidecar_path, create_only = _card_sidecar_write_target_selection(
-        root,
-        conn,
-        row,
-        payload,
-        artifact_index=artifact_index,
+    sidecar_path, create_only = (
+        target_selection
+        if target_selection is not None
+        else _card_sidecar_write_target_selection(
+            root,
+            conn,
+            row,
+            payload,
+            artifact_index=artifact_index,
+        )
     )
     if sidecar_path is not None and _card_sidecar_matches_payload(sidecar_path, payload):
         location_uri = continuum_uri(root, sidecar_path)
-        if row["location_uri"] != location_uri:
+        if update_location and row["location_uri"] != location_uri:
             conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (location_uri, card_id))
         return location_uri
     target_is_link_like = bool(
@@ -6644,7 +7836,11 @@ def sync_card_sidecar(
     )
     if write_observation is not None:
         write_observation["write_completed"] = True
-    if written_location_uri and row["location_uri"] != written_location_uri:
+    if (
+        update_location
+        and written_location_uri
+        and row["location_uri"] != written_location_uri
+    ):
         conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (written_location_uri, card_id))
     return written_location_uri
 
@@ -6764,6 +7960,306 @@ def _graph_edge_source_backfill_triggers_ready(
     return GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES.issubset(installed)
 
 
+def _normalize_sqlite_schema_sql(sql: object) -> str:
+    normalized = re.sub(r"[ \t\r\n\f\v]+", " ", str(sql or "")).strip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].rstrip()
+    return normalized
+
+
+def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
+    reservation_key = CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY.replace(
+        "'",
+        "''",
+    )
+    trigger_error = (
+        CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR.replace(
+            "'",
+            "''",
+        )
+    )
+    artifact_epoch_key = (
+        IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY.replace(
+            "'",
+            "''",
+        )
+    )
+    return {
+        "fence_card_sidecar_artifact_write_immutable_insert": f"""
+            CREATE TRIGGER
+                fence_card_sidecar_artifact_write_immutable_insert
+            BEFORE INSERT ON artifacts
+            WHEN NEW.immutable = 1
+             AND EXISTS(
+                 SELECT 1 FROM meta WHERE key = '{reservation_key}'
+             )
+            BEGIN
+                SELECT RAISE(ROLLBACK, '{trigger_error}');
+            END
+        """,
+        "fence_card_sidecar_artifact_write_immutable_update": f"""
+            CREATE TRIGGER
+                fence_card_sidecar_artifact_write_immutable_update
+            BEFORE UPDATE OF uri, immutable ON artifacts
+            WHEN NEW.immutable = 1
+             AND EXISTS(
+                 SELECT 1 FROM meta WHERE key = '{reservation_key}'
+             )
+            BEGIN
+                SELECT RAISE(ROLLBACK, '{trigger_error}');
+            END
+        """,
+        "advance_immutable_artifact_path_index_epoch_after_insert": f"""
+            CREATE TRIGGER
+                advance_immutable_artifact_path_index_epoch_after_insert
+            AFTER INSERT ON artifacts
+            WHEN NEW.immutable = 1
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{artifact_epoch_key}';
+            END
+        """,
+        "advance_immutable_artifact_path_index_epoch_after_update": f"""
+            CREATE TRIGGER
+                advance_immutable_artifact_path_index_epoch_after_update
+            AFTER UPDATE OF uri, immutable ON artifacts
+            WHEN OLD.immutable = 1 OR NEW.immutable = 1
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{artifact_epoch_key}';
+            END
+        """,
+        "advance_immutable_artifact_path_index_epoch_after_delete": f"""
+            CREATE TRIGGER
+                advance_immutable_artifact_path_index_epoch_after_delete
+            AFTER DELETE ON artifacts
+            WHEN OLD.immutable = 1
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{artifact_epoch_key}';
+            END
+        """,
+    }
+
+
+def _card_sidecar_artifact_write_reservation_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _card_sidecar_artifact_write_reservation_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
+def _ensure_card_sidecar_artifact_write_reservation_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "immutable artifact reservation guard installation requires no "
+            "active transaction"
+        )
+    expected = _card_sidecar_artifact_write_reservation_trigger_sql()
+    try:
+        # Install the baseline and its mutation triggers under one writer
+        # boundary. No immutable artifact commit can fall between them.
+        conn.execute("BEGIN IMMEDIATE")
+        epoch_row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY,),
+        ).fetchone()
+        if epoch_row is None:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, '0')",
+                (IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY,),
+            )
+        elif re.fullmatch(
+            r"(?:0|[1-9][0-9]*)",
+            str(epoch_row["value"]),
+        ) is None:
+            raise RuntimeError(
+                "immutable artifact path index epoch is malformed"
+            )
+        installed = {
+            str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["name"]) in expected
+        }
+        for trigger_name, trigger_sql in expected.items():
+            if (
+                installed.get(trigger_name)
+                == _normalize_sqlite_schema_sql(trigger_sql)
+            ):
+                continue
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"{_quote_sqlite_identifier(trigger_name)}"
+            )
+            conn.execute(trigger_sql)
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _card_sidecar_db_authority_trigger_sql() -> dict[str, str]:
+    epoch_key = CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY.replace(
+        "'",
+        "''",
+    )
+    return {
+        "advance_card_sidecar_db_authority_after_card_insert": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_card_insert
+            AFTER INSERT ON cards
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+        "advance_card_sidecar_db_authority_after_card_update": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_card_update
+            AFTER UPDATE ON cards
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+        "advance_card_sidecar_db_authority_after_card_delete": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_card_delete
+            AFTER DELETE ON cards
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+        "advance_card_sidecar_db_authority_after_outbox_insert": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_outbox_insert
+            AFTER INSERT ON card_sidecar_outbox
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+        "advance_card_sidecar_db_authority_after_outbox_update": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_outbox_update
+            AFTER UPDATE ON card_sidecar_outbox
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+        "advance_card_sidecar_db_authority_after_outbox_delete": f"""
+            CREATE TRIGGER
+                advance_card_sidecar_db_authority_after_outbox_delete
+            AFTER DELETE ON card_sidecar_outbox
+            BEGIN
+                UPDATE meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = '{epoch_key}';
+            END
+        """,
+    }
+
+
+def _card_sidecar_db_authority_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _card_sidecar_db_authority_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
+def _ensure_card_sidecar_db_authority_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar DB authority trigger installation requires no "
+            "active transaction"
+        )
+    expected = _card_sidecar_db_authority_trigger_sql()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        epoch_row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,),
+        ).fetchone()
+        if epoch_row is None:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, '0')",
+                (CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,),
+            )
+        elif re.fullmatch(
+            r"(?:0|[1-9][0-9]*)",
+            str(epoch_row["value"]),
+        ) is None:
+            raise RuntimeError(
+                "Card sidecar DB authority epoch is malformed"
+            )
+        installed = {
+            str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["name"]) in expected
+        }
+        for trigger_name, trigger_sql in expected.items():
+            if (
+                installed.get(trigger_name)
+                == _normalize_sqlite_schema_sql(trigger_sql)
+            ):
+                continue
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"{_quote_sqlite_identifier(trigger_name)}"
+            )
+            conn.execute(trigger_sql)
+        if not _card_sidecar_db_authority_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar DB authority triggers did not install exactly"
+            )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def _graph_edge_source_backfill_queue_pending(
     conn: sqlite3.Connection,
 ) -> bool:
@@ -6783,6 +8279,179 @@ def _resume_authority_indexes_ready(conn: sqlite3.Connection) -> bool:
         ).fetchall()
     }
     return RESUME_AUTHORITY_INDEX_NAMES.issubset(installed)
+
+
+def _queue_claim_index_ready(
+    conn: sqlite3.Connection,
+    *,
+    index_name: str,
+    index_row: sqlite3.Row | None,
+) -> bool:
+    if index_row is None:
+        return False
+    if int(index_row["unique"]) != int(
+        QUEUE_CLAIM_INDEX_UNIQUE[index_name]
+    ):
+        return False
+    if int(index_row["partial"]) != int(
+        QUEUE_CLAIM_INDEX_PARTIAL[index_name]
+    ):
+        return False
+    expected_columns = QUEUE_CLAIM_INDEX_COLUMNS[index_name]
+    columns = tuple(
+        str(row["name"])
+        for row in conn.execute(
+            f"PRAGMA index_info({_quote_sqlite_identifier(index_name)})"
+        ).fetchall()
+    )
+    if columns != expected_columns:
+        return False
+    key_columns = tuple(
+        (
+            str(row["name"]),
+            int(row["desc"]),
+            str(row["coll"]).upper(),
+        )
+        for row in conn.execute(
+            f"PRAGMA index_xinfo({_quote_sqlite_identifier(index_name)})"
+        ).fetchall()
+        if int(row["key"]) == 1
+    )
+    if key_columns != tuple(
+        (column, 0, "BINARY") for column in expected_columns
+    ):
+        return False
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    return bool(
+        _normalize_sqlite_schema_sql(
+            sql_row["sql"] if sql_row is not None else ""
+        )
+        == _normalize_sqlite_schema_sql(QUEUE_CLAIM_INDEX_SQL[index_name])
+    )
+
+
+def _queue_order_indexes_ready(conn: sqlite3.Connection) -> bool:
+    installed = {
+        str(row["name"]): row
+        for row in conn.execute("PRAGMA index_list(queue_jobs)").fetchall()
+    }
+    return all(
+        _queue_claim_index_ready(
+            conn,
+            index_name=index_name,
+            index_row=installed.get(index_name),
+        )
+        for index_name in QUEUE_CLAIM_INDEX_SQL
+    )
+
+
+def _pending_queue_dedupe_duplicate_diagnostic(
+    conn: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    group_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS duplicate_groups
+            FROM (
+                SELECT dedupe_key
+                FROM queue_jobs
+                WHERE status = 'pending' AND dedupe_key IS NOT NULL
+                GROUP BY dedupe_key
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()["duplicate_groups"]
+    )
+    if group_count == 0:
+        return None
+    groups = conn.execute(
+        """
+        SELECT dedupe_key, COUNT(*) AS duplicate_count
+        FROM queue_jobs
+        WHERE status = 'pending' AND dedupe_key IS NOT NULL
+        GROUP BY dedupe_key
+        HAVING COUNT(*) > 1
+        ORDER BY duplicate_count DESC, dedupe_key ASC
+        LIMIT ?
+        """,
+        (MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_GROUPS,),
+    ).fetchall()
+    samples: list[dict[str, Any]] = []
+    for group in groups:
+        raw_dedupe_key = group["dedupe_key"]
+        job_ids = [
+            redact_text_secrets(str(row["id"]))[:160]
+            for row in conn.execute(
+                """
+                SELECT id
+                FROM queue_jobs
+                WHERE status = 'pending' AND dedupe_key = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    raw_dedupe_key,
+                    MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_JOB_IDS,
+                ),
+            ).fetchall()
+        ]
+        samples.append(
+            {
+                "dedupe_key": redact_text_secrets(
+                    str(raw_dedupe_key)
+                )[:160],
+                "duplicate_count": int(group["duplicate_count"]),
+                "job_ids": job_ids,
+            }
+        )
+    return {
+        "duplicate_group_count": group_count,
+        "sample_limit": MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_GROUPS,
+        "job_id_limit_per_group": (
+            MAX_QUEUE_PENDING_DEDUPE_DIAGNOSTIC_JOB_IDS
+        ),
+        "samples": samples,
+    }
+
+
+def _ensure_queue_order_indexes(conn: sqlite3.Connection) -> None:
+    installed = {
+        str(row["name"]): row
+        for row in conn.execute("PRAGMA index_list(queue_jobs)").fetchall()
+    }
+    pending_index_ready = _queue_claim_index_ready(
+        conn,
+        index_name=QUEUE_PENDING_DEDUPE_INDEX_NAME,
+        index_row=installed.get(QUEUE_PENDING_DEDUPE_INDEX_NAME),
+    )
+    if not pending_index_ready:
+        duplicate_diagnostic = (
+            _pending_queue_dedupe_duplicate_diagnostic(conn)
+        )
+        if duplicate_diagnostic is not None:
+            raise RuntimeError(
+                "cannot repair pending queue dedupe authority: "
+                f"{duplicate_diagnostic['duplicate_group_count']} duplicate "
+                "pending dedupe groups; bounded_samples="
+                f"{json_dumps(duplicate_diagnostic)}"
+            )
+    for index_name, index_sql in QUEUE_CLAIM_INDEX_SQL.items():
+        index_row = installed.get(index_name)
+        if _queue_claim_index_ready(
+            conn,
+            index_name=index_name,
+            index_row=index_row,
+        ):
+            continue
+        conn.execute(
+            f"DROP INDEX IF EXISTS {_quote_sqlite_identifier(index_name)}"
+        )
+        conn.execute(index_sql)
+    if not _queue_order_indexes_ready(conn):
+        raise RuntimeError("canonical queue claim indexes could not be installed")
 
 
 def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
@@ -6884,12 +8553,8 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
         applied.append("graph_edge_sources.queued_backfill.v2")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at)")
+    _ensure_queue_order_indexes(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lease_expiry ON queue_jobs(status, lease_expires_at)")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key "
-        "ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL"
-    )
     conn.execute("PRAGMA user_version = 2")
     return applied
 
@@ -6995,8 +8660,21 @@ def _init_db_durable_ready(root: Path) -> bool:
                     value=GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
                 )
                 or not _graph_edge_source_backfill_triggers_ready(conn)
+                or not (
+                    _card_sidecar_artifact_write_reservation_triggers_ready(
+                        conn
+                    )
+                )
+                or not _immutable_artifact_path_index_epoch_ready(conn)
+                or not _card_sidecar_db_authority_triggers_ready(conn)
+                or not _card_sidecar_db_authority_epoch_ready(conn)
                 or not _resume_authority_indexes_ready(conn)
+                or not _queue_order_indexes_ready(conn)
                 or _graph_edge_source_backfill_queue_pending(conn)
+                or (
+                    _card_sidecar_artifact_write_reservation_value(conn)
+                    is not None
+                )
                 or conn.execute(
                     "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
                 ).fetchone()
@@ -7030,9 +8708,12 @@ def init_db(
     pending_sidecar_outbox = False
     try:
         conn.executescript(_schema_table_ddl())
+        _ensure_card_sidecar_db_authority_triggers(conn)
         applied = apply_schema_migrations(root, conn)
         sync_migrated_sidecars = "partition_aliases.backfill" in applied
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        _ensure_card_sidecar_artifact_write_reservation_triggers(conn)
+        _ensure_card_sidecar_db_authority_triggers(conn)
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)", (SCHEMA_VERSION,))
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_user_version', ?)", ("2",))
         if applied:
@@ -7062,6 +8743,7 @@ def init_db(
     if (
         sync_migrated_sidecars
         or pending_sidecar_outbox
+        or _card_sidecar_outbox_pending(root)
         or intent_recovery.get("pending")
     ):
         sidecar_sync = sync_pending_card_sidecars(root)
@@ -7092,6 +8774,19 @@ def record_artifact(
     trust_level: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> str:
+    if (
+        immutable
+        and _card_sidecar_artifact_write_reservation_value(conn) is not None
+    ):
+        # The schema trigger remains the race-closing authority. This early
+        # check gives helper callers a stable error and explicitly releases any
+        # writer transaction they opened before discovering the reservation,
+        # preventing a DB-writer -> sidecar-operation-lock inversion.
+        if conn.in_transaction:
+            conn.rollback()
+        raise CardSidecarArtifactWriteReservationError(
+            CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR
+        )
     artifact_id = stable_id("artifact", kind, uri, sha256)
     conn.execute(
         """
@@ -8548,6 +10243,8 @@ def sync_card_sidecars_after_commit(
             if card_id in compensation_cas_by_card
         ]
 
+    from .operations import operation_lock
+
     conn = connect(root)
     synced = 0
     deferred = 0
@@ -8555,116 +10252,315 @@ def sync_card_sidecars_after_commit(
     generated_sidecar_candidates: list[dict[str, Any]] = []
     intent_reconciliation_results: list[dict[str, Any]] = []
     artifact_index: ImmutableArtifactPathIndex | None = None
-    artifact_index_data_version: int | None = None
+    artifact_index_authority: ImmutableArtifactAuthorityToken | None = None
     try:
         for card_id in unique_card_ids:
             observed_generation: str | None = None
             observed_location_uri: str | None = None
+            observed_state_hash: str | None = None
             observed_card_exists = False
             write_observation: dict[str, Any] = {}
+            artifact_write_reservation_value: str | None = None
             try:
-                # Serialize the Card snapshot, atomic file replacement, and
-                # outbox acknowledgement. A process can die after replacing
-                # the file, so post-write revalidation alone cannot prevent an
-                # older writer from overtaking a newer completed sync.
-                conn.execute("BEGIN IMMEDIATE")
-                data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
-                if artifact_index is None or artifact_index_data_version != data_version:
-                    artifact_index = _immutable_artifact_path_index(root, conn)
-                    artifact_index_data_version = data_version
-                outbox_row = conn.execute(
-                    """
-                    SELECT card.location_uri,
-                           outbox.generation
-                    FROM cards AS card
-                    LEFT JOIN card_sidecar_outbox AS outbox
-                      ON outbox.card_id = card.id
-                    WHERE card.id = ?
-                    """,
-                    (card_id,),
-                ).fetchone()
-                observed_card_exists = outbox_row is not None
-                observed_generation = (
-                    str(outbox_row["generation"] or "")
-                    if outbox_row is not None and outbox_row["generation"] is not None
-                    else None
-                )
-                observed_location_uri = (
-                    str(outbox_row["location_uri"])
-                    if outbox_row is not None
-                    and outbox_row["location_uri"] is not None
-                    else None
-                )
-                location_uri = sync_card_sidecar(
+                # The operation lock serializes sidecar publishers, while the
+                # database transactions on either side of the filesystem write
+                # stay short. A newer Card update may commit during the write;
+                # the generation/location/state-hash CAS below then preserves
+                # its outbox authority instead of acknowledging stale bytes.
+                with operation_lock(
                     root,
-                    conn,
-                    card_id,
-                    artifact_index=artifact_index,
-                    write_observation=write_observation,
-                )
-                card_row = conn.execute(
-                    "SELECT location_uri FROM cards WHERE id = ?",
-                    (card_id,),
-                ).fetchone()
-                disabled_without_promised_sidecar = bool(
-                    location_uri is None
-                    and card_row is not None
-                    and not card_row["location_uri"]
-                )
-                if location_uri is None and card_row is not None:
-                    if not disabled_without_promised_sidecar:
-                        raise RuntimeError(
-                            "Card sidecar materialization is disabled; retry remains pending"
-                        )
-                    audit_event(
+                    CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+                    timeout_seconds=60.0,
+                ):
+                    _recover_stale_card_sidecar_artifact_write_reservation(
+                        root,
                         conn,
-                        action="card_sidecar_sync_skipped",
-                        target_type="card",
-                        target_id=card_id,
-                        payload={"reason": "sidecars_disabled_unmaterialized"},
                     )
-                # A location-less Card selected by sync_pending_card_sidecars
-                # deliberately has no outbox row.  The LEFT JOIN still returns
-                # the Card, so use the observed generation rather than the
-                # joined row's presence to recognize that transaction-bound
-                # backfill case.
-                acknowledged = observed_card_exists and observed_generation is None
-                if observed_generation is not None:
-                    acknowledged = (
-                        conn.execute(
-                            """
-                            DELETE FROM card_sidecar_outbox
-                            WHERE card_id = ? AND generation = ?
-                            """,
-                            (card_id, observed_generation),
-                        ).rowcount
-                        == 1
+                    conn.execute("BEGIN")
+                    snapshot_row = conn.execute(
+                        "SELECT * FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    generation_row = conn.execute(
+                        """
+                        SELECT generation
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                    observed_card_exists = snapshot_row is not None
+                    observed_generation = (
+                        str(generation_row["generation"])
+                        if generation_row is not None
+                        and generation_row["generation"] is not None
+                        else None
                     )
-                if acknowledged:
-                    if not disabled_without_promised_sidecar:
+                    observed_location_uri = (
+                        str(snapshot_row["location_uri"])
+                        if snapshot_row is not None
+                        and snapshot_row["location_uri"] is not None
+                        else None
+                    )
+                    observed_state_hash = (
+                        str(
+                            _card_sidecar_payload_for_row(snapshot_row).get(
+                                "state_hash"
+                            )
+                            or ""
+                        )
+                        if snapshot_row is not None
+                        else None
+                    )
+                    conn.commit()
+
+                    target_selection: tuple[Path | None, bool] | None = None
+                    if snapshot_row is not None:
+                        snapshot_payload = _card_sidecar_payload_for_row(
+                            snapshot_row
+                        )
+                        for _reservation_attempt in range(
+                            MAX_CARD_SIDECAR_ARTIFACT_INDEX_STABILITY_ATTEMPTS
+                        ):
+                            current_artifact_authority = (
+                                _immutable_artifact_authority_token(conn)
+                            )
+                            if (
+                                artifact_index is None
+                                or artifact_index_authority
+                                != current_artifact_authority
+                            ):
+                                (
+                                    artifact_index,
+                                    artifact_index_authority,
+                                ) = _stable_immutable_artifact_path_index(
+                                    root,
+                                    conn,
+                                    required_card_ids=unique_card_ids,
+                                )
+                            target_selection = (
+                                _card_sidecar_write_target_selection(
+                                    root,
+                                    conn,
+                                    snapshot_row,
+                                    snapshot_payload,
+                                    artifact_index=artifact_index,
+                                )
+                            )
+                            selected_path = target_selection[0]
+                            if selected_path is None:
+                                break
+                            selected_target_is_link_like = bool(
+                                os.path.lexists(selected_path)
+                                and _card_sidecar_path_is_link_like(
+                                    selected_path
+                                )
+                            )
+                            selected_target_uri = (
+                                lexical_continuum_uri(root, selected_path)
+                                if selected_target_is_link_like
+                                else continuum_uri(root, selected_path)
+                            )
+                            if artifact_index_authority is None:
+                                raise RuntimeError(
+                                    "immutable artifact DB/schema authority "
+                                    "is unavailable before Card sidecar "
+                                    "reservation"
+                                )
+                            reservation = (
+                                _reserve_card_sidecar_artifact_write(
+                                    conn,
+                                    card_id=card_id,
+                                    target_uri=selected_target_uri,
+                                    expected_state_hash=(
+                                        observed_state_hash or ""
+                                    ),
+                                    expected_artifact_authority=(
+                                        artifact_index_authority
+                                    ),
+                                )
+                            )
+                            if reservation is not None:
+                                (
+                                    _artifact_write_reservation_id,
+                                    artifact_write_reservation_value,
+                                ) = reservation
+                                break
+                            # Another connection changed DB/schema authority
+                            # after the target index was built. Rebuild and
+                            # reselect outside the writer transaction; the
+                            # prior choice has no filesystem authority.
+                            artifact_index = None
+                            artifact_index_authority = None
+                            target_selection = None
+                        else:
+                            raise RuntimeError(
+                                "immutable artifact authority did not remain "
+                                "stable before Card sidecar reservation"
+                            )
+                    location_uri = (
+                        sync_card_sidecar(
+                            root,
+                            conn,
+                            card_id,
+                            artifact_index=artifact_index,
+                            write_observation=write_observation,
+                            row_snapshot=snapshot_row,
+                            update_location=False,
+                            target_selection=target_selection,
+                        )
+                        if snapshot_row is not None
+                        else None
+                    )
+                    if conn.in_transaction:
+                        raise RuntimeError(
+                            "Card sidecar filesystem phase opened a database "
+                            "write transaction"
+                        )
+                    disabled_without_promised_sidecar = bool(
+                        location_uri is None
+                        and snapshot_row is not None
+                        and not snapshot_row["location_uri"]
+                    )
+                    if location_uri is None and snapshot_row is not None:
+                        if not disabled_without_promised_sidecar:
+                            raise RuntimeError(
+                                "Card sidecar materialization is disabled; "
+                                "retry remains pending"
+                            )
+
+                    conn.execute("BEGIN IMMEDIATE")
+                    current_card_row = conn.execute(
+                        "SELECT * FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    current_generation_row = conn.execute(
+                        """
+                        SELECT generation
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                    current_generation = (
+                        str(current_generation_row["generation"])
+                        if current_generation_row is not None
+                        and current_generation_row["generation"] is not None
+                        else None
+                    )
+                    current_location_uri = (
+                        str(current_card_row["location_uri"])
+                        if current_card_row is not None
+                        and current_card_row["location_uri"] is not None
+                        else None
+                    )
+                    current_state_hash = (
+                        str(
+                            _card_sidecar_payload_for_row(current_card_row).get(
+                                "state_hash"
+                            )
+                            or ""
+                        )
+                        if current_card_row is not None
+                        else None
+                    )
+                    state_is_bound = bool(
+                        observed_card_exists
+                        and current_card_row is not None
+                        and current_location_uri == observed_location_uri
+                        and current_generation == observed_generation
+                        and current_state_hash == observed_state_hash
+                    )
+                    if not state_is_bound:
+                        if (
+                            current_card_row is not None
+                            and current_generation is None
+                        ):
+                            mark_card_sidecar_outbox(
+                                conn,
+                                [card_id],
+                                reason="sidecar_sync_superseded",
+                            )
                         audit_event(
                             conn,
-                            action="card_sidecar_synced",
+                            action="card_sidecar_sync_superseded",
                             target_type="card",
                             target_id=card_id,
                             payload={"location_uri": location_uri},
                         )
-                    synced += 1
-                else:
-                    audit_event(
+                        deferred += 1
+                    else:
+                        if (
+                            location_uri
+                            and current_location_uri != location_uri
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE cards
+                                SET location_uri = ?
+                                WHERE id = ?
+                                """,
+                                (location_uri, card_id),
+                            )
+                        # A location-less Card selected by
+                        # sync_pending_card_sidecars deliberately has no outbox
+                        # row. The Card state CAS above binds that backfill.
+                        acknowledged = observed_generation is None
+                        if observed_generation is not None:
+                            acknowledged = (
+                                conn.execute(
+                                    """
+                                    DELETE FROM card_sidecar_outbox
+                                    WHERE card_id = ? AND generation = ?
+                                    """,
+                                    (card_id, observed_generation),
+                                ).rowcount
+                                == 1
+                            )
+                        if acknowledged:
+                            if disabled_without_promised_sidecar:
+                                audit_event(
+                                    conn,
+                                    action="card_sidecar_sync_skipped",
+                                    target_type="card",
+                                    target_id=card_id,
+                                    payload={
+                                        "reason": (
+                                            "sidecars_disabled_unmaterialized"
+                                        )
+                                    },
+                                )
+                            else:
+                                audit_event(
+                                    conn,
+                                    action="card_sidecar_synced",
+                                    target_type="card",
+                                    target_id=card_id,
+                                    payload={"location_uri": location_uri},
+                                )
+                            synced += 1
+                        else:
+                            audit_event(
+                                conn,
+                                action="card_sidecar_sync_superseded",
+                                target_type="card",
+                                target_id=card_id,
+                                payload={"location_uri": location_uri},
+                            )
+                            deferred += 1
+                    if artifact_write_reservation_value is not None:
+                        _release_card_sidecar_artifact_write_reservation(
+                            conn,
+                            artifact_write_reservation_value,
+                        )
+                    pending_compensation_rows = observe_compensation_cas_rows(
                         conn,
-                        action="card_sidecar_sync_superseded",
-                        target_type="card",
-                        target_id=card_id,
-                        payload={"location_uri": location_uri},
+                        [card_id],
                     )
-                    deferred += 1
-                pending_compensation_rows = observe_compensation_cas_rows(
-                    conn,
-                    [card_id],
-                )
-                conn.commit()
-                compensation_cas_by_card.update(pending_compensation_rows)
+                    conn.commit()
+                    compensation_cas_by_card.update(
+                        pending_compensation_rows
+                    )
                 target_uri = str(write_observation.get("target_uri") or "")
                 if (
                     target_uri
@@ -8714,10 +10610,15 @@ def sync_card_sidecars_after_commit(
                 error = str(exc)
                 failures.append({"card_id": card_id, "error": error})
                 conn.execute("BEGIN IMMEDIATE")
+                if artifact_write_reservation_value is not None:
+                    _release_card_sidecar_artifact_write_reservation(
+                        conn,
+                        artifact_write_reservation_value,
+                    )
                 current_failure_row = conn.execute(
                     """
-                    SELECT card.location_uri,
-                           outbox.generation
+                    SELECT card.*,
+                           outbox.generation AS sidecar_generation
                     FROM cards AS card
                     LEFT JOIN card_sidecar_outbox AS outbox
                       ON outbox.card_id = card.id
@@ -8732,9 +10633,19 @@ def sync_card_sidecars_after_commit(
                     else None
                 )
                 current_failure_generation = (
-                    str(current_failure_row["generation"])
+                    str(current_failure_row["sidecar_generation"])
                     if current_failure_row is not None
-                    and current_failure_row["generation"] is not None
+                    and current_failure_row["sidecar_generation"] is not None
+                    else None
+                )
+                current_failure_state_hash = (
+                    str(
+                        _card_sidecar_payload_for_row(
+                            current_failure_row
+                        ).get("state_hash")
+                        or ""
+                    )
+                    if current_failure_row is not None
                     else None
                 )
                 failure_state_is_bound = bool(
@@ -8742,6 +10653,7 @@ def sync_card_sidecars_after_commit(
                     and current_failure_row is not None
                     and current_failure_location == observed_location_uri
                     and current_failure_generation == observed_generation
+                    and current_failure_state_hash == observed_state_hash
                 )
                 if failure_state_is_bound and observed_generation is not None:
                     failure_state_is_bound = (

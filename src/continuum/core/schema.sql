@@ -186,6 +186,63 @@ CREATE TABLE IF NOT EXISTS card_sidecar_outbox (
     last_error TEXT
 );
 
+INSERT OR IGNORE INTO meta(key, value)
+VALUES('card_sidecar_db_authority_epoch', '0');
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_card_insert
+AFTER INSERT ON cards
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_card_update
+AFTER UPDATE ON cards
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_card_delete
+AFTER DELETE ON cards
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_outbox_insert
+AFTER INSERT ON card_sidecar_outbox
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_outbox_update
+AFTER UPDATE ON card_sidecar_outbox
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+    advance_card_sidecar_db_authority_after_outbox_delete
+AFTER DELETE ON card_sidecar_outbox
+BEGIN
+    UPDATE meta
+    SET value = CAST(value AS INTEGER) + 1
+    WHERE key = 'card_sidecar_db_authority_epoch';
+END;
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -269,6 +326,10 @@ CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary_direct ON cards(visibilit
 CREATE INDEX IF NOT EXISTS idx_cards_supersedes_card_id ON cards(supersedes_card_id);
 CREATE INDEX IF NOT EXISTS idx_books_tier ON books(storage_tier, status);
 CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_role_created ON queue_jobs(role, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON queue_jobs(status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_status_created ON queue_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_running_dedupe ON queue_jobs(dedupe_key) WHERE status = 'running' AND dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_queue_job_type_status ON queue_jobs(job_type, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_card_id ON graph_nodes(card_id);

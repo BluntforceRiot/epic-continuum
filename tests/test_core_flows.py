@@ -9,6 +9,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from collections.abc import Callable, Iterator
@@ -142,6 +144,49 @@ def connect_catalog(root: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(root / "catalog" / "catalog.sqlite3"))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def seed_adoptable_sidecar_intent(
+    root: Path,
+) -> tuple[str, str, Path, Path, dict[str, object], dict[str, object]]:
+    init_db(root)
+    with closing(connect_catalog(root)) as conn:
+        card_id = create_card(
+            conn,
+            root=root,
+            card_type="note",
+            title="two-phase-sidecar-reconciliation",
+            summary="The current target is exact durable Card state.",
+            source_refs=[],
+        )
+        conn.commit()
+    synced = sync_card_sidecars_after_commit(root, [card_id])
+    if not synced["ok"]:
+        raise AssertionError(synced)
+    with closing(connect_catalog(root)) as conn:
+        row = conn.execute(
+            "SELECT * FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        if row is None or not row["location_uri"]:
+            raise AssertionError("seed Card sidecar location is unavailable")
+        payload = store_module._card_sidecar_payload_for_row(row)
+        row_values = dict(row)
+    target_path = resolve_stored_uri(root, str(row_values["location_uri"]))
+    intent_id, intent_path = store_module._write_card_sidecar_write_intent(
+        root,
+        card_id=card_id,
+        target_uri=continuum_uri(root, target_path),
+        expected_state_hash=str(payload["state_hash"]),
+    )
+    return (
+        card_id,
+        intent_id,
+        intent_path,
+        target_path,
+        payload,
+        row_values,
+    )
 
 
 class EpicContinuumCoreFlowTest(unittest.TestCase):
@@ -1413,6 +1458,1369 @@ print(json.dumps(result, sort_keys=True))
             self.assertIn(intent_dir.parent, flushed)
             self.assertLess(flushed.index(intent_dir), flushed.index(intent_dir.parent))
 
+    def test_crash_left_intent_publisher_temps_are_bounded_and_retired(
+        self,
+    ) -> None:
+        crash_code = r"""
+import os
+import sys
+from pathlib import Path
+import continuum.core.permissions as permissions
+
+destination = Path(sys.argv[1])
+real_exit = os._exit
+
+def die_at_replace(_source, _destination):
+    real_exit(91)
+
+permissions.os.replace = die_at_replace
+permissions.secure_write_text(destination, '{"unpublished":true}\n')
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="bounded publisher temp recovery",
+                    summary="A valid durable intent must eventually make progress.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.commit()
+
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            assert intent_state is not None
+            intent_dir = intent_state[0]
+            arbitrary_debris = intent_dir / "!arbitrary-debris"
+            arbitrary_debris.write_text("not publisher authority", encoding="utf-8")
+            env = os.environ.copy()
+            repo_src = str(Path(__file__).resolve().parents[1] / "src")
+            env["PYTHONPATH"] = repo_src + (
+                os.pathsep + env["PYTHONPATH"]
+                if env.get("PYTHONPATH")
+                else ""
+            )
+            crash_count = 7
+            for index in range(crash_count):
+                final_path = intent_dir / (
+                    f"card_sidecar_write_intent_{index:024x}.json"
+                )
+                interrupted = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        crash_code,
+                        str(final_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(
+                    interrupted.returncode,
+                    91,
+                    interrupted.stderr,
+                )
+                self.assertFalse(final_path.exists())
+
+            target_path = store_module._configured_card_sidecar_path(
+                root,
+                card_id,
+            )
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=continuum_uri(root, target_path),
+                expected_state_hash=str(payload["state_hash"]),
+            )
+
+            passes: list[dict[str, object]] = []
+            for _attempt in range(crash_count + 3):
+                result = store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    limit=3,
+                )
+                passes.append(result)
+                self.assertLessEqual(int(result["enumerated"]), 4)
+                if int(result["processed"]) > 0:
+                    break
+
+            self.assertGreater(
+                sum(int(item["processed"]) for item in passes),
+                0,
+                passes,
+            )
+            materialized = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(materialized["ok"], materialized)
+            self.assertTrue(target_path.is_file())
+            self.assertTrue(any(bool(item["batch_truncated"]) for item in passes))
+            self.assertEqual(
+                sum(int(item["publisher_temps_retired"]) for item in passes),
+                crash_count,
+                passes,
+            )
+            self.assertTrue(
+                all(
+                    item["publisher_temp_retirements_authoritative"] is False
+                    for item in passes
+                )
+            )
+            self.assertFalse(
+                list(intent_dir.glob(".card_sidecar_write_intent_*.json.*.tmp"))
+            )
+            self.assertTrue(arbitrary_debris.is_file())
+            self.assertTrue(
+                any(
+                    int(item["enumerated"]) >= 1
+                    for item in passes
+                )
+            )
+            self.assertTrue(semantic_integrity_report(root)["ok"])
+
+            non_authority_dir = (
+                root
+                / "run"
+                / "card_sidecar_publisher_temp_retirements"
+            )
+            if non_authority_dir.exists():
+                for retired_path in non_authority_dir.iterdir():
+                    retired_path.unlink()
+                non_authority_dir.rmdir()
+                after_evidence_loss = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=3,
+                    )
+                )
+                self.assertTrue(after_evidence_loss["complete"])
+                self.assertTrue(target_path.is_file())
+
+            for index in range(3):
+                (intent_dir / f"!arbitrary-debris-{index}").write_text(
+                    "not publisher authority",
+                    encoding="utf-8",
+                )
+            debris_only = (
+                store_module.reconcile_card_sidecar_write_intents(
+                    root,
+                    limit=3,
+                )
+            )
+            self.assertTrue(debris_only["batch_truncated"], debris_only)
+            self.assertTrue(debris_only["progress_blocked"], debris_only)
+            self.assertEqual(debris_only["publisher_temps_retired"], 0)
+            self.assertTrue(arbitrary_debris.is_file())
+
+    def test_publisher_temp_inventory_preserves_retirement_fairness(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            retirement_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="retirement_intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            self.assertIsNotNone(retirement_state)
+            assert intent_state is not None
+            assert retirement_state is not None
+            for index in range(3):
+                (
+                    intent_state[0]
+                    / (
+                        ".card_sidecar_write_intent_"
+                        f"{index:024x}.json.abcdefgh.tmp"
+                    )
+                ).write_bytes(b"crash-left publisher temporary")
+            retirement_path = retirement_state[0] / "retirement.json"
+            retirement_path.write_text("{}\n", encoding="utf-8")
+            publisher_temp_candidates: list[
+                tuple[Path, tuple[int, int]]
+            ] = []
+
+            (
+                intent_paths,
+                retirement_paths,
+                truncated,
+                enumerated,
+            ) = store_module._bounded_card_sidecar_intent_inventory(
+                intent_state[0],
+                retirement_state[0],
+                entry_limit=2,
+                publisher_temp_candidates=publisher_temp_candidates,
+                publisher_temp_inventory_state=intent_state,
+            )
+
+            self.assertEqual(intent_paths, [])
+            self.assertEqual(retirement_paths, [retirement_path])
+            self.assertEqual(len(publisher_temp_candidates), 1)
+            self.assertTrue(truncated)
+            self.assertEqual(enumerated, 3)
+
+    def test_deferred_intent_publisher_proves_writer_fence_before_publish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="deferred-publisher-writer-fence",
+                    summary="A deferred transaction must become a writer.",
+                    source_refs=[],
+                )
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute("DELETE FROM card_sidecar_outbox")
+                conn.commit()
+
+            publisher_blocked = threading.Event()
+            allow_publisher_commit = threading.Event()
+            publisher_committed = threading.Event()
+            inventory_started = threading.Event()
+            errors: list[BaseException] = []
+            reconciliation_results: list[dict[str, object]] = []
+            real_secure_write = store_module.secure_write_text
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            blocked_once = False
+
+            def block_after_intent_publication(
+                path: Path,
+                text: str,
+                *,
+                encoding: str = "utf-8",
+            ) -> None:
+                nonlocal blocked_once
+                real_secure_write(path, text, encoding=encoding)
+                if (
+                    not blocked_once
+                    and Path(path).parent.name
+                    == "card_sidecar_write_intents"
+                ):
+                    blocked_once = True
+                    publisher_blocked.set()
+                    if not allow_publisher_commit.wait(timeout=10):
+                        raise TimeoutError(
+                            "deferred publisher commit was not released"
+                        )
+
+            def observe_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+                **kwargs: object,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                inventory_started.set()
+                return real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                    **kwargs,
+                )
+
+            def publish_from_deferred_transaction() -> None:
+                publisher_conn = connect_catalog(root)
+                try:
+                    publisher_conn.execute("BEGIN")
+                    publisher_conn.execute(
+                        "SELECT summary FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()
+                    store_module._write_card_sidecar_write_intent(
+                        root,
+                        card_id=card_id,
+                        target_uri=str(row["location_uri"]),
+                        expected_state_hash=str(payload["state_hash"]),
+                        conn=publisher_conn,
+                    )
+                    publisher_conn.commit()
+                    publisher_committed.set()
+                except BaseException as exc:
+                    if publisher_conn.in_transaction:
+                        publisher_conn.rollback()
+                    errors.append(exc)
+                finally:
+                    publisher_conn.close()
+
+            def reconcile() -> None:
+                try:
+                    reconciliation_results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=10,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            publisher_thread = threading.Thread(
+                target=publish_from_deferred_transaction,
+                daemon=True,
+            )
+            reconciliation_thread = threading.Thread(
+                target=reconcile,
+                daemon=True,
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "secure_write_text",
+                    side_effect=block_after_intent_publication,
+                ),
+                patch.object(
+                    store_module,
+                    "_bounded_card_sidecar_intent_inventory",
+                    side_effect=observe_inventory,
+                ),
+            ):
+                publisher_thread.start()
+                try:
+                    self.assertTrue(publisher_blocked.wait(timeout=5))
+                    reconciliation_thread.start()
+                    self.assertFalse(
+                        inventory_started.wait(timeout=0.25),
+                        "reconciliation crossed an active deferred publisher",
+                    )
+                    self.assertFalse(publisher_committed.is_set())
+                finally:
+                    allow_publisher_commit.set()
+                    publisher_thread.join(timeout=10)
+                    if reconciliation_thread.ident is not None:
+                        reconciliation_thread.join(timeout=10)
+
+            self.assertFalse(publisher_thread.is_alive())
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(publisher_committed.is_set())
+            self.assertTrue(inventory_started.is_set())
+            self.assertEqual(len(reconciliation_results), 1)
+
+    def test_publisher_temp_retirement_preserves_racing_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            assert intent_state is not None
+            temp_path = intent_state[0] / (
+                ".card_sidecar_write_intent_"
+                f"{'a' * 24}.json.abcdefgh.tmp"
+            )
+            original_bytes = b"original crash-left publisher bytes"
+            replacement_bytes = b"racing replacement must survive"
+            temp_path.write_bytes(original_bytes)
+            expected_identity = (
+                store_module._plain_card_sidecar_state_path_identity(
+                    temp_path,
+                    directory=False,
+                )
+            )
+            preserved_original = intent_state[0] / "preserved-original"
+            real_identity = (
+                store_module._plain_card_sidecar_state_path_identity
+            )
+            swapped = False
+
+            def swap_after_first_temp_identity(
+                path: Path,
+                *,
+                directory: bool,
+            ) -> tuple[int, int]:
+                nonlocal swapped
+                identity = real_identity(path, directory=directory)
+                if Path(path) == temp_path and not directory and not swapped:
+                    swapped = True
+                    temp_path.replace(preserved_original)
+                    temp_path.write_bytes(replacement_bytes)
+                return identity
+
+            with (
+                patch.object(
+                    store_module,
+                    "_plain_card_sidecar_state_path_identity",
+                    side_effect=swap_after_first_temp_identity,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "identity changed|changed during quarantine",
+                ),
+            ):
+                store_module._retire_card_sidecar_publisher_temp(
+                    intent_state,
+                    temp_path,
+                    expected_identity=expected_identity,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(preserved_original.read_bytes(), original_bytes)
+            surviving_files = [
+                path
+                for path in root.rglob("*")
+                if path.is_file()
+            ]
+            self.assertIn(
+                replacement_bytes,
+                [path.read_bytes() for path in surviving_files],
+            )
+
+    def test_publisher_temp_cleanup_releases_sqlite_writer_fence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            assert intent_state is not None
+            temp_path = intent_state[0] / (
+                ".card_sidecar_write_intent_"
+                f"{'b' * 24}.json.abcdefgh.tmp"
+            )
+            temp_path.write_bytes(b"crash-left publisher temp")
+            cleanup_entered = threading.Event()
+            allow_cleanup = threading.Event()
+            real_retire = (
+                store_module._retire_card_sidecar_publisher_temp
+            )
+            reconciliation_results: list[dict[str, object]] = []
+            reconciliation_errors: list[BaseException] = []
+
+            def blocking_retire(
+                captured_state: store_module.CardSidecarStateDir,
+                captured_path: Path,
+                *,
+                expected_identity: tuple[int, int],
+            ) -> str:
+                cleanup_entered.set()
+                if not allow_cleanup.wait(timeout=10):
+                    raise RuntimeError(
+                        "timed out waiting for competing DB writer"
+                    )
+                return real_retire(
+                    captured_state,
+                    captured_path,
+                    expected_identity=expected_identity,
+                )
+
+            def run_reconciliation() -> None:
+                try:
+                    reconciliation_results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root,
+                            limit=10,
+                        )
+                    )
+                except BaseException as exc:
+                    reconciliation_errors.append(exc)
+
+            with patch.object(
+                store_module,
+                "_retire_card_sidecar_publisher_temp",
+                side_effect=blocking_retire,
+            ):
+                reconciliation_thread = threading.Thread(
+                    target=run_reconciliation
+                )
+                reconciliation_thread.start()
+                try:
+                    self.assertTrue(cleanup_entered.wait(timeout=5))
+                    with closing(connect_catalog(root)) as writer_conn:
+                        writer_conn.execute("PRAGMA busy_timeout = 250")
+                        writer_conn.execute("BEGIN IMMEDIATE")
+                        store_module.audit_event(
+                            writer_conn,
+                            action="publisher_temp_cleanup_db_probe",
+                            target_type="probe",
+                            target_id="writer_committed",
+                        )
+                        writer_conn.commit()
+                finally:
+                    allow_cleanup.set()
+                    reconciliation_thread.join(timeout=10)
+
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertEqual(reconciliation_errors, [])
+            self.assertEqual(len(reconciliation_results), 1)
+            self.assertTrue(
+                reconciliation_results[0]["ok"],
+                reconciliation_results,
+            )
+            self.assertEqual(
+                reconciliation_results[0]["publisher_temps_retired"],
+                1,
+            )
+            self.assertFalse(temp_path.exists())
+
+    def test_normal_terminal_flush_releases_sqlite_writer_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                _card_id,
+                intent_id,
+                _intent_path,
+                _target_path,
+                _payload,
+                _row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            receipt_flush_entered = threading.Event()
+            allow_receipt_flush = threading.Event()
+            real_flush = store_module.flush_file_strict
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def block_terminal_receipt_flush(path: Path) -> None:
+                if Path(path) == receipt_path:
+                    receipt_flush_entered.set()
+                    if not allow_receipt_flush.wait(timeout=10):
+                        raise TimeoutError(
+                            "terminal receipt flush was not released"
+                        )
+                real_flush(path)
+
+            def reconcile() -> None:
+                try:
+                    results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                store_module,
+                "flush_file_strict",
+                side_effect=block_terminal_receipt_flush,
+            ):
+                thread = threading.Thread(target=reconcile, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(receipt_flush_entered.wait(timeout=5))
+                    started = time.monotonic()
+                    with closing(connect_catalog(root)) as writer_conn:
+                        writer_conn.execute("PRAGMA busy_timeout = 250")
+                        writer_conn.execute("BEGIN IMMEDIATE")
+                        store_module.audit_event(
+                            writer_conn,
+                            action="sidecar_terminal_flush_writer_probe",
+                            target_type="probe",
+                            target_id="writer_committed",
+                        )
+                        writer_conn.commit()
+                    elapsed = time.monotonic() - started
+                finally:
+                    allow_receipt_flush.set()
+                    thread.join(timeout=10)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]["ok"], results)
+            self.assertEqual(results[0]["results"][0]["status"], "adopted")
+            self.assertLess(elapsed, 0.25)
+
+    def test_large_catalog_terminal_cas_and_epoch_trigger_cost_are_bounded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                _card_id,
+                _intent_id,
+                _intent_path,
+                _target_path,
+                _payload,
+                _row,
+            ) = seed_adoptable_sidecar_intent(root)
+            now = store_module.utc_now()
+            bulk_count = 20000
+            with closing(connect_catalog(root)) as conn:
+                started = time.monotonic()
+                conn.executemany(
+                    """
+                    INSERT INTO cards(
+                        id, card_type, title, summary,
+                        created_at, updated_at
+                    )
+                    VALUES(?, 'note', 'bulk authority probe', 'bulk', ?, ?)
+                    """,
+                    [
+                        (
+                            f"card_bulk_authority_{index:05d}",
+                            now,
+                            now,
+                        )
+                        for index in range(bulk_count)
+                    ],
+                )
+                conn.commit()
+                trigger_elapsed = time.monotonic() - started
+
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            cas_elapsed: list[float] = []
+            cas_instructions: list[int] = []
+
+            def measure_cas(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                instruction_count = 0
+
+                def count_instruction() -> int:
+                    nonlocal instruction_count
+                    instruction_count += 1
+                    return 0
+
+                conn.set_progress_handler(count_instruction, 1)
+                started = time.monotonic()
+                try:
+                    return real_cas(conn, expected_token)
+                finally:
+                    cas_elapsed.append(time.monotonic() - started)
+                    cas_instructions.append(instruction_count)
+                    conn.set_progress_handler(None, 0)
+
+            with patch.object(
+                store_module,
+                "_commit_card_sidecar_reconciliation_authority",
+                side_effect=measure_cas,
+            ):
+                result = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["results"][0]["status"], "adopted")
+            self.assertEqual(len(cas_elapsed), 1)
+            self.assertLess(cas_elapsed[0], 0.05)
+            self.assertLess(cas_instructions[0], 5000)
+            self.assertLess(trigger_elapsed, 10.0)
+            with closing(connect_catalog(root)) as conn:
+                self.assertGreaterEqual(
+                    store_module._card_sidecar_db_authority_epoch(conn),
+                    bulk_count,
+                )
+
+    def test_card_outbox_drift_rejects_stale_terminal_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                card_id,
+                intent_id,
+                intent_path,
+                _target_path,
+                _payload,
+                row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            drifted = False
+            with closing(connect_catalog(root)) as conn:
+                initial_sidecar_epoch = (
+                    store_module._card_sidecar_db_authority_epoch(conn)
+                )
+
+            def drift_before_first_cas(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                nonlocal drifted
+                if not drifted:
+                    drifted = True
+                    with closing(connect_catalog(root)) as drift_conn:
+                        drift_conn.execute(
+                            """
+                            UPDATE cards
+                            SET summary = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "drifted after optimistic target inspection",
+                                store_module.utc_now(),
+                                card_id,
+                            ),
+                        )
+                        mark_card_sidecar_outbox(
+                            drift_conn,
+                            [card_id],
+                            reason="optimistic_reconciliation_drift",
+                        )
+                        drift_conn.commit()
+                return real_cas(conn, expected_token)
+
+            with patch.object(
+                store_module,
+                "_commit_card_sidecar_reconciliation_authority",
+                side_effect=drift_before_first_cas,
+            ):
+                rejected = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(drifted)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(receipt_path.exists())
+            with closing(connect_catalog(root)) as conn:
+                self.assertGreater(
+                    store_module._card_sidecar_db_authority_epoch(conn),
+                    initial_sidecar_epoch,
+                )
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET summary = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        row["summary"],
+                        row["updated_at"],
+                        card_id,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.commit()
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["results"][0]["status"], "adopted")
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(intent_path.exists())
+
+    def test_forged_authority_trigger_between_plan_and_cas_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                card_id,
+                intent_id,
+                intent_path,
+                _target_path,
+                _payload,
+                row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            forged = False
+            trigger_name = (
+                "advance_card_sidecar_db_authority_after_card_update"
+            )
+
+            def forge_trigger_before_cas(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                nonlocal forged
+                if not forged:
+                    forged = True
+                    with closing(connect_catalog(root)) as drift_conn:
+                        drift_conn.execute(f"DROP TRIGGER {trigger_name}")
+                        drift_conn.execute(
+                            f"""
+                            CREATE TRIGGER {trigger_name}
+                            AFTER UPDATE ON cards
+                            BEGIN
+                                SELECT 1;
+                            END
+                            """
+                        )
+                        drift_conn.execute(
+                            """
+                            UPDATE cards
+                            SET summary = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "untracked Card drift behind forged trigger",
+                                store_module.utc_now(),
+                                card_id,
+                            ),
+                        )
+                        drift_conn.commit()
+                return real_cas(conn, expected_token)
+
+            with patch.object(
+                store_module,
+                "_commit_card_sidecar_reconciliation_authority",
+                side_effect=forge_trigger_before_cas,
+            ):
+                rejected = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(forged)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(receipt_path.exists())
+            with closing(connect_catalog(root)) as conn:
+                self.assertFalse(
+                    store_module
+                    ._card_sidecar_db_authority_triggers_ready(conn)
+                )
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET summary = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        row["summary"],
+                        row["updated_at"],
+                        card_id,
+                    ),
+                )
+                conn.commit()
+
+            init_db(root, recover_pending_card_sidecars=False)
+            with closing(connect_catalog(root)) as conn:
+                self.assertTrue(
+                    store_module
+                    ._card_sidecar_db_authority_triggers_ready(conn)
+                )
+            resumed = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["results"][0]["status"], "adopted")
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(intent_path.exists())
+
+    def test_transient_trigger_bypass_changes_schema_authority_token(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                card_id,
+                intent_id,
+                intent_path,
+                _target_path,
+                _payload,
+                row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            trigger_name = (
+                "advance_card_sidecar_db_authority_after_card_update"
+            )
+            canonical_trigger = (
+                store_module._card_sidecar_db_authority_trigger_sql()[
+                    trigger_name
+                ]
+            )
+            with closing(connect_catalog(root)) as conn:
+                initial_sidecar_epoch = (
+                    store_module._card_sidecar_db_authority_epoch(conn)
+                )
+                initial_schema_version = (
+                    store_module._sqlite_schema_authority_version(conn)
+                )
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            bypassed = False
+
+            def bypass_then_restore_trigger(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                nonlocal bypassed
+                if not bypassed:
+                    bypassed = True
+                    with closing(connect_catalog(root)) as drift_conn:
+                        drift_conn.execute("BEGIN IMMEDIATE")
+                        drift_conn.execute(f"DROP TRIGGER {trigger_name}")
+                        drift_conn.execute(
+                            f"""
+                            CREATE TRIGGER {trigger_name}
+                            AFTER UPDATE ON cards
+                            BEGIN
+                                SELECT 1;
+                            END
+                            """
+                        )
+                        drift_conn.execute(
+                            """
+                            UPDATE cards
+                            SET summary = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "transient trigger bypass changed Card state",
+                                store_module.utc_now(),
+                                card_id,
+                            ),
+                        )
+                        drift_conn.execute(f"DROP TRIGGER {trigger_name}")
+                        drift_conn.execute(canonical_trigger)
+                        drift_conn.commit()
+                return real_cas(conn, expected_token)
+
+            with patch.object(
+                store_module,
+                "_commit_card_sidecar_reconciliation_authority",
+                side_effect=bypass_then_restore_trigger,
+            ):
+                rejected = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(bypassed)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(receipt_path.exists())
+            with closing(connect_catalog(root)) as conn:
+                self.assertTrue(
+                    store_module
+                    ._card_sidecar_db_authority_triggers_ready(conn)
+                )
+                self.assertEqual(
+                    store_module._card_sidecar_db_authority_epoch(conn),
+                    initial_sidecar_epoch,
+                )
+                self.assertGreater(
+                    store_module._sqlite_schema_authority_version(conn),
+                    initial_schema_version,
+                )
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET summary = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        row["summary"],
+                        row["updated_at"],
+                        card_id,
+                    ),
+                )
+                conn.commit()
+
+            resumed = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["results"][0]["status"], "adopted")
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(intent_path.exists())
+
+    def test_artifact_epoch_drift_rebuilds_before_terminal_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="artifact-epoch-classification",
+                    summary="Immutable authority initially preserves this target.",
+                    source_refs=[],
+                )
+                conn.commit()
+            synced = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(synced["ok"], synced)
+            with closing(connect_catalog(root)) as conn:
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                payload = store_module._card_sidecar_payload_for_row(row)
+                target_path = resolve_stored_uri(
+                    root,
+                    str(row["location_uri"]),
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+                conn.commit()
+            intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=continuum_uri(root, target_path),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            with closing(connect_catalog(root)) as conn:
+                target_bytes = target_path.read_bytes()
+                artifact_id = record_artifact(
+                    conn,
+                    kind="sidecar_epoch_drift_probe",
+                    uri=continuum_uri(root, target_path),
+                    sha256=hashlib.sha256(target_bytes).hexdigest(),
+                    size_bytes=len(target_bytes),
+                    source_type="two_phase_reconciliation_regression",
+                    trust_level="local_evidence",
+                    immutable=True,
+                )
+                conn.commit()
+                initial_epoch = (
+                    store_module._immutable_artifact_path_index_epoch(conn)
+                )
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            cas_calls = 0
+
+            def drift_epoch_before_first_cas(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                nonlocal cas_calls
+                cas_calls += 1
+                if cas_calls == 1:
+                    with closing(connect_catalog(root)) as drift_conn:
+                        drift_conn.execute(
+                            "DELETE FROM artifacts WHERE id = ?",
+                            (artifact_id,),
+                        )
+                        drift_conn.commit()
+                return real_cas(conn, expected_token)
+
+            with patch.object(
+                store_module,
+                "_commit_card_sidecar_reconciliation_authority",
+                side_effect=drift_epoch_before_first_cas,
+            ):
+                result = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            with closing(connect_catalog(root)) as conn:
+                final_epoch = (
+                    store_module._immutable_artifact_path_index_epoch(conn)
+                )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["results"][0]["status"], "quarantined")
+            self.assertEqual(cas_calls, 1)
+            self.assertGreater(final_epoch, initial_epoch)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "quarantined")
+            self.assertFalse(intent_path.exists())
+            self.assertFalse(target_path.exists())
+            self.assertTrue(
+                resolve_stored_uri(root, str(receipt["recovery_uri"])).is_file()
+            )
+
+    def test_crash_after_terminal_cas_keeps_intent_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                _card_id,
+                intent_id,
+                intent_path,
+                _target_path,
+                _payload,
+                _row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_cas = (
+                store_module._commit_card_sidecar_reconciliation_authority
+            )
+            real_publish = store_module.secure_write_text_exclusive
+            cas_committed = False
+
+            def observe_cas(
+                conn: sqlite3.Connection,
+                expected_token: store_module.CardSidecarDbAuthorityToken,
+            ) -> bool:
+                nonlocal cas_committed
+                committed = real_cas(conn, expected_token)
+                cas_committed = cas_committed or committed
+                return committed
+
+            def crash_before_receipt(
+                path: Path,
+                text: str,
+                *,
+                encoding: str = "utf-8",
+            ) -> None:
+                if Path(path) == receipt_path:
+                    raise RuntimeError(
+                        "synthetic crash after DB CAS before receipt"
+                    )
+                real_publish(path, text, encoding=encoding)
+
+            with (
+                patch.object(
+                    store_module,
+                    "_commit_card_sidecar_reconciliation_authority",
+                    side_effect=observe_cas,
+                ),
+                patch.object(
+                    store_module,
+                    "secure_write_text_exclusive",
+                    side_effect=crash_before_receipt,
+                ),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(cas_committed)
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(receipt_path.exists())
+            resumed = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertTrue(resumed["ok"], resumed)
+            self.assertEqual(resumed["results"][0]["status"], "adopted")
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(intent_path.exists())
+
+    def test_uncommitted_target_uses_fresh_writer_quarantine_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="rollback",
+                    title="fresh-writer-quarantine-fallback",
+                    summary="An uncommitted target needs destructive recovery.",
+                    source_refs=[],
+                )
+                target_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                target_path = resolve_stored_uri(root, target_uri)
+                sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    write_observation={},
+                )
+                conn.rollback()
+            self.assertTrue(target_path.is_file())
+            real_resolve = store_module._resolve_card_sidecar_write_intent
+            resolve_fences: list[tuple[bool, bool]] = []
+
+            def observe_resolver_fence(
+                resolve_root: Path,
+                conn: sqlite3.Connection,
+                intent_path: Path,
+                intent: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                resolve_fences.append(
+                    (
+                        bool(kwargs.get("allow_quarantine")),
+                        conn.in_transaction,
+                    )
+                )
+                return real_resolve(
+                    resolve_root,
+                    conn,
+                    intent_path,
+                    intent,
+                    **kwargs,
+                )
+
+            with patch.object(
+                store_module,
+                "_resolve_card_sidecar_write_intent",
+                side_effect=observe_resolver_fence,
+            ):
+                result = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["results"][0]["status"], "quarantined")
+            self.assertGreaterEqual(len(resolve_fences), 2)
+            self.assertEqual(resolve_fences[0], (False, False))
+            self.assertEqual(resolve_fences[1], (True, True))
+
+    def test_committed_receipt_replay_releases_sqlite_writer_fence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            (
+                _card_id,
+                intent_id,
+                intent_path,
+                _target_path,
+                _payload,
+                _row,
+            ) = seed_adoptable_sidecar_intent(root)
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            real_publish = store_module.secure_write_text_exclusive
+
+            def publish_then_crash(
+                path: Path,
+                text: str,
+                *,
+                encoding: str = "utf-8",
+            ) -> None:
+                real_publish(path, text, encoding=encoding)
+                if Path(path) == receipt_path:
+                    raise RuntimeError("synthetic committed receipt crash")
+
+            with patch.object(
+                store_module,
+                "secure_write_text_exclusive",
+                side_effect=publish_then_crash,
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(receipt_path.is_file())
+
+            replay_flush_entered = threading.Event()
+            allow_replay_flush = threading.Event()
+            real_flush = store_module.flush_file_strict
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def block_replay_flush(path: Path) -> None:
+                if Path(path) == receipt_path:
+                    replay_flush_entered.set()
+                    if not allow_replay_flush.wait(timeout=10):
+                        raise TimeoutError(
+                            "committed receipt replay was not released"
+                        )
+                real_flush(path)
+
+            def reconcile() -> None:
+                try:
+                    results.append(
+                        store_module.reconcile_card_sidecar_write_intents(
+                            root
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                store_module,
+                "flush_file_strict",
+                side_effect=block_replay_flush,
+            ):
+                thread = threading.Thread(target=reconcile, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(replay_flush_entered.wait(timeout=5))
+                    started = time.monotonic()
+                    with closing(connect_catalog(root)) as writer_conn:
+                        writer_conn.execute("PRAGMA busy_timeout = 250")
+                        writer_conn.execute("BEGIN IMMEDIATE")
+                        store_module.audit_event(
+                            writer_conn,
+                            action="sidecar_receipt_replay_writer_probe",
+                            target_type="probe",
+                            target_id="writer_committed",
+                        )
+                        writer_conn.commit()
+                    elapsed = time.monotonic() - started
+                finally:
+                    allow_replay_flush.set()
+                    thread.join(timeout=10)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]["ok"], results)
+            self.assertEqual(results[0]["results"][0]["status"], "adopted")
+            self.assertLess(elapsed, 0.25)
+            self.assertFalse(intent_path.exists())
+
     def test_sidecar_strict_namespace_failures_remain_recoverable(self) -> None:
         def seed_unbound(
             root: Path, *, recovery_only: bool
@@ -2207,6 +3615,1276 @@ print(json.dumps(result, sort_keys=True))
             self.assertTrue(
                 list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
             )
+
+    def test_sidecar_reselects_after_competing_immutable_artifact_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="artifact-commit-before-reservation",
+                    summary="generation zero",
+                    source_refs=[],
+                )
+                conn.commit()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, [card_id])["ok"]
+            )
+            with closing(connect_catalog(root)) as conn:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    ("generation one", store_module.utc_now(), card_id),
+                )
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="competing_immutable_artifact",
+                )
+                conn.commit()
+            default_path = resolve_stored_uri(root, default_uri)
+            immutable_bytes = default_path.read_bytes()
+            real_select = store_module._card_sidecar_write_target_selection
+            selection_count = 0
+            artifact_committed = False
+
+            def select_then_register_artifact(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[Path | None, bool]:
+                nonlocal selection_count, artifact_committed
+                selection = real_select(*args, **kwargs)
+                selection_count += 1
+                if not artifact_committed:
+                    self.assertEqual(selection[0], default_path)
+                    with closing(connect_catalog(root)) as artifact_conn:
+                        record_artifact(
+                            artifact_conn,
+                            kind="sidecar_proof",
+                            uri=default_uri,
+                            sha256=hashlib.sha256(
+                                immutable_bytes
+                            ).hexdigest(),
+                            size_bytes=len(immutable_bytes),
+                            source_type="reservation_race_regression",
+                            trust_level="local_evidence",
+                            immutable=True,
+                        )
+                        artifact_conn.commit()
+                    artifact_committed = True
+                return selection
+
+            with patch.object(
+                store_module,
+                "_card_sidecar_write_target_selection",
+                side_effect=select_then_register_artifact,
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(artifact_committed)
+            self.assertGreaterEqual(selection_count, 2)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(default_path.read_bytes(), immutable_bytes)
+            with closing(connect_catalog(root)) as conn:
+                current_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+            current_path = resolve_stored_uri(root, current_uri)
+            self.assertNotEqual(current_path, default_path)
+            self.assertEqual(
+                load_atomic_yaml(
+                    current_path.read_text(encoding="utf-8")
+                )["summary"],
+                "generation one",
+            )
+
+    def test_public_sidecar_reservation_records_db_schema_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="reservation-db-schema-authority",
+                    summary="The normal publisher binds both authority fields.",
+                    source_refs=[],
+                )
+                conn.commit()
+            real_reserve = (
+                store_module._reserve_card_sidecar_artifact_write
+            )
+            observed_authorities: list[
+                store_module.ImmutableArtifactAuthorityToken
+            ] = []
+            observed_reservations: list[dict[str, object]] = []
+
+            def observe_reservation(
+                conn: sqlite3.Connection,
+                *,
+                card_id: str,
+                target_uri: str,
+                expected_state_hash: str,
+                expected_artifact_authority: (
+                    store_module.ImmutableArtifactAuthorityToken
+                ),
+            ) -> tuple[str, str] | None:
+                reservation = real_reserve(
+                    conn,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=expected_state_hash,
+                    expected_artifact_authority=(
+                        expected_artifact_authority
+                    ),
+                )
+                observed_authorities.append(
+                    expected_artifact_authority
+                )
+                if reservation is not None:
+                    observed_reservations.append(
+                        json.loads(reservation[1])
+                    )
+                return reservation
+
+            with patch.object(
+                store_module,
+                "_reserve_card_sidecar_artifact_write",
+                side_effect=observe_reservation,
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(observed_authorities), 1)
+            self.assertEqual(len(observed_reservations), 1)
+            artifact_epoch, schema_version = observed_authorities[0]
+            self.assertGreaterEqual(artifact_epoch, 0)
+            self.assertGreaterEqual(schema_version, 0)
+            self.assertEqual(
+                observed_reservations[0]["artifact_epoch"],
+                artifact_epoch,
+            )
+            self.assertEqual(
+                observed_reservations[0]["sqlite_schema_version"],
+                schema_version,
+            )
+            with closing(connect_catalog(root)) as conn:
+                location_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+            self.assertTrue(resolve_stored_uri(root, location_uri).is_file())
+
+    def test_sidecar_reselects_after_transient_artifact_trigger_ddl_aba(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="artifact-trigger-ddl-aba",
+                    summary="generation zero",
+                    source_refs=[],
+                )
+                conn.commit()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, [card_id])["ok"]
+            )
+            with closing(connect_catalog(root)) as conn:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                initial_epoch = (
+                    store_module._immutable_artifact_path_index_epoch(
+                        conn
+                    )
+                )
+                initial_schema_version = (
+                    store_module._sqlite_schema_authority_version(conn)
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "generation one after transient DDL",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="transient_artifact_trigger_ddl_aba",
+                )
+                conn.commit()
+            default_path = resolve_stored_uri(root, default_uri)
+            immutable_bytes = default_path.read_bytes()
+            trigger_name = (
+                "advance_immutable_artifact_path_index_epoch_after_insert"
+            )
+            canonical_trigger_sql = (
+                store_module
+                ._card_sidecar_artifact_write_reservation_trigger_sql()[
+                    trigger_name
+                ]
+            )
+            real_select = store_module._card_sidecar_write_target_selection
+            selection_count = 0
+            transient_commit_complete = False
+
+            def select_then_transiently_remove_epoch_trigger(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[Path | None, bool]:
+                nonlocal selection_count, transient_commit_complete
+                selection = real_select(*args, **kwargs)
+                selection_count += 1
+                if not transient_commit_complete:
+                    self.assertEqual(selection[0], default_path)
+                    with closing(connect_catalog(root)) as artifact_conn:
+                        artifact_conn.execute("BEGIN IMMEDIATE")
+                        artifact_conn.execute(
+                            f"DROP TRIGGER {trigger_name}"
+                        )
+                        record_artifact(
+                            artifact_conn,
+                            kind="sidecar_proof",
+                            uri=default_uri,
+                            sha256=hashlib.sha256(
+                                immutable_bytes
+                            ).hexdigest(),
+                            size_bytes=len(immutable_bytes),
+                            source_type="transient_ddl_aba_regression",
+                            trust_level="local_evidence",
+                            immutable=True,
+                        )
+                        artifact_conn.execute(canonical_trigger_sql)
+                        artifact_conn.commit()
+                    transient_commit_complete = True
+                return selection
+
+            with patch.object(
+                store_module,
+                "_card_sidecar_write_target_selection",
+                side_effect=(
+                    select_then_transiently_remove_epoch_trigger
+                ),
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(transient_commit_complete)
+            self.assertGreaterEqual(selection_count, 2)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(default_path.read_bytes(), immutable_bytes)
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    store_module._immutable_artifact_path_index_epoch(
+                        conn
+                    ),
+                    initial_epoch,
+                )
+                self.assertNotEqual(
+                    store_module._sqlite_schema_authority_version(conn),
+                    initial_schema_version,
+                )
+                self.assertTrue(
+                    store_module
+                    ._card_sidecar_artifact_write_reservation_triggers_ready(
+                        conn
+                    )
+                )
+                current_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+            current_path = resolve_stored_uri(root, current_uri)
+            self.assertNotEqual(current_path, default_path)
+            self.assertEqual(
+                load_atomic_yaml(
+                    current_path.read_text(encoding="utf-8")
+                )["summary"],
+                "generation one after transient DDL",
+            )
+
+    def test_sidecar_reservation_fails_closed_on_forged_trigger(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="forged-trigger-at-reserve",
+                    summary="generation zero",
+                    source_refs=[],
+                )
+                conn.commit()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, [card_id])["ok"]
+            )
+            with closing(connect_catalog(root)) as conn:
+                default_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "generation one must remain pending",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="forged_artifact_trigger_at_reserve",
+                )
+                conn.commit()
+            default_path = resolve_stored_uri(root, default_uri)
+            immutable_bytes = default_path.read_bytes()
+            trigger_name = (
+                "advance_immutable_artifact_path_index_epoch_after_insert"
+            )
+            real_reserve = (
+                store_module._reserve_card_sidecar_artifact_write
+            )
+            trigger_forged = False
+
+            def forge_trigger_then_reserve(
+                conn: sqlite3.Connection,
+                *,
+                card_id: str,
+                target_uri: str,
+                expected_state_hash: str,
+                expected_artifact_authority: (
+                    store_module.ImmutableArtifactAuthorityToken
+                ),
+            ) -> tuple[str, str] | None:
+                nonlocal trigger_forged
+                if not trigger_forged:
+                    with closing(connect_catalog(root)) as drift_conn:
+                        drift_conn.execute(f"DROP TRIGGER {trigger_name}")
+                        drift_conn.execute(
+                            f"""
+                            CREATE TRIGGER {trigger_name}
+                            AFTER INSERT ON artifacts
+                            WHEN 0
+                            BEGIN
+                                SELECT 1;
+                            END
+                            """
+                        )
+                        drift_conn.commit()
+                    trigger_forged = True
+                return real_reserve(
+                    conn,
+                    card_id=card_id,
+                    target_uri=target_uri,
+                    expected_state_hash=expected_state_hash,
+                    expected_artifact_authority=(
+                        expected_artifact_authority
+                    ),
+                )
+
+            with patch.object(
+                store_module,
+                "_reserve_card_sidecar_artifact_write",
+                side_effect=forge_trigger_then_reserve,
+            ):
+                result = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(trigger_forged)
+            self.assertFalse(result["ok"], result)
+            self.assertIn(
+                "immutable artifact authority triggers are not exact",
+                json.dumps(result),
+            )
+            self.assertEqual(default_path.read_bytes(), immutable_bytes)
+            with closing(connect_catalog(root)) as conn:
+                self.assertFalse(
+                    store_module
+                    ._card_sidecar_artifact_write_reservation_triggers_ready(
+                        conn
+                    )
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+
+    def test_sidecar_artifact_index_query_failure_preserves_immutable_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="artifact-index-query-failure",
+                    summary="immutable generation",
+                    source_refs=[],
+                )
+                conn.commit()
+            first_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(first_sync["ok"], first_sync)
+            with closing(connect_catalog(root)) as conn:
+                row = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                immutable_uri = str(row["location_uri"])
+                immutable_path = resolve_stored_uri(root, immutable_uri)
+                immutable_bytes = immutable_path.read_bytes()
+                record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=immutable_uri,
+                    sha256=hashlib.sha256(immutable_bytes).hexdigest(),
+                    size_bytes=len(immutable_bytes),
+                    source_type="artifact_index_query_failure_regression",
+                    trust_level="local_evidence",
+                    immutable=True,
+                )
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET summary = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "new generation must remain pending",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="artifact_index_query_failure",
+                )
+                conn.commit()
+
+            artifact_query_observed = False
+
+            def fail_artifact_query(
+                _root: Path,
+                _conn: sqlite3.Connection,
+                *,
+                required_card_ids: object = (),
+            ) -> store_module.ImmutableArtifactPathIndex:
+                nonlocal artifact_query_observed
+                self.assertIn(card_id, set(required_card_ids))
+                artifact_query_observed = True
+                raise RuntimeError(
+                    "immutable artifact path authority query failed"
+                )
+
+            with patch.object(
+                store_module,
+                "_immutable_artifact_path_index",
+                side_effect=fail_artifact_query,
+            ):
+                rejected = sync_card_sidecars_after_commit(
+                    root,
+                    [card_id],
+                    reconcile_intents=False,
+                )
+
+            self.assertTrue(artifact_query_observed)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertEqual(immutable_path.read_bytes(), immutable_bytes)
+            self.assertFalse(
+                list(
+                    immutable_path.parent.glob(
+                        f"{card_id}.live*.yaml"
+                    )
+                )
+            )
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"],
+                    immutable_uri,
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        """
+                        SELECT 1
+                        FROM card_sidecar_outbox
+                        WHERE card_id = ?
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                )
+
+    def test_direct_sidecar_sync_artifact_query_failure_is_fail_closed(
+        self,
+    ) -> None:
+        class ArtifactQueryFailureConnection:
+            def __init__(self, delegate: sqlite3.Connection) -> None:
+                self._delegate = delegate
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._delegate, name)
+
+            def execute(
+                self,
+                sql: str,
+                *args: object,
+                **kwargs: object,
+            ) -> sqlite3.Cursor:
+                normalized = " ".join(sql.split()).casefold()
+                if (
+                    "select uri from artifacts where immutable = 1"
+                    in normalized
+                ):
+                    raise sqlite3.OperationalError(
+                        "synthetic immutable artifact query failure"
+                    )
+                return self._delegate.execute(sql, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="direct-artifact-query-failure",
+                    summary="immutable generation",
+                    source_refs=[],
+                )
+                conn.commit()
+            first_sync = sync_card_sidecars_after_commit(root, [card_id])
+            self.assertTrue(first_sync["ok"], first_sync)
+            with closing(connect_catalog(root)) as conn:
+                immutable_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                immutable_path = resolve_stored_uri(root, immutable_uri)
+                immutable_bytes = immutable_path.read_bytes()
+                record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=immutable_uri,
+                    sha256=hashlib.sha256(immutable_bytes).hexdigest(),
+                    size_bytes=len(immutable_bytes),
+                    source_type="direct_artifact_query_failure_regression",
+                    trust_level="local_evidence",
+                    immutable=True,
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "new generation must remain pending",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="direct_artifact_query_failure",
+                )
+                conn.commit()
+
+            raw_conn = store_module.connect(root)
+            conn = ArtifactQueryFailureConnection(raw_conn)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "immutable artifact path authority query failed",
+                ):
+                    sync_card_sidecar(
+                        root,
+                        conn,
+                        card_id,
+                        write_observation={},
+                    )
+                conn.rollback()
+            finally:
+                conn.close()
+
+            self.assertEqual(immutable_path.read_bytes(), immutable_bytes)
+            self.assertFalse(
+                list(
+                    immutable_path.parent.glob(
+                        f"{card_id}.live*.yaml"
+                    )
+                )
+            )
+            self.assertFalse(
+                list(
+                    (
+                        root / "run" / "card_sidecar_write_intents"
+                    ).glob("*.json")
+                )
+            )
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"],
+                    immutable_uri,
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+
+    def test_intent_reconciliation_artifact_query_failure_is_fail_closed(
+        self,
+    ) -> None:
+        class ArtifactQueryFailureConnection:
+            def __init__(self, delegate: sqlite3.Connection) -> None:
+                self._delegate = delegate
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._delegate, name)
+
+            def execute(
+                self,
+                sql: str,
+                *args: object,
+                **kwargs: object,
+            ) -> sqlite3.Cursor:
+                normalized = " ".join(sql.split()).casefold()
+                if (
+                    "select uri from artifacts where immutable = 1"
+                    in normalized
+                ):
+                    raise sqlite3.OperationalError(
+                        "synthetic immutable artifact query failure"
+                    )
+                return self._delegate.execute(sql, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="rollback",
+                    title="reconcile-artifact-query-failure",
+                    summary="A failed artifact query cannot retire this file.",
+                    source_refs=[],
+                )
+                target_uri = str(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+                target_path = resolve_stored_uri(root, target_uri)
+                sync_card_sidecar(
+                    root,
+                    conn,
+                    card_id,
+                    write_observation={},
+                )
+                conn.rollback()
+            immutable_bytes = target_path.read_bytes()
+            with closing(connect_catalog(root)) as conn:
+                record_artifact(
+                    conn,
+                    kind="sidecar_proof",
+                    uri=target_uri,
+                    sha256=hashlib.sha256(immutable_bytes).hexdigest(),
+                    size_bytes=len(immutable_bytes),
+                    source_type="reconcile_artifact_query_failure_regression",
+                    trust_level="local_evidence",
+                    immutable=True,
+                )
+                conn.commit()
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            intent_paths = list(intent_dir.glob("*.json"))
+            self.assertEqual(len(intent_paths), 1)
+
+            real_connect = store_module.connect
+
+            def connect_with_failed_artifact_query(
+                connect_root: Path,
+            ) -> ArtifactQueryFailureConnection:
+                return ArtifactQueryFailureConnection(
+                    real_connect(connect_root)
+                )
+
+            with patch.object(
+                store_module,
+                "connect",
+                side_effect=connect_with_failed_artifact_query,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "immutable artifact path authority query failed",
+            ):
+                store_module.reconcile_card_sidecar_write_intents(root)
+
+            self.assertTrue(target_path.is_file())
+            self.assertEqual(target_path.read_bytes(), immutable_bytes)
+            self.assertTrue(intent_paths[0].is_file())
+            self.assertFalse(
+                list(
+                    (
+                        root / "exports" / "card_sidecar_recovery_receipts"
+                    ).glob("*.json")
+                )
+            )
+            with closing(connect_catalog(root)) as conn:
+                artifact = conn.execute(
+                    "SELECT uri, immutable FROM artifacts WHERE uri = ?",
+                    (target_uri,),
+                ).fetchone()
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact["uri"], target_uri)
+            self.assertEqual(int(artifact["immutable"]), 1)
+
+    def test_unrelated_commits_do_not_rebuild_sidecar_artifact_index(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_ids = [
+                    create_card(
+                        conn,
+                        root=root,
+                        card_type="note",
+                        title=f"artifact-epoch-card-{index}",
+                        summary="generation zero",
+                        source_refs=[],
+                    )
+                    for index in range(2)
+                ]
+                conn.commit()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, card_ids)["ok"]
+            )
+            with closing(connect_catalog(root)) as conn:
+                for index, card_id in enumerate(card_ids):
+                    conn.execute(
+                        """
+                        UPDATE cards
+                        SET summary = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            f"generation one for card {index}",
+                            store_module.utc_now(),
+                            card_id,
+                        ),
+                    )
+                    mark_card_sidecar_outbox(
+                        conn,
+                        [card_id],
+                        reason="unrelated_commit_epoch_regression",
+                    )
+                conn.commit()
+
+            index_built = threading.Event()
+            unrelated_commits_finished = threading.Event()
+            writer_errors: list[BaseException] = []
+            real_index = store_module._immutable_artifact_path_index
+            index_calls = 0
+
+            def counted_index(
+                index_root: Path,
+                index_conn: sqlite3.Connection,
+                **index_kwargs: object,
+            ) -> store_module.ImmutableArtifactPathIndex:
+                nonlocal index_calls
+                result = real_index(
+                    index_root,
+                    index_conn,
+                    **index_kwargs,
+                )
+                index_calls += 1
+                if index_calls == 1:
+                    index_built.set()
+                    if not unrelated_commits_finished.wait(timeout=10):
+                        raise RuntimeError(
+                            "unrelated DB commits did not finish during index"
+                        )
+                return result
+
+            def commit_unrelated_audits() -> None:
+                try:
+                    if not index_built.wait(timeout=5):
+                        raise RuntimeError(
+                            "sidecar artifact index was not built"
+                        )
+                    with closing(connect_catalog(root)) as noise_conn:
+                        for sequence in range(32):
+                            store_module.audit_event(
+                                noise_conn,
+                                action="artifact_epoch_unrelated_commit",
+                                target_type="probe",
+                                target_id=str(sequence),
+                            )
+                            noise_conn.commit()
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    unrelated_commits_finished.set()
+
+            writer_thread = threading.Thread(
+                target=commit_unrelated_audits
+            )
+            writer_thread.start()
+            with patch.object(
+                store_module,
+                "_immutable_artifact_path_index",
+                side_effect=counted_index,
+            ):
+                result = sync_card_sidecars_after_commit(
+                    root,
+                    card_ids,
+                    reconcile_intents=False,
+                )
+            writer_thread.join(timeout=10)
+
+            self.assertFalse(writer_thread.is_alive())
+            self.assertEqual(writer_errors, [])
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(index_calls, 1)
+
+    def test_sidecar_reservation_guards_all_immutable_artifact_writers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            unrelated_path = root / "archive" / "reservation-guard.txt"
+            unrelated_path.parent.mkdir(parents=True, exist_ok=True)
+            unrelated_bytes = b"immutable registration must wait\n"
+            unrelated_path.write_bytes(unrelated_bytes)
+            unrelated_uri = continuum_uri(root, unrelated_path)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="artifact-reservation-guard",
+                    summary="Publish outside the SQLite writer transaction.",
+                    source_refs=[],
+                )
+                mutable_artifact_id = record_artifact(
+                    conn,
+                    kind="mutable_probe",
+                    uri=unrelated_uri,
+                    sha256=hashlib.sha256(unrelated_bytes).hexdigest(),
+                    size_bytes=len(unrelated_bytes),
+                    source_type="reservation_guard_regression",
+                    trust_level="local_evidence",
+                    immutable=False,
+                )
+                conn.commit()
+
+            write_entered = threading.Event()
+            allow_write = threading.Event()
+            real_write = store_module.write_card_sidecar_from_values
+            sync_results: list[dict[str, object]] = []
+            sync_errors: list[BaseException] = []
+
+            def blocking_write(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                write_entered.set()
+                if not allow_write.wait(timeout=10):
+                    raise RuntimeError("timed out waiting for artifact probes")
+                return real_write(*args, **kwargs)
+
+            def run_sync() -> None:
+                try:
+                    sync_results.append(
+                        sync_card_sidecars_after_commit(root, [card_id])
+                    )
+                except BaseException as exc:
+                    sync_errors.append(exc)
+
+            with patch.object(
+                store_module,
+                "write_card_sidecar_from_values",
+                side_effect=blocking_write,
+            ):
+                sync_thread = threading.Thread(target=run_sync)
+                sync_thread.start()
+                try:
+                    self.assertTrue(write_entered.wait(timeout=5))
+                    with closing(connect_catalog(root)) as artifact_conn:
+                        artifact_conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "immutable artifact registration blocked",
+                        ):
+                            record_artifact(
+                                artifact_conn,
+                                kind="helper_guard_probe",
+                                uri=unrelated_uri,
+                                sha256="1" * 64,
+                                size_bytes=len(unrelated_bytes),
+                                immutable=True,
+                            )
+                        self.assertFalse(artifact_conn.in_transaction)
+
+                        artifact_conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaisesRegex(
+                            sqlite3.IntegrityError,
+                            "immutable artifact registration blocked",
+                        ):
+                            artifact_conn.execute(
+                                """
+                                INSERT INTO artifacts(
+                                    id, kind, uri, sha256, size_bytes,
+                                    created_at, immutable, metadata_json
+                                )
+                                VALUES(?, ?, ?, ?, ?, ?, 1, '{}')
+                                """,
+                                (
+                                    "artifact_direct_reservation_guard",
+                                    "direct_guard_probe",
+                                    unrelated_uri,
+                                    "2" * 64,
+                                    len(unrelated_bytes),
+                                    store_module.utc_now(),
+                                ),
+                            )
+                        self.assertFalse(artifact_conn.in_transaction)
+
+                        artifact_conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaisesRegex(
+                            sqlite3.IntegrityError,
+                            "immutable artifact registration blocked",
+                        ):
+                            artifact_conn.execute(
+                                """
+                                UPDATE artifacts
+                                SET immutable = 1
+                                WHERE id = ?
+                                """,
+                                (mutable_artifact_id,),
+                            )
+                        self.assertFalse(artifact_conn.in_transaction)
+                finally:
+                    allow_write.set()
+                    sync_thread.join(timeout=10)
+
+            self.assertFalse(sync_thread.is_alive())
+            self.assertEqual(sync_errors, [])
+            self.assertEqual(len(sync_results), 1)
+            self.assertTrue(sync_results[0]["ok"], sync_results)
+            with closing(connect_catalog(root)) as conn:
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT immutable FROM artifacts WHERE id = ?",
+                        (mutable_artifact_id,),
+                    ).fetchone()["immutable"],
+                    0,
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM artifacts WHERE id = ?",
+                        ("artifact_direct_reservation_guard",),
+                    ).fetchone()
+                )
+
+    def test_crash_left_sidecar_reservation_recovers_under_operation_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="crash-left-artifact-reservation",
+                    summary="The durable outbox survives a publisher crash.",
+                    source_refs=[],
+                )
+                conn.commit()
+            real_write = store_module.write_card_sidecar_from_values
+
+            def crash_after_write(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                real_write(*args, **kwargs)
+                raise SystemExit("simulated death after sidecar replace")
+
+            with patch.object(
+                store_module,
+                "write_card_sidecar_from_values",
+                side_effect=crash_after_write,
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "simulated death",
+            ):
+                sync_card_sidecars_after_commit(root, [card_id])
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "immutable artifact registration blocked",
+                ):
+                    record_artifact(
+                        conn,
+                        kind="stale_reservation_probe",
+                        uri="continuum://archive/stale-reservation-probe",
+                        sha256="3" * 64,
+                        size_bytes=0,
+                        immutable=True,
+                    )
+                self.assertFalse(conn.in_transaction)
+
+            recovered = sync_card_sidecars_after_commit(root, [card_id])
+
+            self.assertTrue(recovered["ok"], recovered)
+            with closing(connect_catalog(root)) as conn:
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        """
+                        SELECT 1
+                        FROM audit_events
+                        WHERE action = ?
+                          AND target_id = ?
+                        """,
+                        (
+                            "card_sidecar_artifact_write_reservation_recovered",
+                            card_id,
+                        ),
+                    ).fetchone()
+                )
+
+    def test_pre_intent_locationless_crash_rearms_outbox_on_fresh_init(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            with closing(connect_catalog(root)) as conn:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="pre-intent-locationless-crash",
+                    summary=(
+                        "The reservation must become durable outbox authority."
+                    ),
+                    source_refs=[],
+                )
+                conn.execute(
+                    "UPDATE cards SET location_uri = NULL WHERE id = ?",
+                    (card_id,),
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.commit()
+
+            with patch.object(
+                store_module,
+                "_write_card_sidecar_write_intent",
+                side_effect=SystemExit(
+                    "simulated death before intent publication"
+                ),
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "before intent publication",
+            ):
+                sync_card_sidecars_after_commit(root, [card_id])
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT location_uri FROM cards WHERE id = ?",
+                        (card_id,),
+                    ).fetchone()["location_uri"]
+                )
+            intent_dir = root / "run" / "card_sidecar_write_intents"
+            self.assertFalse(
+                list(intent_dir.glob("*.json"))
+                if intent_dir.exists()
+                else []
+            )
+
+            _INIT_DB_CACHE.discard(cache_key)
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                row = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                self.assertIsNotNone(row["location_uri"])
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                        (card_id,),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()
+                )
+                recovery_row = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM audit_events
+                    WHERE action = ?
+                      AND target_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (
+                        "card_sidecar_artifact_write_reservation_recovered",
+                        card_id,
+                    ),
+                ).fetchone()
+            self.assertIsNotNone(recovery_row)
+            recovery_payload = json.loads(recovery_row["payload_json"])
+            self.assertTrue(recovery_payload["outbox_rearmed"])
+            self.assertEqual(
+                recovery_payload["recovery_authority"],
+                (
+                    "stale_reservation_converted_to_durable_outbox_under_"
+                    "sidecar_operation_lock"
+                ),
+            )
+            sidecar_path = resolve_stored_uri(root, str(row["location_uri"]))
+            self.assertTrue(sidecar_path.is_file())
+            self.assertIn(cache_key, _INIT_DB_CACHE)
 
     def test_disabled_existing_card_upsert_refreshes_after_reenable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4430,6 +7108,238 @@ print(json.dumps(result, sort_keys=True))
                 details,
             )
 
+    def test_queue_claim_order_indexes_avoid_temp_sorts_for_role_lanes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            roles = ("archivist", "librarian", "scribe")
+            with closing(connect_catalog(root)) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(?, ?, 'query_plan_probe', ?, 'pending', 1,
+                           '[]', '{}', ?, ?)
+                    """,
+                    [
+                        (
+                            f"job_queue_plan_{index:04d}",
+                            roles[index % len(roles)],
+                            (index * 17) % 1000,
+                            (
+                                "2026-01-01T00:"
+                                f"{(index // 60) % 60:02d}:"
+                                f"{index % 60:02d}+00:00"
+                            ),
+                            (
+                                "2026-01-01T00:"
+                                f"{(index // 60) % 60:02d}:"
+                                f"{index % 60:02d}+00:00"
+                            ),
+                        )
+                        for index in range(720)
+                    ],
+                )
+                conn.commit()
+                conn.execute("ANALYZE")
+
+                cases = (
+                    (
+                        "all-strict",
+                        "",
+                        (),
+                        (
+                            "pending_job.priority ASC, "
+                            "pending_job.created_at ASC, "
+                            "pending_job.rowid ASC"
+                        ),
+                        "idx_queue_status_priority",
+                    ),
+                    (
+                        "all-oldest",
+                        "",
+                        (),
+                        (
+                            "pending_job.created_at ASC, "
+                            "pending_job.rowid ASC"
+                        ),
+                        "idx_queue_status_created",
+                    ),
+                    (
+                        "one-role-strict",
+                        " AND pending_job.role IN (?)",
+                        ("archivist",),
+                        (
+                            "pending_job.priority ASC, "
+                            "pending_job.created_at ASC, "
+                            "pending_job.rowid ASC"
+                        ),
+                        "idx_queue_role_priority",
+                    ),
+                    (
+                        "one-role-oldest",
+                        " AND pending_job.role IN (?)",
+                        ("archivist",),
+                        (
+                            "pending_job.created_at ASC, "
+                            "pending_job.rowid ASC"
+                        ),
+                        "idx_queue_role_created",
+                    ),
+                )
+                for (
+                    label,
+                    role_clause,
+                    role_params,
+                    order_by,
+                    expected_index,
+                ) in cases:
+                    with self.subTest(label=label):
+                        plan = conn.execute(
+                            f"""
+                            EXPLAIN QUERY PLAN
+                            SELECT pending_job.*
+                            FROM queue_jobs AS pending_job
+                            WHERE pending_job.status = ?
+                              AND (
+                                  pending_job.dedupe_key IS NULL
+                                  OR NOT EXISTS (
+                                      SELECT 1
+                                      FROM queue_jobs AS active_job
+                                      WHERE active_job.status = 'running'
+                                        AND active_job.dedupe_key =
+                                            pending_job.dedupe_key
+                                  )
+                              )
+                              {role_clause}
+                            ORDER BY {order_by}
+                            LIMIT 1
+                            """,
+                            ("pending", *role_params),
+                        ).fetchall()
+                        details = [
+                            str(row["detail"]).lower()
+                            for row in plan
+                        ]
+                        self.assertFalse(
+                            any(
+                                "temp b-tree for order by" in detail
+                                for detail in details
+                            ),
+                            details,
+                        )
+                        self.assertTrue(
+                            any(
+                                expected_index in detail
+                                for detail in details
+                            ),
+                            details,
+                        )
+                        self.assertTrue(
+                            any(
+                                "search active_job using covering index "
+                                "idx_queue_running_dedupe (dedupe_key=?)"
+                                in detail
+                                for detail in details
+                            ),
+                            details,
+                        )
+
+    def test_single_role_oldest_claim_skips_other_role_backlog(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with closing(connect_catalog(root)) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(?, 'scribe', 'role_scan_probe', 1, 'pending', 1,
+                           '[]', '{}', ?, ?)
+                    """,
+                    [
+                        (
+                            f"job_role_scan_scribe_{index:05d}",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                        )
+                        for index in range(5000)
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        'job_role_scan_archivist',
+                        'archivist',
+                        'role_scan_probe',
+                        1,
+                        'pending',
+                        1,
+                        '[]',
+                        '{}',
+                        '2026-02-01T00:00:00+00:00',
+                        '2026-02-01T00:00:00+00:00'
+                    )
+                    """
+                )
+                conn.commit()
+                conn.execute("ANALYZE")
+
+                instruction_count = 0
+
+                def count_instruction() -> int:
+                    nonlocal instruction_count
+                    instruction_count += 1
+                    return 0
+
+                conn.set_progress_handler(count_instruction, 1)
+                try:
+                    claimed = conn.execute(
+                        """
+                        SELECT pending_job.id
+                        FROM queue_jobs AS pending_job
+                        WHERE pending_job.status = ?
+                          AND (
+                              pending_job.dedupe_key IS NULL
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM queue_jobs AS active_job
+                                  WHERE active_job.status = 'running'
+                                    AND active_job.dedupe_key =
+                                        pending_job.dedupe_key
+                              )
+                          )
+                          AND pending_job.role IN (?)
+                        ORDER BY pending_job.created_at ASC,
+                                 pending_job.rowid ASC
+                        LIMIT 1
+                        """,
+                        ("pending", "archivist"),
+                    ).fetchone()
+                finally:
+                    conn.set_progress_handler(None, 0)
+
+            self.assertEqual(
+                claimed["id"],
+                "job_role_scan_archivist",
+            )
+            self.assertLess(instruction_count, 500)
+
     def test_init_repairs_graph_sources_added_after_migration_marker(
         self,
     ) -> None:
@@ -4825,6 +7735,522 @@ print(json.dumps(result, sort_keys=True))
             self.assertTrue(
                 store_module.RESUME_AUTHORITY_INDEX_NAMES.issubset(installed)
             )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_restores_queue_order_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            with closing(connect_catalog(root)) as conn:
+                for index_name in store_module.QUEUE_CLAIM_INDEX_NAMES:
+                    conn.execute(f"DROP INDEX {index_name}")
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_role_created
+                    ON queue_jobs(
+                        role COLLATE NOCASE,
+                        status,
+                        created_at DESC
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_status_priority
+                    ON queue_jobs(
+                        status,
+                        priority DESC,
+                        created_at ASC
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_status_created
+                    ON queue_jobs(
+                        status,
+                        created_at COLLATE NOCASE
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_running_dedupe
+                    ON queue_jobs(dedupe_key)
+                    WHERE status = 'running'
+                      AND dedupe_key IS NOT NULL
+                      AND 0
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_pending_dedupe_key
+                    ON queue_jobs(dedupe_key)
+                    WHERE status = 'failed'
+                      AND dedupe_key IS NOT NULL
+                    """
+                )
+                conn.commit()
+                self.assertFalse(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                installed = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA index_list(queue_jobs)"
+                    ).fetchall()
+                }
+                queue_indexes_ready = (
+                    store_module._queue_order_indexes_ready(conn)
+                )
+                installed_sql = {
+                    str(row["name"]): str(row["sql"])
+                    for row in conn.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_schema
+                        WHERE type = 'index'
+                        """
+                    ).fetchall()
+                    if str(row["name"])
+                    in store_module.QUEUE_CLAIM_INDEX_NAMES
+                }
+                installed_metadata = {
+                    str(row["name"]): row
+                    for row in conn.execute(
+                        "PRAGMA index_list(queue_jobs)"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                store_module.QUEUE_CLAIM_INDEX_NAMES.issubset(installed)
+            )
+            self.assertTrue(queue_indexes_ready)
+            self.assertEqual(
+                {
+                    index_name: store_module._normalize_sqlite_schema_sql(
+                        installed_sql[index_name]
+                    )
+                    for index_name in store_module.QUEUE_CLAIM_INDEX_NAMES
+                },
+                {
+                    index_name: store_module._normalize_sqlite_schema_sql(
+                        index_sql
+                    )
+                    for index_name, index_sql in (
+                        store_module.QUEUE_CLAIM_INDEX_SQL.items()
+                    )
+                },
+            )
+            for index_name in store_module.QUEUE_CLAIM_INDEX_NAMES:
+                with self.subTest(index_name=index_name):
+                    self.assertEqual(
+                        int(installed_metadata[index_name]["unique"]),
+                        int(
+                            store_module.QUEUE_CLAIM_INDEX_UNIQUE[
+                                index_name
+                            ]
+                        ),
+                    )
+                    self.assertEqual(
+                        int(installed_metadata[index_name]["partial"]),
+                        int(
+                            store_module.QUEUE_CLAIM_INDEX_PARTIAL[
+                                index_name
+                            ]
+                        ),
+                    )
+                    with closing(connect_catalog(root)) as conn:
+                        key_columns = [
+                            (
+                                str(row["name"]),
+                                int(row["desc"]),
+                                str(row["coll"]).upper(),
+                            )
+                            for row in conn.execute(
+                                "PRAGMA index_xinfo("
+                                f"{index_name}"
+                                ")"
+                            ).fetchall()
+                            if int(row["key"]) == 1
+                        ]
+                    self.assertEqual(
+                        key_columns,
+                        [
+                            (column, 0, "BINARY")
+                            for column in (
+                                store_module.QUEUE_CLAIM_INDEX_COLUMNS[
+                                    index_name
+                                ]
+                            )
+                        ],
+                    )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_queue_pending_dedupe_repair_fails_closed_on_duplicates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            duplicate_key = "queue_v1_" + "a" * 64
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(
+                    "DROP INDEX idx_queue_pending_dedupe_key"
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status,
+                        preemptible, dedupe_key,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'scribe', 'duplicate_repair_probe', 100,
+                        'pending', 1, ?, '[]', '{}', ?, ?
+                    )
+                    """,
+                    [
+                        (
+                            "job_duplicate_pending_a",
+                            duplicate_key,
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                        ),
+                        (
+                            "job_duplicate_pending_b",
+                            duplicate_key,
+                            "2026-01-01T00:00:01+00:00",
+                            "2026-01-01T00:00:01+00:00",
+                        ),
+                    ],
+                )
+                conn.commit()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "2 duplicate|1 duplicate pending dedupe groups",
+            ) as raised:
+                init_db(root)
+
+            message = str(raised.exception)
+            self.assertIn("1 duplicate pending dedupe groups", message)
+            self.assertIn(duplicate_key, message)
+            self.assertIn("job_duplicate_pending_a", message)
+            self.assertIn("job_duplicate_pending_b", message)
+            self.assertNotIn(cache_key, _INIT_DB_CACHE)
+            with closing(connect_catalog(root)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND dedupe_key = ?
+                        """,
+                        (duplicate_key,),
+                    ).fetchone()["n"],
+                    2,
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        """
+                        SELECT 1
+                        FROM sqlite_schema
+                        WHERE type = 'index'
+                          AND name = 'idx_queue_pending_dedupe_key'
+                        """
+                    ).fetchone()
+                )
+
+    def test_concurrent_enqueue_uses_pending_unique_index_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            lookup_barrier = threading.Barrier(2)
+            results: list[str] = []
+            errors: list[BaseException] = []
+            result_guard = threading.Lock()
+
+            class BarrierCursor:
+                def __init__(self, cursor: sqlite3.Cursor) -> None:
+                    self.cursor = cursor
+
+                def fetchone(self) -> sqlite3.Row | None:
+                    row = self.cursor.fetchone()
+                    self.cursor.close()
+                    lookup_barrier.wait(timeout=5)
+                    return row
+
+            class BarrierConnection:
+                def __init__(self, conn: sqlite3.Connection) -> None:
+                    self.conn = conn
+                    self.gated = False
+
+                def execute(
+                    self,
+                    sql: str,
+                    parameters: object = (),
+                ) -> object:
+                    cursor = self.conn.execute(sql, parameters)
+                    if (
+                        not self.gated
+                        and "SELECT id FROM queue_jobs"
+                        in " ".join(sql.split())
+                        and "status = 'pending'" in sql
+                    ):
+                        self.gated = True
+                        return BarrierCursor(cursor)
+                    return cursor
+
+            def enqueue() -> None:
+                conn = connect_catalog(root)
+                try:
+                    wrapped = BarrierConnection(conn)
+                    job_id = enqueue_job(
+                        wrapped,  # type: ignore[arg-type]
+                        role="scribe",
+                        job_type="concurrent_dedupe_probe",
+                        priority=100,
+                        payload={"source": "concurrent"},
+                        dedupe_key="session:concurrent-dedupe",
+                    )
+                    conn.commit()
+                    with result_guard:
+                        results.append(job_id)
+                except BaseException as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    with result_guard:
+                        errors.append(exc)
+                finally:
+                    conn.close()
+
+            threads = [
+                threading.Thread(target=enqueue, daemon=True)
+                for _index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len(set(results)), 1)
+            with closing(connect_catalog(root)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM queue_jobs
+                    WHERE status = 'pending'
+                      AND job_type = 'concurrent_dedupe_probe'
+                    """
+                ).fetchall()
+            self.assertEqual([str(row["id"]) for row in rows], [results[0]])
+
+    def test_cached_init_replaces_forged_sidecar_reservation_triggers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            expected = (
+                store_module
+                ._card_sidecar_artifact_write_reservation_trigger_sql()
+            )
+            with closing(connect_catalog(root)) as conn:
+                for trigger_name in expected:
+                    conn.execute(f"DROP TRIGGER {trigger_name}")
+                    conn.execute(
+                        f"""
+                        CREATE TRIGGER {trigger_name}
+                        AFTER INSERT ON artifacts
+                        WHEN 0
+                        BEGIN
+                            SELECT 1;
+                        END
+                        """
+                    )
+                conn.commit()
+                self.assertFalse(
+                    store_module
+                    ._card_sidecar_artifact_write_reservation_triggers_ready(
+                        conn
+                    )
+                )
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                installed = {
+                    str(row["name"]): str(row["sql"])
+                    for row in conn.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_schema
+                        WHERE type = 'trigger'
+                        """
+                    ).fetchall()
+                    if str(row["name"]) in expected
+                }
+                self.assertTrue(
+                    store_module
+                    ._card_sidecar_artifact_write_reservation_triggers_ready(
+                        conn
+                    )
+                )
+            self.assertEqual(
+                {
+                    trigger_name: (
+                        store_module._normalize_sqlite_schema_sql(
+                            installed[trigger_name]
+                        )
+                    )
+                    for trigger_name in expected
+                },
+                {
+                    trigger_name: (
+                        store_module._normalize_sqlite_schema_sql(
+                            trigger_sql
+                        )
+                    )
+                    for trigger_name, trigger_sql in expected.items()
+                },
+            )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_cached_init_repairs_sidecar_db_authority_triggers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            expected = (
+                store_module._card_sidecar_db_authority_trigger_sql()
+            )
+            forged_name = (
+                "advance_card_sidecar_db_authority_after_card_update"
+            )
+            missing_name = (
+                "advance_card_sidecar_db_authority_after_outbox_delete"
+            )
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(f"DROP TRIGGER {forged_name}")
+                conn.execute(
+                    f"""
+                    CREATE TRIGGER {forged_name}
+                    AFTER UPDATE ON cards
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                conn.execute(f"DROP TRIGGER {missing_name}")
+                conn.commit()
+                self.assertFalse(
+                    store_module
+                    ._card_sidecar_db_authority_triggers_ready(conn)
+                )
+
+            init_db(root)
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertTrue(
+                    store_module
+                    ._card_sidecar_db_authority_triggers_ready(conn)
+                )
+                installed = {
+                    str(row["name"]): str(row["sql"])
+                    for row in conn.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_schema
+                        WHERE type = 'trigger'
+                        """
+                    ).fetchall()
+                    if str(row["name"]) in expected
+                }
+                before_epoch = (
+                    store_module._card_sidecar_db_authority_epoch(conn)
+                )
+                now = store_module.utc_now()
+                card_id = "card_sidecar_epoch_trigger_probe"
+                conn.execute(
+                    """
+                    INSERT INTO cards(
+                        id, card_type, title, summary,
+                        created_at, updated_at
+                    )
+                    VALUES(?, 'note', 'epoch trigger probe', 'insert', ?, ?)
+                    """,
+                    (card_id, now, now),
+                )
+                conn.execute(
+                    "UPDATE cards SET summary = 'update' WHERE id = ?",
+                    (card_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO card_sidecar_outbox(
+                        card_id, reason, generation, created_at, updated_at
+                    )
+                    VALUES(?, 'insert', 'generation-1', ?, ?)
+                    """,
+                    (card_id, now, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE card_sidecar_outbox
+                    SET reason = 'update', generation = 'generation-2'
+                    WHERE card_id = ?
+                    """,
+                    (card_id,),
+                )
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+                conn.commit()
+                after_epoch = (
+                    store_module._card_sidecar_db_authority_epoch(conn)
+                )
+
+            self.assertEqual(
+                {
+                    trigger_name: (
+                        store_module._normalize_sqlite_schema_sql(
+                            installed[trigger_name]
+                        )
+                    )
+                    for trigger_name in expected
+                },
+                {
+                    trigger_name: (
+                        store_module._normalize_sqlite_schema_sql(
+                            trigger_sql
+                        )
+                    )
+                    for trigger_name, trigger_sql in expected.items()
+                },
+            )
+            self.assertEqual(after_epoch, before_epoch + 6)
             self.assertIn(cache_key, _INIT_DB_CACHE)
 
     def test_cached_init_restores_graph_backfill_trigger(self) -> None:

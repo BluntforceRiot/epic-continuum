@@ -50,7 +50,6 @@ from .store import (
     segment_hash_material,
     semantic_integrity_report,
     snapshot,
-    sync_card_sidecar,
     sync_card_sidecars_after_commit,
     unique_id,
     upsert_graph_node,
@@ -71,6 +70,12 @@ PRUNE_MEMORY_GLOBAL_MATCHING_MODE = "explicit_global"
 DEFAULT_WORKER_MAINTENANCE_INTERVAL_SECONDS = 300.0
 WORKER_SIDECAR_INTENT_LIMIT = 50
 WORKER_MAINTENANCE_FAILURE_LIMIT = 10
+WORKER_FAILED_SIDECAR_RECOVERY_LIMIT = 50
+WORKER_FAILED_SCRIBE_STEP_VALIDATION_LIMIT = 64
+POST_COMMIT_SIDECAR_RETRY_REASON = "post_commit_sidecar_retry_pending"
+POST_COMMIT_EXCEPTION_RETRY_REASON = "post_commit_exception_retry_pending"
+MAX_CONSECUTIVE_PRIORITY_BYPASSES = 8
+_QUEUE_FAIRNESS_META_PREFIX = "worker_queue_priority_burst_v1:"
 # A single notification may represent an arbitrarily large per-session backlog
 # because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
 # than one window, but yield after a bounded amount of work and leave a durable
@@ -88,6 +93,19 @@ _SIDECAR_WORKER_PHASE_SCHEMA = "continuum.worker_card_sidecar_phase.v1"
 _SCRIBE_STEP_ACTION = "worker_scribe_segment_step_intent"
 _SCRIBE_STEP_COMMITTED_ACTION = "worker_scribe_segment_step_committed"
 _SCRIBE_STEP_COMPLETED_ACTION = "worker_scribe_segment_step_completed"
+_FAILED_SIDECAR_RECOVERY_ACTION = (
+    "worker_failed_post_phase_sidecar_recovery"
+)
+_FAILED_SIDECAR_RECOVERY_SCHEMA = (
+    "continuum.worker_failed_post_phase_sidecar_recovery.v1"
+)
+_FAILED_SIDECAR_RECOVERY_JOB_ROLES = {
+    "review_card_placement": "librarian",
+    "review_mempalace_import": "librarian",
+    "scroll_event_ingested": "scribe",
+    "sync_card_sidecar": "archivist",
+}
+_FAILED_SIDECAR_EFFECTLESS_KEY = "effectless"
 
 
 class _JobLease:
@@ -475,18 +493,63 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
     return superseded + reclaimed + int(failed_cursor.rowcount or 0)
 
 
-def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_seconds: int) -> dict[str, Any] | None:
-    params: list[Any] = [PENDING_JOB_STATUS]
-    role_clause = ""
-    if roles:
-        placeholders = ",".join("?" for _ in roles)
-        role_clause = f" AND pending_job.role IN ({placeholders})"
-        params.extend(sorted(roles))
+def _queue_fairness_meta_key(roles: set[str] | None) -> str:
+    lane = ["*"] if not roles else sorted(roles)
+    return _QUEUE_FAIRNESS_META_PREFIX + content_hash(json_dumps(lane))[:32]
+
+
+def _queue_priority_bypass_count(conn, roles: set[str] | None) -> int:
     row = conn.execute(
-        f"""
-        SELECT pending_job.*
-        FROM queue_jobs AS pending_job
-        WHERE pending_job.status = ?{role_clause}
+        "SELECT value FROM meta WHERE key = ?",
+        (_queue_fairness_meta_key(roles),),
+    ).fetchone()
+    if row is None:
+        return 0
+    try:
+        return max(0, int(row["value"]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_queue_priority_bypass_count(
+    conn,
+    roles: set[str] | None,
+    value: int,
+) -> None:
+    key = _queue_fairness_meta_key(roles)
+    bounded_value = max(
+        0,
+        min(int(value), MAX_CONSECUTIVE_PRIORITY_BYPASSES),
+    )
+    if bounded_value == 0:
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        return
+    conn.execute(
+        """
+        INSERT INTO meta(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(bounded_value)),
+    )
+
+
+def _role_filtered_candidate_sql(*, oldest: bool) -> str:
+    if oldest:
+        index_name = "idx_queue_role_created"
+        order_by = (
+            "pending_job.created_at ASC, pending_job.rowid ASC"
+        )
+    else:
+        index_name = "idx_queue_role_priority"
+        order_by = (
+            "pending_job.priority ASC, pending_job.created_at ASC, "
+            "pending_job.rowid ASC"
+        )
+    return f"""
+        SELECT pending_job.*, pending_job.rowid AS queue_rowid
+        FROM queue_jobs AS pending_job INDEXED BY {index_name}
+        WHERE pending_job.role = ? AND pending_job.status = ?
           AND (
               pending_job.dedupe_key IS NULL
               OR NOT EXISTS (
@@ -496,13 +559,106 @@ def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_s
                     AND active_job.dedupe_key = pending_job.dedupe_key
               )
           )
-        ORDER BY pending_job.priority ASC, pending_job.created_at ASC
+        ORDER BY {order_by}
+        LIMIT 1
+    """
+
+
+def _eligible_job_candidate(
+    conn,
+    roles: set[str] | None,
+    *,
+    oldest: bool,
+) -> sqlite3.Row | None:
+    if roles:
+        candidates: list[sqlite3.Row] = []
+        query = _role_filtered_candidate_sql(oldest=oldest)
+        for role in sorted(roles):
+            row = conn.execute(
+                query,
+                (role, PENDING_JOB_STATUS),
+            ).fetchone()
+            if row is not None:
+                candidates.append(row)
+        if not candidates:
+            return None
+        if oldest:
+            return min(
+                candidates,
+                key=lambda row: (
+                    str(row["created_at"]),
+                    int(row["queue_rowid"]),
+                ),
+            )
+        return min(
+            candidates,
+            key=lambda row: (
+                int(row["priority"]),
+                str(row["created_at"]),
+                int(row["queue_rowid"]),
+            ),
+        )
+    order_by = (
+        "pending_job.created_at ASC, pending_job.rowid ASC"
+        if oldest
+        else (
+            "pending_job.priority ASC, pending_job.created_at ASC, "
+            "pending_job.rowid ASC"
+        )
+    )
+    return conn.execute(
+        f"""
+        SELECT pending_job.*, pending_job.rowid AS queue_rowid
+        FROM queue_jobs AS pending_job
+        WHERE pending_job.status = ?
+          AND (
+              pending_job.dedupe_key IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                  FROM queue_jobs AS active_job
+                  WHERE active_job.status = '{ACTIVE_JOB_STATUS}'
+                    AND active_job.dedupe_key = pending_job.dedupe_key
+              )
+          )
+        ORDER BY {order_by}
         LIMIT 1
         """,
-        params,
+        (PENDING_JOB_STATUS,),
     ).fetchone()
-    if row is None:
+
+
+def _claim_job(
+    conn,
+    roles: set[str] | None = None,
+    *,
+    lease_owner: str,
+    lease_seconds: int,
+) -> dict[str, Any] | None:
+    strict_priority_row = _eligible_job_candidate(
+        conn,
+        roles,
+        oldest=False,
+    )
+    if strict_priority_row is None:
+        _set_queue_priority_bypass_count(conn, roles, 0)
         return None
+    oldest_row = _eligible_job_candidate(conn, roles, oldest=True)
+    if oldest_row is None:
+        _set_queue_priority_bypass_count(conn, roles, 0)
+        return None
+    bypass_count = _queue_priority_bypass_count(conn, roles)
+    real_priority_bypass = str(strict_priority_row["id"]) != str(
+        oldest_row["id"]
+    )
+    if (
+        real_priority_bypass
+        and bypass_count >= MAX_CONSECUTIVE_PRIORITY_BYPASSES
+    ):
+        row = oldest_row
+        next_bypass_count = 0
+    else:
+        row = strict_priority_row
+        next_bypass_count = bypass_count + 1 if real_priority_bypass else 0
     now = utc_now()
     expires_at = _lease_expiry(lease_seconds)
     cursor = conn.execute(
@@ -517,7 +673,9 @@ def _claim_job(conn, roles: set[str] | None = None, *, lease_owner: str, lease_s
     )
     if int(cursor.rowcount or 0) != 1:
         return None
+    _set_queue_priority_bypass_count(conn, roles, next_bypass_count)
     job = dict(row)
+    job.pop("queue_rowid", None)
     job["lease_owner"] = lease_owner
     job["lease_expires_at"] = expires_at
     job["heartbeat_at"] = now
@@ -580,6 +738,59 @@ def _prior_worker_effect(conn, lease: _JobLease | None) -> dict[str, Any] | None
     if payload.get("post_phase_complete") is True:
         replayed[_WORKER_POST_PHASE_COMPLETE_KEY] = True
     return replayed
+
+
+def _prior_non_post_phase_worker_effect(
+    conn,
+    lease: _JobLease | None,
+    *,
+    job_type: str,
+) -> dict[str, Any] | None:
+    """Read an exact legacy core receipt without treating terminal output as core."""
+
+    if lease is None:
+        return None
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.schema') = ?
+          AND json_extract(payload_json, '$.job_type') = ?
+          AND (
+              json_type(payload_json, '$.post_phase_complete') = 'false'
+              OR json_type(payload_json, '$.post_phase_complete') IS NULL
+          )
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (
+            _WORKER_EFFECT_ACTION,
+            lease.job_id,
+            _WORKER_EFFECT_SCHEMA,
+            job_type,
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json_loads(row["payload_json"], {})
+    if not isinstance(payload, dict):
+        return None
+    required_keys = {"schema", "job_type", "result"}
+    if (
+        not required_keys.issubset(payload)
+        or set(payload) - required_keys - {"post_phase_complete"}
+        or (
+            "post_phase_complete" in payload
+            and payload["post_phase_complete"] is not False
+        )
+    ):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    return dict(result)
 
 
 def _record_worker_effect(
@@ -851,8 +1062,29 @@ def _defer_worker_card_sidecars_for_intent_budget(
 def _sync_worker_card_sidecars(
     root: Path,
     card_ids: list[str],
+    *,
+    reconcile_intents: bool = True,
 ) -> dict[str, Any]:
     """Materialize worker-owned sidecars under the shared intent budget."""
+
+    if not reconcile_intents:
+        shared_budget = _current_card_sidecar_intent_reconciliation_budget()
+        budget = shared_budget or {
+            "limit": WORKER_SIDECAR_INTENT_LIMIT,
+            "used": 0,
+            "remaining": WORKER_SIDECAR_INTENT_LIMIT,
+        }
+        result = dict(
+            sync_card_sidecars_after_commit(
+                root,
+                card_ids,
+                reconcile_intents=False,
+            )
+        )
+        result["worker_intent_budget"] = (
+            _worker_sidecar_intent_budget_snapshot(budget)
+        )
+        return result
 
     budget, allowance, shared = (
         _worker_sidecar_intent_budget_allowance()
@@ -894,6 +1126,94 @@ def _sync_worker_card_sidecars(
         _worker_sidecar_intent_budget_snapshot(budget)
     )
     return result
+
+
+def _sidecar_result_requires_queue_retry(
+    sidecars: dict[str, Any] | None,
+) -> bool:
+    """Identify incomplete post-commit sidecar authority that remains durable."""
+
+    if not isinstance(sidecars, dict) or sidecars.get("ok", True):
+        return False
+    if sidecars.get("completion_receipt_missing"):
+        return bool(sidecars.get("pending_outbox"))
+    return True
+
+
+def _result_has_failed_sidecar_phase(result: dict[str, Any] | None) -> bool:
+    """Recognize only the sidecar result locations owned by worker protocols."""
+
+    if not isinstance(result, dict) or result.get("ok") is not False:
+        return False
+    known_sidecars: list[Any] = [result.get("sidecars")]
+    conflicts = result.get("conflicts")
+    if isinstance(conflicts, dict):
+        known_sidecars.append(conflicts.get("sidecars"))
+    rolled = result.get("rolled")
+    if isinstance(rolled, list):
+        known_sidecars.extend(
+            item.get("sidecars")
+            for item in rolled
+            if isinstance(item, dict)
+        )
+    return any(
+        isinstance(sidecars, dict) and sidecars.get("ok") is False
+        for sidecars in known_sidecars
+    )
+
+
+def _result_has_explicit_non_sidecar_failure(
+    result: dict[str, Any] | None,
+) -> bool:
+    """Keep explicit business failures outside sidecar retry/recovery paths."""
+
+    if not isinstance(result, dict):
+        return True
+    for key in ("reason", "error"):
+        value = result.get(key)
+        if value not in (None, "", POST_COMMIT_SIDECAR_RETRY_REASON):
+            return True
+    rolled = result.get("rolled")
+    if not isinstance(rolled, list):
+        return False
+    for item in rolled:
+        if not isinstance(item, dict):
+            return True
+        if item.get("ok") is not False:
+            continue
+        sidecars = item.get("sidecars")
+        if not (
+            isinstance(sidecars, dict)
+            and sidecars.get("ok") is False
+        ):
+            return True
+        if any(item.get(key) not in (None, "") for key in ("reason", "error")):
+            return True
+    return False
+
+
+def _result_is_replayable_sidecar_failure(
+    result: dict[str, Any] | None,
+) -> bool:
+    return bool(
+        _result_has_failed_sidecar_phase(result)
+        and not _result_has_explicit_non_sidecar_failure(result)
+    )
+
+
+def _mark_post_commit_sidecar_retry(
+    result: dict[str, Any],
+    *sidecar_results: dict[str, Any] | None,
+) -> bool:
+    retry_pending = any(
+        _sidecar_result_requires_queue_retry(sidecars)
+        for sidecars in sidecar_results
+    )
+    if retry_pending:
+        result["ok"] = False
+        result["reason"] = POST_COMMIT_SIDECAR_RETRY_REASON
+        result["retry_pending"] = True
+    return retry_pending
 
 
 def _record_scribe_step_intent(
@@ -1085,6 +1405,7 @@ def _committed_scribe_steps(
     committed: list[dict[str, Any]] = []
     seen_segments: set[str] = set()
     max_batch_number = 0
+    missing_expected_sidecars: set[str] = set()
     location_conn = connect_existing(root)
     try:
         for payload in committed_payloads:
@@ -1098,11 +1419,33 @@ def _committed_scribe_steps(
             step_key = str(payload.get("step_key") or "")
             completed_result = completed_by_step.get(step_key)
             materialized = dict(completed_result or step_result)
-            card_id = str(materialized.get("card_id") or "")
+            committed_card_id = str(step_result.get("card_id") or "")
+            committed_segment_id = str(step_result.get("segment_id") or "")
+            completed_identity_matches = bool(
+                isinstance(completed_result, dict)
+                and str(completed_result.get("card_id") or "")
+                == committed_card_id
+                and str(completed_result.get("segment_id") or "")
+                == committed_segment_id
+            )
+            revalidate_sidecars = bool(
+                completed_result is None
+                or (
+                    completed_identity_matches
+                    and _result_is_replayable_sidecar_failure(
+                        completed_result
+                    )
+                )
+            )
+            card_id = (
+                committed_card_id
+                if revalidate_sidecars
+                else str(materialized.get("card_id") or "")
+            )
             card_state = (
                 location_conn.execute(
                     """
-                    SELECT c.location_uri,
+                    SELECT c.location_uri, c.status,
                            EXISTS(
                                SELECT 1
                                FROM card_sidecar_outbox AS outbox
@@ -1129,15 +1472,28 @@ def _committed_scribe_steps(
                 if sidecar_exists
                 else None
             )
-            if completed_result is None:
+            if revalidate_sidecars:
                 sidecar_pending = bool(
                     card_state is not None and card_state["sidecar_pending"]
+                )
+                card_is_current = bool(
+                    card_state is not None
+                    and str(card_state["status"] or "").casefold()
+                    not in NON_CURRENT_CARD_STATUSES
                 )
                 sidecar_expected = bool(
                     card_state is not None and card_state["location_uri"]
                 )
+                if (
+                    card_is_current
+                    and sidecar_expected
+                    and not sidecar_pending
+                    and not sidecar_exists
+                ):
+                    missing_expected_sidecars.add(card_id)
+                    sidecar_pending = True
                 sidecar_ok = bool(
-                    card_state is not None
+                    card_is_current
                     and not sidecar_pending
                     and (not sidecar_expected or sidecar_exists)
                 )
@@ -1146,21 +1502,30 @@ def _committed_scribe_steps(
                     "synced": int(sidecar_ok and sidecar_expected),
                     "failed": int(not sidecar_ok),
                     "pending_outbox": sidecar_pending,
-                    "completion_receipt_missing": True,
+                    "completion_receipt_missing": completed_result is None,
                     "replayed_from_committed_step": True,
+                    "stale_failed_completion_revalidated": (
+                        completed_result is not None
+                    ),
                 }
                 if not sidecar_ok:
                     sidecar_result["failures"] = [
                         {
                             "card_id": card_id or None,
                             "error": (
-                                "Committed Scribe step has no durable "
+                                "Committed Scribe step still has no durable "
                                 "post-sidecar success evidence"
                             ),
                         }
                     ]
+                materialized["segment_id"] = committed_segment_id
+                materialized["card_id"] = committed_card_id
                 materialized["ok"] = sidecar_ok
                 materialized["sidecars"] = sidecar_result
+                if sidecar_ok:
+                    materialized.pop("reason", None)
+                    materialized.pop("error", None)
+                    materialized.pop("retry_pending", None)
             committed.append(materialized)
             try:
                 max_batch_number = max(
@@ -1171,6 +1536,54 @@ def _committed_scribe_steps(
                 pass
     finally:
         location_conn.close()
+    if missing_expected_sidecars:
+        rearm_conn = connect(root)
+        try:
+            rearm_conn.execute("BEGIN IMMEDIATE")
+            live_card_ids: list[str] = []
+            for card_id in sorted(missing_expected_sidecars):
+                row = rearm_conn.execute(
+                    """
+                    SELECT status, location_uri
+                    FROM cards
+                    WHERE id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+                if (
+                    row is not None
+                    and str(row["status"] or "").casefold()
+                    not in NON_CURRENT_CARD_STATUSES
+                    and row["location_uri"]
+                ):
+                    live_card_ids.append(card_id)
+            if live_card_ids:
+                mark_card_sidecar_outbox(
+                    rearm_conn,
+                    live_card_ids,
+                    reason="scribe_committed_step_sidecar_authority_missing",
+                )
+                audit_event(
+                    rearm_conn,
+                    action="worker_scribe_sidecar_authority_rearmed",
+                    target_type="queue_job",
+                    target_id=lease.job_id,
+                    payload={
+                        "schema": (
+                            "continuum."
+                            "worker_scribe_sidecar_authority_rearmed.v1"
+                        ),
+                        "card_ids": live_card_ids,
+                    },
+                    actor="worker",
+                )
+            rearm_conn.commit()
+        except Exception:
+            if rearm_conn.in_transaction:
+                rearm_conn.rollback()
+            raise
+        finally:
+            rearm_conn.close()
     return committed, max_batch_number
 
 
@@ -1730,12 +2143,25 @@ def review_mempalace_import(
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
         legacy_core_result: dict[str, Any] | None = None
+        failed_terminal_replay: dict[str, Any] | None = None
         if prior is not None:
-            if prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False):
-                conn.commit()
-                return prior
-            legacy_core_result = dict(prior)
-            legacy_core_result.pop("idempotent_replay", None)
+            post_phase_complete = bool(
+                prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False)
+            )
+            if post_phase_complete:
+                if not _result_is_replayable_sidecar_failure(prior):
+                    conn.commit()
+                    return prior
+                failed_terminal_replay = dict(prior)
+                legacy_core_result = _prior_non_post_phase_worker_effect(
+                    conn,
+                    lease,
+                    job_type="review_mempalace_import",
+                )
+            else:
+                legacy_core_result = dict(prior)
+            if legacy_core_result is not None:
+                legacy_core_result.pop("idempotent_replay", None)
         committed_phase = _prior_worker_phase(
             conn,
             lease,
@@ -1749,6 +2175,7 @@ def review_mempalace_import(
                 not isinstance(phase_core_result, dict)
                 or str(phase_core_result.get("reviewed_import") or "")
                 != import_id
+                or phase_core_result.get("ok") is not True
                 or not isinstance(phase_changed_cards, list)
                 or any(
                     not isinstance(card_id, str) or not card_id
@@ -1765,6 +2192,8 @@ def review_mempalace_import(
             if (
                 str(legacy_core_result.get("reviewed_import") or "")
                 != import_id
+                or legacy_core_result.get("ok") is not True
+                or _result_has_failed_sidecar_phase(legacy_core_result)
             ):
                 raise RuntimeError(
                     "Legacy review_mempalace_import receipt is invalid"
@@ -1811,13 +2240,21 @@ def review_mempalace_import(
                 and not pending_outbox,
                 "sidecars": legacy_sidecars,
             }
-            _commit_worker_effect_result(
-                root,
-                lease,
-                job_type="review_mempalace_import",
-                result=result,
+            retry_pending = _mark_post_commit_sidecar_retry(
+                result,
+                legacy_sidecars,
             )
+            if not retry_pending:
+                _commit_worker_effect_result(
+                    root,
+                    lease,
+                    job_type="review_mempalace_import",
+                    result=result,
+                )
             return result
+        elif failed_terminal_replay is not None:
+            conn.commit()
+            return failed_terminal_replay
         else:
             candidate_window = _legacy_card_candidates(
                 conn,
@@ -1908,12 +2345,14 @@ def review_mempalace_import(
         "ok": bool(core_result["ok"]) and bool(sidecars.get("ok", True)),
         "sidecars": sidecars,
     }
-    _commit_worker_effect_result(
-        root,
-        lease,
-        job_type="review_mempalace_import",
-        result=result,
-    )
+    retry_pending = _mark_post_commit_sidecar_retry(result, sidecars)
+    if not retry_pending:
+        _commit_worker_effect_result(
+            root,
+            lease,
+            job_type="review_mempalace_import",
+            result=result,
+        )
     return result
 
 
@@ -1958,17 +2397,30 @@ def _ensure_scribe_continuation(root: Path, *, session_id: str, threshold: int) 
         backlog = _scroll_segment_backlog(conn, session_id)
         continuation_job_id: str | None = None
         if backlog["pending_events"] >= threshold:
+            continuation_priority = 100
+            lease = _CURRENT_JOB_LEASE.get()
+            if lease is not None:
+                current_job = conn.execute(
+                    "SELECT priority FROM queue_jobs WHERE id = ?",
+                    (lease.job_id,),
+                ).fetchone()
+                if (
+                    current_job is not None
+                    and current_job["priority"] is not None
+                ):
+                    continuation_priority = int(current_job["priority"])
             continuation_job_id = enqueue_job(
                 conn,
                 role="scribe",
                 job_type="scroll_event_ingested",
-                priority=100,
+                priority=continuation_priority,
                 payload={
                     "session_id": session_id,
                     "seq": backlog["max_seq"],
                     "reason": "scroll_segment_backlog_continuation",
                 },
                 dedupe_key=f"session:{session_id}",
+                replace_pending=True,
             )
         conn.commit()
         return {**backlog, "continuation_job_id": continuation_job_id}
@@ -2041,7 +2493,8 @@ def roll_due_scroll_segments(
             _WORKER_POST_PHASE_COMPLETE_KEY,
             False,
         ):
-            return prior
+            if not _result_is_replayable_sidecar_failure(prior):
+                return prior
     config = load_config(root)
     threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
     if session_id:
@@ -2148,15 +2601,16 @@ def roll_due_scroll_segments(
                     )
                     if heartbeat is not None and not heartbeat():
                         raise RuntimeError("worker lease lost during Scribe segmentation")
-                    _record_scribe_step_completed(
-                        root,
-                        lease,
-                        session_id=current_session,
-                        start_seq=run_start,
-                        end_seq=run_end,
-                        batch_number=batches_processed,
-                        result=result,
-                    )
+                    if result.get("ok", True):
+                        _record_scribe_step_completed(
+                            root,
+                            lease,
+                            session_id=current_session,
+                            start_seq=run_start,
+                            end_seq=run_end,
+                            batch_number=batches_processed,
+                            result=result,
+                        )
                 except ValueError:
                     # Another valid Scribe can win between the backlog read and
                     # the idempotent segment write. Only absorb the error when the
@@ -2226,7 +2680,16 @@ def roll_due_scroll_segments(
         "concurrent_progress": concurrent_progress,
         "sidecar_failures": sidecar_failures,
     }
-    if lease is not None:
+    retry_pending = _mark_post_commit_sidecar_retry(
+        result,
+        *[
+            item.get("sidecars")
+            if isinstance(item.get("sidecars"), dict)
+            else None
+            for item in rolled
+        ],
+    )
+    if lease is not None and not retry_pending:
         receipt_conn = connect(root)
         try:
             receipt_conn.execute("BEGIN IMMEDIATE")
@@ -2258,12 +2721,25 @@ def review_card_placement(
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
         legacy_core_result: dict[str, Any] | None = None
+        failed_terminal_replay: dict[str, Any] | None = None
         if prior is not None:
-            if prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False):
-                conn.commit()
-                return prior
-            legacy_core_result = dict(prior)
-            legacy_core_result.pop("idempotent_replay", None)
+            post_phase_complete = bool(
+                prior.pop(_WORKER_POST_PHASE_COMPLETE_KEY, False)
+            )
+            if post_phase_complete:
+                if not _result_is_replayable_sidecar_failure(prior):
+                    conn.commit()
+                    return prior
+                failed_terminal_replay = dict(prior)
+                legacy_core_result = _prior_non_post_phase_worker_effect(
+                    conn,
+                    lease,
+                    job_type="review_card_placement",
+                )
+            else:
+                legacy_core_result = dict(prior)
+            if legacy_core_result is not None:
+                legacy_core_result.pop("idempotent_replay", None)
         committed_phase = _prior_worker_phase(
             conn,
             lease,
@@ -2275,6 +2751,7 @@ def review_card_placement(
             if (
                 not isinstance(phase_core_result, dict)
                 or str(phase_core_result.get("card_id") or "") != card_id
+                or phase_core_result.get("ok") is not True
             ):
                 raise RuntimeError(
                     "Committed review_card_placement core phase is invalid"
@@ -2282,7 +2759,11 @@ def review_card_placement(
             core_result = dict(phase_core_result)
             conn.commit()
         elif legacy_core_result is not None:
-            if str(legacy_core_result.get("card_id") or "") != card_id:
+            if (
+                str(legacy_core_result.get("card_id") or "") != card_id
+                or legacy_core_result.get("ok") is not True
+                or _result_has_failed_sidecar_phase(legacy_core_result)
+            ):
                 raise RuntimeError(
                     "Legacy review_card_placement receipt is invalid"
                 )
@@ -2295,6 +2776,9 @@ def review_card_placement(
                 result={"core_result": core_result},
             )
             conn.commit()
+        elif failed_terminal_replay is not None:
+            conn.commit()
+            return failed_terminal_replay
         else:
             row = conn.execute(
                 "SELECT * FROM cards WHERE id = ?",
@@ -2399,12 +2883,22 @@ def review_card_placement(
             "sidecars": sidecars,
             "conflicts": conflict,
         }
-        _commit_worker_effect_result(
-            root,
-            lease,
-            job_type="review_card_placement",
-            result=result,
+        retry_pending = _mark_post_commit_sidecar_retry(
+            result,
+            sidecars,
+            (
+                conflict.get("sidecars")
+                if isinstance(conflict.get("sidecars"), dict)
+                else None
+            ),
         )
+        if not retry_pending:
+            _commit_worker_effect_result(
+                root,
+                lease,
+                job_type="review_card_placement",
+                result=result,
+            )
         return result
     except Exception:
         if conn.in_transaction:
@@ -5374,129 +5868,26 @@ def prune_memory(
 
 
 def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
-    conn = connect(root)
     lease = _CURRENT_JOB_LEASE.get()
-    write_observation: dict[str, Any] = {}
+    conn = connect(root)
     try:
         conn.execute("BEGIN IMMEDIATE")
         prior = _begin_worker_effect(conn, lease)
-        if prior is not None:
-            conn.commit()
-            reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
-            prior["intent_reconciliation"] = reconciliation
-            reconciliation_clean = bool(
-                reconciliation.get("ok")
-                and int(reconciliation.get("pending", 0)) == 0
-                and reconciliation.get(
-                    "scope_complete",
-                    reconciliation.get("complete"),
-                )
-            )
-            if not reconciliation_clean:
-                prior["ok"] = False
-                conn.execute("BEGIN IMMEDIATE")
-                mark_card_sidecar_outbox(
-                    conn,
-                    [card_id],
-                    reason="intent_reconciliation_incomplete",
-                )
-                _commit_sidecar_worker_phase(
-                    conn,
-                    lease,
-                    result=prior,
-                    phase="reconciliation_deferred",
-                    terminal=False,
-                )
-            return prior
-        location_uri = sync_card_sidecar(
-            root,
-            conn,
-            card_id,
-            write_observation=write_observation,
-        )
-        if location_uri is None:
-            card_row = conn.execute(
-                "SELECT location_uri FROM cards WHERE id = ?",
-                (card_id,),
-            ).fetchone()
-            card_exists = card_row is not None
-            unmaterialized = bool(
-                card_row is not None and not card_row["location_uri"]
-            )
-            reason = "sidecars_disabled" if card_exists else "card_missing"
-            if unmaterialized:
-                reason = "sidecars_disabled_unmaterialized"
-            audit_event(
-                conn,
-                action="card_sidecar_sync_skipped",
-                target_type="card",
-                target_id=card_id,
-                payload={"reason": reason},
-            )
-            if card_exists and not unmaterialized:
-                if conn.execute(
-                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
-                    (card_id,),
-                ).fetchone() is None:
-                    mark_card_sidecar_outbox(
-                        conn,
-                        [card_id],
-                        reason="sidecars_disabled",
-                    )
-                else:
-                    conn.execute(
-                        """
-                        UPDATE card_sidecar_outbox
-                        SET attempt_count = attempt_count + 1,
-                            last_error = ?,
-                            updated_at = ?
-                        WHERE card_id = ?
-                        """,
-                        ("Card sidecar materialization is disabled", utc_now(), card_id),
-                    )
-            else:
-                conn.execute(
-                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
-                    (card_id,),
-                )
-            result = {
-                "ok": bool(unmaterialized),
-                "reason": reason,
-                "card_id": card_id,
-            }
-            terminal = not card_exists or unmaterialized
-            if not terminal:
-                result["retry_pending"] = True
-            _commit_sidecar_worker_phase(
-                conn,
-                lease,
-                result=result,
-                phase=(
-                    "sidecar_not_required"
-                    if terminal
-                    else "sidecars_disabled_retry_pending"
-                ),
-                terminal=terminal,
-            )
-            return result
-        audit_event(
-            conn,
-            action="card_sidecar_synced",
-            target_type="card",
-            target_id=card_id,
-            payload={"location_uri": location_uri, "worker": "archivist"},
-        )
-        conn.execute("DELETE FROM card_sidecar_outbox WHERE card_id = ?", (card_id,))
-        result = {"ok": True, "card_id": card_id, "location_uri": location_uri}
-        _commit_sidecar_worker_phase(
-            conn,
-            lease,
-            result=result,
-            phase="materialized_pending_reconciliation",
-            terminal=False,
-        )
+        card_row = conn.execute(
+            "SELECT location_uri FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    if prior is not None:
         reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
-        result["intent_reconciliation"] = reconciliation
+        prior["intent_reconciliation"] = reconciliation
         reconciliation_clean = bool(
             reconciliation.get("ok")
             and int(reconciliation.get("pending", 0)) == 0
@@ -5506,48 +5897,293 @@ def sync_card_sidecar_job(root: Path, *, card_id: str) -> dict[str, Any]:
             )
         )
         if not reconciliation_clean:
+            prior["ok"] = False
+            prior["reason"] = "intent_reconciliation_incomplete"
+            prior["retry_pending"] = True
+            phase_conn = connect(root)
+            try:
+                phase_conn.execute("BEGIN IMMEDIATE")
+                mark_card_sidecar_outbox(
+                    phase_conn,
+                    [card_id],
+                    reason="intent_reconciliation_incomplete",
+                )
+                _commit_sidecar_worker_phase(
+                    phase_conn,
+                    lease,
+                    result=prior,
+                    phase="reconciliation_deferred",
+                    terminal=False,
+                )
+            except Exception:
+                if phase_conn.in_transaction:
+                    phase_conn.rollback()
+                raise
+            finally:
+                phase_conn.close()
+        return prior
+
+    writes_enabled = bool(
+        load_config(root)
+        .get("atomic_memory", {})
+        .get("write_card_sidecars", True)
+    )
+    card_exists = card_row is not None
+    promised_location = bool(
+        card_row is not None and card_row["location_uri"]
+    )
+    if not card_exists or not writes_enabled:
+        unmaterialized = bool(card_exists and not promised_location)
+        reason = "sidecars_disabled" if card_exists else "card_missing"
+        if unmaterialized:
+            reason = "sidecars_disabled_unmaterialized"
+        result = {
+            "ok": bool(unmaterialized),
+            "reason": reason,
+            "card_id": card_id,
+        }
+        terminal = not card_exists or unmaterialized
+        if not terminal:
+            result["retry_pending"] = True
+        phase_conn = connect(root)
+        try:
+            phase_conn.execute("BEGIN IMMEDIATE")
+            audit_event(
+                phase_conn,
+                action="card_sidecar_sync_skipped",
+                target_type="card",
+                target_id=card_id,
+                payload={"reason": reason},
+            )
+            if card_exists and not unmaterialized:
+                if phase_conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                ).fetchone() is None:
+                    mark_card_sidecar_outbox(
+                        phase_conn,
+                        [card_id],
+                        reason="sidecars_disabled",
+                    )
+                else:
+                    phase_conn.execute(
+                        """
+                        UPDATE card_sidecar_outbox
+                        SET attempt_count = attempt_count + 1,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE card_id = ?
+                        """,
+                        (
+                            "Card sidecar materialization is disabled",
+                            utc_now(),
+                            card_id,
+                        ),
+                    )
+            else:
+                phase_conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+            _commit_sidecar_worker_phase(
+                phase_conn,
+                lease,
+                result=result,
+                phase=(
+                    "sidecar_not_required"
+                    if terminal
+                    else "sidecars_disabled_retry_pending"
+                ),
+                terminal=terminal,
+            )
+        except Exception:
+            if phase_conn.in_transaction:
+                phase_conn.rollback()
+            raise
+        finally:
+            phase_conn.close()
+        return result
+
+    sidecar_sync = _sync_worker_card_sidecars(
+        root,
+        [card_id],
+        reconcile_intents=False,
+    )
+    state_conn = connect_existing(root)
+    try:
+        current_row = state_conn.execute(
+            """
+            SELECT card.location_uri,
+                   EXISTS(
+                       SELECT 1
+                       FROM card_sidecar_outbox AS outbox
+                       WHERE outbox.card_id = card.id
+                   ) AS sidecar_pending
+            FROM cards AS card
+            WHERE card.id = ?
+            """,
+            (card_id,),
+        ).fetchone()
+    finally:
+        state_conn.close()
+    current_card_exists = current_row is not None
+    location_uri = (
+        str(current_row["location_uri"])
+        if current_row is not None and current_row["location_uri"]
+        else None
+    )
+    sidecar_pending = bool(
+        current_row is not None and current_row["sidecar_pending"]
+    )
+    materialized = bool(
+        sidecar_sync.get("ok")
+        and not int(sidecar_sync.get("deferred", 0))
+        and current_card_exists
+        and location_uri
+        and not sidecar_pending
+    )
+    if not materialized:
+        if not current_card_exists:
+            result = {
+                "ok": False,
+                "reason": "card_missing",
+                "card_id": card_id,
+                "sidecars": sidecar_sync,
+            }
+            terminal = True
+        else:
+            result = {
+                "ok": False,
+                "reason": "sidecar_sync_incomplete",
+                "retry_pending": True,
+                "card_id": card_id,
+                "location_uri": location_uri,
+                "sidecars": sidecar_sync,
+            }
+            terminal = False
+        phase_conn = connect(root)
+        try:
+            phase_conn.execute("BEGIN IMMEDIATE")
+            if not terminal:
+                mark_card_sidecar_outbox(
+                    phase_conn,
+                    [card_id],
+                    reason="sidecar_sync_incomplete",
+                )
+            audit_event(
+                phase_conn,
+                action=(
+                    "card_sidecar_sync_deferred"
+                    if not terminal
+                    else "card_sidecar_sync_skipped"
+                ),
+                target_type="card",
+                target_id=card_id,
+                payload={"reason": result["reason"]},
+            )
+            _commit_sidecar_worker_phase(
+                phase_conn,
+                lease,
+                result=result,
+                phase=(
+                    "sidecar_sync_deferred"
+                    if not terminal
+                    else "sidecar_not_required"
+                ),
+                terminal=terminal,
+            )
+        except Exception:
+            if phase_conn.in_transaction:
+                phase_conn.rollback()
+            raise
+        finally:
+            phase_conn.close()
+        return result
+
+    result = {
+        "ok": True,
+        "card_id": card_id,
+        "location_uri": location_uri,
+    }
+    phase_conn = connect(root)
+    try:
+        phase_conn.execute("BEGIN IMMEDIATE")
+        _commit_sidecar_worker_phase(
+            phase_conn,
+            lease,
+            result=result,
+            phase="materialized_pending_reconciliation",
+            terminal=False,
+        )
+    except Exception:
+        if phase_conn.in_transaction:
+            phase_conn.rollback()
+        raise
+    finally:
+        phase_conn.close()
+
+    reconciliation = _reconcile_sidecar_worker_intents(root, card_id)
+    result["intent_reconciliation"] = reconciliation
+    reconciliation_clean = bool(
+        reconciliation.get("ok")
+        and int(reconciliation.get("pending", 0)) == 0
+        and reconciliation.get(
+            "scope_complete",
+            reconciliation.get("complete"),
+        )
+    )
+    terminal_conn = connect(root)
+    try:
+        terminal_conn.execute("BEGIN IMMEDIATE")
+        newer_sidecar_pending = (
+            terminal_conn.execute(
+                "SELECT 1 FROM card_sidecar_outbox WHERE card_id = ?",
+                (card_id,),
+            ).fetchone()
+            is not None
+        )
+        if not reconciliation_clean or newer_sidecar_pending:
             result["ok"] = False
             result["reason"] = "intent_reconciliation_incomplete"
             result["retry_pending"] = True
-            conn.execute("BEGIN IMMEDIATE")
             mark_card_sidecar_outbox(
-                conn,
+                terminal_conn,
                 [card_id],
                 reason="intent_reconciliation_incomplete",
             )
             audit_event(
-                conn,
+                terminal_conn,
                 action="card_sidecar_intent_reconciliation_incomplete",
                 target_type="card",
                 target_id=card_id,
                 payload={
                     "pending": int(reconciliation.get("pending", 0)),
                     "failure_count": len(reconciliation.get("failures", [])),
+                    "newer_sidecar_pending": newer_sidecar_pending,
                 },
             )
             _commit_sidecar_worker_phase(
-                conn,
+                terminal_conn,
                 lease,
                 result=result,
                 phase="reconciliation_deferred",
                 terminal=False,
             )
-            return result
-        conn.execute("BEGIN IMMEDIATE")
-        _commit_sidecar_worker_phase(
-            conn,
-            lease,
-            result=result,
-            phase="complete",
-            terminal=True,
-        )
-        return result
+        else:
+            _commit_sidecar_worker_phase(
+                terminal_conn,
+                lease,
+                result=result,
+                phase="complete",
+                terminal=True,
+            )
     except Exception:
-        if conn.in_transaction:
-            conn.rollback()
+        if terminal_conn.in_transaction:
+            terminal_conn.rollback()
         raise
     finally:
-        conn.close()
+        terminal_conn.close()
+    return result
 
 
 def drain_card_sidecar_outbox(
@@ -5674,6 +6310,2819 @@ def _reconcile_card_sidecar_intent_maintenance(
         "failures": failures[:WORKER_MAINTENANCE_FAILURE_LIMIT],
         "status_counts": status_counts,
     }
+
+
+def _json_values_match(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's bool/int equality coercion."""
+
+    return json_dumps(left) == json_dumps(right)
+
+
+def _opaque_queue_dedupe_key(
+    role: Any,
+    job_type: Any,
+    raw_dedupe_key: Any,
+) -> str:
+    return "queue_v1_" + content_hash(
+        json_dumps(
+            [
+                str(role),
+                str(job_type),
+                str(raw_dedupe_key),
+            ]
+        )
+    )
+
+
+def _failed_sidecar_recovery_candidates(
+    conn,
+    *,
+    limit: int,
+    job_id: str | None = None,
+) -> list[dict[str, Any]]:
+    job_clause = ""
+    if job_id is not None:
+        job_clause = " AND q.id = ?"
+    job_placeholders = ",".join(
+        "?" for _ in _FAILED_SIDECAR_RECOVERY_JOB_ROLES
+    )
+    rows = conn.execute(
+        f"""
+        WITH latest_effect AS (
+            SELECT q.rowid AS queue_rowid, q.*,
+                   effect.rowid AS effect_rowid,
+                   effect.id AS effect_event_id,
+                   effect.payload_json AS effect_payload_json
+            FROM queue_jobs AS q
+            JOIN audit_events AS effect
+              ON effect.rowid = (
+                  SELECT candidate_effect.rowid
+                  FROM audit_events AS candidate_effect
+                  WHERE candidate_effect.action = ?
+                    AND candidate_effect.target_type = 'queue_job'
+                    AND candidate_effect.target_id = q.id
+                  ORDER BY candidate_effect.rowid DESC
+                  LIMIT 1
+            )
+            WHERE q.status = 'failed'
+              AND q.job_type IN ({job_placeholders}){job_clause}
+        )
+        SELECT q.*
+        FROM latest_effect AS q
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM audit_events AS disposition
+            WHERE disposition.action = ?
+              AND disposition.target_type = 'queue_job'
+              AND disposition.target_id = q.id
+              AND json_valid(disposition.payload_json)
+              AND json_extract(disposition.payload_json, '$.schema') = ?
+              AND json_extract(
+                  disposition.payload_json,
+                  '$.effect_event_id'
+               ) = q.effect_event_id
+              AND json_extract(
+                  disposition.payload_json,
+                  '$.decision'
+              ) IN ('requeued', 'rejected')
+        )
+        ORDER BY q.effect_rowid, q.queue_rowid
+        LIMIT ?
+        """,
+        [
+            _WORKER_EFFECT_ACTION,
+            *_FAILED_SIDECAR_RECOVERY_JOB_ROLES,
+            *([job_id] if job_id is not None else []),
+            _FAILED_SIDECAR_RECOVERY_ACTION,
+            _FAILED_SIDECAR_RECOVERY_SCHEMA,
+            max(1, int(limit)),
+        ],
+    ).fetchall()
+    return [
+        {
+            **dict(row),
+            "recovery_effect_key": str(row["effect_event_id"]),
+            "recovery_mode": "effect",
+        }
+        for row in rows
+    ]
+
+
+def _failed_effectless_recovery_candidates(
+    conn,
+    *,
+    limit: int,
+    job_id: str | None = None,
+) -> list[dict[str, Any]]:
+    job_clause = ""
+    if job_id is not None:
+        job_clause = " AND q.id = ?"
+    job_placeholders = ",".join(
+        "?" for _ in _FAILED_SIDECAR_RECOVERY_JOB_ROLES
+    )
+    rows = conn.execute(
+        f"""
+        SELECT q.rowid AS queue_rowid, q.*,
+               NULL AS effect_rowid,
+               NULL AS effect_event_id,
+               NULL AS effect_payload_json
+        FROM queue_jobs AS q
+        WHERE q.status = 'failed'
+          AND q.job_type IN ({job_placeholders}){job_clause}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM audit_events AS effect
+              WHERE effect.action = ?
+                AND effect.target_type = 'queue_job'
+                AND effect.target_id = q.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM audit_events AS disposition
+              WHERE disposition.action = ?
+                AND disposition.target_type = 'queue_job'
+                AND disposition.target_id = q.id
+                AND json_valid(disposition.payload_json)
+                AND json_extract(disposition.payload_json, '$.schema') = ?
+                AND json_extract(
+                    disposition.payload_json,
+                    '$.effect_event_id'
+                ) = ?
+                AND json_extract(
+                    disposition.payload_json,
+                    '$.decision'
+                ) IN ('requeued', 'rejected')
+          )
+        ORDER BY q.rowid
+        LIMIT ?
+        """,
+        [
+            *_FAILED_SIDECAR_RECOVERY_JOB_ROLES,
+            *([job_id] if job_id is not None else []),
+            _WORKER_EFFECT_ACTION,
+            _FAILED_SIDECAR_RECOVERY_ACTION,
+            _FAILED_SIDECAR_RECOVERY_SCHEMA,
+            _FAILED_SIDECAR_EFFECTLESS_KEY,
+            max(1, int(limit)),
+        ],
+    ).fetchall()
+    return [
+        {
+            **dict(row),
+            "effect_event_id": None,
+            "effect_rowid": None,
+            "effect_payload_json": None,
+            "recovery_effect_key": _FAILED_SIDECAR_EFFECTLESS_KEY,
+            "recovery_mode": "effectless",
+        }
+        for row in rows
+    ]
+
+
+def _all_failed_sidecar_recovery_candidates(
+    conn,
+    *,
+    limit: int,
+    job_id: str | None = None,
+) -> list[dict[str, Any]]:
+    bounded = max(1, int(limit))
+    candidates = [
+        *_failed_sidecar_recovery_candidates(
+            conn,
+            limit=bounded,
+            job_id=job_id,
+        ),
+        *_failed_effectless_recovery_candidates(
+            conn,
+            limit=bounded,
+            job_id=job_id,
+        ),
+    ]
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("queue_rowid") or 0),
+            0 if item.get("recovery_mode") == "effect" else 1,
+        )
+    )
+    return candidates[:bounded]
+
+
+_FAILED_RECOVERY_SNAPSHOT_FIELDS = (
+    "queue_rowid",
+    "id",
+    "job_type",
+    "role",
+    "status",
+    "priority",
+    "attempt_count",
+    "error_json",
+    "payload_json",
+    "related_card_ids_json",
+    "dedupe_key",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "lease_owner",
+    "lease_expires_at",
+    "heartbeat_at",
+    "effect_event_id",
+    "effect_rowid",
+    "effect_payload_json",
+    "recovery_effect_key",
+    "recovery_mode",
+)
+
+
+def _failed_recovery_snapshot(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: candidate.get(key)
+        for key in _FAILED_RECOVERY_SNAPSHOT_FIELDS
+    }
+
+
+def _failed_recovery_snapshot_sha256(
+    candidate: dict[str, Any],
+) -> str:
+    return content_hash(json_dumps(_failed_recovery_snapshot(candidate)))
+
+
+def _exact_worker_phase_receipt(
+    conn,
+    *,
+    job_id: str,
+    job_type: str,
+    before_rowid: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    rowid_clause = ""
+    params: list[Any] = [
+        _WORKER_PHASE_ACTION,
+        job_id,
+    ]
+    if before_rowid is not None:
+        rowid_clause = " AND rowid < ?"
+        params.append(int(before_rowid))
+    row = conn.execute(
+        f"""
+        SELECT id, rowid AS event_rowid, payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          {rowid_clause}
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json_loads(row["payload_json"], None)
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {"schema", "job_type", "phase", "result"}
+        or payload.get("schema") != _WORKER_PHASE_SCHEMA
+        or payload.get("job_type") != job_type
+        or payload.get("phase") != "core"
+        or not isinstance(payload.get("result"), dict)
+    ):
+        return None
+    return dict(row), payload
+
+
+def _exact_legacy_core_effect(
+    conn,
+    *,
+    job_id: str,
+    job_type: str,
+    before_rowid: int,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    row = conn.execute(
+        """
+        SELECT id, rowid AS event_rowid, payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          AND rowid < ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (_WORKER_EFFECT_ACTION, job_id, int(before_rowid)),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json_loads(row["payload_json"], None)
+    if not isinstance(payload, dict):
+        return None
+    required_keys = {"schema", "job_type", "result"}
+    if (
+        not required_keys.issubset(payload)
+        or set(payload) - required_keys - {"post_phase_complete"}
+        or payload.get("schema") != _WORKER_EFFECT_SCHEMA
+        or payload.get("job_type") != job_type
+        or (
+            "post_phase_complete" in payload
+            and payload["post_phase_complete"] is not False
+        )
+        or not isinstance(payload.get("result"), dict)
+    ):
+        return None
+    return dict(row), payload
+
+
+def _worker_core_fields(
+    result: dict[str, Any],
+    *,
+    post_phase_keys: set[str],
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in post_phase_keys
+        and key not in {"reason", "error", "retry_pending", "idempotent_replay"}
+    }
+
+
+def _validate_failed_queue_state(
+    candidate: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    expected_role = _FAILED_SIDECAR_RECOVERY_JOB_ROLES.get(
+        str(candidate.get("job_type") or "")
+    )
+    if expected_role is None or candidate.get("role") != expected_role:
+        return None, "queue_role_mismatch"
+    if (
+        candidate.get("status") != "failed"
+        or candidate.get("finished_at") is None
+        or any(
+            candidate.get(field) is not None
+            for field in ("lease_owner", "lease_expires_at")
+        )
+    ):
+        return None, "queue_not_terminally_failed"
+    queue_payload = json_loads(candidate.get("payload_json"), None)
+    related_card_ids = json_loads(
+        candidate.get("related_card_ids_json"),
+        None,
+    )
+    error_payload = json_loads(candidate.get("error_json"), None)
+    if not isinstance(queue_payload, dict):
+        return None, "queue_payload_invalid"
+    if (
+        not isinstance(related_card_ids, list)
+        or any(
+            not isinstance(card_id, str) or not card_id
+            for card_id in related_card_ids
+        )
+        or len(set(related_card_ids)) != len(related_card_ids)
+    ):
+        return None, "queue_related_cards_invalid"
+    if (
+        not isinstance(error_payload, dict)
+        or set(error_payload) != {"error", "result"}
+        or not isinstance(error_payload.get("result"), dict)
+    ):
+        return None, "queue_failure_envelope_invalid"
+    return {
+        "queue_payload": queue_payload,
+        "related_card_ids": related_card_ids,
+        "error_payload": error_payload,
+    }, "eligible"
+
+
+def _validate_failed_queue_effect(
+    candidate: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    parsed, reason = _validate_failed_queue_state(candidate)
+    if parsed is None:
+        return None, reason
+    effect_payload = json_loads(candidate.get("effect_payload_json"), None)
+    if (
+        not isinstance(effect_payload, dict)
+        or set(effect_payload)
+        != {"schema", "job_type", "post_phase_complete", "result"}
+        or effect_payload.get("schema") != _WORKER_EFFECT_SCHEMA
+        or effect_payload.get("job_type") != candidate.get("job_type")
+        or effect_payload.get("post_phase_complete") is not True
+        or not isinstance(effect_payload.get("result"), dict)
+    ):
+        return None, "latest_worker_effect_invalid"
+    result = effect_payload["result"]
+    if (
+        not _result_is_replayable_sidecar_failure(result)
+        or result.get("retry_pending") is True
+    ):
+        return None, "not_exclusive_sidecar_failure"
+    error_payload = parsed["error_payload"]
+    queue_result = dict(error_payload["result"])
+    if "idempotent_replay" in queue_result:
+        if queue_result["idempotent_replay"] is not True:
+            return None, "queue_failure_result_mismatch"
+        queue_result.pop("idempotent_replay")
+    if not _json_values_match(queue_result, result):
+        return None, "queue_failure_result_mismatch"
+    expected_error = str(
+        result.get("reason")
+        or result.get("error")
+        or "worker result reported ok=false"
+    )
+    if error_payload.get("error") != expected_error:
+        return None, "queue_failure_error_mismatch"
+    parsed.update(
+        {
+            "effect_payload": effect_payload,
+            "result": result,
+            "effectless": False,
+        }
+    )
+    return parsed, "eligible"
+
+
+def _validate_failed_effectless_queue(
+    candidate: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    parsed, reason = _validate_failed_queue_state(candidate)
+    if parsed is None:
+        return None, reason
+    error_payload = parsed["error_payload"]
+    if (
+        not isinstance(error_payload.get("error"), str)
+        or not str(error_payload["error"]).strip()
+        or error_payload["result"]
+    ):
+        return None, "effectless_queue_failure_envelope_invalid"
+    parsed.update({"result": None, "effectless": True})
+    return parsed, "eligible"
+
+
+def _validate_failed_placement_authority(
+    conn,
+    candidate: dict[str, Any],
+    parsed: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    payload = parsed["queue_payload"]
+    result = parsed["result"]
+    card_id = payload.get("card_id")
+    related_card_ids = parsed["related_card_ids"]
+    if (
+        not isinstance(card_id, str)
+        or not card_id
+        or card_id not in related_card_ids
+    ):
+        return None, "placement_identity_mismatch"
+    if result is not None:
+        if result.get("card_id") != card_id:
+            return None, "placement_identity_mismatch"
+        direct_sidecars = result.get("sidecars")
+        conflicts = result.get("conflicts")
+        conflict_sidecars = (
+            conflicts.get("sidecars")
+            if isinstance(conflicts, dict)
+            else None
+        )
+        direct_failed = bool(
+            isinstance(direct_sidecars, dict)
+            and direct_sidecars.get("ok") is False
+        )
+        conflict_failed = bool(
+            isinstance(conflict_sidecars, dict)
+            and conflict_sidecars.get("ok") is False
+        )
+        if not (direct_failed or conflict_failed):
+            return None, "placement_sidecar_shape_invalid"
+        if (
+            isinstance(conflicts, dict)
+            and conflicts.get("ok") is False
+            and not conflict_failed
+        ):
+            return None, "placement_non_sidecar_conflict_failure"
+    before_rowid = (
+        int(candidate["effect_rowid"])
+        if candidate.get("effect_rowid") is not None
+        else None
+    )
+    authority = _exact_worker_phase_receipt(
+        conn,
+        job_id=str(candidate["id"]),
+        job_type="review_card_placement",
+        before_rowid=before_rowid,
+    )
+    if authority is None:
+        if before_rowid is None:
+            return None, "placement_core_receipt_missing"
+        authority = _exact_legacy_core_effect(
+            conn,
+            job_id=str(candidate["id"]),
+            job_type="review_card_placement",
+            before_rowid=before_rowid,
+        )
+        if authority is None:
+            return None, "placement_core_receipt_missing"
+        receipt_row, receipt_payload = authority
+        core_result = receipt_payload["result"]
+    else:
+        receipt_row, receipt_payload = authority
+        phase_result = receipt_payload["result"]
+        if set(phase_result) != {"core_result"}:
+            return None, "placement_core_receipt_invalid"
+        core_result = phase_result["core_result"]
+    if (
+        not isinstance(core_result, dict)
+        or core_result.get("ok") is not True
+        or core_result.get("card_id") != card_id
+    ):
+        return None, "placement_core_receipt_invalid"
+    if result is not None and not _json_values_match(
+        _worker_core_fields(
+            result,
+            post_phase_keys={"ok", "sidecars", "conflicts"},
+        ),
+        _worker_core_fields(core_result, post_phase_keys={"ok"}),
+    ):
+        return None, "placement_core_receipt_invalid"
+    card = conn.execute(
+        "SELECT status FROM cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if (
+        card is None
+        or str(card["status"] or "") in NON_CURRENT_CARD_STATUSES
+    ):
+        return None, "placement_live_card_missing"
+    return {
+        "identity": {"card_id": card_id},
+        "authority_event_ids": [str(receipt_row["id"])],
+    }, "eligible"
+
+
+def _validate_failed_mempalace_authority(
+    conn,
+    candidate: dict[str, Any],
+    parsed: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    payload = parsed["queue_payload"]
+    result = parsed["result"]
+    import_id = payload.get("import_id")
+    if (
+        not isinstance(import_id, str)
+        or not import_id
+    ):
+        return None, "mempalace_identity_or_sidecar_mismatch"
+    if result is not None:
+        sidecars = result.get("sidecars")
+        if (
+            result.get("reviewed_import") != import_id
+            or not isinstance(sidecars, dict)
+            or sidecars.get("ok") is not False
+        ):
+            return None, "mempalace_identity_or_sidecar_mismatch"
+    before_rowid = (
+        int(candidate["effect_rowid"])
+        if candidate.get("effect_rowid") is not None
+        else None
+    )
+    authority = _exact_worker_phase_receipt(
+        conn,
+        job_id=str(candidate["id"]),
+        job_type="review_mempalace_import",
+        before_rowid=before_rowid,
+    )
+    changed_cards: list[str] | None = None
+    if authority is None:
+        if before_rowid is None:
+            return None, "mempalace_core_receipt_missing"
+        authority = _exact_legacy_core_effect(
+            conn,
+            job_id=str(candidate["id"]),
+            job_type="review_mempalace_import",
+            before_rowid=before_rowid,
+        )
+        if authority is None:
+            return None, "mempalace_core_receipt_missing"
+        receipt_row, receipt_payload = authority
+        core_result = receipt_payload["result"]
+    else:
+        receipt_row, receipt_payload = authority
+        phase_result = receipt_payload["result"]
+        if (
+            set(phase_result) != {"core_result", "changed_cards"}
+            or not isinstance(phase_result.get("changed_cards"), list)
+        ):
+            return None, "mempalace_core_receipt_invalid"
+        core_result = phase_result["core_result"]
+        changed_cards = phase_result["changed_cards"]
+    if (
+        not isinstance(core_result, dict)
+        or core_result.get("ok") is not True
+        or core_result.get("reviewed_import") != import_id
+    ):
+        return None, "mempalace_core_receipt_invalid"
+    if result is not None and not _json_values_match(
+        _worker_core_fields(
+            result,
+            post_phase_keys={"ok", "sidecars"},
+        ),
+        _worker_core_fields(core_result, post_phase_keys={"ok"}),
+    ):
+        return None, "mempalace_core_receipt_invalid"
+    if changed_cards is not None:
+        if (
+            not changed_cards
+            or len(changed_cards) > MAX_BACKLOG_RECONCILE_LIMIT
+            or any(
+                not isinstance(card_id, str) or not card_id
+                for card_id in changed_cards
+            )
+            or len(set(changed_cards)) != len(changed_cards)
+        ):
+            return None, "mempalace_changed_cards_invalid"
+        non_current_statuses = sorted(NON_CURRENT_CARD_STATUSES)
+        status_placeholders = ",".join(
+            "?" for _ in non_current_statuses
+        )
+        matching = conn.execute(
+            f"""
+            SELECT count(*) AS n
+            FROM json_each(?) AS changed
+            JOIN cards AS card ON card.id = changed.value
+            WHERE card.card_type LIKE 'mempalace_%'
+              AND card.status NOT IN ({status_placeholders})
+              AND json_valid(card.metadata_json)
+              AND json_extract(card.metadata_json, '$.import_id') = ?
+            """,
+            (
+                json_dumps(changed_cards),
+                *non_current_statuses,
+                import_id,
+            ),
+        ).fetchone()
+        if matching is None or int(matching["n"] or 0) != len(changed_cards):
+            return None, "mempalace_live_card_identity_mismatch"
+        live_card_ids = list(changed_cards)
+    else:
+        non_current_statuses = sorted(NON_CURRENT_CARD_STATUSES)
+        status_placeholders = ",".join(
+            "?" for _ in non_current_statuses
+        )
+        live_card = conn.execute(
+            f"""
+            SELECT id
+            FROM cards
+            WHERE card_type LIKE 'mempalace_%'
+              AND status NOT IN ({status_placeholders})
+              AND json_valid(metadata_json)
+              AND json_extract(metadata_json, '$.import_id') = ?
+            ORDER BY rowid
+            LIMIT 1
+            """,
+            (*non_current_statuses, import_id),
+        ).fetchone()
+        if live_card is None:
+            return None, "mempalace_live_import_missing"
+        live_card_ids = [str(live_card["id"])]
+    return {
+        "identity": {
+            "import_id": import_id,
+            "card_ids": live_card_ids,
+        },
+        "authority_event_ids": [str(receipt_row["id"])],
+    }, "eligible"
+
+
+def _exact_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+_SCRIBE_COMMITTED_CORE_KEYS = {
+    "segment_id",
+    "card_id",
+    "event_count",
+    "token_estimate",
+    "librarian_job_id",
+    "archivist_job_id",
+}
+_SCRIBE_RECEIPT_KEYS = {
+    "schema",
+    "step_key",
+    "session_id",
+    "start_seq",
+    "end_seq",
+    "batch_number",
+    "result",
+}
+_SCRIBE_TERMINAL_RESULT_KEYS = {
+    "ok",
+    "rolled_count",
+    "rolled",
+    "batches_processed",
+    "batch_limit",
+    "drain_limited",
+    "continuations",
+    "concurrent_progress",
+    "sidecar_failures",
+}
+_SCRIBE_VALIDATION_STATE_KEYS = {
+    "validated_count",
+    "completed_count",
+    "last_committed_rowid",
+    "first_start_seq",
+    "last_end_seq",
+    "last_batch_number",
+    "batch_numbers",
+    "authority_chain_sha256",
+}
+
+
+def _exact_scribe_committed_core(
+    value: Any,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _SCRIBE_COMMITTED_CORE_KEYS
+        or any(
+            not isinstance(value.get(key), str) or not value[key]
+            for key in (
+                "segment_id",
+                "card_id",
+                "librarian_job_id",
+                "archivist_job_id",
+            )
+        )
+        or value["librarian_job_id"] == value["archivist_job_id"]
+        or not _exact_int(value.get("event_count"))
+        or int(value["event_count"]) <= 0
+        or not _exact_int(value.get("token_estimate"))
+        or int(value["token_estimate"]) < 0
+    ):
+        return None
+    return dict(value)
+
+
+def _parse_exact_scribe_receipt(
+    row: Any,
+    *,
+    action: str,
+    session_id: str,
+) -> tuple[dict[str, Any] | None, str]:
+    receipt = json_loads(row["payload_json"], None)
+    expected_schema = (
+        "continuum.worker_scribe_segment_step_committed.v1"
+        if action == _SCRIBE_STEP_COMMITTED_ACTION
+        else "continuum.worker_scribe_segment_step_completed.v1"
+    )
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != _SCRIBE_RECEIPT_KEYS
+        or receipt.get("schema") != expected_schema
+        or receipt.get("session_id") != session_id
+        or not _exact_int(receipt.get("start_seq"))
+        or int(receipt["start_seq"]) < 1
+        or not _exact_int(receipt.get("end_seq"))
+        or int(receipt["end_seq"]) < int(receipt["start_seq"])
+        or not _exact_int(receipt.get("batch_number"))
+        or not 1 <= int(receipt["batch_number"]) <= (
+            MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+        )
+        or receipt.get("step_key")
+        != (
+            f"{session_id}:{receipt['start_seq']}:"
+            f"{receipt['end_seq']}"
+        )
+        or not isinstance(receipt.get("result"), dict)
+    ):
+        return None, "scribe_receipt_invalid"
+    return receipt, "eligible"
+
+
+def _scribe_post_sidecar_result_matches_core(
+    value: Any,
+    core: dict[str, Any],
+) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != _SCRIBE_COMMITTED_CORE_KEYS | {"ok", "sidecars", "card_uri"}
+        or not isinstance(value.get("ok"), bool)
+        or not isinstance(value.get("sidecars"), dict)
+        or not isinstance(value["sidecars"].get("ok"), bool)
+        or value["sidecars"]["ok"] is not value["ok"]
+        or value.get("card_uri") is not None
+        and (
+            not isinstance(value.get("card_uri"), str)
+            or not value["card_uri"]
+        )
+    ):
+        return False
+    return _json_values_match(
+        {key: value[key] for key in _SCRIBE_COMMITTED_CORE_KEYS},
+        core,
+    )
+
+
+def _scribe_missing_completion_matches(
+    value: Any,
+    core: dict[str, Any],
+) -> bool:
+    if not _scribe_post_sidecar_result_matches_core(value, core):
+        return False
+    sidecars = value["sidecars"]
+    required = {
+        "ok",
+        "synced",
+        "failed",
+        "pending_outbox",
+        "completion_receipt_missing",
+        "replayed_from_committed_step",
+        "stale_failed_completion_revalidated",
+    }
+    if (
+        not required.issubset(sidecars)
+        or set(sidecars) - required - {"failures"}
+        or sidecars.get("completion_receipt_missing") is not True
+        or sidecars.get("replayed_from_committed_step") is not True
+        or sidecars.get("stale_failed_completion_revalidated") is not False
+        or not isinstance(sidecars.get("pending_outbox"), bool)
+        or not _exact_int(sidecars.get("synced"))
+        or not _exact_int(sidecars.get("failed"))
+        or value["ok"] is not False
+        or sidecars["ok"] is not False
+        or sidecars["synced"] != 0
+        or sidecars["failed"] != 1
+        or sidecars["pending_outbox"] is not True
+    ):
+        return False
+    failures = sidecars.get("failures")
+    return bool(
+        isinstance(failures, list)
+        and len(failures) == 1
+        and isinstance(failures[0], dict)
+        and set(failures[0]) == {"card_id", "error"}
+        and failures[0]["card_id"] == core["card_id"]
+        and failures[0]["error"]
+        in {
+            (
+                "Committed Scribe step has no durable "
+                "post-sidecar success evidence"
+            ),
+            (
+                "Committed Scribe step still has no durable "
+                "post-sidecar success evidence"
+            ),
+        }
+    )
+
+
+def _validate_live_scribe_core(
+    conn,
+    *,
+    session_id: str,
+    start_seq: int,
+    end_seq: int,
+    core: dict[str, Any],
+) -> str | None:
+    live = conn.execute(
+        """
+        SELECT segment.session_id, segment.start_seq, segment.end_seq,
+               segment.summary_card_id, segment.token_estimate,
+               segment.segment_hash, card.status, card.visibility_scope,
+               card.project_id
+        FROM scroll_segments AS segment
+        JOIN cards AS card ON card.id = segment.summary_card_id
+        WHERE segment.id = ?
+        """,
+        (core["segment_id"],),
+    ).fetchone()
+    if (
+        live is None
+        or live["session_id"] != session_id
+        or int(live["start_seq"]) != start_seq
+        or int(live["end_seq"]) != end_seq
+        or live["summary_card_id"] != core["card_id"]
+        or int(live["token_estimate"]) != core["token_estimate"]
+        or not isinstance(live["segment_hash"], str)
+        or not live["segment_hash"]
+        or str(live["status"] or "").casefold()
+        in NON_CURRENT_CARD_STATUSES
+    ):
+        return "scribe_live_segment_identity_mismatch"
+    event_state = conn.execute(
+        """
+        SELECT count(*) AS event_count, min(seq) AS first_seq,
+               max(seq) AS last_seq,
+               coalesce(sum(token_estimate), 0) AS token_estimate
+        FROM scroll_events
+        WHERE session_id = ? AND seq BETWEEN ? AND ?
+        """,
+        (session_id, start_seq, end_seq),
+    ).fetchone()
+    expected_event_count = end_seq - start_seq + 1
+    if (
+        event_state is None
+        or int(event_state["event_count"]) != expected_event_count
+        or int(event_state["event_count"]) != core["event_count"]
+        or int(event_state["first_seq"]) != start_seq
+        or int(event_state["last_seq"]) != end_seq
+        or int(event_state["token_estimate"]) != core["token_estimate"]
+    ):
+        return "scribe_live_event_or_token_mismatch"
+    boundary_state = conn.execute(
+        """
+        WITH boundaries AS (
+            SELECT visibility_scope, coalesce(project_id, '') AS project_id
+            FROM scroll_events
+            WHERE session_id = ? AND seq BETWEEN ? AND ?
+            GROUP BY visibility_scope, coalesce(project_id, '')
+        )
+        SELECT count(*) AS boundary_count,
+               min(visibility_scope) AS visibility_scope,
+               min(project_id) AS project_id
+        FROM boundaries
+        """,
+        (session_id, start_seq, end_seq),
+    ).fetchone()
+    if (
+        boundary_state is None
+        or int(boundary_state["boundary_count"]) != 1
+        or str(boundary_state["visibility_scope"] or "")
+        != str(live["visibility_scope"] or "")
+        or str(boundary_state["project_id"] or "")
+        != str(live["project_id"] or "")
+    ):
+        return "scribe_live_security_boundary_mismatch"
+    project_id = str(live["project_id"] or "")
+    shared_payload = {
+        "session_id": session_id,
+        "visibility_scope": str(live["visibility_scope"]),
+        **({"project_id": project_id} if project_id else {}),
+    }
+    expected_children = {
+        core["librarian_job_id"]: {
+            "role": "librarian",
+            "job_type": "review_card_placement",
+            "payload": {
+                "card_id": core["card_id"],
+                "segment_id": core["segment_id"],
+                **shared_payload,
+            },
+            "dedupe_key": _opaque_queue_dedupe_key(
+                "librarian",
+                "review_card_placement",
+                f"card:{core['card_id']}",
+            ),
+        },
+        core["archivist_job_id"]: {
+            "role": "archivist",
+            "job_type": "verify_segment_integrity",
+            "payload": {
+                "segment_id": core["segment_id"],
+                "segment_hash": str(live["segment_hash"]),
+                **shared_payload,
+            },
+            "dedupe_key": _opaque_queue_dedupe_key(
+                "archivist",
+                "verify_segment_integrity",
+                f"segment:{core['segment_id']}",
+            ),
+        },
+    }
+    child_rows = conn.execute(
+        """
+        SELECT id, role, job_type, payload_json, related_card_ids_json,
+               dedupe_key
+        FROM queue_jobs
+        WHERE id IN (?, ?)
+        """,
+        (
+            core["librarian_job_id"],
+            core["archivist_job_id"],
+        ),
+    ).fetchall()
+    if len(child_rows) != 2:
+        return "scribe_live_child_job_missing"
+    for child in child_rows:
+        expected = expected_children.get(str(child["id"]))
+        if (
+            expected is None
+            or child["role"] != expected["role"]
+            or child["job_type"] != expected["job_type"]
+            or child["dedupe_key"] != expected["dedupe_key"]
+            or not _json_values_match(
+                json_loads(child["payload_json"], None),
+                expected["payload"],
+            )
+            or not _json_values_match(
+                json_loads(child["related_card_ids_json"], None),
+                [core["card_id"]],
+            )
+        ):
+            return "scribe_live_child_job_identity_mismatch"
+    return None
+
+
+def _validate_scribe_terminal_result(
+    result: Any,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    if (
+        not isinstance(result, dict)
+        or set(result) != _SCRIBE_TERMINAL_RESULT_KEYS
+        or result.get("ok") is not False
+        or not isinstance(result.get("rolled"), list)
+        or not result["rolled"]
+        or not _exact_int(result.get("rolled_count"))
+        or result["rolled_count"] != len(result["rolled"])
+        or not _exact_int(result.get("batches_processed"))
+        or not 1 <= result["batches_processed"] <= (
+            MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+        )
+        or result.get("batch_limit")
+        != MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+        or not isinstance(result.get("drain_limited"), bool)
+        or not isinstance(result.get("continuations"), list)
+        or not _exact_int(result.get("concurrent_progress"))
+        or result["concurrent_progress"] < 0
+        or not isinstance(result.get("sidecar_failures"), list)
+    ):
+        return None, "scribe_result_identity_invalid"
+    expected_failures: list[dict[str, Any]] = []
+    for item in result["rolled"]:
+        if not isinstance(item, dict) or not isinstance(item.get("ok"), bool):
+            return None, "scribe_rolled_item_invalid"
+        if item["ok"] is False:
+            sidecars = item.get("sidecars")
+            if (
+                not isinstance(sidecars, dict)
+                or sidecars.get("ok") is not False
+                or any(
+                    item.get(key) not in (None, "")
+                    for key in ("reason", "error")
+                )
+            ):
+                return None, "scribe_non_sidecar_failure"
+            expected_failures.append(
+                {
+                    "segment_id": item.get("segment_id"),
+                    "card_id": item.get("card_id"),
+                    "sidecars": sidecars,
+                }
+            )
+    if (
+        not expected_failures
+        or not _json_values_match(
+            result["sidecar_failures"],
+            expected_failures,
+        )
+    ):
+        return None, "scribe_sidecar_failure_set_invalid"
+    return result["rolled"], "eligible"
+
+
+def _scribe_validation_progress_state(
+    conn,
+    candidate: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    snapshot_sha256 = _failed_recovery_snapshot_sha256(candidate)
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE action = ? AND target_type = 'queue_job' AND target_id = ?
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.schema') = ?
+          AND json_extract(payload_json, '$.decision') = 'validating'
+          AND json_extract(payload_json, '$.effect_event_id') = ?
+          AND json_extract(
+              payload_json,
+              '$.queue_snapshot_sha256'
+          ) = ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (
+            _FAILED_SIDECAR_RECOVERY_ACTION,
+            candidate["id"],
+            _FAILED_SIDECAR_RECOVERY_SCHEMA,
+            candidate["recovery_effect_key"],
+            snapshot_sha256,
+        ),
+    ).fetchone()
+    if row is None:
+        return None, "none"
+    payload = json_loads(row["payload_json"], None)
+    state = payload.get("validation_state") if isinstance(payload, dict) else None
+    if (
+        not isinstance(state, dict)
+        or set(state) != _SCRIBE_VALIDATION_STATE_KEYS
+        or not _exact_int(state.get("validated_count"))
+        or state["validated_count"] < 1
+        or not _exact_int(state.get("completed_count"))
+        or not 0 <= state["completed_count"] <= state["validated_count"]
+        or not _exact_int(state.get("last_committed_rowid"))
+        or state["last_committed_rowid"] < 1
+        or not _exact_int(state.get("first_start_seq"))
+        or state["first_start_seq"] < 1
+        or not _exact_int(state.get("last_end_seq"))
+        or state["last_end_seq"] < state["first_start_seq"]
+        or not _exact_int(state.get("last_batch_number"))
+        or not 1 <= state["last_batch_number"] <= (
+            MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+        )
+        or not isinstance(state.get("batch_numbers"), list)
+        or state["batch_numbers"]
+        != sorted(set(state["batch_numbers"]))
+        or any(
+            not _exact_int(batch_number)
+            or not 1 <= batch_number <= MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+            for batch_number in state["batch_numbers"]
+        )
+        or len(state["batch_numbers"])
+        > MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN
+        or state["last_batch_number"] not in state["batch_numbers"]
+        or not isinstance(state.get("authority_chain_sha256"), str)
+        or not state["authority_chain_sha256"]
+    ):
+        return None, "scribe_validation_progress_invalid"
+    return dict(state), "eligible"
+
+
+def _scribe_receipt_count_state(
+    conn,
+    *,
+    job_id: str,
+    before_rowid: int | None,
+) -> tuple[int, int]:
+    before_clause = ""
+    if before_rowid is not None:
+        before_clause = " AND rowid < ?"
+    row = conn.execute(
+        f"""
+        SELECT sum(action = ?) AS committed_count,
+               sum(action = ?) AS completed_count
+        FROM audit_events
+        WHERE target_type = 'queue_job' AND target_id = ?
+          AND action IN (?, ?){before_clause}
+        """,
+        [
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            _SCRIBE_STEP_COMPLETED_ACTION,
+            job_id,
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            _SCRIBE_STEP_COMPLETED_ACTION,
+            *([before_rowid] if before_rowid is not None else []),
+        ],
+    ).fetchone()
+    return (
+        int(row["committed_count"] or 0),
+        int(row["completed_count"] or 0),
+    )
+
+
+def _scribe_final_authority_drift_reason(
+    conn,
+    *,
+    job_id: str,
+    session_id: str,
+    before_rowid: int | None,
+    terminal_result: dict[str, Any] | None,
+) -> str | None:
+    conn.create_function(
+        "_continuum_queue_dedupe_v1",
+        3,
+        _opaque_queue_dedupe_key,
+        deterministic=True,
+    )
+    upper_clause = ""
+    upper_params: list[Any] = []
+    if before_rowid is not None:
+        upper_clause = " AND rowid < ?"
+        upper_params.append(before_rowid)
+    malformed = conn.execute(
+        f"""
+        SELECT 1
+        FROM audit_events
+        WHERE target_type = 'queue_job' AND target_id = ?
+          AND action IN (?, ?){upper_clause}
+          AND NOT json_valid(payload_json)
+        LIMIT 1
+        """,
+        (
+            job_id,
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            _SCRIBE_STEP_COMPLETED_ACTION,
+            *upper_params,
+        ),
+    ).fetchone()
+    if malformed is not None:
+        return "scribe_final_receipt_json_drift"
+    malformed_child = conn.execute(
+        f"""
+        WITH committed AS (
+            SELECT payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              {upper_clause}
+        )
+        SELECT 1
+        FROM committed
+        LEFT JOIN queue_jobs AS librarian
+          ON librarian.id = json_extract(
+              committed.payload_json,
+              '$.result.librarian_job_id'
+          )
+        LEFT JOIN queue_jobs AS archivist
+          ON archivist.id = json_extract(
+              committed.payload_json,
+              '$.result.archivist_job_id'
+          )
+        WHERE librarian.id IS NULL
+           OR archivist.id IS NULL
+           OR NOT json_valid(librarian.payload_json)
+           OR NOT json_valid(librarian.related_card_ids_json)
+           OR NOT json_valid(archivist.payload_json)
+           OR NOT json_valid(archivist.related_card_ids_json)
+        LIMIT 1
+        """,
+        (
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            job_id,
+            *upper_params,
+        ),
+    ).fetchone()
+    if malformed_child is not None:
+        return "scribe_final_child_authority_drift"
+    non_current_statuses = sorted(NON_CURRENT_CARD_STATUSES)
+    status_placeholders = ",".join(
+        "?" for _ in non_current_statuses
+    )
+    terminal_json = (
+        json_dumps(terminal_result)
+        if terminal_result is not None
+        else None
+    )
+    committed_drift = conn.execute(
+        f"""
+        WITH committed AS (
+            SELECT rowid AS committed_rowid, payload_json,
+                   row_number() OVER (ORDER BY rowid) - 1 AS ordinal
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              {upper_clause}
+        ),
+        rolled AS (
+            SELECT CAST(key AS INTEGER) AS ordinal, value
+            FROM json_each(?, '$.rolled')
+        )
+        SELECT 1
+        FROM committed AS receipt
+        LEFT JOIN rolled
+          ON rolled.ordinal = receipt.ordinal
+        LEFT JOIN scroll_segments AS segment
+          ON segment.id = json_extract(
+              receipt.payload_json,
+              '$.result.segment_id'
+          )
+        LEFT JOIN cards AS card
+          ON card.id = segment.summary_card_id
+        LEFT JOIN queue_jobs AS librarian
+          ON librarian.id = json_extract(
+              receipt.payload_json,
+              '$.result.librarian_job_id'
+          )
+        LEFT JOIN queue_jobs AS archivist
+          ON archivist.id = json_extract(
+              receipt.payload_json,
+              '$.result.archivist_job_id'
+          )
+        WHERE
+            (SELECT count(*) FROM json_each(receipt.payload_json)) != 7
+            OR (
+                SELECT count(*)
+                FROM json_each(receipt.payload_json)
+                WHERE key IN (
+                    'schema', 'step_key', 'session_id', 'start_seq',
+                    'end_seq', 'batch_number', 'result'
+                )
+            ) != 7
+            OR json_extract(receipt.payload_json, '$.schema')
+               IS NOT
+               'continuum.worker_scribe_segment_step_committed.v1'
+            OR json_extract(receipt.payload_json, '$.session_id')
+               IS NOT ?
+            OR json_type(receipt.payload_json, '$.start_seq')
+               IS NOT 'integer'
+            OR json_extract(receipt.payload_json, '$.start_seq') < 1
+            OR json_type(receipt.payload_json, '$.end_seq')
+               IS NOT 'integer'
+            OR json_extract(receipt.payload_json, '$.end_seq')
+               < json_extract(receipt.payload_json, '$.start_seq')
+            OR json_type(receipt.payload_json, '$.batch_number')
+               IS NOT 'integer'
+            OR json_extract(receipt.payload_json, '$.batch_number')
+               NOT BETWEEN 1 AND ?
+            OR json_extract(receipt.payload_json, '$.step_key')
+               IS NOT (
+                   ? || ':' ||
+                   json_extract(receipt.payload_json, '$.start_seq')
+                   || ':' ||
+                   json_extract(receipt.payload_json, '$.end_seq')
+               )
+            OR json_type(receipt.payload_json, '$.result')
+               IS NOT 'object'
+            OR (
+                SELECT count(*)
+                FROM json_each(receipt.payload_json, '$.result')
+            ) != 6
+            OR (
+                SELECT count(*)
+                FROM json_each(receipt.payload_json, '$.result')
+                WHERE key IN (
+                    'segment_id', 'card_id', 'event_count',
+                    'token_estimate', 'librarian_job_id',
+                    'archivist_job_id'
+                )
+            ) != 6
+            OR json_type(
+                receipt.payload_json,
+                '$.result.segment_id'
+            ) IS NOT 'text'
+            OR json_type(
+                receipt.payload_json,
+                '$.result.card_id'
+            ) IS NOT 'text'
+            OR json_type(
+                receipt.payload_json,
+                '$.result.librarian_job_id'
+            ) IS NOT 'text'
+            OR json_type(
+                receipt.payload_json,
+                '$.result.archivist_job_id'
+            ) IS NOT 'text'
+            OR json_type(
+                receipt.payload_json,
+                '$.result.event_count'
+            ) IS NOT 'integer'
+            OR json_extract(
+                receipt.payload_json,
+                '$.result.event_count'
+            ) <= 0
+            OR json_type(
+                receipt.payload_json,
+                '$.result.token_estimate'
+            ) IS NOT 'integer'
+            OR json_extract(
+                receipt.payload_json,
+                '$.result.token_estimate'
+            ) < 0
+            OR segment.id IS NULL
+            OR segment.session_id IS NOT ?
+            OR segment.start_seq IS NOT json_extract(
+                receipt.payload_json,
+                '$.start_seq'
+            )
+            OR segment.end_seq IS NOT json_extract(
+                receipt.payload_json,
+                '$.end_seq'
+            )
+            OR segment.summary_card_id IS NOT json_extract(
+                receipt.payload_json,
+                '$.result.card_id'
+            )
+            OR segment.token_estimate IS NOT json_extract(
+                receipt.payload_json,
+                '$.result.token_estimate'
+            )
+            OR segment.segment_hash IS NULL
+            OR segment.segment_hash = ''
+            OR card.id IS NULL
+            OR lower(card.status) IN ({status_placeholders})
+            OR card.session_id IS NOT ?
+            OR (
+                SELECT count(*)
+                FROM (
+                    SELECT event.visibility_scope,
+                           coalesce(event.project_id, '') AS project_id
+                    FROM scroll_events AS event
+                    WHERE event.session_id = ?
+                      AND event.seq BETWEEN
+                          json_extract(
+                              receipt.payload_json,
+                              '$.start_seq'
+                          )
+                          AND json_extract(
+                              receipt.payload_json,
+                              '$.end_seq'
+                          )
+                    GROUP BY event.visibility_scope,
+                             coalesce(event.project_id, '')
+                )
+            ) != 1
+            OR card.visibility_scope IS NOT (
+                SELECT event.visibility_scope
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+                ORDER BY event.seq
+                LIMIT 1
+            )
+            OR coalesce(card.project_id, '') IS NOT coalesce((
+                SELECT event.project_id
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+                ORDER BY event.seq
+                LIMIT 1
+            ), '')
+            OR (
+                SELECT count(*)
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+            ) IS NOT json_extract(
+                receipt.payload_json,
+                '$.result.event_count'
+            )
+            OR (
+                SELECT min(event.seq)
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+            ) IS NOT json_extract(receipt.payload_json, '$.start_seq')
+            OR (
+                SELECT max(event.seq)
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+            ) IS NOT json_extract(receipt.payload_json, '$.end_seq')
+            OR (
+                SELECT coalesce(sum(event.token_estimate), 0)
+                FROM scroll_events AS event
+                WHERE event.session_id = ?
+                  AND event.seq BETWEEN
+                      json_extract(receipt.payload_json, '$.start_seq')
+                      AND json_extract(receipt.payload_json, '$.end_seq')
+            ) IS NOT json_extract(
+                receipt.payload_json,
+                '$.result.token_estimate'
+            )
+            OR librarian.id IS NULL
+            OR librarian.role IS NOT 'librarian'
+            OR librarian.job_type IS NOT 'review_card_placement'
+            OR json_type(librarian.payload_json) IS NOT 'object'
+            OR (
+                SELECT count(*)
+                FROM json_each(librarian.payload_json)
+            ) != 4 + (coalesce(card.project_id, '') != '')
+            OR (
+                SELECT count(*)
+                FROM json_each(librarian.payload_json)
+                WHERE key IN (
+                    'card_id', 'segment_id', 'session_id',
+                    'visibility_scope', 'project_id'
+                )
+            ) != 4 + (coalesce(card.project_id, '') != '')
+            OR json_extract(librarian.payload_json, '$.card_id')
+               IS NOT card.id
+            OR json_extract(librarian.payload_json, '$.segment_id')
+               IS NOT segment.id
+            OR json_extract(librarian.payload_json, '$.session_id')
+               IS NOT ?
+            OR json_extract(
+                librarian.payload_json,
+                '$.visibility_scope'
+            ) IS NOT card.visibility_scope
+            OR coalesce(
+                json_extract(librarian.payload_json, '$.project_id'),
+                ''
+            ) IS NOT coalesce(card.project_id, '')
+            OR json_type(librarian.related_card_ids_json)
+               IS NOT 'array'
+            OR json_array_length(librarian.related_card_ids_json) != 1
+            OR json_extract(
+                librarian.related_card_ids_json,
+                '$[0]'
+            ) IS NOT card.id
+            OR librarian.dedupe_key IS NOT
+               _continuum_queue_dedupe_v1(
+                   'librarian',
+                   'review_card_placement',
+                   'card:' || card.id
+               )
+            OR archivist.id IS NULL
+            OR archivist.role IS NOT 'archivist'
+            OR archivist.job_type IS NOT 'verify_segment_integrity'
+            OR json_type(archivist.payload_json) IS NOT 'object'
+            OR (
+                SELECT count(*)
+                FROM json_each(archivist.payload_json)
+            ) != 4 + (coalesce(card.project_id, '') != '')
+            OR (
+                SELECT count(*)
+                FROM json_each(archivist.payload_json)
+                WHERE key IN (
+                    'segment_id', 'segment_hash', 'session_id',
+                    'visibility_scope', 'project_id'
+                )
+            ) != 4 + (coalesce(card.project_id, '') != '')
+            OR json_extract(archivist.payload_json, '$.segment_id')
+               IS NOT segment.id
+            OR json_extract(archivist.payload_json, '$.segment_hash')
+               IS NOT segment.segment_hash
+            OR json_extract(archivist.payload_json, '$.session_id')
+               IS NOT ?
+            OR json_extract(
+                archivist.payload_json,
+                '$.visibility_scope'
+            ) IS NOT card.visibility_scope
+            OR coalesce(
+                json_extract(archivist.payload_json, '$.project_id'),
+                ''
+            ) IS NOT coalesce(card.project_id, '')
+            OR json_type(archivist.related_card_ids_json)
+               IS NOT 'array'
+            OR json_array_length(archivist.related_card_ids_json) != 1
+            OR json_extract(
+                archivist.related_card_ids_json,
+                '$[0]'
+            ) IS NOT card.id
+            OR archivist.dedupe_key IS NOT
+               _continuum_queue_dedupe_v1(
+                   'archivist',
+                   'verify_segment_integrity',
+                   'segment:' || segment.id
+               )
+            OR (
+                ? IS NOT NULL
+                AND (
+                    rolled.ordinal IS NULL
+                    OR json_extract(rolled.value, '$.segment_id')
+                       IS NOT segment.id
+                    OR json_extract(rolled.value, '$.card_id')
+                       IS NOT card.id
+                    OR json_extract(rolled.value, '$.event_count')
+                       IS NOT json_extract(
+                           receipt.payload_json,
+                           '$.result.event_count'
+                       )
+                    OR json_extract(rolled.value, '$.token_estimate')
+                       IS NOT segment.token_estimate
+                    OR json_extract(rolled.value, '$.librarian_job_id')
+                       IS NOT librarian.id
+                    OR json_extract(rolled.value, '$.archivist_job_id')
+                       IS NOT archivist.id
+                )
+            )
+        LIMIT 1
+        """,
+        (
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            job_id,
+            *upper_params,
+            terminal_json,
+            session_id,
+            MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN,
+            session_id,
+            session_id,
+            *non_current_statuses,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            session_id,
+            terminal_json,
+        ),
+    ).fetchone()
+    if committed_drift is not None:
+        return "scribe_final_committed_or_live_authority_drift"
+    completed_drift = conn.execute(
+        f"""
+        WITH committed AS (
+            SELECT rowid AS committed_rowid, payload_json,
+                   row_number() OVER (ORDER BY rowid) - 1 AS ordinal
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              {upper_clause}
+        ),
+        completed AS (
+            SELECT rowid AS completed_rowid, payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              {upper_clause}
+        ),
+        rolled AS (
+            SELECT CAST(key AS INTEGER) AS ordinal, value
+            FROM json_each(?, '$.rolled')
+        )
+        SELECT 1
+        FROM completed
+        LEFT JOIN committed
+          ON json_extract(completed.payload_json, '$.step_key')
+             = json_extract(committed.payload_json, '$.step_key')
+        LEFT JOIN rolled ON rolled.ordinal = committed.ordinal
+        WHERE committed.committed_rowid IS NULL
+           OR completed.completed_rowid <= committed.committed_rowid
+           OR (
+               SELECT count(*)
+               FROM json_each(completed.payload_json)
+           ) != 7
+           OR (
+               SELECT count(*)
+               FROM json_each(completed.payload_json)
+               WHERE key IN (
+                   'schema', 'step_key', 'session_id', 'start_seq',
+                   'end_seq', 'batch_number', 'result'
+               )
+           ) != 7
+           OR json_extract(completed.payload_json, '$.schema')
+              IS NOT
+              'continuum.worker_scribe_segment_step_completed.v1'
+           OR json_extract(completed.payload_json, '$.session_id')
+              IS NOT ?
+           OR json_extract(completed.payload_json, '$.start_seq')
+              IS NOT json_extract(
+                  committed.payload_json,
+                  '$.start_seq'
+              )
+           OR json_extract(completed.payload_json, '$.end_seq')
+              IS NOT json_extract(committed.payload_json, '$.end_seq')
+           OR json_extract(completed.payload_json, '$.batch_number')
+              IS NOT json_extract(
+                  committed.payload_json,
+                  '$.batch_number'
+              )
+           OR (
+               SELECT count(*)
+               FROM json_each(completed.payload_json, '$.result')
+           ) != 9
+           OR (
+               SELECT count(*)
+               FROM json_each(completed.payload_json, '$.result')
+               WHERE key IN (
+                   'segment_id', 'card_id', 'event_count',
+                   'token_estimate', 'librarian_job_id',
+                   'archivist_job_id', 'ok', 'sidecars', 'card_uri'
+               )
+           ) != 9
+           OR json_type(completed.payload_json, '$.result.ok')
+              NOT IN ('true', 'false')
+           OR json_type(completed.payload_json, '$.result.sidecars')
+              IS NOT 'object'
+           OR json_type(completed.payload_json, '$.result.card_uri')
+              NOT IN ('null', 'text')
+           OR json_extract(completed.payload_json, '$.result.segment_id')
+              IS NOT json_extract(
+                  committed.payload_json,
+                  '$.result.segment_id'
+              )
+           OR json_extract(completed.payload_json, '$.result.card_id')
+              IS NOT json_extract(
+                  committed.payload_json,
+                  '$.result.card_id'
+              )
+           OR json_extract(completed.payload_json, '$.result.event_count')
+              IS NOT json_extract(
+                  committed.payload_json,
+                  '$.result.event_count'
+              )
+           OR json_extract(
+               completed.payload_json,
+               '$.result.token_estimate'
+           ) IS NOT json_extract(
+               committed.payload_json,
+               '$.result.token_estimate'
+           )
+           OR json_extract(
+               completed.payload_json,
+               '$.result.librarian_job_id'
+           ) IS NOT json_extract(
+               committed.payload_json,
+               '$.result.librarian_job_id'
+           )
+           OR json_extract(
+               completed.payload_json,
+               '$.result.archivist_job_id'
+           ) IS NOT json_extract(
+               committed.payload_json,
+               '$.result.archivist_job_id'
+           )
+           OR (
+               ? IS NOT NULL
+               AND json(
+                   json_remove(
+                       json_extract(completed.payload_json, '$.result'),
+                       '$.card_uri'
+                   )
+               ) IS NOT json(json_remove(rolled.value, '$.card_uri'))
+           )
+        LIMIT 1
+        """,
+        (
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            job_id,
+            *upper_params,
+            _SCRIBE_STEP_COMPLETED_ACTION,
+            job_id,
+            *upper_params,
+            terminal_json,
+            session_id,
+            terminal_json,
+        ),
+    ).fetchone()
+    if completed_drift is not None:
+        return "scribe_final_completed_authority_drift"
+    return None
+
+
+def _validate_failed_scribe_authority(
+    conn,
+    candidate: dict[str, Any],
+    parsed: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    payload = parsed["queue_payload"]
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None, "scribe_result_identity_invalid"
+    rolled: list[dict[str, Any]] | None = None
+    if not parsed["effectless"]:
+        rolled, reason = _validate_scribe_terminal_result(parsed["result"])
+        if rolled is None:
+            return None, reason
+    effect_rowid = (
+        int(candidate["effect_rowid"])
+        if candidate.get("effect_rowid") is not None
+        else None
+    )
+    state, progress_reason = _scribe_validation_progress_state(
+        conn,
+        candidate,
+    )
+    if progress_reason == "scribe_validation_progress_invalid":
+        return None, progress_reason
+    snapshot_sha256 = _failed_recovery_snapshot_sha256(candidate)
+    if state is None:
+        validated_count = 0
+        completed_count = 0
+        last_committed_rowid = 0
+        first_start_seq: int | None = None
+        last_end_seq: int | None = None
+        last_batch_number = 0
+        batch_numbers: set[int] = set()
+        authority_chain_sha256 = content_hash(
+            f"scribe-recovery-v1:{snapshot_sha256}"
+        )
+    else:
+        validated_count = int(state["validated_count"])
+        completed_count = int(state["completed_count"])
+        last_committed_rowid = int(state["last_committed_rowid"])
+        first_start_seq = int(state["first_start_seq"])
+        last_end_seq = int(state["last_end_seq"])
+        last_batch_number = int(state["last_batch_number"])
+        batch_numbers = set(state["batch_numbers"])
+        authority_chain_sha256 = str(state["authority_chain_sha256"])
+    rowid_clause = ""
+    params: list[Any] = [
+        _SCRIBE_STEP_COMMITTED_ACTION,
+        candidate["id"],
+        last_committed_rowid,
+    ]
+    if effect_rowid is not None:
+        rowid_clause = " AND rowid < ?"
+        params.append(effect_rowid)
+    rows = conn.execute(
+        f"""
+        SELECT id, rowid AS event_rowid, payload_json
+        FROM audit_events
+        WHERE action = ?
+          AND target_type = 'queue_job' AND target_id = ?
+          AND rowid > ?{rowid_clause}
+        ORDER BY rowid
+        LIMIT ?
+        """,
+        [
+            *params,
+            WORKER_FAILED_SCRIBE_STEP_VALIDATION_LIMIT + 1,
+        ],
+    ).fetchall()
+    for committed_row in rows[
+        :WORKER_FAILED_SCRIBE_STEP_VALIDATION_LIMIT
+    ]:
+        committed_receipt, reason = _parse_exact_scribe_receipt(
+            committed_row,
+            action=_SCRIBE_STEP_COMMITTED_ACTION,
+            session_id=session_id,
+        )
+        if committed_receipt is None:
+            return None, reason
+        core = _exact_scribe_committed_core(
+            committed_receipt["result"]
+        )
+        if core is None:
+            return None, "scribe_committed_core_invalid"
+        start_seq = int(committed_receipt["start_seq"])
+        end_seq = int(committed_receipt["end_seq"])
+        batch_number = int(committed_receipt["batch_number"])
+        if (
+            last_end_seq is not None
+            and start_seq != last_end_seq + 1
+        ):
+            return None, "scribe_committed_range_not_contiguous"
+        if batch_number < last_batch_number:
+            return None, "scribe_batch_chronology_invalid"
+        batch_numbers.add(batch_number)
+        if len(batch_numbers) > MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN:
+            return None, "scribe_batch_set_exceeded"
+        live_reason = _validate_live_scribe_core(
+            conn,
+            session_id=session_id,
+            start_seq=start_seq,
+            end_seq=end_seq,
+            core=core,
+        )
+        if live_reason is not None:
+            return None, live_reason
+        ordinal = validated_count
+        terminal_item = (
+            rolled[ordinal]
+            if rolled is not None and ordinal < len(rolled)
+            else None
+        )
+        if rolled is not None and terminal_item is None:
+            return None, "scribe_terminal_result_missing_step"
+        if terminal_item is not None and not (
+            _scribe_post_sidecar_result_matches_core(
+                terminal_item,
+                core,
+            )
+        ):
+            return None, "scribe_terminal_core_mismatch"
+        completion_params: list[Any] = [
+            _SCRIBE_STEP_COMPLETED_ACTION,
+            candidate["id"],
+            committed_receipt["step_key"],
+        ]
+        completion_upper = ""
+        if effect_rowid is not None:
+            completion_upper = " AND rowid < ?"
+            completion_params.append(effect_rowid)
+        completed_rows = conn.execute(
+            f"""
+            SELECT id, rowid AS event_rowid, payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.step_key') = ?
+              {completion_upper}
+            ORDER BY rowid
+            LIMIT 2
+            """,
+            completion_params,
+        ).fetchall()
+        completed_event_id: str | None = None
+        completed_payload_sha256: str | None = None
+        if len(completed_rows) > 1:
+            return None, "scribe_completed_step_duplicate"
+        if completed_rows:
+            completed_row = completed_rows[0]
+            if int(completed_row["event_rowid"]) <= int(
+                committed_row["event_rowid"]
+            ):
+                return None, "scribe_completed_chronology_invalid"
+            completed_receipt, reason = _parse_exact_scribe_receipt(
+                completed_row,
+                action=_SCRIBE_STEP_COMPLETED_ACTION,
+                session_id=session_id,
+            )
+            if completed_receipt is None:
+                return None, reason
+            if any(
+                completed_receipt[key] != committed_receipt[key]
+                for key in (
+                    "step_key",
+                    "session_id",
+                    "start_seq",
+                    "end_seq",
+                    "batch_number",
+                )
+            ) or not _scribe_post_sidecar_result_matches_core(
+                completed_receipt["result"],
+                core,
+            ):
+                return None, "scribe_completed_identity_mismatch"
+            if terminal_item is not None:
+                comparable_item = dict(terminal_item)
+                comparable_completed = dict(completed_receipt["result"])
+                comparable_item.pop("card_uri", None)
+                comparable_completed.pop("card_uri", None)
+                if not _json_values_match(
+                    comparable_item,
+                    comparable_completed,
+                ):
+                    return None, "scribe_completed_result_mismatch"
+            completed_count += 1
+            completed_event_id = str(completed_row["id"])
+            completed_payload_sha256 = content_hash(
+                str(completed_row["payload_json"])
+            )
+        elif terminal_item is not None and not (
+            _scribe_missing_completion_matches(terminal_item, core)
+        ):
+            return None, "scribe_completed_step_missing"
+        authority_chain_sha256 = content_hash(
+            json_dumps(
+                {
+                    "previous": authority_chain_sha256,
+                    "committed_event_id": str(committed_row["id"]),
+                    "committed_payload_sha256": content_hash(
+                        str(committed_row["payload_json"])
+                    ),
+                    "completed_event_id": completed_event_id,
+                    "completed_payload_sha256": completed_payload_sha256,
+                    "terminal_result_sha256": (
+                        content_hash(json_dumps(terminal_item))
+                        if terminal_item is not None
+                        else None
+                    ),
+                }
+            )
+        )
+        validated_count += 1
+        last_committed_rowid = int(committed_row["event_rowid"])
+        if first_start_seq is None:
+            first_start_seq = start_seq
+        last_end_seq = end_seq
+        last_batch_number = batch_number
+    if len(rows) > WORKER_FAILED_SCRIBE_STEP_VALIDATION_LIMIT:
+        if first_start_seq is None or last_end_seq is None:
+            return None, "scribe_committed_range_missing"
+        return {
+            "validation_pending": True,
+            "queue_snapshot_sha256": snapshot_sha256,
+            "validation_state": {
+                "validated_count": validated_count,
+                "completed_count": completed_count,
+                "last_committed_rowid": last_committed_rowid,
+                "first_start_seq": first_start_seq,
+                "last_end_seq": last_end_seq,
+                "last_batch_number": last_batch_number,
+                "batch_numbers": sorted(batch_numbers),
+                "authority_chain_sha256": authority_chain_sha256,
+            },
+        }, "scribe_validation_pending"
+    if validated_count < 1:
+        return None, "scribe_committed_step_missing"
+    if rolled is not None and len(rolled) != validated_count:
+        return None, "scribe_terminal_result_step_count_mismatch"
+    if (
+        rolled is not None
+        and parsed["result"]["batches_processed"]
+        != max(batch_numbers)
+    ):
+        return None, "scribe_batch_count_mismatch"
+    receipt_counts = _scribe_receipt_count_state(
+        conn,
+        job_id=str(candidate["id"]),
+        before_rowid=effect_rowid,
+    )
+    if receipt_counts != (validated_count, completed_count):
+        return None, "scribe_receipt_set_mismatch"
+    if effect_rowid is not None:
+        post_effect_receipt = conn.execute(
+            """
+            SELECT 1
+            FROM audit_events
+            WHERE target_type = 'queue_job' AND target_id = ?
+              AND action IN (?, ?) AND rowid >= ?
+            LIMIT 1
+            """,
+            (
+                candidate["id"],
+                _SCRIBE_STEP_COMMITTED_ACTION,
+                _SCRIBE_STEP_COMPLETED_ACTION,
+                effect_rowid,
+            ),
+        ).fetchone()
+        if post_effect_receipt is not None:
+            return None, "scribe_receipt_after_terminal_effect"
+    duplicate = conn.execute(
+        """
+        WITH committed AS (
+            SELECT payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+              AND (? IS NULL OR rowid < ?)
+        ),
+        identities(kind, value) AS (
+            SELECT 'step', json_extract(payload_json, '$.step_key')
+            FROM committed
+            UNION ALL
+            SELECT 'range',
+                   json_extract(payload_json, '$.start_seq') || ':'
+                   || json_extract(payload_json, '$.end_seq')
+            FROM committed
+            UNION ALL
+            SELECT 'segment',
+                   json_extract(payload_json, '$.result.segment_id')
+            FROM committed
+            UNION ALL
+            SELECT 'card',
+                   json_extract(payload_json, '$.result.card_id')
+            FROM committed
+        )
+        SELECT 1
+        FROM identities
+        GROUP BY kind, value
+        HAVING value IS NULL OR count(*) != 1
+        LIMIT 1
+        """,
+        (
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            candidate["id"],
+            effect_rowid,
+            effect_rowid,
+        ),
+    ).fetchone()
+    if duplicate is not None:
+        return None, "scribe_committed_identity_duplicate"
+    final_batch_state = conn.execute(
+        """
+        SELECT count(DISTINCT json_extract(
+                   payload_json,
+                   '$.batch_number'
+               )) AS batch_count,
+               max(json_extract(
+                   payload_json,
+                   '$.batch_number'
+               )) AS max_batch
+        FROM audit_events
+        WHERE action = ?
+          AND target_type = 'queue_job' AND target_id = ?
+          AND (? IS NULL OR rowid < ?)
+        """,
+        (
+            _SCRIBE_STEP_COMMITTED_ACTION,
+            candidate["id"],
+            effect_rowid,
+            effect_rowid,
+        ),
+    ).fetchone()
+    if (
+        final_batch_state is None
+        or int(final_batch_state["batch_count"] or 0) != len(batch_numbers)
+        or int(final_batch_state["max_batch"] or 0) != max(batch_numbers)
+        or (
+            rolled is not None
+            and int(final_batch_state["max_batch"] or 0)
+            != parsed["result"]["batches_processed"]
+        )
+    ):
+        return None, "scribe_final_batch_authority_drift"
+    drift_reason = _scribe_final_authority_drift_reason(
+        conn,
+        job_id=str(candidate["id"]),
+        session_id=session_id,
+        before_rowid=effect_rowid,
+        terminal_result=(
+            parsed["result"] if rolled is not None else None
+        ),
+    )
+    if drift_reason is not None:
+        return None, drift_reason
+    if first_start_seq is None or last_end_seq is None:
+        return None, "scribe_committed_range_missing"
+    return {
+        "identity": {
+            "session_id": session_id,
+            "step_count": validated_count,
+            "first_start_seq": first_start_seq,
+            "last_end_seq": last_end_seq,
+        },
+        "authority_chain_sha256": authority_chain_sha256,
+        "completed_step_count": completed_count,
+        "batch_numbers": sorted(batch_numbers),
+        "queue_snapshot_sha256": snapshot_sha256,
+    }, "eligible"
+
+
+def _sidecar_reconciliation_is_clean(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("ok") is True
+        and _exact_int(value.get("pending"))
+        and int(value["pending"]) == 0
+        and value.get("scope_complete", value.get("complete")) is True
+    )
+
+
+def _validate_failed_sync_sidecar_authority(
+    conn,
+    candidate: dict[str, Any],
+    parsed: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    payload = parsed["queue_payload"]
+    card_id = payload.get("card_id")
+    if (
+        not isinstance(card_id, str)
+        or not card_id
+        or card_id not in parsed["related_card_ids"]
+    ):
+        return None, "sidecar_job_identity_mismatch"
+    live = conn.execute(
+        "SELECT status, location_uri FROM cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if (
+        live is None
+        or str(live["status"] or "").casefold()
+        in NON_CURRENT_CARD_STATUSES
+    ):
+        return None, "sidecar_job_live_card_missing"
+    if parsed["effectless"]:
+        phase_row = conn.execute(
+            """
+            SELECT id, rowid AS event_rowid, payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (_SIDECAR_WORKER_PHASE_ACTION, candidate["id"]),
+        ).fetchone()
+        if phase_row is None:
+            return None, "sidecar_job_phase_missing"
+        phase_payload = json_loads(phase_row["payload_json"], None)
+        allowed_phases = {
+            "materialized_pending_reconciliation",
+            "reconciliation_deferred",
+            "sidecar_sync_deferred",
+            "sidecars_disabled_retry_pending",
+        }
+        if (
+            not isinstance(phase_payload, dict)
+            or set(phase_payload)
+            != {"schema", "job_type", "phase", "result"}
+            or phase_payload.get("schema")
+            != _SIDECAR_WORKER_PHASE_SCHEMA
+            or phase_payload.get("job_type") != "sync_card_sidecar"
+            or phase_payload.get("phase") not in allowed_phases
+            or not isinstance(phase_payload.get("result"), dict)
+            or phase_payload["result"].get("card_id") != card_id
+        ):
+            return None, "sidecar_job_phase_invalid"
+        phase_location = phase_payload["result"].get("location_uri")
+        if (
+            phase_location is not None
+            and phase_location != live["location_uri"]
+        ):
+            return None, "sidecar_job_phase_live_location_mismatch"
+        return {
+            "identity": {"card_id": card_id},
+            "authority_event_ids": [str(phase_row["id"])],
+        }, "eligible"
+    effect_payload = json_loads(
+        candidate.get("effect_payload_json"),
+        None,
+    )
+    if (
+        not isinstance(effect_payload, dict)
+        or set(effect_payload)
+        != {"schema", "job_type", "post_phase_complete", "result"}
+        or effect_payload.get("schema") != _WORKER_EFFECT_SCHEMA
+        or effect_payload.get("job_type") != "sync_card_sidecar"
+        or effect_payload.get("post_phase_complete") is not False
+        or not isinstance(effect_payload.get("result"), dict)
+    ):
+        return None, "sidecar_job_terminal_effect_invalid"
+    effect_result = effect_payload["result"]
+    if (
+        set(effect_result)
+        != {"ok", "card_id", "location_uri", "intent_reconciliation"}
+        or effect_result.get("ok") is not True
+        or effect_result.get("card_id") != card_id
+        or not isinstance(effect_result.get("location_uri"), str)
+        or not effect_result["location_uri"]
+        or not _sidecar_reconciliation_is_clean(
+            effect_result.get("intent_reconciliation")
+        )
+        or effect_result["location_uri"] != live["location_uri"]
+    ):
+        return None, "sidecar_job_terminal_effect_invalid"
+    error_payload = parsed["error_payload"]
+    queue_result = error_payload["result"]
+    if (
+        error_payload.get("error") != "worker result reported ok=false"
+        or set(queue_result)
+        != set(effect_result) | {"idempotent_replay"}
+        or queue_result.get("idempotent_replay") is not True
+        or queue_result.get("ok") is not False
+        or queue_result.get("card_id") != card_id
+        or queue_result.get("location_uri") != effect_result["location_uri"]
+        or not isinstance(queue_result.get("intent_reconciliation"), dict)
+        or _sidecar_reconciliation_is_clean(
+            queue_result["intent_reconciliation"]
+        )
+    ):
+        return None, "sidecar_job_failed_replay_envelope_invalid"
+    phase_row = conn.execute(
+        """
+        SELECT id, rowid AS event_rowid, payload_json
+        FROM audit_events
+        WHERE action = ?
+          AND target_type = 'queue_job' AND target_id = ?
+          AND rowid > ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (
+            _SIDECAR_WORKER_PHASE_ACTION,
+            candidate["id"],
+            int(candidate["effect_rowid"]),
+        ),
+    ).fetchone()
+    if phase_row is None:
+        return None, "sidecar_job_failed_replay_phase_missing"
+    phase_payload = json_loads(phase_row["payload_json"], None)
+    if (
+        not isinstance(phase_payload, dict)
+        or set(phase_payload)
+        != {"schema", "job_type", "phase", "result"}
+        or phase_payload.get("schema") != _SIDECAR_WORKER_PHASE_SCHEMA
+        or phase_payload.get("job_type") != "sync_card_sidecar"
+        or phase_payload.get("phase") != "reconciliation_deferred"
+        or not _json_values_match(
+            phase_payload.get("result"),
+            queue_result,
+        )
+    ):
+        return None, "sidecar_job_failed_replay_phase_invalid"
+    return {
+        "identity": {"card_id": card_id},
+        "authority_event_ids": [
+            str(candidate["effect_event_id"]),
+            str(phase_row["id"]),
+        ],
+    }, "eligible"
+
+
+def _validate_failed_sidecar_recovery_candidate(
+    conn,
+    candidate: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    recovery_mode = str(candidate.get("recovery_mode") or "")
+    job_type = str(candidate["job_type"])
+    if recovery_mode == "effectless":
+        parsed, reason = _validate_failed_effectless_queue(candidate)
+    elif job_type == "sync_card_sidecar":
+        parsed, reason = _validate_failed_queue_state(candidate)
+        if parsed is not None:
+            parsed.update({"result": None, "effectless": False})
+    else:
+        parsed, reason = _validate_failed_queue_effect(candidate)
+    if parsed is None:
+        return None, reason
+    if job_type == "review_card_placement":
+        return _validate_failed_placement_authority(
+            conn,
+            candidate,
+            parsed,
+        )
+    if job_type == "review_mempalace_import":
+        return _validate_failed_mempalace_authority(
+            conn,
+            candidate,
+            parsed,
+        )
+    if job_type == "scroll_event_ingested":
+        return _validate_failed_scribe_authority(
+            conn,
+            candidate,
+            parsed,
+        )
+    if job_type == "sync_card_sidecar":
+        return _validate_failed_sync_sidecar_authority(
+            conn,
+            candidate,
+            parsed,
+        )
+    return None, "job_type_not_allowed"
+
+
+def _record_failed_sidecar_recovery_disposition(
+    conn,
+    candidate: dict[str, Any],
+    *,
+    decision: str,
+    reason: str,
+    authority: dict[str, Any] | None = None,
+) -> str:
+    return audit_event(
+        conn,
+        action=_FAILED_SIDECAR_RECOVERY_ACTION,
+        target_type="queue_job",
+        target_id=str(candidate["id"]),
+        payload={
+            "schema": _FAILED_SIDECAR_RECOVERY_SCHEMA,
+            "decision": decision,
+            "reason": reason,
+            "job_type": candidate["job_type"],
+            "effect_event_id": candidate["recovery_effect_key"],
+            "effect_event_rowid": (
+                int(candidate["effect_rowid"])
+                if candidate.get("effect_rowid") is not None
+                else None
+            ),
+            "effect_payload_sha256": content_hash(
+                str(candidate.get("effect_payload_json") or "")
+            ),
+            "queue_payload_sha256": content_hash(
+                str(candidate["payload_json"])
+            ),
+            "previous_error_sha256": content_hash(
+                str(candidate.get("error_json") or "")
+            ),
+            "attempt_count": int(candidate.get("attempt_count") or 0),
+            "queue_snapshot_sha256": (
+                _failed_recovery_snapshot_sha256(candidate)
+            ),
+            **(authority or {}),
+        },
+        actor="worker",
+    )
+
+
+def _recover_failed_post_phase_sidecar_jobs(
+    root: Path,
+    *,
+    limit: int = WORKER_FAILED_SIDECAR_RECOVERY_LIMIT,
+) -> dict[str, Any]:
+    bounded_limit = max(
+        1,
+        min(int(limit), WORKER_FAILED_SIDECAR_RECOVERY_LIMIT),
+    )
+    read_conn = connect(root)
+    try:
+        window = _all_failed_sidecar_recovery_candidates(
+            read_conn,
+            limit=bounded_limit + 1,
+        )
+    finally:
+        read_conn.close()
+    selected = window[:bounded_limit]
+    dispositions: list[dict[str, Any]] = []
+    requeued = 0
+    rejected = 0
+    validating = 0
+    changed = 0
+    for snapshot_candidate in selected:
+        conn = connect(root)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current_window = _all_failed_sidecar_recovery_candidates(
+                conn,
+                limit=1,
+                job_id=str(snapshot_candidate["id"]),
+            )
+            if not current_window:
+                conn.rollback()
+                changed += 1
+                continue
+            candidate = current_window[0]
+            if not _json_values_match(
+                _failed_recovery_snapshot(candidate),
+                _failed_recovery_snapshot(snapshot_candidate),
+            ):
+                conn.rollback()
+                changed += 1
+                continue
+            authority, reason = (
+                _validate_failed_sidecar_recovery_candidate(
+                    conn,
+                    candidate,
+                )
+            )
+            if (
+                authority is not None
+                and authority.get("validation_pending") is True
+            ):
+                progress_authority = dict(authority)
+                progress_authority.pop("validation_pending", None)
+                disposition_id = (
+                    _record_failed_sidecar_recovery_disposition(
+                        conn,
+                        candidate,
+                        decision="validating",
+                        reason=reason,
+                        authority=progress_authority,
+                    )
+                )
+                conn.commit()
+                validating += 1
+                dispositions.append(
+                    {
+                        "job_id": candidate["id"],
+                        "effect_event_id": candidate[
+                            "recovery_effect_key"
+                        ],
+                        "disposition_id": disposition_id,
+                        "decision": "validating",
+                        "reason": reason,
+                    }
+                )
+                continue
+            if authority is not None and candidate.get("dedupe_key"):
+                collision = conn.execute(
+                    """
+                    SELECT id, status
+                    FROM queue_jobs
+                    WHERE id != ? AND dedupe_key = ?
+                      AND status IN ('pending', 'running')
+                    ORDER BY rowid
+                    LIMIT 1
+                    """,
+                    (candidate["id"], candidate["dedupe_key"]),
+                ).fetchone()
+                if collision is not None:
+                    authority = None
+                    reason = "live_dedupe_job_exists"
+            if authority is None:
+                disposition_id = (
+                    _record_failed_sidecar_recovery_disposition(
+                        conn,
+                        candidate,
+                        decision="rejected",
+                        reason=reason,
+                    )
+                )
+                conn.commit()
+                rejected += 1
+                dispositions.append(
+                    {
+                        "job_id": candidate["id"],
+                        "effect_event_id": candidate[
+                            "recovery_effect_key"
+                        ],
+                        "disposition_id": disposition_id,
+                        "decision": "rejected",
+                        "reason": reason,
+                    }
+                )
+                continue
+            now = utc_now()
+            recovery_result = {
+                "ok": False,
+                "reason": POST_COMMIT_SIDECAR_RETRY_REASON,
+                "retry_pending": True,
+                "recovered_from_failed_status": True,
+                "effect_event_id": candidate["recovery_effect_key"],
+            }
+            cursor = conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = 'pending', finished_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, updated_at = ?, error_json = ?
+                WHERE rowid = ? AND id = ? AND status = 'failed'
+                  AND job_type = ? AND role = ?
+                  AND attempt_count = ? AND payload_json = ?
+                  AND related_card_ids_json = ?
+                  AND error_json IS ? AND updated_at = ?
+                  AND finished_at IS ?
+                   AND lease_owner IS ? AND lease_expires_at IS ?
+                   AND heartbeat_at IS ?
+                   AND (
+                       (
+                           ? = 'effect'
+                           AND ? = (
+                               SELECT effect.id
+                               FROM audit_events AS effect
+                               WHERE effect.action = ?
+                                 AND effect.target_type = 'queue_job'
+                                 AND effect.target_id = queue_jobs.id
+                               ORDER BY effect.rowid DESC
+                               LIMIT 1
+                           )
+                       )
+                       OR (
+                           ? = 'effectless'
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM audit_events AS effect
+                               WHERE effect.action = ?
+                                 AND effect.target_type = 'queue_job'
+                                 AND effect.target_id = queue_jobs.id
+                           )
+                       )
+                   )
+                """,
+                (
+                    now,
+                    json_dumps(
+                        {
+                            "error": None,
+                            "result": recovery_result,
+                            "retry_pending": True,
+                        }
+                    ),
+                    int(candidate["queue_rowid"]),
+                    candidate["id"],
+                    candidate["job_type"],
+                    candidate["role"],
+                    int(candidate.get("attempt_count") or 0),
+                    candidate["payload_json"],
+                    candidate["related_card_ids_json"],
+                    candidate.get("error_json"),
+                    candidate["updated_at"],
+                    candidate.get("finished_at"),
+                    candidate.get("lease_owner"),
+                    candidate.get("lease_expires_at"),
+                    candidate.get("heartbeat_at"),
+                    candidate["recovery_mode"],
+                    candidate["effect_event_id"],
+                    _WORKER_EFFECT_ACTION,
+                    candidate["recovery_mode"],
+                    _WORKER_EFFECT_ACTION,
+                ),
+            )
+            if int(cursor.rowcount or 0) != 1:
+                conn.rollback()
+                changed += 1
+                continue
+            disposition_id = _record_failed_sidecar_recovery_disposition(
+                conn,
+                candidate,
+                decision="requeued",
+                reason=(
+                    "exact_failed_sidecar_effect_recovered"
+                    if candidate["recovery_mode"] == "effect"
+                    else "exact_failed_post_commit_authority_recovered"
+                ),
+                authority=authority,
+            )
+            conn.commit()
+            requeued += 1
+            dispositions.append(
+                {
+                    "job_id": candidate["id"],
+                    "effect_event_id": candidate[
+                        "recovery_effect_key"
+                    ],
+                    "disposition_id": disposition_id,
+                    "decision": "requeued",
+                    "reason": (
+                        "exact_failed_sidecar_effect_recovered"
+                        if candidate["recovery_mode"] == "effect"
+                        else (
+                            "exact_failed_post_commit_authority_recovered"
+                        )
+                    ),
+                }
+            )
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+    final_conn = connect(root)
+    try:
+        remaining = bool(
+            _all_failed_sidecar_recovery_candidates(
+                final_conn,
+                limit=1,
+            )
+        )
+    finally:
+        final_conn.close()
+    has_more = bool(validating or changed or remaining)
+    return {
+        "ok": True,
+        "limit": bounded_limit,
+        "selected": len(selected),
+        "requeued": requeued,
+        "rejected": rejected,
+        "validating": validating,
+        "changed_during_scan": changed,
+        "has_more": has_more,
+        "complete": not has_more,
+        "dispositions": dispositions[:WORKER_MAINTENANCE_FAILURE_LIMIT],
+    }
+
+
+def _running_job_post_commit_authority(
+    conn,
+    job: dict[str, Any],
+) -> dict[str, Any] | None:
+    job_id = str(job["id"])
+    job_type = str(job["job_type"])
+    payload = json_loads(job.get("payload_json"), None)
+    if not isinstance(payload, dict):
+        return None
+    effect_row = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM audit_events
+        WHERE action = ?
+          AND target_type = 'queue_job' AND target_id = ?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (_WORKER_EFFECT_ACTION, job_id),
+    ).fetchone()
+    if effect_row is not None:
+        effect_payload = json_loads(effect_row["payload_json"], None)
+        if (
+            isinstance(effect_payload, dict)
+            and set(effect_payload)
+            == {"schema", "job_type", "post_phase_complete", "result"}
+            and effect_payload.get("schema") == _WORKER_EFFECT_SCHEMA
+            and effect_payload.get("job_type") == job_type
+            and isinstance(effect_payload.get("post_phase_complete"), bool)
+            and isinstance(effect_payload.get("result"), dict)
+        ):
+            return {
+                "kind": "worker_effect",
+                "event_id": str(effect_row["id"]),
+            }
+    if job_type == "review_card_placement":
+        card_id = payload.get("card_id")
+        phase = _exact_worker_phase_receipt(
+            conn,
+            job_id=job_id,
+            job_type=job_type,
+        )
+        if (
+            not isinstance(card_id, str)
+            or not card_id
+            or phase is None
+        ):
+            return None
+        phase_row, phase_payload = phase
+        phase_result = phase_payload["result"]
+        core_result = phase_result.get("core_result")
+        live = conn.execute(
+            "SELECT status FROM cards WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        if (
+            set(phase_result) != {"core_result"}
+            or not isinstance(core_result, dict)
+            or core_result.get("ok") is not True
+            or core_result.get("card_id") != card_id
+            or live is None
+            or str(live["status"] or "").casefold()
+            in NON_CURRENT_CARD_STATUSES
+        ):
+            return None
+        return {
+            "kind": "placement_core_phase",
+            "event_id": str(phase_row["id"]),
+            "card_id": card_id,
+        }
+    if job_type == "review_mempalace_import":
+        import_id = payload.get("import_id")
+        phase = _exact_worker_phase_receipt(
+            conn,
+            job_id=job_id,
+            job_type=job_type,
+        )
+        if (
+            not isinstance(import_id, str)
+            or not import_id
+            or phase is None
+        ):
+            return None
+        phase_row, phase_payload = phase
+        phase_result = phase_payload["result"]
+        core_result = phase_result.get("core_result")
+        changed_cards = phase_result.get("changed_cards")
+        if (
+            set(phase_result) != {"core_result", "changed_cards"}
+            or not isinstance(core_result, dict)
+            or core_result.get("ok") is not True
+            or core_result.get("reviewed_import") != import_id
+            or not isinstance(changed_cards, list)
+            or not changed_cards
+            or len(changed_cards) > MAX_BACKLOG_RECONCILE_LIMIT
+            or len(set(changed_cards)) != len(changed_cards)
+        ):
+            return None
+        live_count = int(
+            conn.execute(
+                """
+                SELECT count(*)
+                FROM cards
+                WHERE id IN (SELECT value FROM json_each(?))
+                  AND status NOT IN (
+                      'superseded', 'archived', 'pruned', 'deleted'
+                  )
+                """,
+                (json_dumps(changed_cards),),
+            ).fetchone()[0]
+        )
+        if live_count != len(changed_cards):
+            return None
+        return {
+            "kind": "mempalace_core_phase",
+            "event_id": str(phase_row["id"]),
+            "import_id": import_id,
+        }
+    if job_type == "scroll_event_ingested":
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        committed_row = conn.execute(
+            """
+            SELECT id, rowid AS event_rowid, payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (_SCRIBE_STEP_COMMITTED_ACTION, job_id),
+        ).fetchone()
+        if committed_row is None:
+            return None
+        committed_receipt, _reason = _parse_exact_scribe_receipt(
+            committed_row,
+            action=_SCRIBE_STEP_COMMITTED_ACTION,
+            session_id=session_id,
+        )
+        if committed_receipt is None:
+            return None
+        core = _exact_scribe_committed_core(
+            committed_receipt["result"]
+        )
+        if core is None:
+            return None
+        live_reason = _validate_live_scribe_core(
+            conn,
+            session_id=session_id,
+            start_seq=int(committed_receipt["start_seq"]),
+            end_seq=int(committed_receipt["end_seq"]),
+            core=core,
+        )
+        if live_reason is not None:
+            return None
+        return {
+            "kind": "scribe_committed_step",
+            "event_id": str(committed_row["id"]),
+            "step_key": committed_receipt["step_key"],
+        }
+    if job_type == "sync_card_sidecar":
+        card_id = payload.get("card_id")
+        if not isinstance(card_id, str) or not card_id:
+            return None
+        phase_row = conn.execute(
+            """
+            SELECT id, payload_json
+            FROM audit_events
+            WHERE action = ?
+              AND target_type = 'queue_job' AND target_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (_SIDECAR_WORKER_PHASE_ACTION, job_id),
+        ).fetchone()
+        if phase_row is None:
+            return None
+        phase_payload = json_loads(phase_row["payload_json"], None)
+        if (
+            not isinstance(phase_payload, dict)
+            or set(phase_payload)
+            != {"schema", "job_type", "phase", "result"}
+            or phase_payload.get("schema")
+            != _SIDECAR_WORKER_PHASE_SCHEMA
+            or phase_payload.get("job_type") != job_type
+            or not isinstance(phase_payload.get("result"), dict)
+            or phase_payload["result"].get("card_id") != card_id
+        ):
+            return None
+        return {
+            "kind": "sidecar_worker_phase",
+            "event_id": str(phase_row["id"]),
+            "card_id": card_id,
+        }
+    return None
 
 
 def _process_job(
@@ -5821,11 +9270,69 @@ def _run_worker_pass_with_sidecar_intent_budget(
             renewer.stop()
             conn = connect(root)
             try:
-                _finish_job(conn, job["id"], status="failed", error=str(exc), lease_owner=worker_id)
+                conn.execute("BEGIN IMMEDIATE")
+                post_commit_authority = (
+                    _running_job_post_commit_authority(conn, job)
+                )
+                retry_authority_is_owned = bool(
+                    post_commit_authority is not None
+                    and _job_lease_is_owned(
+                        conn,
+                        str(job["id"]),
+                        lease_owner=worker_id,
+                    )
+                )
+                if retry_authority_is_owned:
+                    retry_result = {
+                        "ok": False,
+                        "reason": POST_COMMIT_EXCEPTION_RETRY_REASON,
+                        "retry_pending": True,
+                        "post_commit_authority": post_commit_authority,
+                        "exception_sha256": content_hash(
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    }
+                    _retry_owned_job(
+                        conn,
+                        job["id"],
+                        lease_owner=worker_id,
+                        lease_seconds=lease_seconds,
+                        result=retry_result,
+                    )
+                else:
+                    post_commit_authority = None
+                    _finish_job(
+                        conn,
+                        job["id"],
+                        status="failed",
+                        error=str(exc),
+                        lease_owner=worker_id,
+                    )
                 conn.commit()
             finally:
                 conn.close()
-            processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "ok": False, "error": str(exc)})
+            if post_commit_authority is not None:
+                processed.append(
+                    {
+                        "job_id": job["id"],
+                        "role": job["role"],
+                        "job_type": job["job_type"],
+                        "status": "pending",
+                        "ok": False,
+                        "result": retry_result,
+                    }
+                )
+                break
+            processed.append(
+                {
+                    "job_id": job["id"],
+                    "role": job["role"],
+                    "job_type": job["job_type"],
+                    "status": "failed",
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
         finally:
             renewer.stop()
             _CURRENT_JOB_LEASE.reset(lease_token)
@@ -5838,6 +9345,9 @@ def _run_worker_pass_with_sidecar_intent_budget(
         )
         maintenance_result["sidecar_intents"] = (
             _reconcile_card_sidecar_intent_maintenance(root)
+        )
+        maintenance_result["failed_sidecar_jobs"] = (
+            _recover_failed_post_phase_sidecar_jobs(root)
         )
         maintenance_result["decay"] = decay_graph_routes(
             root,

@@ -86,6 +86,15 @@ class ScribeBacklogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _root_with_threshold(tmp, threshold=2)
             original_job_ids = _append_events(root, session_id="bounded-backlog", count=6)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE queue_jobs SET priority = 7 WHERE id = ?",
+                    (original_job_ids[0],),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             with patch("continuum.core.workers.MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN", 2):
                 first = run_worker_pass(root, roles=["scribe"], limit=1, maintenance=False)
@@ -106,7 +115,7 @@ class ScribeBacklogTest(unittest.TestCase):
                     ).fetchall()
                     mid_jobs = conn.execute(
                         """
-                        SELECT id, status
+                        SELECT id, status, priority
                         FROM queue_jobs
                         WHERE role = 'scribe' AND job_type = 'scroll_event_ingested'
                         ORDER BY created_at, id
@@ -120,8 +129,14 @@ class ScribeBacklogTest(unittest.TestCase):
                     [(1, 2), (3, 4)],
                 )
                 self.assertEqual(
-                    {row["id"]: row["status"] for row in mid_jobs},
-                    {original_job_ids[0]: "succeeded", continuation_job_id: "pending"},
+                    {
+                        row["id"]: (row["status"], row["priority"])
+                        for row in mid_jobs
+                    },
+                    {
+                        original_job_ids[0]: ("succeeded", 7),
+                        continuation_job_id: ("pending", 7),
+                    },
                 )
 
                 second = run_worker_pass(root, roles=["scribe"], limit=1, maintenance=False)
@@ -152,6 +167,99 @@ class ScribeBacklogTest(unittest.TestCase):
                 [(1, 2), (3, 4), (5, 6)],
             )
             self.assertEqual({row["status"]: row["n"] for row in final_states}, {"succeeded": 2})
+
+    def test_existing_pending_continuation_is_refreshed_to_parent_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _root_with_threshold(tmp, threshold=2)
+            running_job = _append_events(root, session_id="priority-refresh", count=6)[0]
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE queue_jobs SET priority = 7 WHERE id = ?",
+                    (running_job,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_ensure = worker_module._ensure_scribe_continuation
+            concurrent_job_ids: list[str] = []
+
+            def append_before_continuation(
+                continuation_root: Path,
+                *,
+                session_id: str,
+                threshold: int,
+            ) -> dict[str, object]:
+                concurrent_job_ids.append(
+                    append_scroll_event(
+                        continuation_root,
+                        session_id=session_id,
+                        event_type="message",
+                        role="user",
+                        content=(
+                            "A concurrent append creates a default-priority "
+                            "pending generation."
+                        ),
+                    )["scribe_job_id"]
+                )
+                return original_ensure(
+                    continuation_root,
+                    session_id=session_id,
+                    threshold=threshold,
+                )
+
+            with (
+                patch(
+                    "continuum.core.workers.MAX_SCRIBE_SEGMENT_BATCHES_PER_RUN",
+                    2,
+                ),
+                patch.object(
+                    worker_module,
+                    "_ensure_scribe_continuation",
+                    side_effect=append_before_continuation,
+                ),
+            ):
+                result = run_worker_pass(
+                    root,
+                    roles=["scribe"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(concurrent_job_ids), 1)
+            pending_job = concurrent_job_ids[0]
+            self.assertNotEqual(pending_job, running_job)
+            self.assertEqual(
+                result["processed"][0]["result"]["continuations"][0][
+                    "continuation_job_id"
+                ],
+                pending_job,
+            )
+            conn = connect(root)
+            try:
+                refreshed = conn.execute(
+                    """
+                    SELECT id, status, priority
+                    FROM queue_jobs
+                    WHERE id IN (?, ?)
+                    ORDER BY id
+                    """,
+                    (running_job, pending_job),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(
+                {
+                    row["id"]: (row["status"], row["priority"])
+                    for row in refreshed
+                },
+                {
+                    running_job: ("succeeded", 7),
+                    pending_job: ("pending", 7),
+                },
+            )
 
     def test_pending_generation_waits_for_same_dedupe_running_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

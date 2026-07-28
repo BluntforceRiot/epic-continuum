@@ -10,6 +10,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -224,6 +226,44 @@ class OperationLedgerTest(unittest.TestCase):
                 verification = verify_operation_event_log(path, operation_id=operation_id)
                 self.assertTrue(verification["ok"], verification["errors"])
                 self.assertEqual(verification["event_count"], 41)
+
+    def test_operation_lock_timeout_includes_in_process_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            holder_ready = threading.Event()
+            release_holder = threading.Event()
+
+            def hold_lock() -> None:
+                with operations_module.operation_lock(
+                    root,
+                    "thread-timeout",
+                    timeout_seconds=1.0,
+                ):
+                    holder_ready.set()
+                    release_holder.wait(timeout=0.3)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                holder = executor.submit(hold_lock)
+                self.assertTrue(holder_ready.wait(timeout=1.0))
+                started = time.monotonic()
+                try:
+                    with self.assertRaisesRegex(
+                        TimeoutError,
+                        "timed out waiting for operation lock",
+                    ):
+                        with operations_module.operation_lock(
+                            root,
+                            "thread-timeout",
+                            timeout_seconds=0.05,
+                        ):
+                            self.fail("timed-out waiter entered operation lock")
+                finally:
+                    elapsed = time.monotonic() - started
+                    release_holder.set()
+                holder.result(timeout=1.0)
+
+            self.assertGreaterEqual(elapsed, 0.03)
+            self.assertLess(elapsed, 0.25)
 
     def test_cross_process_progress_updates_are_lossless_and_hash_chained(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -553,6 +593,88 @@ class OperationLedgerTest(unittest.TestCase):
             verification = verify_proof_pack(Path(proof["proof_pack_uri"]))
             self.assertTrue(verification["ok"])
             self.assertEqual(verification["operation_id"], started["operation_id"])
+
+    def test_proof_pack_remains_available_during_sidecar_artifact_reservation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            started = start_operation(
+                root,
+                operation_type="proof_reservation_best_effort",
+                title="Proof reservation best effort",
+            )
+            finish_operation(
+                root,
+                started["operation_id"],
+                status="succeeded",
+                result={"ok": True},
+            )
+            reservation = store_module.json_dumps(
+                {
+                    "schema": (
+                        store_module
+                        .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_SCHEMA
+                    ),
+                    "reservation_id": "sidecar_artifact_write_test",
+                    "card_id": "card_" + "a" * 24,
+                    "target_uri": "continuum://catalog/cards/test.yaml",
+                    "expected_state_hash": "b" * 64,
+                    "artifact_epoch": 0,
+                    "created_at": store_module.utc_now(),
+                }
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                    (
+                        store_module
+                        .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        reservation,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            proof = create_proof_pack(root, started["operation_id"])
+
+            proof_path = Path(proof["proof_pack_uri"])
+            self.assertTrue(proof_path.is_file())
+            verification = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(verification["ok"], verification)
+            self.assertEqual(
+                [error["check"] for error in verification["errors"]],
+                ["artifact_ledger_proof_pack_bound"],
+                verification,
+            )
+            conn = connect(root)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (
+                            store_module
+                            .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                        ),
+                    ).fetchone()["value"],
+                    reservation,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM artifacts
+                        WHERE operation_id = ?
+                        """,
+                        (started["operation_id"],),
+                    ).fetchone()["n"],
+                    0,
+                )
+            finally:
+                conn.close()
 
     def test_proof_pack_retention_keeps_ledgered_artifacts_verifiable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

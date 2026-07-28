@@ -36,6 +36,7 @@ from .permissions import (
 )
 from .safety import redact_text_secrets, redact_value_secrets, scan_text_for_secrets, scan_value_for_secrets
 from .store import (
+    CardSidecarArtifactWriteReservationError,
     SCHEMA_PATH,
     SCHEMA_VERSION,
     SNAPSHOT_DURABLE_TABLES,
@@ -214,10 +215,15 @@ def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60
     safe_id = validate_operation_id(operation_id)
     lock_path = root / "run" / "locks" / "operations" / f"{safe_id}.lock"
     key = str(lock_path.resolve(strict=False))
+    bounded_timeout = max(0.0, float(timeout_seconds))
+    deadline = time.monotonic() + bounded_timeout
     thread_lock = _thread_operation_lock(key)
     held: dict[str, int] = getattr(_OPERATION_LOCK_STATE, "held", {})
     _OPERATION_LOCK_STATE.held = held
-    with thread_lock:
+    remaining = max(0.0, deadline - time.monotonic())
+    if not thread_lock.acquire(timeout=remaining):
+        raise TimeoutError("timed out waiting for operation lock")
+    try:
         if held.get(key, 0):
             held[key] += 1
             try:
@@ -229,7 +235,10 @@ def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60
         handle = _open_operation_lock_file(lock_path)
         secure_file(lock_path)
         try:
-            _lock_file_handle(handle, timeout_seconds=timeout_seconds)
+            _lock_file_handle(
+                handle,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+            )
             held[key] = 1
             try:
                 yield
@@ -238,6 +247,10 @@ def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60
                 _unlock_file_handle(handle)
         finally:
             handle.close()
+    finally:
+        thread_lock.release()
+
+
 OPERATION_SCHEMA = "epic_continuum.operation_receipt.v1"
 OPERATION_EVENT_SCHEMA = "epic_continuum.operation_event.v1"
 PROOF_PACK_SCHEMA = "epic_continuum.proof_pack.v1"
@@ -1464,7 +1477,7 @@ def _record_proof_artifacts(
                 metadata={"schema": PROOF_PACK_SCHEMA},
             )
         conn.commit()
-    except sqlite3.Error:
+    except (sqlite3.Error, CardSidecarArtifactWriteReservationError):
         conn.rollback()
     finally:
         conn.close()

@@ -16,18 +16,112 @@ the configured cadence rather than on every idle poll. A failed job or
 maintenance pass exits the service with a failed result so its supervisor can
 alert or restart it instead of masking the failure.
 
+Claims normally preserve strict numeric priority. After eight consecutive
+claims that bypass the oldest eligible job, the next claim serves that oldest
+job and resets the durable fairness counter. This bounds starvation without
+discarding priority ordering during normal operation. A bounded Scribe drain
+inherits its parent job's priority when it leaves a continuation. If a
+same-session pending generation already arrived while the parent was running,
+the continuation refreshes that exact pending row instead of retaining its
+default priority. Status-first priority and creation-order indexes serve
+unrestricted lanes. Role-first priority and creation-order indexes serve each
+selected role; a multi-role worker reads one indexed candidate per allowed role
+and chooses the exact global winner instead of scanning excluded-role backlog.
+A running-only dedupe index keeps eligibility checks off the full
+active/pending history. A separate unique pending-only dedupe index makes one
+pending generation authoritative even when producers race.
+
 Every claimed queue job has a background lease renewer. Durable processor
 transactions re-check the unexpired owner token before committing and write a
 versioned effect receipt in the same transaction. If a process stops after that
 commit but before finishing the queue row, the reclaimed job returns the prior
 receipt instead of repeating database-visible work. Card sidecar synchronization
-serializes the Card snapshot and generation-specific outbox acknowledgement in
-one SQLite writer transaction. Before creating a new physical target it writes
-a unique durable intent, chooses a copy-on-write generation when the prior path
-is artifact-bound, atomically writes the YAML, and commits the catalog-selected
-`location_uri`. Post-commit reconciliation emits a terminal receipt. It adopts
-only bytes bound to the committed Card, preserves immutable bytes, quarantines
-uncommitted bytes without deleting them, and requeues any incomplete result.
+uses the sidecar operation lock to serialize publishers. It commits a short
+database snapshot, builds the immutable-artifact path index outside a writer
+transaction, and binds that index to both an artifact-only catalog epoch and the
+SQLite schema authority version. Exact insert, URI/immutability-update, and
+delete triggers maintain the epoch. A short writer transaction rechecks the
+trigger definitions, epoch, and schema authority before publishing a durable
+global reservation and before any selected target is replaced. If artifact or
+trigger authority changed, the publisher rebuilds the index and reselects
+instead of using the stale path.
+An artifact-index query failure is an authority failure, never an empty index,
+so direct publication and intent recovery both preserve possibly immutable
+bytes and leave retry evidence pending.
+While the reservation exists, schema triggers reject both helper-based and raw
+SQL immutable-artifact registration, including conversion of a mutable row to
+immutable.
+
+After committing the reservation, synchronization writes its unique durable
+intent, chooses a copy-on-write generation when the prior path is
+artifact-bound, atomically writes the YAML, and flushes the file and directory.
+A second short writer transaction acknowledges the exact outbox generation
+only when the Card location and state hash still match the snapshot, then
+removes the reservation; otherwise it preserves newer outbox authority while
+still releasing the completed publisher fence. A crash leaves the reservation
+visible as initial recovery authority and normally also leaves the outbox or
+intent pending. An active reservation makes initialization unready. The next
+holder of the sidecar operation lock validates its Card identity, atomically
+rearms that Card's outbox, audits the recovery, and only then retires the
+reservation. This converts even a crash in the narrow location-less backfill
+window before intent creation into ordinary worker-retryable outbox authority.
+An artifact registrar never needs to acquire the operation lock while holding a
+database writer.
+
+Crash-left publisher temporary files are inventoried with exact path identities
+while a short SQLite writer fence waits out transaction-bound publishers. The
+fence is committed before those identities are retired and their directories
+are flushed; a same-name replacement fails the identity check. Specifically,
+neither post-commit YAML publication and its file/directory flushes nor
+publisher-temp retirement and its flushes run while these paths hold a SQLite
+writer transaction. Worker sidecar jobs use this same after-commit path rather
+than writing files from their effect transaction.
+
+Normal post-write reconciliation captures Cards, sidecar outbox rows, immutable
+artifact authority, their two monotonic epochs, and the SQLite schema authority
+version in one WAL read snapshot.
+It then validates target, recovery, and committed-receipt files without holding
+a SQLite writer transaction. Exact triggers advance the sidecar authority epoch
+for every Card or outbox insert, update, and delete. Before publishing a new
+terminal receipt, a short writer compare-and-swap verifies both trigger sets,
+the two epochs, and the schema authority version in constant work; catalog or
+trigger-definition drift rebuilds the snapshot instead of publishing stale
+authority. After that commit, reconciliation reopens the exact file identities,
+durably publishes the receipt, and retires the intent. A crash between the
+compare-and-swap and receipt publication therefore leaves the intent replayable.
+
+Only a destructive quarantine decision is rerun under a fresh writer snapshot.
+That exceptional path may move and flush an unreferenced file while holding its
+writer fence so it cannot quarantine newly committed Card or artifact authority.
+Normal adoption, immutable preservation, no-file completion, receipt replay,
+and terminal receipt publication perform their filesystem work outside the
+writer transaction. Reconciliation adopts only bytes bound to the committed
+Card, preserves immutable bytes, quarantines uncommitted bytes without deleting
+them, and requeues any incomplete result.
+
+Post-commit sidecar work is part of queue completion authority. Scribe,
+Librarian placement (including nested conflict updates), MemPalace migration,
+and Archivist sidecar jobs remain `pending` with a durable retry reason whenever
+materialization or intent reconciliation is incomplete. They do not write a
+terminal worker-effect receipt or enter failed-job history while that durable
+work can still be repaired and retried.
+
+Maintenance also repairs failed rows left by older workers that recorded this
+post-commit condition as terminal. After draining sidecar work, one pass
+examines at most 50 failed candidates and requeues only a row whose latest
+effect (or exact effectless post-commit authority), queue failure envelope, job
+payload, committed core or Scribe step receipts, live Card identities, and
+expected worker role all match the known sidecar-only failure protocol. A
+pending or running dedupe peer blocks requeue. Every exact authority receives
+one immutable requeued or rejected disposition, so malformed older evidence
+cannot starve later candidates and an old effect cannot cause a requeue loop.
+Large Scribe histories validate at most 64 committed steps per maintenance
+call. A durable `validating` receipt binds the full queue/effect snapshot and
+the cumulative receipt chain; finalization rechecks the complete receipt/live
+authority set in the same writer transaction as the requeue. A validation-only
+pass reports incomplete work rather than a false completion. Explicit business
+failures remain failed.
+
 Disabling future sidecar writes leaves existing locations readable and pending
 refresh work unacknowledged until writes are re-enabled. Cards that never had a
 sidecar are intentional skips while disabled and are backfilled by pending sync

@@ -95,6 +95,16 @@ GRAPH_EDGE_SOURCES_BACKFILL_META_KEY = (
     "migration.graph_edge_sources_backfill.v2"
 )
 GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE = "complete"
+QUEUE_RETRY_PENDING_BACKFILL_META_KEY = (
+    "migration.queue_retry_pending_backfill.v1"
+)
+QUEUE_RETRY_PENDING_BACKFILL_META_VALUE = "complete"
+QUEUE_RETRY_ORDER_BACKFILL_META_KEY = (
+    "migration.queue_retry_order_backfill.v1"
+)
+QUEUE_RETRY_ORDER_BACKFILL_META_VALUE = "complete"
+QUEUE_RETRY_ORDER_META_KEY = "worker_queue_retry_order_v1"
+MAX_QUEUE_RETRY_ORDER = (1 << 63) - 1
 RESUME_AUTHORITY_INDEX_NAMES = frozenset(
     {
         "idx_graph_edge_sources_card_id_authority",
@@ -105,23 +115,64 @@ QUEUE_ROLE_PRIORITY_INDEX_NAME = "idx_queue_role_priority"
 QUEUE_ROLE_CREATED_INDEX_NAME = "idx_queue_role_created"
 QUEUE_STATUS_PRIORITY_INDEX_NAME = "idx_queue_status_priority"
 QUEUE_STATUS_CREATED_INDEX_NAME = "idx_queue_status_created"
+QUEUE_ROLE_RETRY_INDEX_NAME = "idx_queue_role_retry"
+QUEUE_STATUS_RETRY_INDEX_NAME = "idx_queue_status_retry"
+QUEUE_ROLE_LEASE_INDEX_NAME = "idx_queue_role_lease"
+QUEUE_STATUS_LEASE_INDEX_NAME = "idx_queue_lease_expiry"
+QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME = (
+    "idx_queue_retry_order_authority"
+)
+QUEUE_RETRY_AUTHORITY_TRIGGER_NAMES = frozenset(
+    {
+        "enforce_queue_retry_authority_insert",
+        "enforce_queue_retry_authority_update",
+    }
+)
+QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR = (
+    "queue retry authority invariant violated"
+)
 QUEUE_RUNNING_DEDUPE_INDEX_NAME = "idx_queue_running_dedupe"
 QUEUE_PENDING_DEDUPE_INDEX_NAME = "idx_queue_pending_dedupe_key"
 QUEUE_ROLE_PRIORITY_INDEX_SQL = """
     CREATE INDEX idx_queue_role_priority
-    ON queue_jobs(role, status, priority, created_at)
+    ON queue_jobs(role, status, retry_pending, priority, created_at)
 """
 QUEUE_ROLE_CREATED_INDEX_SQL = """
     CREATE INDEX idx_queue_role_created
-    ON queue_jobs(role, status, created_at)
+    ON queue_jobs(role, status, retry_pending, created_at)
 """
 QUEUE_STATUS_PRIORITY_INDEX_SQL = """
     CREATE INDEX idx_queue_status_priority
-    ON queue_jobs(status, priority, created_at)
+    ON queue_jobs(status, retry_pending, priority, created_at)
 """
 QUEUE_STATUS_CREATED_INDEX_SQL = """
     CREATE INDEX idx_queue_status_created
-    ON queue_jobs(status, created_at)
+    ON queue_jobs(status, retry_pending, created_at)
+"""
+QUEUE_ROLE_RETRY_INDEX_SQL = """
+    CREATE INDEX idx_queue_role_retry
+    ON queue_jobs(
+        role, status, retry_pending, retry_order, priority, created_at
+    )
+"""
+QUEUE_STATUS_RETRY_INDEX_SQL = """
+    CREATE INDEX idx_queue_status_retry
+    ON queue_jobs(
+        status, retry_pending, retry_order, priority, created_at
+    )
+"""
+QUEUE_ROLE_LEASE_INDEX_SQL = """
+    CREATE INDEX idx_queue_role_lease
+    ON queue_jobs(role, status, lease_expires_at, id)
+"""
+QUEUE_STATUS_LEASE_INDEX_SQL = """
+    CREATE INDEX idx_queue_lease_expiry
+    ON queue_jobs(status, lease_expires_at, id)
+"""
+QUEUE_RETRY_ORDER_AUTHORITY_INDEX_SQL = """
+    CREATE UNIQUE INDEX idx_queue_retry_order_authority
+    ON queue_jobs(retry_order)
+    WHERE retry_pending = 1
 """
 QUEUE_RUNNING_DEDUPE_INDEX_SQL = """
     CREATE INDEX idx_queue_running_dedupe
@@ -138,6 +189,13 @@ QUEUE_CLAIM_INDEX_SQL = {
     QUEUE_ROLE_CREATED_INDEX_NAME: QUEUE_ROLE_CREATED_INDEX_SQL,
     QUEUE_STATUS_PRIORITY_INDEX_NAME: QUEUE_STATUS_PRIORITY_INDEX_SQL,
     QUEUE_STATUS_CREATED_INDEX_NAME: QUEUE_STATUS_CREATED_INDEX_SQL,
+    QUEUE_ROLE_RETRY_INDEX_NAME: QUEUE_ROLE_RETRY_INDEX_SQL,
+    QUEUE_STATUS_RETRY_INDEX_NAME: QUEUE_STATUS_RETRY_INDEX_SQL,
+    QUEUE_ROLE_LEASE_INDEX_NAME: QUEUE_ROLE_LEASE_INDEX_SQL,
+    QUEUE_STATUS_LEASE_INDEX_NAME: QUEUE_STATUS_LEASE_INDEX_SQL,
+    QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME: (
+        QUEUE_RETRY_ORDER_AUTHORITY_INDEX_SQL
+    ),
     QUEUE_RUNNING_DEDUPE_INDEX_NAME: QUEUE_RUNNING_DEDUPE_INDEX_SQL,
     QUEUE_PENDING_DEDUPE_INDEX_NAME: QUEUE_PENDING_DEDUPE_INDEX_SQL,
 }
@@ -145,17 +203,63 @@ QUEUE_CLAIM_INDEX_COLUMNS = {
     QUEUE_ROLE_PRIORITY_INDEX_NAME: (
         "role",
         "status",
+        "retry_pending",
         "priority",
         "created_at",
     ),
-    QUEUE_ROLE_CREATED_INDEX_NAME: ("role", "status", "created_at"),
-    QUEUE_STATUS_PRIORITY_INDEX_NAME: ("status", "priority", "created_at"),
-    QUEUE_STATUS_CREATED_INDEX_NAME: ("status", "created_at"),
+    QUEUE_ROLE_CREATED_INDEX_NAME: (
+        "role",
+        "status",
+        "retry_pending",
+        "created_at",
+    ),
+    QUEUE_STATUS_PRIORITY_INDEX_NAME: (
+        "status",
+        "retry_pending",
+        "priority",
+        "created_at",
+    ),
+    QUEUE_STATUS_CREATED_INDEX_NAME: (
+        "status",
+        "retry_pending",
+        "created_at",
+    ),
+    QUEUE_ROLE_RETRY_INDEX_NAME: (
+        "role",
+        "status",
+        "retry_pending",
+        "retry_order",
+        "priority",
+        "created_at",
+    ),
+    QUEUE_STATUS_RETRY_INDEX_NAME: (
+        "status",
+        "retry_pending",
+        "retry_order",
+        "priority",
+        "created_at",
+    ),
+    QUEUE_ROLE_LEASE_INDEX_NAME: (
+        "role",
+        "status",
+        "lease_expires_at",
+        "id",
+    ),
+    QUEUE_STATUS_LEASE_INDEX_NAME: (
+        "status",
+        "lease_expires_at",
+        "id",
+    ),
+    QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME: ("retry_order",),
     QUEUE_RUNNING_DEDUPE_INDEX_NAME: ("dedupe_key",),
     QUEUE_PENDING_DEDUPE_INDEX_NAME: ("dedupe_key",),
 }
 QUEUE_CLAIM_INDEX_UNIQUE = {
-    index_name: index_name == QUEUE_PENDING_DEDUPE_INDEX_NAME
+    index_name: index_name
+    in {
+        QUEUE_PENDING_DEDUPE_INDEX_NAME,
+        QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME,
+    }
     for index_name in QUEUE_CLAIM_INDEX_SQL
 }
 QUEUE_CLAIM_INDEX_PARTIAL = {
@@ -163,6 +267,7 @@ QUEUE_CLAIM_INDEX_PARTIAL = {
     in {
         QUEUE_RUNNING_DEDUPE_INDEX_NAME,
         QUEUE_PENDING_DEDUPE_INDEX_NAME,
+        QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME,
     }
     for index_name in QUEUE_CLAIM_INDEX_SQL
 }
@@ -173,6 +278,11 @@ QUEUE_ORDER_INDEX_COLUMNS = {
         QUEUE_ROLE_CREATED_INDEX_NAME,
         QUEUE_STATUS_PRIORITY_INDEX_NAME,
         QUEUE_STATUS_CREATED_INDEX_NAME,
+        QUEUE_ROLE_RETRY_INDEX_NAME,
+        QUEUE_STATUS_RETRY_INDEX_NAME,
+        QUEUE_ROLE_LEASE_INDEX_NAME,
+        QUEUE_STATUS_LEASE_INDEX_NAME,
+        QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME,
     )
 }
 QUEUE_ORDER_INDEX_NAMES = frozenset(QUEUE_ORDER_INDEX_COLUMNS)
@@ -7967,6 +8077,103 @@ def _normalize_sqlite_schema_sql(sql: object) -> str:
     return normalized
 
 
+def _queue_retry_authority_trigger_sql() -> dict[str, str]:
+    trigger_error = QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR.replace(
+        "'",
+        "''",
+    )
+    invariant = """
+        typeof(NEW.retry_pending) = 'integer'
+        AND typeof(NEW.retry_order) = 'integer'
+        AND (
+            (
+                NEW.retry_pending = 0
+                AND NEW.retry_order = 0
+            )
+            OR (
+                NEW.retry_pending = 1
+                AND NEW.retry_order > 0
+                AND NEW.status IN ('pending', 'running')
+            )
+        )
+    """
+    return {
+        "enforce_queue_retry_authority_insert": f"""
+            CREATE TRIGGER enforce_queue_retry_authority_insert
+            BEFORE INSERT ON queue_jobs
+            WHEN NOT ({invariant})
+            BEGIN
+                SELECT RAISE(ABORT, '{trigger_error}');
+            END
+        """,
+        "enforce_queue_retry_authority_update": f"""
+            CREATE TRIGGER enforce_queue_retry_authority_update
+            BEFORE UPDATE OF status, retry_pending, retry_order
+            ON queue_jobs
+            WHEN NOT ({invariant})
+            BEGIN
+                SELECT RAISE(ABORT, '{trigger_error}');
+            END
+        """,
+    }
+
+
+def _queue_retry_authority_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _queue_retry_authority_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
+def _drop_queue_retry_authority_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    for trigger_name in QUEUE_RETRY_AUTHORITY_TRIGGER_NAMES:
+        conn.execute(
+            f"DROP TRIGGER IF EXISTS "
+            f"{_quote_sqlite_identifier(trigger_name)}"
+        )
+
+
+def _ensure_queue_retry_authority_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    expected = _queue_retry_authority_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    for trigger_name, trigger_sql in expected.items():
+        if (
+            installed.get(trigger_name)
+            == _normalize_sqlite_schema_sql(trigger_sql)
+        ):
+            continue
+        conn.execute(
+            f"DROP TRIGGER IF EXISTS "
+            f"{_quote_sqlite_identifier(trigger_name)}"
+        )
+        conn.execute(trigger_sql)
+    if not _queue_retry_authority_triggers_ready(conn):
+        raise RuntimeError(
+            "Queue retry authority triggers did not install exactly"
+        )
+
+
 def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
     reservation_key = CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY.replace(
         "'",
@@ -8348,6 +8555,42 @@ def _queue_order_indexes_ready(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _queue_retry_order_counter_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (QUEUE_RETRY_ORDER_META_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        value = int(row["value"])
+    except (TypeError, ValueError):
+        return False
+    if not 0 <= value <= MAX_QUEUE_RETRY_ORDER:
+        return False
+    maximum_row = conn.execute(
+        """
+        SELECT
+            coalesce(max(retry_order), 0) AS value,
+            typeof(coalesce(max(retry_order), 0)) AS value_type
+        FROM queue_jobs
+        WHERE retry_pending = 1
+        """
+    ).fetchone()
+    if (
+        maximum_row is None
+        or str(maximum_row["value_type"]) != "integer"
+    ):
+        return False
+    try:
+        maximum_value = int(maximum_row["value"])
+    except (TypeError, ValueError):
+        return False
+    return value >= maximum_value
+
+
 def _pending_queue_dedupe_duplicate_diagnostic(
     conn: sqlite3.Connection,
 ) -> dict[str, Any] | None:
@@ -8418,40 +8661,82 @@ def _pending_queue_dedupe_duplicate_diagnostic(
 
 
 def _ensure_queue_order_indexes(conn: sqlite3.Connection) -> None:
-    installed = {
-        str(row["name"]): row
-        for row in conn.execute("PRAGMA index_list(queue_jobs)").fetchall()
-    }
-    pending_index_ready = _queue_claim_index_ready(
-        conn,
-        index_name=QUEUE_PENDING_DEDUPE_INDEX_NAME,
-        index_row=installed.get(QUEUE_PENDING_DEDUPE_INDEX_NAME),
-    )
-    if not pending_index_ready:
-        duplicate_diagnostic = (
-            _pending_queue_dedupe_duplicate_diagnostic(conn)
-        )
-        if duplicate_diagnostic is not None:
-            raise RuntimeError(
-                "cannot repair pending queue dedupe authority: "
-                f"{duplicate_diagnostic['duplicate_group_count']} duplicate "
-                "pending dedupe groups; bounded_samples="
-                f"{json_dumps(duplicate_diagnostic)}"
+    owns_transaction = not conn.in_transaction
+    savepoint_identifier: str | None = None
+    try:
+        if owns_transaction:
+            # Fence the duplicate diagnostic and every schema mutation before
+            # inspecting repair state. A concurrent queue writer cannot enter
+            # between the diagnostic and restoration of the unique authority.
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            candidate_savepoint_identifier = _quote_sqlite_identifier(
+                f"continuum_queue_order_indexes_{uuid.uuid4().hex}"
             )
-    for index_name, index_sql in QUEUE_CLAIM_INDEX_SQL.items():
-        index_row = installed.get(index_name)
-        if _queue_claim_index_ready(
+            conn.execute(f"SAVEPOINT {candidate_savepoint_identifier}")
+            savepoint_identifier = candidate_savepoint_identifier
+            # A savepoint scopes rollback but does not upgrade an outer
+            # deferred transaction to a writer. Acquire the main-database
+            # write lock before reading installed state so a concurrent queue
+            # writer cannot commit between the duplicate diagnostic and DDL.
+            conn.execute(
+                "UPDATE meta SET value = value WHERE 0"
+            )
+
+        installed = {
+            str(row["name"]): row
+            for row in conn.execute("PRAGMA index_list(queue_jobs)").fetchall()
+        }
+        pending_index_ready = _queue_claim_index_ready(
             conn,
-            index_name=index_name,
-            index_row=index_row,
-        ):
-            continue
-        conn.execute(
-            f"DROP INDEX IF EXISTS {_quote_sqlite_identifier(index_name)}"
+            index_name=QUEUE_PENDING_DEDUPE_INDEX_NAME,
+            index_row=installed.get(QUEUE_PENDING_DEDUPE_INDEX_NAME),
         )
-        conn.execute(index_sql)
-    if not _queue_order_indexes_ready(conn):
-        raise RuntimeError("canonical queue claim indexes could not be installed")
+        if not pending_index_ready:
+            duplicate_diagnostic = (
+                _pending_queue_dedupe_duplicate_diagnostic(conn)
+            )
+            if duplicate_diagnostic is not None:
+                raise RuntimeError(
+                    "cannot repair pending queue dedupe authority: "
+                    f"{duplicate_diagnostic['duplicate_group_count']} duplicate "
+                    "pending dedupe groups; bounded_samples="
+                    f"{json_dumps(duplicate_diagnostic)}"
+                )
+        for index_name, index_sql in QUEUE_CLAIM_INDEX_SQL.items():
+            index_row = installed.get(index_name)
+            if _queue_claim_index_ready(
+                conn,
+                index_name=index_name,
+                index_row=index_row,
+            ):
+                continue
+            conn.execute(
+                f"DROP INDEX IF EXISTS {_quote_sqlite_identifier(index_name)}"
+            )
+            conn.execute(index_sql)
+        if not _queue_order_indexes_ready(conn):
+            raise RuntimeError(
+                "canonical queue claim indexes could not be installed"
+            )
+
+        if owns_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_identifier}")
+            savepoint_identifier = None
+    except BaseException:
+        if owns_transaction:
+            if conn.in_transaction:
+                conn.rollback()
+        elif savepoint_identifier is not None and conn.in_transaction:
+            try:
+                conn.execute(
+                    f"ROLLBACK TO SAVEPOINT {savepoint_identifier}"
+                )
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint_identifier}")
+        raise
 
 
 def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
@@ -8477,6 +8762,40 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
             "generation TEXT NOT NULL DEFAULT ''",
         ),
         ("queue_jobs", "attempt_count", "attempt_count INTEGER NOT NULL DEFAULT 0"),
+        (
+            "queue_jobs",
+            "retry_order",
+            (
+                "retry_order INTEGER NOT NULL DEFAULT 0 "
+                "CHECK("
+                "typeof(retry_order) = 'integer' "
+                "AND retry_order >= 0"
+                ")"
+            ),
+        ),
+        (
+            "queue_jobs",
+            "retry_pending",
+            (
+                "retry_pending INTEGER NOT NULL DEFAULT 0 "
+                "CHECK("
+                "typeof(retry_pending) = 'integer' "
+                "AND typeof(retry_order) = 'integer' "
+                "AND retry_pending IN (0, 1) "
+                "AND ("
+                "("
+                "retry_pending = 0 "
+                "AND retry_order = 0"
+                ") "
+                "OR ("
+                "retry_pending = 1 "
+                "AND retry_order > 0 "
+                "AND status IN ('pending', 'running')"
+                ")"
+                ")"
+                ")"
+            ),
+        ),
         ("queue_jobs", "error_json", "error_json TEXT"),
         ("queue_jobs", "lease_owner", "lease_owner TEXT"),
         ("queue_jobs", "lease_expires_at", "lease_expires_at TEXT"),
@@ -8496,6 +8815,139 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     for table, column, ddl in migrations:
         if _add_column_if_missing(conn, table, column, ddl):
             applied.append(f"{table}.{column}")
+    queue_retry_authority_triggers_ready = (
+        _queue_retry_authority_triggers_ready(conn)
+    )
+    queue_retry_authority_backfill_required = (
+        "queue_jobs.retry_order" in applied
+        or "queue_jobs.retry_pending" in applied
+        or not _migration_marker_complete(
+            conn,
+            key=QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+            value=QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+        )
+        or not _migration_marker_complete(
+            conn,
+            key=QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+            value=QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+        )
+        or not queue_retry_authority_triggers_ready
+    )
+    if queue_retry_authority_backfill_required:
+        # Fence the main catalog before the temp-table authority snapshot.
+        # Without this no-op write, a deferred WAL reader can snapshot first,
+        # lose a race to another writer, and fail to resume the migration.
+        conn.execute("UPDATE meta SET value = value WHERE 0")
+        if not queue_retry_authority_triggers_ready:
+            # Rebinding and exact guard installation commit atomically with
+            # the surrounding migration.
+            _drop_queue_retry_authority_triggers(conn)
+        # Existing exact flags survive a lost-marker recovery even when their
+        # receipt JSON was later replaced by lease-reclaim evidence. Capture
+        # authority before clearing the live rows so an existing unique index
+        # cannot reject transient order swaps during deterministic rebinding.
+        conn.execute(
+            """
+            DROP TABLE IF EXISTS
+            temp.queue_retry_authority_backfill_v2
+            """
+        )
+        conn.execute(
+            """
+            CREATE TEMP TABLE queue_retry_authority_backfill_v2 (
+                queue_rowid INTEGER PRIMARY KEY,
+                retry_order INTEGER NOT NULL UNIQUE
+                    CHECK(retry_order > 0)
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO temp.queue_retry_authority_backfill_v2(
+                queue_rowid,
+                retry_order
+            )
+            SELECT
+                rowid,
+                ROW_NUMBER() OVER (ORDER BY rowid)
+            FROM queue_jobs
+            WHERE status IN ('pending', 'running')
+              AND (
+                    retry_pending = 1
+                    OR CASE
+                           WHEN json_valid(error_json)
+                           THEN json_type(
+                               error_json,
+                               '$.retry_pending'
+                           ) = 'true'
+                           ELSE 0
+                       END
+                  )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE queue_jobs
+            SET retry_pending = 0,
+                retry_order = 0
+            """
+        )
+        conn.execute(
+            """
+            UPDATE queue_jobs
+            SET retry_pending = 1,
+                retry_order = (
+                    SELECT retry_order
+                    FROM temp.queue_retry_authority_backfill_v2
+                    WHERE queue_rowid = queue_jobs.rowid
+                )
+            WHERE rowid IN (
+                SELECT queue_rowid
+                FROM temp.queue_retry_authority_backfill_v2
+            )
+            """
+        )
+        conn.execute(
+            "DROP TABLE temp.queue_retry_authority_backfill_v2"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+            ),
+        )
+        applied.append("queue_retry_authority.backfill.v2")
+    _ensure_queue_retry_authority_triggers(conn)
+    queue_retry_counter_repair_required = (
+        queue_retry_authority_backfill_required
+        or not _queue_retry_order_counter_ready(conn)
+    )
+    if queue_retry_counter_repair_required:
+        maximum_retry_order = int(
+            conn.execute(
+                """
+                SELECT coalesce(max(retry_order), 0) AS value
+                FROM queue_jobs
+                WHERE retry_pending = 1
+                """
+            ).fetchone()["value"]
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (
+                QUEUE_RETRY_ORDER_META_KEY,
+                str(maximum_retry_order),
+            ),
+        )
+        applied.append("queue_retry_order.counter.v1")
     if not _migration_marker_complete(
         conn,
         key=SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,
@@ -8554,7 +9006,6 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scroll_events_visibility ON scroll_events(session_id, visibility_scope, project_id, seq DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_visibility ON cards(visibility_scope, session_id, project_id, salience DESC)")
     _ensure_queue_order_indexes(conn)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lease_expiry ON queue_jobs(status, lease_expires_at)")
     conn.execute("PRAGMA user_version = 2")
     return applied
 
@@ -8659,6 +9110,22 @@ def _init_db_durable_ready(root: Path) -> bool:
                     key=GRAPH_EDGE_SOURCES_BACKFILL_META_KEY,
                     value=GRAPH_EDGE_SOURCES_BACKFILL_META_VALUE,
                 )
+                or "retry_pending"
+                not in _table_columns(conn, "queue_jobs")
+                or "retry_order"
+                not in _table_columns(conn, "queue_jobs")
+                or not _migration_marker_complete(
+                    conn,
+                    key=QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                    value=QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+                )
+                or not _migration_marker_complete(
+                    conn,
+                    key=QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                    value=QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+                )
+                or not _queue_retry_authority_triggers_ready(conn)
+                or not _queue_retry_order_counter_ready(conn)
                 or not _graph_edge_source_backfill_triggers_ready(conn)
                 or not (
                     _card_sidecar_artifact_write_reservation_triggers_ready(
@@ -9966,7 +10433,8 @@ def enqueue_job(
             """
             UPDATE queue_jobs
             SET priority = ?, preemptible = ?, related_card_ids_json = ?,
-                payload_json = ?, updated_at = ?
+                payload_json = ?, updated_at = ?, retry_pending = 0,
+                retry_order = 0, error_json = NULL
             WHERE id = ? AND status = 'pending' AND dedupe_key = ?
               AND role = ? AND job_type = ?
             """,

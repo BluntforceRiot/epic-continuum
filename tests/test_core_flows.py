@@ -7206,6 +7206,7 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                             SELECT pending_job.*
                             FROM queue_jobs AS pending_job
                             WHERE pending_job.status = ?
+                              AND pending_job.retry_pending = 0
                               AND (
                                   pending_job.dedupe_key IS NULL
                                   OR NOT EXISTS (
@@ -7737,6 +7738,816 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             )
             self.assertIn(cache_key, _INIT_DB_CACHE)
 
+    def test_init_backfills_exact_retry_lane_authority_and_indexes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            rows = (
+                (
+                    "job_retry_backfill_true",
+                    "pending",
+                    json_dumps(
+                        {
+                            "error": None,
+                            "result": {
+                                "ok": False,
+                                "retry_pending": True,
+                            },
+                            "retry_pending": True,
+                        }
+                    ),
+                ),
+                (
+                    "job_retry_backfill_numeric",
+                    "pending",
+                    '{"retry_pending":1}',
+                ),
+                (
+                    "job_retry_backfill_nested_only",
+                    "pending",
+                    '{"result":{"retry_pending":true}}',
+                ),
+                (
+                    "job_retry_backfill_malformed",
+                    "pending",
+                    "{",
+                ),
+                (
+                    "job_retry_backfill_terminal",
+                    "failed",
+                    '{"retry_pending":true}',
+                ),
+            )
+            with closing(connect_catalog(root)) as conn:
+                conn.execute("DELETE FROM queue_jobs")
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status,
+                        preemptible, error_json,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'retry_backfill_probe',
+                        1, ?, 1, ?, '[]', '{}',
+                        '2026-07-28T00:00:00+00:00',
+                        '2026-07-28T00:00:00+00:00'
+                    )
+                    """,
+                    rows,
+                )
+                conn.execute(
+                    "DELETE FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                    ),
+                )
+                for index_name in (
+                    store_module.QUEUE_ROLE_PRIORITY_INDEX_NAME,
+                    store_module.QUEUE_STATUS_PRIORITY_INDEX_NAME,
+                    store_module.QUEUE_ROLE_CREATED_INDEX_NAME,
+                    store_module.QUEUE_STATUS_CREATED_INDEX_NAME,
+                    store_module.QUEUE_ROLE_RETRY_INDEX_NAME,
+                    store_module.QUEUE_STATUS_RETRY_INDEX_NAME,
+                    (
+                        store_module
+                        .QUEUE_RETRY_ORDER_AUTHORITY_INDEX_NAME
+                    ),
+                ):
+                    conn.execute(f"DROP INDEX {index_name}")
+                for trigger_name in (
+                    store_module.QUEUE_RETRY_AUTHORITY_TRIGGER_NAMES
+                ):
+                    conn.execute(f"DROP TRIGGER {trigger_name}")
+                conn.execute(
+                    "ALTER TABLE queue_jobs DROP COLUMN retry_pending"
+                )
+                conn.execute(
+                    "ALTER TABLE queue_jobs DROP COLUMN retry_order"
+                )
+                conn.commit()
+
+            _INIT_DB_CACHE.discard(cache_key)
+            init_db(root, recover_pending_card_sidecars=False)
+
+            with closing(connect_catalog(root)) as conn:
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA table_info(queue_jobs)"
+                    ).fetchall()
+                }
+                observed = {
+                    str(row["id"]): (
+                        int(row["retry_pending"]),
+                        int(row["retry_order"]),
+                    )
+                    for row in conn.execute(
+                        """
+                        SELECT id, retry_pending, retry_order
+                        FROM queue_jobs
+                        WHERE job_type = 'retry_backfill_probe'
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                }
+                marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                    ),
+                ).fetchone()
+                order_marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                    ),
+                ).fetchone()
+                self.assertTrue(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET retry_pending = 1
+                        WHERE id = 'job_retry_backfill_terminal'
+                        """
+                    )
+                conn.rollback()
+
+            self.assertIn("retry_pending", columns)
+            self.assertIn("retry_order", columns)
+            self.assertEqual(
+                observed,
+                {
+                    "job_retry_backfill_malformed": (0, 0),
+                    "job_retry_backfill_nested_only": (0, 0),
+                    "job_retry_backfill_numeric": (0, 0),
+                    "job_retry_backfill_terminal": (0, 0),
+                    "job_retry_backfill_true": (1, 1),
+                },
+            )
+            self.assertEqual(
+                marker["value"],
+                store_module.QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+            )
+            self.assertEqual(
+                order_marker["value"],
+                store_module.QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+            )
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+
+            with closing(connect_catalog(root)) as conn:
+                preserved_before = conn.execute(
+                    """
+                    SELECT retry_order
+                    FROM queue_jobs
+                    WHERE id = 'job_retry_backfill_true'
+                    """
+                ).fetchone()["retry_order"]
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET error_json = '{"reclaimed":true}'
+                    WHERE id = 'job_retry_backfill_true'
+                    """
+                )
+                conn.execute(
+                    "DELETE FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                    ),
+                )
+                conn.commit()
+            _INIT_DB_CACHE.discard(cache_key)
+            init_db(root, recover_pending_card_sidecars=False)
+            with closing(connect_catalog(root)) as conn:
+                preserved_after = conn.execute(
+                    """
+                    SELECT retry_pending, retry_order, error_json
+                    FROM queue_jobs
+                    WHERE id = 'job_retry_backfill_true'
+                    """
+                ).fetchone()
+            self.assertEqual(preserved_after["retry_pending"], 1)
+            self.assertGreater(preserved_after["retry_order"], 0)
+            self.assertEqual(
+                preserved_after["error_json"],
+                '{"reclaimed":true}',
+            )
+            self.assertGreater(preserved_before, 0)
+
+            for counter_value in (None, "invalid", "0"):
+                with self.subTest(counter_value=counter_value):
+                    with closing(connect_catalog(root)) as conn:
+                        retry_order_before = int(
+                            conn.execute(
+                                """
+                                SELECT retry_order
+                                FROM queue_jobs
+                                WHERE id = 'job_retry_backfill_true'
+                                """
+                            ).fetchone()["retry_order"]
+                        )
+                        if counter_value is None:
+                            conn.execute(
+                                "DELETE FROM meta WHERE key = ?",
+                                (
+                                    store_module
+                                    .QUEUE_RETRY_ORDER_META_KEY,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO meta(key, value)
+                                VALUES(?, ?)
+                                """,
+                                (
+                                    store_module
+                                    .QUEUE_RETRY_ORDER_META_KEY,
+                                    counter_value,
+                                ),
+                            )
+                        conn.commit()
+                    _INIT_DB_CACHE.discard(cache_key)
+                    init_db(
+                        root,
+                        recover_pending_card_sidecars=False,
+                    )
+                    with closing(connect_catalog(root)) as conn:
+                        retry_row = conn.execute(
+                            """
+                            SELECT retry_order
+                            FROM queue_jobs
+                            WHERE id = 'job_retry_backfill_true'
+                            """
+                        ).fetchone()
+                        counter_row = conn.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            (
+                                store_module
+                                .QUEUE_RETRY_ORDER_META_KEY,
+                            ),
+                        ).fetchone()
+                    self.assertEqual(
+                        int(retry_row["retry_order"]),
+                        retry_order_before,
+                    )
+                    self.assertGreaterEqual(
+                        int(counter_row["value"]),
+                        retry_order_before,
+                    )
+                    self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_init_resumes_retry_order_backfill_after_add_column_crash(
+        self,
+    ) -> None:
+        for row_count in (1, 2):
+            with self.subTest(row_count=row_count):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    init_db(root)
+                    cache_key = str(root.resolve(strict=False))
+                    self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+                    with closing(connect_catalog(root)) as conn:
+                        conn.execute("DELETE FROM queue_jobs")
+                        conn.execute(
+                            "ALTER TABLE queue_jobs RENAME TO queue_jobs_new"
+                        )
+                        conn.execute(
+                            """
+                            CREATE TABLE queue_jobs (
+                                id TEXT PRIMARY KEY,
+                                role TEXT NOT NULL,
+                                job_type TEXT NOT NULL,
+                                priority INTEGER NOT NULL DEFAULT 500,
+                                status TEXT NOT NULL DEFAULT 'pending',
+                                preemptible INTEGER NOT NULL DEFAULT 1,
+                                attempt_count INTEGER NOT NULL DEFAULT 0,
+                                retry_pending INTEGER NOT NULL DEFAULT 0
+                                    CHECK(retry_pending IN (0, 1)),
+                                error_json TEXT,
+                                lease_owner TEXT,
+                                lease_expires_at TEXT,
+                                heartbeat_at TEXT,
+                                dedupe_key TEXT,
+                                related_card_ids_json TEXT NOT NULL
+                                    DEFAULT '[]',
+                                payload_json TEXT NOT NULL DEFAULT '{}',
+                                created_at TEXT NOT NULL,
+                                updated_at TEXT NOT NULL,
+                                started_at TEXT,
+                                finished_at TEXT
+                            )
+                            """
+                        )
+                        conn.executemany(
+                            """
+                            INSERT INTO queue_jobs(
+                                id,
+                                role,
+                                job_type,
+                                priority,
+                                status,
+                                retry_pending,
+                                error_json,
+                                related_card_ids_json,
+                                payload_json,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES(
+                                ?,
+                                'archivist',
+                                'retry_order_crash_probe',
+                                1,
+                                'pending',
+                                1,
+                                '{"reclaimed":true}',
+                                '[]',
+                                '{}',
+                                '2026-07-28T00:00:00+00:00',
+                                '2026-07-28T00:00:00+00:00'
+                            )
+                            """,
+                            [
+                                (f"job_retry_order_crash_{index}",)
+                                for index in range(row_count)
+                            ],
+                        )
+                        conn.execute("DROP TABLE queue_jobs_new")
+                        conn.execute(
+                            "DELETE FROM meta WHERE key IN (?, ?)",
+                            (
+                                store_module
+                                .QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                                store_module.QUEUE_RETRY_ORDER_META_KEY,
+                            ),
+                        )
+                        old_marker = conn.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            (
+                                store_module
+                                .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                            ),
+                        ).fetchone()
+                        self.assertEqual(
+                            old_marker["value"],
+                            store_module
+                            .QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+                        )
+                        conn.commit()
+
+                        # Model a process death after SQLite durably commits the
+                        # additive column but before retry orders or a new
+                        # migration marker can be written.
+                        conn.execute(
+                            """
+                            ALTER TABLE queue_jobs
+                            ADD COLUMN retry_order INTEGER NOT NULL DEFAULT 0
+                                CHECK(retry_order >= 0)
+                            """
+                        )
+                        conn.execute(
+                            """
+                            UPDATE queue_jobs
+                            SET retry_order = ?
+                            WHERE id = 'job_retry_order_crash_0'
+                            """,
+                            ("not-an-order",),
+                        )
+                        conn.commit()
+
+                    from continuum.core.workers import memory_health
+
+                    poisoned_health = memory_health(root)
+                    self.assertFalse(poisoned_health["ok"])
+                    self.assertEqual(
+                        poisoned_health["reason"],
+                        "schema_migration_required",
+                    )
+                    self.assertIn(
+                        "queue_jobs.retry_authority_triggers",
+                        poisoned_health["missing_schema_authority"],
+                    )
+
+                    _INIT_DB_CACHE.discard(cache_key)
+                    init_db(
+                        root,
+                        recover_pending_card_sidecars=False,
+                    )
+
+                    with closing(connect_catalog(root)) as conn:
+                        retry_rows = conn.execute(
+                            """
+                            SELECT retry_pending, retry_order
+                            FROM queue_jobs
+                            WHERE job_type = 'retry_order_crash_probe'
+                            ORDER BY retry_order
+                            """
+                        ).fetchall()
+                        order_marker = conn.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            (
+                                store_module
+                                .QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                            ),
+                        ).fetchone()
+                        counter = conn.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            (
+                                store_module
+                                .QUEUE_RETRY_ORDER_META_KEY,
+                            ),
+                        ).fetchone()
+                        self.assertTrue(
+                            store_module._queue_order_indexes_ready(conn)
+                        )
+                        self.assertTrue(
+                            store_module
+                            ._queue_retry_authority_triggers_ready(conn)
+                        )
+                        with self.assertRaisesRegex(
+                            sqlite3.IntegrityError,
+                            store_module
+                            .QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR,
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE queue_jobs
+                                SET retry_order = 0
+                                WHERE id = ?
+                                """,
+                                ("job_retry_order_crash_0",),
+                            )
+                        conn.rollback()
+                        for invalid_retry_order in (
+                            "not-an-order",
+                            1.5,
+                        ):
+                            with self.subTest(
+                                row_count=row_count,
+                                invalid_retry_order=invalid_retry_order,
+                                operation="update",
+                            ), self.assertRaisesRegex(
+                                sqlite3.IntegrityError,
+                                store_module
+                                .QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR,
+                            ):
+                                conn.execute(
+                                    """
+                                    UPDATE queue_jobs
+                                    SET retry_order = ?
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        invalid_retry_order,
+                                        "job_retry_order_crash_0",
+                                    ),
+                                )
+                            conn.rollback()
+                        with self.assertRaisesRegex(
+                            sqlite3.IntegrityError,
+                            store_module
+                            .QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR,
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE queue_jobs
+                                SET status = 'failed'
+                                WHERE id = ?
+                                """,
+                                ("job_retry_order_crash_0",),
+                            )
+                        conn.rollback()
+                        with self.assertRaisesRegex(
+                            sqlite3.IntegrityError,
+                            store_module
+                            .QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR,
+                        ):
+                            conn.execute(
+                                """
+                                INSERT INTO queue_jobs(
+                                    id,
+                                    role,
+                                    job_type,
+                                    priority,
+                                    status,
+                                    retry_pending,
+                                    retry_order,
+                                    related_card_ids_json,
+                                    payload_json,
+                                    created_at,
+                                    updated_at
+                                )
+                                VALUES(
+                                    'job_retry_order_invalid_insert',
+                                    'archivist',
+                                    'retry_order_crash_probe',
+                                    1,
+                                    'pending',
+                                    1,
+                                    0,
+                                    '[]',
+                                    '{}',
+                                    '2026-07-28T00:00:00+00:00',
+                                    '2026-07-28T00:00:00+00:00'
+                                )
+                                """
+                            )
+                        conn.rollback()
+                        for invalid_index, invalid_retry_order in enumerate(
+                            ("not-an-order", 1.5),
+                        ):
+                            with self.subTest(
+                                row_count=row_count,
+                                invalid_retry_order=invalid_retry_order,
+                                operation="insert",
+                            ), self.assertRaisesRegex(
+                                sqlite3.IntegrityError,
+                                store_module
+                                .QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR,
+                            ):
+                                conn.execute(
+                                    """
+                                    INSERT INTO queue_jobs(
+                                        id,
+                                        role,
+                                        job_type,
+                                        priority,
+                                        status,
+                                        retry_pending,
+                                        retry_order,
+                                        related_card_ids_json,
+                                        payload_json,
+                                        created_at,
+                                        updated_at
+                                    )
+                                    VALUES(
+                                        ?,
+                                        'archivist',
+                                        'retry_order_crash_probe',
+                                        1,
+                                        'pending',
+                                        1,
+                                        ?,
+                                        '[]',
+                                        '{}',
+                                        '2026-07-28T00:00:00+00:00',
+                                        '2026-07-28T00:00:00+00:00'
+                                    )
+                                    """,
+                                    (
+                                        (
+                                            "job_retry_order_invalid_type_"
+                                            f"{invalid_index}"
+                                        ),
+                                        invalid_retry_order,
+                                    ),
+                                )
+                            conn.rollback()
+
+                    self.assertEqual(
+                        [
+                            (
+                                int(row["retry_pending"]),
+                                int(row["retry_order"]),
+                            )
+                            for row in retry_rows
+                        ],
+                        [
+                            (1, expected_order)
+                            for expected_order in range(1, row_count + 1)
+                        ],
+                    )
+                    self.assertEqual(
+                        order_marker["value"],
+                        store_module
+                        .QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+                    )
+                    self.assertEqual(int(counter["value"]), row_count)
+                    self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_retry_authority_backfill_fences_writer_before_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO queue_jobs(
+                        id,
+                        role,
+                        job_type,
+                        priority,
+                        status,
+                        retry_pending,
+                        retry_order,
+                        related_card_ids_json,
+                        payload_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES(
+                        'job_retry_snapshot_fence',
+                        'archivist',
+                        'retry_snapshot_fence_probe',
+                        1,
+                        'pending',
+                        1,
+                        1,
+                        '[]',
+                        '{}',
+                        '2026-07-28T00:00:00+00:00',
+                        '2026-07-28T00:00:00+00:00'
+                    )
+                    """
+                )
+                conn.execute(
+                    "DELETE FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                    ),
+                )
+                conn.commit()
+
+            snapshot_reached = threading.Event()
+            release_migration = threading.Event()
+            writer_statement_started = threading.Event()
+            writer_finished = threading.Event()
+            migration_errors: list[BaseException] = []
+            writer_errors: list[BaseException] = []
+            writer_outcomes: list[str] = []
+            writer_marker = "test.queue_retry_snapshot_fence_writer"
+
+            class SnapshotGateConnection:
+                def __init__(self, delegate: sqlite3.Connection) -> None:
+                    self.delegate = delegate
+                    self.gated = False
+
+                def execute(
+                    self,
+                    sql: str,
+                    parameters: object = (),
+                ) -> object:
+                    result = self.delegate.execute(
+                        sql,
+                        parameters,  # type: ignore[arg-type]
+                    )
+                    normalized_sql = (
+                        store_module._normalize_sqlite_schema_sql(sql).upper()
+                    )
+                    if (
+                        not self.gated
+                        and normalized_sql.startswith(
+                            "INSERT INTO "
+                            "TEMP.QUEUE_RETRY_AUTHORITY_BACKFILL_V2"
+                        )
+                    ):
+                        self.gated = True
+                        snapshot_reached.set()
+                        if not release_migration.wait(timeout=5):
+                            raise TimeoutError(
+                                "retry authority snapshot gate timed out"
+                            )
+                    return result
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.delegate, name)
+
+            def migrate_retry_authority() -> None:
+                conn = connect_catalog(root)
+                conn.execute("PRAGMA busy_timeout = 5000")
+                try:
+                    store_module.apply_schema_migrations(
+                        root,
+                        SnapshotGateConnection(  # type: ignore[arg-type]
+                            conn
+                        ),
+                    )
+                    conn.commit()
+                except BaseException as exc:
+                    migration_errors.append(exc)
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+
+            def write_during_snapshot() -> None:
+                conn = connect_catalog(root)
+                conn.execute("PRAGMA busy_timeout = 5000")
+
+                def trace_statement(sql: str) -> None:
+                    if writer_marker in sql:
+                        writer_statement_started.set()
+
+                conn.set_trace_callback(trace_statement)
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO meta(key, value)
+                        VALUES(?, 'committed')
+                        """,
+                        (writer_marker,),
+                    )
+                    conn.commit()
+                    writer_outcomes.append("committed")
+                except BaseException as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    writer_errors.append(exc)
+                finally:
+                    writer_finished.set()
+                    conn.close()
+
+            migration_thread = threading.Thread(
+                target=migrate_retry_authority,
+                daemon=True,
+            )
+            writer_thread = threading.Thread(
+                target=write_during_snapshot,
+                daemon=True,
+            )
+            migration_thread.start()
+            try:
+                self.assertTrue(snapshot_reached.wait(timeout=5))
+                writer_thread.start()
+                self.assertTrue(
+                    writer_statement_started.wait(timeout=5)
+                )
+                self.assertFalse(writer_finished.wait(timeout=0.2))
+            finally:
+                release_migration.set()
+            migration_thread.join(timeout=10)
+            writer_thread.join(timeout=10)
+
+            self.assertFalse(migration_thread.is_alive())
+            self.assertFalse(writer_thread.is_alive())
+            self.assertEqual(migration_errors, [])
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(writer_outcomes, ["committed"])
+            with closing(connect_catalog(root)) as conn:
+                order_marker = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (
+                        store_module
+                        .QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                    ),
+                ).fetchone()
+                writer_row = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (writer_marker,),
+                ).fetchone()
+                retry_row = conn.execute(
+                    """
+                    SELECT
+                        retry_pending,
+                        retry_order,
+                        typeof(retry_pending) AS retry_pending_type,
+                        typeof(retry_order) AS retry_order_type
+                    FROM queue_jobs
+                    WHERE id = 'job_retry_snapshot_fence'
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    order_marker["value"],
+                    store_module
+                    .QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+                )
+                self.assertEqual(writer_row["value"], "committed")
+                self.assertEqual(
+                    (
+                        retry_row["retry_pending"],
+                        retry_row["retry_order"],
+                        retry_row["retry_pending_type"],
+                        retry_row["retry_order_type"],
+                    ),
+                    (1, 1, "integer", "integer"),
+                )
+                self.assertTrue(
+                    store_module
+                    ._queue_retry_authority_triggers_ready(conn)
+                )
+                self.assertTrue(
+                    store_module._queue_retry_order_counter_ready(conn)
+                )
+
     def test_cached_init_restores_queue_order_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -7892,6 +8703,345 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                         ],
                     )
             self.assertIn(cache_key, _INIT_DB_CACHE)
+
+    def test_queue_order_index_repair_rolls_back_all_ddl_on_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            forged_sql = {
+                store_module.QUEUE_ROLE_CREATED_INDEX_NAME: """
+                    CREATE INDEX idx_queue_role_created
+                    ON queue_jobs(role, status, created_at DESC)
+                """,
+                store_module.QUEUE_STATUS_CREATED_INDEX_NAME: """
+                    CREATE INDEX idx_queue_status_created
+                    ON queue_jobs(status, created_at DESC)
+                """,
+            }
+
+            with closing(connect_catalog(root)) as conn:
+                for index_name, index_sql in forged_sql.items():
+                    conn.execute(f"DROP INDEX {index_name}")
+                    conn.execute(index_sql)
+                conn.commit()
+
+                class FailingCreateConnection:
+                    def __init__(self, delegate: sqlite3.Connection) -> None:
+                        self.delegate = delegate
+
+                    def execute(
+                        self,
+                        sql: str,
+                        parameters: object = (),
+                    ) -> object:
+                        if (
+                            store_module._normalize_sqlite_schema_sql(sql)
+                            == store_module._normalize_sqlite_schema_sql(
+                                store_module.QUEUE_STATUS_CREATED_INDEX_SQL
+                            )
+                        ):
+                            raise RuntimeError("injected queue index DDL failure")
+                        return self.delegate.execute(
+                            sql,
+                            parameters,  # type: ignore[arg-type]
+                        )
+
+                    def __getattr__(self, name: str) -> object:
+                        return getattr(self.delegate, name)
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "injected queue index DDL failure",
+                ):
+                    store_module._ensure_queue_order_indexes(
+                        FailingCreateConnection(conn)  # type: ignore[arg-type]
+                    )
+
+                self.assertFalse(conn.in_transaction)
+                restored = {
+                    str(row["name"]): str(row["sql"])
+                    for row in conn.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_schema
+                        WHERE type = 'index'
+                        """
+                    ).fetchall()
+                    if str(row["name"]) in forged_sql
+                }
+                self.assertEqual(
+                    {
+                        index_name: (
+                            store_module._normalize_sqlite_schema_sql(index_sql)
+                        )
+                        for index_name, index_sql in restored.items()
+                    },
+                    {
+                        index_name: (
+                            store_module._normalize_sqlite_schema_sql(index_sql)
+                        )
+                        for index_name, index_sql in forged_sql.items()
+                    },
+                )
+                self.assertFalse(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+
+    def test_queue_order_index_repair_joins_existing_transaction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            index_name = store_module.QUEUE_ROLE_CREATED_INDEX_NAME
+            forged_index_sql = """
+                CREATE INDEX idx_queue_role_created
+                ON queue_jobs(role, status, created_at DESC)
+            """
+            outer_marker = "test.queue_index_outer_transaction"
+
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(f"DROP INDEX {index_name}")
+                conn.execute(forged_index_sql)
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, 'pending')",
+                    (outer_marker,),
+                )
+
+                store_module._ensure_queue_order_indexes(conn)
+
+                self.assertTrue(conn.in_transaction)
+                self.assertTrue(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+                with closing(connect_catalog(root)) as observer:
+                    self.assertIsNone(
+                        observer.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            (outer_marker,),
+                        ).fetchone()
+                    )
+                conn.rollback()
+
+            with closing(connect_catalog(root)) as conn:
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (outer_marker,),
+                    ).fetchone()
+                )
+                index_row = conn.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_schema
+                    WHERE type = 'index' AND name = ?
+                    """,
+                    (index_name,),
+                ).fetchone()
+                self.assertIsNotNone(index_row)
+                self.assertEqual(
+                    store_module._normalize_sqlite_schema_sql(
+                        index_row["sql"]
+                    ),
+                    store_module._normalize_sqlite_schema_sql(
+                        forged_index_sql
+                    ),
+                )
+                self.assertFalse(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+
+    def test_queue_order_index_repair_fences_concurrent_duplicate_writer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            duplicate_key = "queue_v1_" + "b" * 64
+            pending_index_name = (
+                store_module.QUEUE_PENDING_DEDUPE_INDEX_NAME
+            )
+            with closing(connect_catalog(root)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status,
+                        preemptible, dedupe_key,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        'job_queue_index_existing', 'scribe',
+                        'queue_index_atomicity_probe', 100, 'pending',
+                        1, ?, '[]', '{}', ?, ?
+                    )
+                    """,
+                    (
+                        duplicate_key,
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+                conn.execute(f"DROP INDEX {pending_index_name}")
+                conn.execute(
+                    f"""
+                    CREATE INDEX {pending_index_name}
+                    ON queue_jobs(dedupe_key)
+                    WHERE status = 'pending' AND dedupe_key IS NOT NULL
+                    """
+                )
+                conn.commit()
+
+            drop_reached = threading.Event()
+            release_repair = threading.Event()
+            writer_statement_started = threading.Event()
+            writer_finished = threading.Event()
+            migration_errors: list[BaseException] = []
+            writer_errors: list[BaseException] = []
+            writer_outcomes: list[str] = []
+
+            class DropGateConnection:
+                def __init__(self, delegate: sqlite3.Connection) -> None:
+                    self.delegate = delegate
+                    self.gated = False
+
+                def execute(
+                    self,
+                    sql: str,
+                    parameters: object = (),
+                ) -> object:
+                    if (
+                        not self.gated
+                        and sql.lstrip().upper().startswith("DROP INDEX")
+                        and pending_index_name in sql
+                    ):
+                        self.gated = True
+                        drop_reached.set()
+                        if not release_repair.wait(timeout=5):
+                            raise TimeoutError(
+                                "queue index repair gate timed out"
+                            )
+                    return self.delegate.execute(
+                        sql,
+                        parameters,  # type: ignore[arg-type]
+                    )
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.delegate, name)
+
+            def repair_indexes() -> None:
+                conn = connect_catalog(root)
+                conn.execute("PRAGMA busy_timeout = 5000")
+                try:
+                    conn.execute("BEGIN")
+                    store_module._ensure_queue_order_indexes(
+                        DropGateConnection(conn)  # type: ignore[arg-type]
+                    )
+                    conn.commit()
+                except BaseException as exc:
+                    migration_errors.append(exc)
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+
+            def insert_duplicate() -> None:
+                conn = connect_catalog(root)
+                conn.execute("PRAGMA busy_timeout = 5000")
+
+                def trace_statement(sql: str) -> None:
+                    if "job_queue_index_duplicate" in sql:
+                        writer_statement_started.set()
+
+                conn.set_trace_callback(trace_statement)
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO queue_jobs(
+                            id, role, job_type, priority, status,
+                            preemptible, dedupe_key,
+                            related_card_ids_json, payload_json,
+                            created_at, updated_at
+                        )
+                        VALUES(
+                            'job_queue_index_duplicate', 'scribe',
+                            'queue_index_atomicity_probe', 100, 'pending',
+                            1, ?, '[]', '{}', ?, ?
+                        )
+                        """,
+                        (
+                            duplicate_key,
+                            "2026-01-01T00:00:01+00:00",
+                            "2026-01-01T00:00:01+00:00",
+                        ),
+                    )
+                    conn.commit()
+                    writer_outcomes.append("committed")
+                except sqlite3.IntegrityError:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    writer_outcomes.append("unique_constraint")
+                except BaseException as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    writer_errors.append(exc)
+                finally:
+                    writer_finished.set()
+                    conn.close()
+
+            repair_thread = threading.Thread(
+                target=repair_indexes,
+                daemon=True,
+            )
+            writer_thread = threading.Thread(
+                target=insert_duplicate,
+                daemon=True,
+            )
+            repair_thread.start()
+            try:
+                self.assertTrue(drop_reached.wait(timeout=5))
+                writer_thread.start()
+                self.assertTrue(
+                    writer_statement_started.wait(timeout=5)
+                )
+                self.assertFalse(writer_finished.wait(timeout=0.2))
+            finally:
+                release_repair.set()
+            repair_thread.join(timeout=10)
+            writer_thread.join(timeout=10)
+
+            self.assertFalse(repair_thread.is_alive())
+            self.assertFalse(writer_thread.is_alive())
+            self.assertEqual(migration_errors, [])
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(writer_outcomes, ["unique_constraint"])
+            with closing(connect_catalog(root)) as conn:
+                self.assertTrue(
+                    store_module._queue_order_indexes_ready(conn)
+                )
+                self.assertEqual(
+                    int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) AS n
+                            FROM queue_jobs
+                            WHERE status = 'pending' AND dedupe_key = ?
+                            """,
+                            (duplicate_key,),
+                        ).fetchone()["n"]
+                    ),
+                    1,
+                )
 
     def test_queue_pending_dedupe_repair_fails_closed_on_duplicates(
         self,

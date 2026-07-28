@@ -224,6 +224,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 """
                 UPDATE queue_jobs
                 SET status = 'failed', finished_at = ?, updated_at = ?,
+                    retry_pending = 0, retry_order = 0,
                     lease_owner = NULL, lease_expires_at = NULL,
                     heartbeat_at = NULL, error_json = ?
                 WHERE id = ? AND status = 'pending'
@@ -3443,7 +3444,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 maintenance=False,
             )
 
-            self.assertFalse(first_pass["ok"], first_pass)
+            self.assertTrue(first_pass["ok"], first_pass)
+            self.assertEqual(first_pass["retry_pending_count"], 1)
             self.assertEqual(
                 first_pass["sidecar_intent_budget"]["remaining"],
                 0,
@@ -3592,7 +3594,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     maintenance=False,
                 )
 
-            self.assertFalse(worker["ok"], worker)
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(worker["retry_pending_count"], 1)
             self.assertEqual(worker["processed_count"], 1)
             self.assertEqual(len(reconciliation_calls), 1)
             for call in reconciliation_calls:
@@ -3720,7 +3723,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
 
             budget = worker["sidecar_intent_budget"]
-            self.assertFalse(worker["ok"], worker)
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(worker["retry_pending_count"], 1)
             self.assertEqual(worker["processed_count"], 1)
             self.assertGreaterEqual(len(calls), 1)
             self.assertLessEqual(
@@ -3861,7 +3865,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     maintenance=False,
                 )
 
-            self.assertFalse(worker["ok"], worker)
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(worker["retry_pending_count"], 1)
             self.assertEqual(worker["processed_count"], 1)
             self.assertEqual(len(calls), 1, calls)
             self.assertLessEqual(
@@ -3994,7 +3999,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 maintenance=False,
             )
 
-            self.assertFalse(worker["ok"], worker)
+            self.assertTrue(worker["ok"], worker)
+            self.assertEqual(worker["retry_pending_count"], 1)
             self.assertEqual(worker["processed_count"], 1)
             self.assertEqual(
                 worker["sidecar_intent_budget"]["used"],
@@ -4404,9 +4410,10 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                                     "EXPLAIN QUERY PLAN "
                                     + worker_module
                                     ._role_filtered_candidate_sql(
-                                        oldest=oldest
+                                        oldest=oldest,
+                                        retry_pending=False,
                                     ),
-                                    ("archivist", "pending"),
+                                    ("archivist", "pending", 0),
                                 ).fetchall()
                             )
                             self.assertIn(index_name, plan)
@@ -4429,6 +4436,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                                         conn,
                                         None,
                                         oldest=oldest,
+                                        retry_pending=False,
                                     )
                                 finally:
                                     conn.set_trace_callback(None)
@@ -4509,6 +4517,14 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         ),
                         len(roles),
                     )
+                    self.assertEqual(
+                        sum(
+                            "indexed by idx_queue_role_retry"
+                            in statement
+                            for statement in normalized_trace
+                        ),
+                        len(roles),
+                    )
                     self.assertFalse(
                         any(
                             "pending_job.role in"
@@ -4517,6 +4533,359 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         ),
                         traced_sql,
                     )
+
+    def test_retry_lane_claim_is_index_bounded_on_large_queue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        attempt_count, retry_order, retry_pending, error_json,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'large_retry_lane_probe',
+                        1, 'pending', 1, 1, ?, 1, ?,
+                        '[]', '{}', ?, ?
+                    )
+                    """,
+                    [
+                        (
+                            f"job_large_retry_lane_{index:05d}",
+                            index + 1,
+                            store_module.json_dumps(
+                                {
+                                    "error": None,
+                                    "result": {
+                                        "ok": False,
+                                        "retry_pending": True,
+                                    },
+                                    "retry_pending": True,
+                                }
+                            ),
+                            "2026-07-28T00:00:00+00:00",
+                            "2026-07-28T00:00:00+00:00",
+                        )
+                        for index in range(20_000)
+                    ],
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = ?",
+                    (
+                        "20000",
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.commit()
+                conn.execute("ANALYZE")
+                plan = " ".join(
+                    str(row["detail"])
+                    for row in conn.execute(
+                        "EXPLAIN QUERY PLAN "
+                        + worker_module._role_filtered_candidate_sql(
+                            oldest=False,
+                            retry_pending=True,
+                            retry_rotation=True,
+                        ),
+                        ("archivist", "pending", 1),
+                    ).fetchall()
+                )
+                self.assertIn("idx_queue_role_retry", plan)
+                self.assertNotIn("TEMP B-TREE", plan)
+                counter_plan = " ".join(
+                    str(row["detail"])
+                    for row in conn.execute(
+                        """
+                        EXPLAIN QUERY PLAN
+                        SELECT coalesce(max(retry_order), 0)
+                        FROM queue_jobs
+                        WHERE retry_pending = 1
+                        """
+                    ).fetchall()
+                )
+                self.assertIn(
+                    "idx_queue_retry_order_authority",
+                    counter_plan,
+                )
+
+                instruction_count = 0
+
+                def count_instruction() -> int:
+                    nonlocal instruction_count
+                    instruction_count += 1
+                    return 0
+
+                counter_instruction_count = 0
+
+                def count_counter_instruction() -> int:
+                    nonlocal counter_instruction_count
+                    counter_instruction_count += 1
+                    return 0
+
+                conn.set_progress_handler(
+                    count_counter_instruction,
+                    1,
+                )
+                try:
+                    self.assertTrue(
+                        store_module
+                        ._queue_retry_order_counter_ready(conn)
+                    )
+                finally:
+                    conn.set_progress_handler(None, 0)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.set_progress_handler(count_instruction, 1)
+                try:
+                    claimed = worker_module._claim_job(
+                        conn,
+                        {"archivist"},
+                        lease_owner="large-retry-lane-owner",
+                        lease_seconds=300,
+                    )
+                finally:
+                    conn.set_progress_handler(None, 0)
+                    conn.rollback()
+            finally:
+                conn.close()
+
+            self.assertEqual(
+                claimed["id"],
+                "job_large_retry_lane_00000",
+            )
+            self.assertLess(counter_instruction_count, 250)
+            self.assertLess(instruction_count, 2_500)
+
+    def test_public_pass_bounds_large_expired_retry_reclamation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            row_count = 20_000
+            fixed_now = "2026-07-28T12:00:00+00:00"
+            expired_at = "2026-07-28T11:00:00+00:00"
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id,
+                        role,
+                        job_type,
+                        priority,
+                        status,
+                        preemptible,
+                        attempt_count,
+                        retry_pending,
+                        retry_order,
+                        lease_owner,
+                        lease_expires_at,
+                        heartbeat_at,
+                        related_card_ids_json,
+                        payload_json,
+                        created_at,
+                        updated_at,
+                        started_at
+                    )
+                    VALUES(
+                        ?,
+                        'archivist',
+                        'expired_retry_bound_probe',
+                        1,
+                        'running',
+                        1,
+                        1,
+                        1,
+                        ?,
+                        'crashed-worker',
+                        ?,
+                        ?,
+                        '[]',
+                        '{}',
+                        '2026-07-28T10:00:00+00:00',
+                        '2026-07-28T10:00:00+00:00',
+                        '2026-07-28T10:00:00+00:00'
+                    )
+                    """,
+                    (
+                        (
+                            f"job_expired_retry_bound_{index:05d}",
+                            index + 1,
+                            expired_at,
+                            expired_at,
+                        )
+                        for index in range(row_count)
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE meta
+                    SET value = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        str(row_count),
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.commit()
+                status_lease_plan = " ".join(
+                    str(row["detail"])
+                    for row in conn.execute(
+                        f"""
+                        EXPLAIN QUERY PLAN
+                        SELECT id
+                        FROM queue_jobs INDEXED BY
+                            {store_module.QUEUE_STATUS_LEASE_INDEX_NAME}
+                        WHERE status = 'running'
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at <= ?
+                        ORDER BY lease_expires_at ASC, id ASC
+                        LIMIT 50
+                        """,
+                        (fixed_now,),
+                    ).fetchall()
+                )
+                role_lease_plan = " ".join(
+                    str(row["detail"])
+                    for row in conn.execute(
+                        f"""
+                        EXPLAIN QUERY PLAN
+                        SELECT id
+                        FROM queue_jobs INDEXED BY
+                            {store_module.QUEUE_ROLE_LEASE_INDEX_NAME}
+                        WHERE role = 'archivist'
+                          AND status = 'running'
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at <= ?
+                        ORDER BY lease_expires_at ASC, id ASC
+                        LIMIT 50
+                        """,
+                        (fixed_now,),
+                    ).fetchall()
+                )
+            finally:
+                conn.close()
+
+            reclaim_instruction_counts: list[int] = []
+            real_reclaim = worker_module._reclaim_expired_leases
+
+            def measured_reclaim(conn, roles=None):
+                instruction_count = 0
+
+                def count_instruction() -> int:
+                    nonlocal instruction_count
+                    instruction_count += 1
+                    return 0
+
+                conn.set_progress_handler(count_instruction, 1)
+                try:
+                    return real_reclaim(conn, roles)
+                finally:
+                    conn.set_progress_handler(None, 0)
+                    reclaim_instruction_counts.append(instruction_count)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "_reclaim_expired_leases",
+                    side_effect=measured_reclaim,
+                ),
+                patch.object(
+                    worker_module,
+                    "utc_now",
+                    return_value=fixed_now,
+                ),
+            ):
+                result = run_worker_pass(
+                    root,
+                    limit=1,
+                    maintenance=False,
+                )
+
+            conn = connect_existing(root)
+            try:
+                running_retries = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS value
+                        FROM queue_jobs
+                        WHERE status = 'running' AND retry_pending = 1
+                        """
+                    ).fetchone()["value"]
+                )
+                pending_retries = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS value
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND retry_pending = 1
+                        """
+                    ).fetchone()["value"]
+                )
+                counter = int(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (store_module.QUEUE_RETRY_ORDER_META_KEY,),
+                    ).fetchone()["value"]
+                )
+                distinct_orders = int(
+                    conn.execute(
+                        """
+                        SELECT count(DISTINCT retry_order) AS value
+                        FROM queue_jobs
+                        WHERE retry_pending = 1
+                        """
+                    ).fetchone()["value"]
+                )
+            finally:
+                conn.close()
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn(
+                store_module.QUEUE_STATUS_LEASE_INDEX_NAME,
+                status_lease_plan,
+            )
+            self.assertNotIn("TEMP B-TREE", status_lease_plan)
+            self.assertIn(
+                store_module.QUEUE_ROLE_LEASE_INDEX_NAME,
+                role_lease_plan,
+            )
+            self.assertNotIn("TEMP B-TREE", role_lease_plan)
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(
+                result["reclaimed_expired_jobs"],
+                worker_module.WORKER_EXPIRED_LEASE_RECLAIM_LIMIT,
+            )
+            self.assertEqual(len(reclaim_instruction_counts), 1)
+            self.assertLess(reclaim_instruction_counts[0], 50_000)
+            self.assertEqual(
+                running_retries,
+                row_count
+                - worker_module.WORKER_EXPIRED_LEASE_RECLAIM_LIMIT,
+            )
+            self.assertEqual(
+                pending_retries,
+                worker_module.WORKER_EXPIRED_LEASE_RECLAIM_LIMIT - 1,
+            )
+            self.assertEqual(
+                distinct_orders,
+                running_retries + pending_retries,
+            )
+            self.assertEqual(
+                counter,
+                row_count
+                + worker_module.WORKER_EXPIRED_LEASE_RECLAIM_LIMIT,
+            )
 
     def test_worker_priority_burst_serves_oldest_job_after_bounded_bypasses(
         self,
@@ -4645,6 +5014,263 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 resumed_priority,
             )
 
+    def test_worker_retry_lane_is_served_after_bounded_fresh_bypasses(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                retry_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="bounded_retry_lane_probe",
+                    priority=1,
+                    payload={},
+                )
+                retry_order = worker_module._next_queue_retry_order(
+                    conn
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET error_json = ?, retry_pending = 1,
+                        retry_order = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        store_module.json_dumps(
+                            {
+                                "error": None,
+                                "result": {
+                                    "ok": False,
+                                    "retry_pending": True,
+                                },
+                                "retry_pending": True,
+                            }
+                        ),
+                        retry_order,
+                        retry_job_id,
+                    ),
+                )
+                fresh_job_ids = [
+                    enqueue_job(
+                        conn,
+                        role="archivist",
+                        job_type="bounded_fresh_lane_probe",
+                        priority=2,
+                        payload={"index": index},
+                    )
+                    for index in range(
+                        worker_module.MAX_CONSECUTIVE_RETRY_BYPASSES
+                        + 1
+                    )
+                ]
+                conn.commit()
+            finally:
+                conn.close()
+
+            for expected_job_id in fresh_job_ids[:-1]:
+                claimed = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+                self.assertEqual(
+                    claimed["processed"][0]["job_id"],
+                    expected_job_id,
+                    claimed,
+                )
+
+            retry_claim = run_worker_pass(
+                root,
+                roles=["archivist"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertEqual(
+                retry_claim["processed"][0]["job_id"],
+                retry_job_id,
+                retry_claim,
+            )
+            conn = connect_existing(root)
+            try:
+                remaining_fresh = conn.execute(
+                    """
+                    SELECT status, attempt_count
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (fresh_job_ids[-1],),
+                ).fetchone()
+                fairness_counter = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (
+                        worker_module._queue_fairness_meta_key(
+                            {"archivist"}
+                        ),
+                    ),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(
+                dict(remaining_fresh),
+                {"status": "pending", "attempt_count": 0},
+            )
+            self.assertIsNone(fairness_counter)
+
+    def test_retry_lane_does_not_reset_fresh_priority_aging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                oldest_fresh_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="retry_composition_oldest_fresh",
+                    priority=900,
+                    payload={},
+                )
+                retry_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="retry_composition_probe",
+                    priority=1,
+                    payload={},
+                )
+                retry_order = worker_module._next_queue_retry_order(
+                    conn
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET retry_pending = 1, error_json = ?,
+                        retry_order = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        store_module.json_dumps(
+                            {
+                                "error": None,
+                                "result": {
+                                    "ok": False,
+                                    "retry_pending": True,
+                                },
+                                "retry_pending": True,
+                            }
+                        ),
+                        retry_order,
+                        retry_job_id,
+                    ),
+                )
+                high_fresh_job_ids = [
+                    enqueue_job(
+                        conn,
+                        role="archivist",
+                        job_type="retry_composition_high_fresh",
+                        priority=1,
+                        payload={"index": index},
+                    )
+                    for index in range(
+                        worker_module
+                        .MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                    )
+                ]
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_process_job = worker_module._process_job
+
+            def process_retry_probe(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if job["job_type"] == "retry_composition_probe":
+                    return {
+                        "ok": False,
+                        "reason": "retry_composition_pending",
+                        "retry_pending": True,
+                    }
+                return original_process_job(worker_root, job, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=process_retry_probe,
+            ):
+                for expected_job_id in high_fresh_job_ids:
+                    claimed = run_worker_pass(
+                        root,
+                        roles=["archivist"],
+                        limit=1,
+                        maintenance=False,
+                    )
+                    self.assertEqual(
+                        claimed["processed"][0]["job_id"],
+                        expected_job_id,
+                        claimed,
+                    )
+
+                retry_claim = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+                self.assertEqual(
+                    retry_claim["processed"][0]["job_id"],
+                    retry_job_id,
+                    retry_claim,
+                )
+
+                conn = connect(root)
+                try:
+                    next_high_job_id = enqueue_job(
+                        conn,
+                        role="archivist",
+                        job_type="retry_composition_high_fresh",
+                        priority=1,
+                        payload={"index": "after-retry"},
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                oldest_claim = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertEqual(
+                oldest_claim["processed"][0]["job_id"],
+                oldest_fresh_job_id,
+                oldest_claim,
+            )
+            conn = connect_existing(root)
+            try:
+                next_high = conn.execute(
+                    """
+                    SELECT status, attempt_count
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (next_high_job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(
+                dict(next_high),
+                {"status": "pending", "attempt_count": 0},
+            )
+
     def test_worker_priority_bypass_counter_rolls_back_with_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -4665,6 +5291,38 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     priority=1,
                     payload={},
                 )
+                retry_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="fairness_rollback_retry",
+                    priority=1,
+                    payload={},
+                )
+                retry_order = worker_module._next_queue_retry_order(
+                    conn
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET retry_pending = 1, error_json = ?,
+                        retry_order = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        store_module.json_dumps(
+                            {
+                                "error": None,
+                                "result": {
+                                    "ok": False,
+                                    "retry_pending": True,
+                                },
+                                "retry_pending": True,
+                            }
+                        ),
+                        retry_order,
+                        retry_job_id,
+                    ),
+                )
                 conn.commit()
                 conn.execute("BEGIN IMMEDIATE")
                 claimed = worker_module._claim_job(
@@ -4676,6 +5334,13 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 self.assertEqual(claimed["id"], high_job_id)
                 self.assertEqual(
                     worker_module._queue_priority_bypass_count(
+                        conn,
+                        {"archivist"},
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    worker_module._queue_retry_bypass_count(
                         conn,
                         {"archivist"},
                     ),
@@ -4698,6 +5363,14 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         ),
                     ),
                 ).fetchone()
+                retry_counter = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (
+                        worker_module._queue_retry_fairness_meta_key(
+                            {"archivist"}
+                        ),
+                    ),
+                ).fetchone()
             finally:
                 conn.close()
             self.assertTrue(
@@ -4709,6 +5382,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 states,
             )
             self.assertIsNone(counter)
+            self.assertIsNone(retry_counter)
 
     def test_worker_pass_reclaims_expired_running_job_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5262,7 +5936,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     limit=1,
                     maintenance=False,
                 )
-            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(interrupted["ok"], interrupted)
+            self.assertEqual(interrupted["retry_pending_count"], 1)
             interrupted_job = interrupted["processed"][0]
             self.assertEqual(interrupted_job["status"], "pending")
             self.assertEqual(
@@ -5337,6 +6012,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     """
                     UPDATE queue_jobs
                     SET status = 'failed', finished_at = ?, updated_at = ?,
+                        retry_pending = 0, retry_order = 0,
                         heartbeat_at = NULL, error_json = ?
                     WHERE id = ? AND status = 'pending'
                     """,
@@ -5464,7 +6140,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     limit=1,
                     maintenance=False,
                 )
-            self.assertFalse(deferred["ok"], deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["retry_pending_count"], 1)
             deferred_job = deferred["processed"][0]
             self.assertEqual(deferred_job["status"], "pending", deferred)
             self.assertTrue(deferred_job["result"]["retry_pending"], deferred)
@@ -5534,7 +6211,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 limit=1,
                 maintenance=True,
             )
-            self.assertFalse(repairing["ok"], repairing)
+            self.assertTrue(repairing["ok"], repairing)
+            self.assertEqual(repairing["retry_pending_count"], 1)
             self.assertEqual(repairing["processed"][0]["status"], "pending")
             self.assertTrue(repairing["maintenance"]["sidecars"]["ok"])
             conn = connect_existing(root)
@@ -6337,7 +7015,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     limit=1,
                     maintenance=False,
                 )
-            self.assertFalse(deferred["ok"], deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["retry_pending_count"], 1)
             deferred_job = deferred["processed"][0]
             self.assertEqual(deferred_job["status"], "pending", deferred)
             self.assertTrue(deferred_job["result"]["retry_pending"], deferred)
@@ -6543,7 +7222,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     limit=1,
                     maintenance=False,
                 )
-            self.assertFalse(deferred["ok"], deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["retry_pending_count"], 1)
             deferred_job = deferred["processed"][0]
             self.assertEqual(deferred_job["status"], "pending", deferred)
             self.assertTrue(deferred_job["result"]["retry_pending"], deferred)
@@ -6742,7 +7422,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 limit=1,
                 maintenance=True,
             )
-            self.assertFalse(deferred["ok"], deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["retry_pending_count"], 1)
             self.assertEqual(deferred["processed_count"], 1)
             deferred_job = deferred["processed"][0]
             self.assertEqual(deferred_job["job_id"], job_id)
@@ -6863,6 +7544,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     """
                     UPDATE queue_jobs
                     SET status = 'failed', finished_at = ?, updated_at = ?,
+                        retry_pending = 0, retry_order = 0,
                         lease_owner = NULL, lease_expires_at = NULL,
                         heartbeat_at = NULL, error_json = ?
                     WHERE id = ? AND status = 'pending'
@@ -7366,7 +8048,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 limit=1,
                 maintenance=False,
             )
-            self.assertFalse(rearmed["ok"], rearmed)
+            self.assertTrue(rearmed["ok"], rearmed)
+            self.assertEqual(rearmed["retry_pending_count"], 1)
             self.assertEqual(rearmed["processed"][0]["status"], "pending")
             self.assertTrue(
                 rearmed["processed"][0]["result"]["retry_pending"]
@@ -7851,6 +8534,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     """
                     UPDATE queue_jobs
                     SET status = 'failed', finished_at = ?, updated_at = ?,
+                        retry_pending = 0, retry_order = 0,
                         lease_owner = NULL, lease_expires_at = NULL,
                         error_json = ?
                     WHERE id = ? AND status = 'succeeded'
@@ -8354,6 +9038,13 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         related_card_ids=related_card_ids,
                         dedupe_key=f"effectless:{job_type}:{card_id}",
                     )
+                    follower_job_id = enqueue_job(
+                        conn,
+                        role=role,
+                        job_type="post_commit_retry_followup_probe",
+                        priority=2,
+                        payload={},
+                    )
                     conn.commit()
                 finally:
                     conn.close()
@@ -8368,10 +9059,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     interrupted = run_worker_pass(
                         root,
                         roles=[role],
-                        limit=1,
+                        limit=2,
                         maintenance=False,
                     )
-                self.assertFalse(interrupted["ok"], interrupted)
+                self.assertTrue(interrupted["ok"], interrupted)
+                self.assertEqual(interrupted["retry_pending_count"], 1)
+                self.assertEqual(interrupted["processed_count"], 2)
                 interrupted_job = interrupted["processed"][0]
                 self.assertEqual(interrupted_job["status"], "pending")
                 self.assertEqual(
@@ -8381,6 +9074,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 self.assertTrue(
                     interrupted_job["result"]["retry_pending"]
                 )
+                follower_job = interrupted["processed"][1]
+                self.assertEqual(
+                    follower_job["job_id"],
+                    follower_job_id,
+                )
+                self.assertEqual(follower_job["status"], "skipped")
 
                 conn = connect(root)
                 try:
@@ -8414,6 +9113,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         UPDATE queue_jobs
                         SET status = 'failed', finished_at = ?,
                             updated_at = ?, error_json = ?,
+                            retry_pending = 0, retry_order = 0,
                             lease_owner = NULL, lease_expires_at = NULL,
                             heartbeat_at = NULL
                         WHERE id = ? AND status = 'pending'
@@ -8641,6 +9341,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     """
                     UPDATE queue_jobs
                     SET status = 'failed', finished_at = ?, updated_at = ?,
+                        retry_pending = 0, retry_order = 0,
                         error_json = ?
                     WHERE id = ?
                     """,
@@ -11596,7 +12297,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 limit=1,
                 maintenance=False,
             )
-            self.assertFalse(deferred["ok"], deferred)
+            self.assertTrue(deferred["ok"], deferred)
+            self.assertEqual(deferred["retry_pending_count"], 1)
             self.assertEqual(deferred["processed"][0]["job_id"], job_id)
             self.assertEqual(deferred["processed"][0]["status"], "pending")
             conn = connect_existing(root)
@@ -11643,6 +12345,605 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(recovered_status, "succeeded")
             self.assertIsNone(pending_outbox)
             self.assertEqual(memory_health(root)["failed_jobs"], 0)
+
+    def test_worker_service_continues_past_durable_retry_without_reclaiming_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="worker-service-durable-retry",
+                    summary="Initial materialized state.",
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, [card_id])["ok"]
+            )
+
+            config = store_module.load_config(root)
+            config["atomic_memory"]["write_card_sidecars"] = False
+            write_config(root, config)
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "Durably deferred while writes are disabled.",
+                        store_module.utc_now(),
+                        card_id,
+                    ),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="worker_service_durable_retry",
+                )
+                retry_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                    dedupe_key=f"service-retry:{card_id}",
+                )
+                follower_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="bounded_retry_followup_probe",
+                    priority=2,
+                    payload={},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            service = worker_module.serve_workers(
+                root,
+                roles=["archivist"],
+                limit=1,
+                interval_seconds=0.1,
+                maintenance_interval_seconds=3600.0,
+                maintenance_on_start=False,
+            )
+
+            self.assertTrue(service["ok"], service)
+            self.assertEqual(service["passes"], 1)
+            self.assertEqual(service["processed_count"], 2)
+            self.assertEqual(service["retry_pending_count"], 1)
+            conn = connect_existing(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, attempt_count, lease_owner,
+                               retry_pending
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (retry_job_id, follower_job_id),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(rows[retry_job_id]["status"], "pending")
+            self.assertEqual(rows[retry_job_id]["attempt_count"], 1)
+            self.assertIsNone(rows[retry_job_id]["lease_owner"])
+            self.assertEqual(rows[retry_job_id]["retry_pending"], 1)
+            self.assertEqual(rows[follower_job_id]["status"], "skipped")
+            self.assertEqual(rows[follower_job_id]["attempt_count"], 1)
+            self.assertIsNone(rows[follower_job_id]["lease_owner"])
+            self.assertEqual(rows[follower_job_id]["retry_pending"], 0)
+
+    def test_worker_service_crosses_full_retry_window_to_reach_fresh_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            retry_job_ids: list[str] = []
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                for index in range(50):
+                    retry_job_ids.append(
+                        enqueue_job(
+                            conn,
+                            role="archivist",
+                            job_type="scheduler_retry_probe",
+                            priority=1,
+                            payload={"index": index},
+                        )
+                    )
+                follower_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="scheduler_fresh_followup_probe",
+                    priority=2,
+                    payload={},
+                )
+                conn.execute(
+                    "UPDATE queue_jobs SET error_json = '{' WHERE id = ?",
+                    (follower_job_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_process_job = worker_module._process_job
+
+            def process_retry_probe(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if job["job_type"] == "scheduler_retry_probe":
+                    return {
+                        "ok": False,
+                        "reason": "scheduler_retry_probe_pending",
+                        "retry_pending": True,
+                    }
+                return original_process_job(worker_root, job, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=process_retry_probe,
+            ):
+                service = worker_module.serve_workers(
+                    root,
+                    roles=["archivist"],
+                    limit=2,
+                    interval_seconds=0.1,
+                    maintenance_interval_seconds=3600.0,
+                    maintenance_on_start=False,
+                )
+
+            self.assertTrue(service["ok"], service)
+            self.assertEqual(service["passes"], 2)
+            self.assertEqual(service["processed_count"], 100)
+            self.assertEqual(service["retry_pending_count"], 99)
+            conn = connect_existing(root)
+            try:
+                follower = conn.execute(
+                    """
+                    SELECT status, attempt_count, lease_owner
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (follower_job_id,),
+                ).fetchone()
+                retry_attempts = [
+                    int(row["attempt_count"])
+                    for row in conn.execute(
+                        """
+                        SELECT attempt_count
+                        FROM queue_jobs
+                        WHERE id IN (
+                            SELECT value FROM json_each(?)
+                        )
+                        """,
+                        (store_module.json_dumps(retry_job_ids),),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(
+                dict(follower),
+                {
+                    "status": "skipped",
+                    "attempt_count": 1,
+                    "lease_owner": None,
+                },
+            )
+            self.assertEqual(len(retry_attempts), 50)
+            self.assertEqual(sum(retry_attempts), 99)
+            self.assertEqual(set(retry_attempts), {1, 2})
+
+    def test_worker_service_rotates_retry_lane_during_sustained_fresh_backlog(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            retry_job_ids = [
+                f"job_retry_rotation_{index:02d}"
+                for index in range(10)
+            ]
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                retry_receipt = store_module.json_dumps(
+                    {
+                        "error": None,
+                        "result": {
+                            "ok": False,
+                            "retry_pending": True,
+                        },
+                        "retry_pending": True,
+                    }
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        retry_order, retry_pending, error_json,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'scheduler_rotation_retry_probe',
+                        1, 'pending', 1, ?, 1, ?,
+                        '[]', '{}',
+                        '2026-07-28T00:00:00+00:00',
+                        '2026-07-28T00:00:00+00:00'
+                    )
+                    """,
+                    [
+                        (job_id, index + 1, retry_receipt)
+                        for index, job_id in enumerate(retry_job_ids)
+                    ],
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = ?",
+                    (
+                        str(len(retry_job_ids)),
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'scheduler_rotation_fresh_probe',
+                        2, 'pending', 1, '[]', '{}',
+                        '2026-07-28T00:00:01+00:00',
+                        '2026-07-28T00:00:01+00:00'
+                    )
+                    """,
+                    [
+                        (f"job_fresh_rotation_{index:04d}",)
+                        for index in range(1_000)
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_process_job = worker_module._process_job
+
+            def process_retry_probe(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if (
+                    job["job_type"]
+                    == "scheduler_rotation_retry_probe"
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "scheduler_rotation_retry_pending",
+                        "retry_pending": True,
+                    }
+                return original_process_job(worker_root, job, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=process_retry_probe,
+            ):
+                service = worker_module.serve_workers(
+                    root,
+                    roles=["archivist"],
+                    limit=10,
+                    interval_seconds=0.1,
+                    maintenance_interval_seconds=3600.0,
+                    maintenance_on_start=False,
+                )
+
+            self.assertTrue(service["ok"], service)
+            self.assertEqual(service["passes"], 10)
+            self.assertEqual(service["processed_count"], 500)
+            self.assertEqual(service["retry_pending_count"], 55)
+            conn = connect_existing(root)
+            try:
+                retry_attempts = [
+                    int(row["attempt_count"])
+                    for row in conn.execute(
+                        """
+                        SELECT attempt_count
+                        FROM queue_jobs
+                        WHERE job_type =
+                            'scheduler_rotation_retry_probe'
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                ]
+                pending_fresh = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM queue_jobs
+                        WHERE job_type =
+                            'scheduler_rotation_fresh_probe'
+                          AND status = 'pending'
+                        """
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(len(retry_attempts), 10)
+            self.assertGreater(min(retry_attempts), 0)
+            self.assertLessEqual(
+                max(retry_attempts) - min(retry_attempts),
+                1,
+            )
+            self.assertEqual(sum(retry_attempts), 55)
+            self.assertEqual(pending_fresh, 555)
+
+    def test_retry_rotation_does_not_starve_high_attempt_rows_under_new_arrivals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            old_retry_job_ids = [
+                f"job_old_retry_{index}"
+                for index in range(3)
+            ]
+            retry_receipt = store_module.json_dumps(
+                {
+                    "error": None,
+                    "result": {
+                        "ok": False,
+                        "retry_pending": True,
+                    },
+                    "retry_pending": True,
+                }
+            )
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status, preemptible,
+                        attempt_count, retry_order, retry_pending, error_json,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'scheduler_arrival_retry_probe',
+                        1, 'pending', 1, ?, ?, 1, ?,
+                        '[]', '{}',
+                        '2000-01-01T00:00:00+00:00',
+                        '2000-01-01T00:00:00+00:00'
+                    )
+                    """,
+                    [
+                        (
+                            job_id,
+                            (index + 1) * 100,
+                            index + 1,
+                            retry_receipt,
+                        )
+                        for index, job_id in enumerate(old_retry_job_ids)
+                    ],
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = ?",
+                    (
+                        str(len(old_retry_job_ids)),
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            original_process_job = worker_module._process_job
+
+            def process_retry_probe(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if job["job_type"] == "scheduler_arrival_retry_probe":
+                    return {
+                        "ok": False,
+                        "reason": "scheduler_arrival_retry_pending",
+                        "retry_pending": True,
+                    }
+                return original_process_job(worker_root, job, **kwargs)
+
+            observed_job_ids: list[str] = []
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=process_retry_probe,
+            ):
+                for index in range(6):
+                    conn = connect(root)
+                    try:
+                        retry_order = (
+                            worker_module._next_queue_retry_order(
+                                conn
+                            )
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO queue_jobs(
+                                id, role, job_type, priority, status,
+                                preemptible, attempt_count, retry_order,
+                                retry_pending,
+                                error_json, related_card_ids_json,
+                                payload_json, created_at, updated_at
+                            )
+                            VALUES(
+                                ?, 'archivist',
+                                'scheduler_arrival_retry_probe',
+                                1, 'pending', 1, 0, ?, 1, ?,
+                                '[]', '{}', ?, ?
+                            )
+                            """,
+                            (
+                                f"job_new_retry_{index}",
+                                retry_order,
+                                retry_receipt,
+                                f"2001-01-01T00:00:{index:02d}+00:00",
+                                f"2001-01-01T00:00:{index:02d}+00:00",
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    result = run_worker_pass(
+                        root,
+                        roles=["archivist"],
+                        limit=1,
+                        maintenance=False,
+                    )
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["retry_pending_count"], 1)
+                    observed_job_ids.append(
+                        str(result["processed"][0]["job_id"])
+                    )
+
+            self.assertEqual(
+                observed_job_ids[: len(old_retry_job_ids)],
+                old_retry_job_ids,
+            )
+            conn = connect_existing(root)
+            try:
+                old_attempts = {
+                    str(row["id"]): int(row["attempt_count"])
+                    for row in conn.execute(
+                        """
+                        SELECT id, attempt_count
+                        FROM queue_jobs
+                        WHERE id IN (
+                            SELECT value FROM json_each(?)
+                        )
+                        """,
+                        (
+                            store_module.json_dumps(
+                                old_retry_job_ids
+                            ),
+                        ),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            for index, job_id in enumerate(old_retry_job_ids):
+                self.assertGreaterEqual(
+                    old_attempts[job_id],
+                    (index + 1) * 100 + 1,
+                )
+
+    def test_retry_rotation_is_claim_bounded_when_clock_is_constant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            retry_job_ids = [
+                f"job_constant_clock_retry_{index}"
+                for index in range(3)
+            ]
+            conn = connect(root)
+            try:
+                conn.execute("DELETE FROM queue_jobs")
+                conn.executemany(
+                    """
+                    INSERT INTO queue_jobs(
+                        id, role, job_type, priority, status,
+                        preemptible, attempt_count, retry_order,
+                        retry_pending, error_json,
+                        related_card_ids_json, payload_json,
+                        created_at, updated_at
+                    )
+                    VALUES(
+                        ?, 'archivist', 'constant_clock_retry_probe',
+                        1, 'pending', 1, 10, ?, 1,
+                        '{"retry_pending":true}', '[]', '{}', ?, ?
+                    )
+                    """,
+                    [
+                        (
+                            job_id,
+                            index + 1,
+                            "2026-07-28T12:00:00+00:00",
+                            "2026-07-28T12:00:00+00:00",
+                        )
+                        for index, job_id in enumerate(retry_job_ids)
+                    ],
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = ?",
+                    (
+                        str(len(retry_job_ids)),
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            observed_job_ids: list[str] = []
+            constant_now = store_module.utc_now()
+            with patch.object(
+                worker_module,
+                "utc_now",
+                return_value=constant_now,
+            ):
+                for _ in retry_job_ids:
+                    conn = connect(root)
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        job = worker_module._claim_job(
+                            conn,
+                            {"archivist"},
+                            lease_owner="constant-clock-owner",
+                            lease_seconds=300,
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    self.assertIsNotNone(job)
+                    observed_job_ids.append(str(job["id"]))
+                    conn = connect(root)
+                    try:
+                        worker_module._retry_owned_job(
+                            conn,
+                            str(job["id"]),
+                            lease_owner="constant-clock-owner",
+                            lease_seconds=300,
+                            result={
+                                "ok": False,
+                                "reason": "constant_clock_retry_pending",
+                                "retry_pending": True,
+                            },
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+            self.assertEqual(observed_job_ids, retry_job_ids)
 
     def test_sidecar_worker_expiry_after_materialization_replays_idempotently(
         self,
@@ -12210,7 +13511,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     maintenance=True,
                 )
 
-            self.assertFalse(replayed["ok"], replayed)
+            self.assertTrue(replayed["ok"], replayed)
+            self.assertEqual(replayed["retry_pending_count"], 1)
             self.assertEqual(replayed["processed_count"], 1)
             replayed_job = replayed["processed"][0]
             self.assertEqual(replayed_job["job_id"], job_id)
@@ -14236,6 +15538,100 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertFalse(old_reader.exists())
             self.assertTrue((root / row["original_uri"]).exists())
             self.assertTrue((root / row["reader_uri"]).exists())
+
+    def test_memory_health_reports_legacy_retry_schema_without_mutating(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                for index_name in store_module.QUEUE_ORDER_INDEX_NAMES:
+                    conn.execute(f"DROP INDEX {index_name}")
+                for trigger_name in (
+                    store_module.QUEUE_RETRY_AUTHORITY_TRIGGER_NAMES
+                ):
+                    conn.execute(f"DROP TRIGGER {trigger_name}")
+                conn.execute(
+                    "ALTER TABLE queue_jobs DROP COLUMN retry_pending"
+                )
+                conn.execute(
+                    "ALTER TABLE queue_jobs DROP COLUMN retry_order"
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_role_priority
+                    ON queue_jobs(role, status, priority, created_at)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_role_created
+                    ON queue_jobs(role, status, created_at)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_status_priority
+                    ON queue_jobs(status, priority, created_at)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX idx_queue_status_created
+                    ON queue_jobs(status, created_at)
+                    """
+                )
+                conn.execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (
+                        store_module
+                        .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                        store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                worker_module,
+                "init_db",
+                side_effect=AssertionError(
+                    "memory health must remain read-only"
+                ),
+            ):
+                health = memory_health(root)
+
+            self.assertFalse(health["ok"], health)
+            self.assertTrue(health["initialized"])
+            self.assertEqual(
+                health["reason"],
+                "schema_migration_required",
+            )
+            self.assertEqual(
+                set(health["missing_schema_authority"]),
+                {
+                    "queue_jobs.retry_pending",
+                    "queue_jobs.retry_order",
+                    store_module
+                    .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                    store_module.QUEUE_RETRY_ORDER_META_KEY,
+                },
+            )
+            conn = connect_existing(root)
+            try:
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA table_info(queue_jobs)"
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertNotIn("retry_pending", columns)
+            self.assertNotIn("retry_order", columns)
 
     def test_memory_health_skips_inaccessible_reparse_like_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

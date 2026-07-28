@@ -101,6 +101,29 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     preemptible INTEGER NOT NULL DEFAULT 1,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    retry_order INTEGER NOT NULL DEFAULT 0
+        CHECK(
+            typeof(retry_order) = 'integer'
+            AND retry_order >= 0
+        ),
+    retry_pending INTEGER NOT NULL DEFAULT 0
+        CHECK(
+            typeof(retry_pending) = 'integer'
+            AND typeof(retry_order) = 'integer'
+            AND retry_pending IN (0, 1)
+            AND (
+                (
+                    retry_pending = 0
+                    AND retry_order = 0
+                )
+                OR (
+                    retry_pending = 1
+                    AND
+                    retry_order > 0
+                    AND status IN ('pending', 'running')
+                )
+            )
+        ),
     error_json TEXT,
     lease_owner TEXT,
     lease_expires_at TEXT,
@@ -325,10 +348,56 @@ CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary ON cards(coalesce(visibil
 CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary_direct ON cards(visibility_scope, project_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_cards_supersedes_card_id ON cards(supersedes_card_id);
 CREATE INDEX IF NOT EXISTS idx_books_tier ON books(storage_tier, status);
-CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, priority, created_at);
-CREATE INDEX IF NOT EXISTS idx_queue_role_created ON queue_jobs(role, status, created_at);
-CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON queue_jobs(status, priority, created_at);
-CREATE INDEX IF NOT EXISTS idx_queue_status_created ON queue_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_role_priority ON queue_jobs(role, status, retry_pending, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_role_created ON queue_jobs(role, status, retry_pending, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON queue_jobs(status, retry_pending, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_status_created ON queue_jobs(status, retry_pending, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_role_retry ON queue_jobs(role, status, retry_pending, retry_order, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_status_retry ON queue_jobs(status, retry_pending, retry_order, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_queue_role_lease ON queue_jobs(role, status, lease_expires_at, id);
+CREATE INDEX IF NOT EXISTS idx_queue_lease_expiry ON queue_jobs(status, lease_expires_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_retry_order_authority ON queue_jobs(retry_order) WHERE retry_pending = 1;
+CREATE TRIGGER IF NOT EXISTS enforce_queue_retry_authority_insert
+BEFORE INSERT ON queue_jobs
+WHEN NOT (
+    typeof(NEW.retry_pending) = 'integer'
+    AND typeof(NEW.retry_order) = 'integer'
+    AND (
+        (
+            NEW.retry_pending = 0
+            AND NEW.retry_order = 0
+        )
+        OR (
+            NEW.retry_pending = 1
+            AND NEW.retry_order > 0
+            AND NEW.status IN ('pending', 'running')
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'queue retry authority invariant violated');
+END;
+CREATE TRIGGER IF NOT EXISTS enforce_queue_retry_authority_update
+BEFORE UPDATE OF status, retry_pending, retry_order
+ON queue_jobs
+WHEN NOT (
+    typeof(NEW.retry_pending) = 'integer'
+    AND typeof(NEW.retry_order) = 'integer'
+    AND (
+        (
+            NEW.retry_pending = 0
+            AND NEW.retry_order = 0
+        )
+        OR (
+            NEW.retry_pending = 1
+            AND NEW.retry_order > 0
+            AND NEW.status IN ('pending', 'running')
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'queue retry authority invariant violated');
+END;
 CREATE INDEX IF NOT EXISTS idx_queue_running_dedupe ON queue_jobs(dedupe_key) WHERE status = 'running' AND dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_queue_job_type_status ON queue_jobs(job_type, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL;

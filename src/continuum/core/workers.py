@@ -25,6 +25,8 @@ from .store import (
     _card_sidecar_intent_reconciliation_limit,
     _current_card_sidecar_intent_reconciliation_budget,
     _project_state_card_integrity_error,
+    _queue_retry_authority_triggers_ready,
+    _queue_retry_order_counter_ready,
     add_graph_edge,
     audit_event,
     canonical_partition_identifier,
@@ -41,7 +43,15 @@ from .store import (
     json_dumps,
     json_loads,
     mark_card_sidecar_outbox,
+    MAX_QUEUE_RETRY_ORDER,
     NON_CURRENT_CARD_STATUSES,
+    QUEUE_RETRY_ORDER_META_KEY,
+    QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+    QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+    QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+    QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+    QUEUE_ROLE_LEASE_INDEX_NAME,
+    QUEUE_STATUS_LEASE_INDEX_NAME,
     reconcile_card_sidecar_write_intents,
     register_card_sidecar_compensation_intents,
     refresh_graph_edge_aggregate,
@@ -72,10 +82,13 @@ WORKER_SIDECAR_INTENT_LIMIT = 50
 WORKER_MAINTENANCE_FAILURE_LIMIT = 10
 WORKER_FAILED_SIDECAR_RECOVERY_LIMIT = 50
 WORKER_FAILED_SCRIBE_STEP_VALIDATION_LIMIT = 64
+WORKER_EXPIRED_LEASE_RECLAIM_LIMIT = 50
 POST_COMMIT_SIDECAR_RETRY_REASON = "post_commit_sidecar_retry_pending"
 POST_COMMIT_EXCEPTION_RETRY_REASON = "post_commit_exception_retry_pending"
 MAX_CONSECUTIVE_PRIORITY_BYPASSES = 8
+MAX_CONSECUTIVE_RETRY_BYPASSES = 8
 _QUEUE_FAIRNESS_META_PREFIX = "worker_queue_priority_burst_v1:"
+_QUEUE_RETRY_FAIRNESS_META_PREFIX = "worker_queue_retry_burst_v1:"
 # A single notification may represent an arbitrarily large per-session backlog
 # because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
 # than one window, but yield after a bounded amount of work and leave a durable
@@ -413,84 +426,260 @@ def _parse_utc_timestamp(value: str) -> dt.datetime:
     return parsed.astimezone(dt.UTC)
 
 
+def _expired_lease_candidates(
+    conn,
+    *,
+    roles: set[str] | None,
+    now: str,
+) -> list[Any]:
+    columns = """
+        id, preemptible, retry_pending, dedupe_key, lease_expires_at
+    """
+    if not roles:
+        return conn.execute(
+            f"""
+            SELECT {columns}
+            FROM queue_jobs INDEXED BY {QUEUE_STATUS_LEASE_INDEX_NAME}
+            WHERE status = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            ORDER BY lease_expires_at ASC, id ASC
+            LIMIT ?
+            """,
+            (
+                ACTIVE_JOB_STATUS,
+                now,
+                WORKER_EXPIRED_LEASE_RECLAIM_LIMIT,
+            ),
+        ).fetchall()
+
+    candidates: list[Any] = []
+    for role in sorted(roles):
+        candidates.extend(
+            conn.execute(
+                f"""
+                SELECT {columns}
+                FROM queue_jobs INDEXED BY {QUEUE_ROLE_LEASE_INDEX_NAME}
+                WHERE role = ?
+                  AND status = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                ORDER BY lease_expires_at ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    role,
+                    ACTIVE_JOB_STATUS,
+                    now,
+                    WORKER_EXPIRED_LEASE_RECLAIM_LIMIT,
+                ),
+            ).fetchall()
+        )
+    candidates.sort(
+        key=lambda row: (
+            str(row["lease_expires_at"]),
+            str(row["id"]),
+        )
+    )
+    return candidates[:WORKER_EXPIRED_LEASE_RECLAIM_LIMIT]
+
+
 def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
     now = utc_now()
-    params: list[Any] = [now]
-    role_clause = ""
-    if roles:
-        placeholders = ",".join("?" for _ in roles)
-        role_clause = f" AND queue_jobs.role IN ({placeholders})"
-        params.extend(sorted(roles))
-    superseded_cursor = conn.execute(
-        f"""
-        UPDATE queue_jobs
-        SET status = 'skipped', finished_at = ?, lease_owner = NULL,
-            lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?,
-            error_json = ?
-        WHERE status = ?
-          AND preemptible = 1
-          AND lease_expires_at IS NOT NULL
-          AND lease_expires_at <= ?
-          AND dedupe_key IS NOT NULL
-          AND EXISTS (
-              SELECT 1
-              FROM queue_jobs AS pending
-              WHERE pending.status = ?
-                AND pending.dedupe_key = queue_jobs.dedupe_key
-                AND pending.id != queue_jobs.id
-          ){role_clause}
-        """,
-        [
-            now,
-            now,
-            json_dumps(
-                {
-                    "error": None,
-                    "result": {
-                        "skipped": True,
-                        "reason": "expired_lease_superseded_by_pending_dedupe_job",
-                    },
-                }
-            ),
-            ACTIVE_JOB_STATUS,
-            now,
-            PENDING_JOB_STATUS,
-            *params[1:],
-        ],
+    candidates = _expired_lease_candidates(
+        conn,
+        roles=roles,
+        now=now,
     )
-    superseded = int(superseded_cursor.rowcount or 0)
-    cursor = conn.execute(
-        f"""
-        UPDATE queue_jobs
-        SET status = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?,
-            error_json = ?
-        WHERE status = ?
-          AND preemptible = 1
-          AND lease_expires_at IS NOT NULL
-          AND lease_expires_at <= ?{role_clause}
-        """,
-        [PENDING_JOB_STATUS, now, json_dumps({"reclaimed": True, "reason": "worker_lease_expired"}), ACTIVE_JOB_STATUS, *params],
+    retry_candidates = [
+        row
+        for row in candidates
+        if int(row["preemptible"]) == 1
+        and int(row["retry_pending"]) == 1
+        and not (
+            row["dedupe_key"] is not None
+            and conn.execute(
+                """
+                SELECT 1
+                FROM queue_jobs
+                WHERE status = ?
+                  AND dedupe_key = ?
+                  AND id != ?
+                LIMIT 1
+                """,
+                (
+                    PENDING_JOB_STATUS,
+                    row["dedupe_key"],
+                    row["id"],
+                ),
+            ).fetchone()
+            is not None
+        )
+    ]
+    retry_order_start = (
+        _reserve_queue_retry_orders(conn, len(retry_candidates))
+        if retry_candidates
+        else 0
     )
-    reclaimed = int(cursor.rowcount or 0)
-    failed_cursor = conn.execute(
-        f"""
-        UPDATE queue_jobs
-        SET status = 'failed', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-            heartbeat_at = NULL, updated_at = ?, error_json = ?
-        WHERE status = ?
-          AND preemptible = 0
-          AND lease_expires_at IS NOT NULL
-          AND lease_expires_at <= ?{role_clause}
-        """,
-        [
-            now,
-            now,
-            json_dumps({"error": "non_preemptible_worker_lease_expired", "reclaimed": False}),
-            ACTIVE_JOB_STATUS,
-            *params,
-        ],
-    )
-    return superseded + reclaimed + int(failed_cursor.rowcount or 0)
+    retry_orders = {
+        str(row["id"]): retry_order_start + offset
+        for offset, row in enumerate(retry_candidates)
+    }
+    reclaimed = 0
+    for row in candidates:
+        job_id = str(row["id"])
+        preemptible = int(row["preemptible"])
+        retry_pending = int(row["retry_pending"])
+        dedupe_key = row["dedupe_key"]
+        superseded = bool(
+            preemptible == 1
+            and dedupe_key is not None
+            and conn.execute(
+                """
+                SELECT 1
+                FROM queue_jobs
+                WHERE status = ?
+                  AND dedupe_key = ?
+                  AND id != ?
+                LIMIT 1
+                """,
+                (
+                    PENDING_JOB_STATUS,
+                    dedupe_key,
+                    job_id,
+                ),
+            ).fetchone()
+            is not None
+        )
+        if superseded:
+            cursor = conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = 'skipped', finished_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, updated_at = ?, error_json = ?,
+                    retry_pending = 0, retry_order = 0
+                WHERE id = ? AND status = ?
+                  AND preemptible = 1
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                  AND dedupe_key = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM queue_jobs AS pending
+                      WHERE pending.status = ?
+                        AND pending.dedupe_key = queue_jobs.dedupe_key
+                        AND pending.id != queue_jobs.id
+                  )
+                """,
+                (
+                    now,
+                    now,
+                    json_dumps(
+                        {
+                            "error": None,
+                            "result": {
+                                "skipped": True,
+                                "reason": (
+                                    "expired_lease_superseded_by_"
+                                    "pending_dedupe_job"
+                                ),
+                            },
+                        }
+                    ),
+                    job_id,
+                    ACTIVE_JOB_STATUS,
+                    now,
+                    dedupe_key,
+                    PENDING_JOB_STATUS,
+                ),
+            )
+        elif preemptible == 1 and retry_pending == 1:
+            cursor = conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, heartbeat_at = NULL,
+                    updated_at = ?, error_json = ?, retry_order = ?
+                WHERE id = ? AND status = ?
+                  AND preemptible = 1
+                  AND retry_pending = 1
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (
+                    PENDING_JOB_STATUS,
+                    now,
+                    json_dumps(
+                        {
+                            "reclaimed": True,
+                            "reason": "worker_lease_expired",
+                        }
+                    ),
+                    retry_orders[job_id],
+                    job_id,
+                    ACTIVE_JOB_STATUS,
+                    now,
+                ),
+            )
+        elif preemptible == 1 and retry_pending == 0:
+            cursor = conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, heartbeat_at = NULL,
+                    updated_at = ?, error_json = ?, retry_order = 0
+                WHERE id = ? AND status = ?
+                  AND preemptible = 1
+                  AND retry_pending = 0
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (
+                    PENDING_JOB_STATUS,
+                    now,
+                    json_dumps(
+                        {
+                            "reclaimed": True,
+                            "reason": "worker_lease_expired",
+                        }
+                    ),
+                    job_id,
+                    ACTIVE_JOB_STATUS,
+                    now,
+                ),
+            )
+        elif preemptible == 0:
+            cursor = conn.execute(
+                """
+                UPDATE queue_jobs
+                SET status = 'failed', finished_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, updated_at = ?, error_json = ?,
+                    retry_pending = 0, retry_order = 0
+                WHERE id = ? AND status = ?
+                  AND preemptible = 0
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (
+                    now,
+                    now,
+                    json_dumps(
+                        {
+                            "error": "non_preemptible_worker_lease_expired",
+                            "reclaimed": False,
+                        }
+                    ),
+                    job_id,
+                    ACTIVE_JOB_STATUS,
+                    now,
+                ),
+            )
+        else:
+            continue
+        reclaimed += int(cursor.rowcount or 0)
+    return reclaimed
 
 
 def _queue_fairness_meta_key(roles: set[str] | None) -> str:
@@ -498,10 +687,53 @@ def _queue_fairness_meta_key(roles: set[str] | None) -> str:
     return _QUEUE_FAIRNESS_META_PREFIX + content_hash(json_dumps(lane))[:32]
 
 
-def _queue_priority_bypass_count(conn, roles: set[str] | None) -> int:
+def _queue_retry_fairness_meta_key(roles: set[str] | None) -> str:
+    lane = ["*"] if not roles else sorted(roles)
+    return (
+        _QUEUE_RETRY_FAIRNESS_META_PREFIX
+        + content_hash(json_dumps(lane))[:32]
+    )
+
+
+def _reserve_queue_retry_orders(conn, count: int) -> int:
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("queue retry-order reservation count must be positive")
     row = conn.execute(
         "SELECT value FROM meta WHERE key = ?",
-        (_queue_fairness_meta_key(roles),),
+        (QUEUE_RETRY_ORDER_META_KEY,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("queue retry-order authority is unavailable")
+    try:
+        current = int(row["value"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "queue retry-order authority is invalid"
+        ) from exc
+    if current < 0 or count > MAX_QUEUE_RETRY_ORDER - current:
+        raise RuntimeError("queue retry-order authority is exhausted")
+    next_order = current + count
+    cursor = conn.execute(
+        "UPDATE meta SET value = ? WHERE key = ? AND value = ?",
+        (
+            str(next_order),
+            QUEUE_RETRY_ORDER_META_KEY,
+            str(row["value"]),
+        ),
+    )
+    if int(cursor.rowcount or 0) != 1:
+        raise RuntimeError("queue retry-order authority changed")
+    return current + 1
+
+
+def _next_queue_retry_order(conn) -> int:
+    return _reserve_queue_retry_orders(conn, 1)
+
+
+def _queue_bypass_count(conn, key: str) -> int:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (key,),
     ).fetchone()
     if row is None:
         return 0
@@ -511,15 +743,16 @@ def _queue_priority_bypass_count(conn, roles: set[str] | None) -> int:
         return 0
 
 
-def _set_queue_priority_bypass_count(
+def _set_queue_bypass_count(
     conn,
-    roles: set[str] | None,
+    key: str,
     value: int,
+    *,
+    maximum: int,
 ) -> None:
-    key = _queue_fairness_meta_key(roles)
     bounded_value = max(
         0,
-        min(int(value), MAX_CONSECUTIVE_PRIORITY_BYPASSES),
+        min(int(value), int(maximum)),
     )
     if bounded_value == 0:
         conn.execute("DELETE FROM meta WHERE key = ?", (key,))
@@ -534,8 +767,62 @@ def _set_queue_priority_bypass_count(
     )
 
 
-def _role_filtered_candidate_sql(*, oldest: bool) -> str:
-    if oldest:
+def _queue_priority_bypass_count(conn, roles: set[str] | None) -> int:
+    return _queue_bypass_count(conn, _queue_fairness_meta_key(roles))
+
+
+def _set_queue_priority_bypass_count(
+    conn,
+    roles: set[str] | None,
+    value: int,
+) -> None:
+    _set_queue_bypass_count(
+        conn,
+        _queue_fairness_meta_key(roles),
+        value,
+        maximum=MAX_CONSECUTIVE_PRIORITY_BYPASSES,
+    )
+
+
+def _queue_retry_bypass_count(conn, roles: set[str] | None) -> int:
+    return _queue_bypass_count(
+        conn,
+        _queue_retry_fairness_meta_key(roles),
+    )
+
+
+def _set_queue_retry_bypass_count(
+    conn,
+    roles: set[str] | None,
+    value: int,
+) -> None:
+    _set_queue_bypass_count(
+        conn,
+        _queue_retry_fairness_meta_key(roles),
+        value,
+        maximum=MAX_CONSECUTIVE_RETRY_BYPASSES,
+    )
+
+
+def _role_filtered_candidate_sql(
+    *,
+    oldest: bool,
+    exclude_deferred: bool = False,
+    retry_pending: bool | None = None,
+    retry_rotation: bool = False,
+) -> str:
+    if retry_rotation:
+        if oldest or retry_pending is not True:
+            raise ValueError(
+                "retry rotation requires the retry-pending lane"
+            )
+        index_name = "idx_queue_role_retry"
+        order_by = (
+            "pending_job.retry_order ASC, "
+            "pending_job.priority ASC, "
+            "pending_job.created_at ASC, pending_job.rowid ASC"
+        )
+    elif oldest:
         index_name = "idx_queue_role_created"
         order_by = (
             "pending_job.created_at ASC, pending_job.rowid ASC"
@@ -546,10 +833,25 @@ def _role_filtered_candidate_sql(*, oldest: bool) -> str:
             "pending_job.priority ASC, pending_job.created_at ASC, "
             "pending_job.rowid ASC"
         )
+    deferred_clause = (
+        """
+          AND pending_job.id NOT IN (
+              SELECT value FROM json_each(?)
+          )"""
+        if exclude_deferred
+        else ""
+    )
+    retry_clause = (
+        "AND pending_job.retry_pending = ?"
+        if retry_pending is not None
+        else ""
+    )
     return f"""
         SELECT pending_job.*, pending_job.rowid AS queue_rowid
         FROM queue_jobs AS pending_job INDEXED BY {index_name}
         WHERE pending_job.role = ? AND pending_job.status = ?
+          {retry_clause}
+          {deferred_clause}
           AND (
               pending_job.dedupe_key IS NULL
               OR NOT EXISTS (
@@ -569,19 +871,50 @@ def _eligible_job_candidate(
     roles: set[str] | None,
     *,
     oldest: bool,
+    deferred_job_ids: set[str] | None = None,
+    retry_pending: bool | None = None,
+    retry_rotation: bool = False,
 ) -> sqlite3.Row | None:
+    if retry_rotation and (oldest or retry_pending is not True):
+        raise ValueError(
+            "retry rotation requires the retry-pending lane"
+        )
+    deferred_ids = sorted(
+        {str(job_id) for job_id in (deferred_job_ids or set())}
+    )
+    deferred_json = json_dumps(deferred_ids) if deferred_ids else None
     if roles:
         candidates: list[sqlite3.Row] = []
-        query = _role_filtered_candidate_sql(oldest=oldest)
+        query = _role_filtered_candidate_sql(
+            oldest=oldest,
+            exclude_deferred=bool(deferred_ids),
+            retry_pending=retry_pending,
+            retry_rotation=retry_rotation,
+        )
         for role in sorted(roles):
+            params: list[Any] = [role, PENDING_JOB_STATUS]
+            if retry_pending is not None:
+                params.append(1 if retry_pending else 0)
+            if deferred_json is not None:
+                params.append(deferred_json)
             row = conn.execute(
                 query,
-                (role, PENDING_JOB_STATUS),
+                params,
             ).fetchone()
             if row is not None:
                 candidates.append(row)
         if not candidates:
             return None
+        if retry_rotation:
+            return min(
+                candidates,
+                key=lambda row: (
+                    int(row["retry_order"]),
+                    int(row["priority"]),
+                    str(row["created_at"]),
+                    int(row["queue_rowid"]),
+                ),
+            )
         if oldest:
             return min(
                 candidates,
@@ -598,19 +931,47 @@ def _eligible_job_candidate(
                 int(row["queue_rowid"]),
             ),
         )
-    order_by = (
-        "pending_job.created_at ASC, pending_job.rowid ASC"
-        if oldest
-        else (
+    if retry_rotation:
+        index_name = "idx_queue_status_retry"
+        order_by = (
+            "pending_job.retry_order ASC, "
+            "pending_job.priority ASC, "
+            "pending_job.created_at ASC, pending_job.rowid ASC"
+        )
+    elif oldest:
+        index_name = "idx_queue_status_created"
+        order_by = "pending_job.created_at ASC, pending_job.rowid ASC"
+    else:
+        index_name = "idx_queue_status_priority"
+        order_by = (
             "pending_job.priority ASC, pending_job.created_at ASC, "
             "pending_job.rowid ASC"
         )
+    deferred_clause = (
+        """
+          AND pending_job.id NOT IN (
+              SELECT value FROM json_each(?)
+          )"""
+        if deferred_json is not None
+        else ""
     )
+    retry_clause = (
+        "AND pending_job.retry_pending = ?"
+        if retry_pending is not None
+        else ""
+    )
+    params = [PENDING_JOB_STATUS]
+    if retry_pending is not None:
+        params.append(1 if retry_pending else 0)
+    if deferred_json is not None:
+        params.append(deferred_json)
     return conn.execute(
         f"""
         SELECT pending_job.*, pending_job.rowid AS queue_rowid
-        FROM queue_jobs AS pending_job
+        FROM queue_jobs AS pending_job INDEXED BY {index_name}
         WHERE pending_job.status = ?
+          {retry_clause}
+          {deferred_clause}
           AND (
               pending_job.dedupe_key IS NULL
               OR NOT EXISTS (
@@ -623,7 +984,7 @@ def _eligible_job_candidate(
         ORDER BY {order_by}
         LIMIT 1
         """,
-        (PENDING_JOB_STATUS,),
+        params,
     ).fetchone()
 
 
@@ -633,32 +994,84 @@ def _claim_job(
     *,
     lease_owner: str,
     lease_seconds: int,
+    deferred_job_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
-    strict_priority_row = _eligible_job_candidate(
+    fresh_priority_row = _eligible_job_candidate(
         conn,
         roles,
         oldest=False,
+        deferred_job_ids=deferred_job_ids,
+        retry_pending=False,
     )
-    if strict_priority_row is None:
-        _set_queue_priority_bypass_count(conn, roles, 0)
-        return None
-    oldest_row = _eligible_job_candidate(conn, roles, oldest=True)
-    if oldest_row is None:
-        _set_queue_priority_bypass_count(conn, roles, 0)
-        return None
-    bypass_count = _queue_priority_bypass_count(conn, roles)
-    real_priority_bypass = str(strict_priority_row["id"]) != str(
-        oldest_row["id"]
+    retry_row = _eligible_job_candidate(
+        conn,
+        roles,
+        oldest=False,
+        deferred_job_ids=deferred_job_ids,
+        retry_pending=True,
+        retry_rotation=True,
     )
-    if (
-        real_priority_bypass
-        and bypass_count >= MAX_CONSECUTIVE_PRIORITY_BYPASSES
-    ):
-        row = oldest_row
-        next_bypass_count = 0
+    if fresh_priority_row is None and retry_row is None:
+        _set_queue_priority_bypass_count(conn, roles, 0)
+        _set_queue_retry_bypass_count(conn, roles, 0)
+        return None
+
+    priority_bypass_count = 0
+    next_priority_bypass_count = 0
+    fresh_row = fresh_priority_row
+    if fresh_priority_row is not None:
+        oldest_fresh_row = _eligible_job_candidate(
+            conn,
+            roles,
+            oldest=True,
+            deferred_job_ids=deferred_job_ids,
+            retry_pending=False,
+        )
+        if oldest_fresh_row is not None:
+            priority_bypass_count = _queue_priority_bypass_count(
+                conn,
+                roles,
+            )
+            real_priority_bypass = (
+                str(fresh_priority_row["id"])
+                != str(oldest_fresh_row["id"])
+            )
+            if (
+                real_priority_bypass
+                and priority_bypass_count
+                >= MAX_CONSECUTIVE_PRIORITY_BYPASSES
+            ):
+                fresh_row = oldest_fresh_row
+            else:
+                next_priority_bypass_count = (
+                    priority_bypass_count + 1
+                    if real_priority_bypass
+                    else 0
+                )
+
+    if fresh_row is not None and retry_row is not None:
+        retry_bypass_count = _queue_retry_bypass_count(conn, roles)
+        if (
+            retry_bypass_count
+            >= MAX_CONSECUTIVE_RETRY_BYPASSES
+        ):
+            row = retry_row
+            next_retry_bypass_count = 0
+            next_priority_bypass_count = priority_bypass_count
+        else:
+            row = fresh_row
+            next_retry_bypass_count = retry_bypass_count + 1
+    elif fresh_row is not None:
+        row = fresh_row
+        next_retry_bypass_count = 0
     else:
-        row = strict_priority_row
-        next_bypass_count = bypass_count + 1 if real_priority_bypass else 0
+        if retry_row is None:
+            raise RuntimeError(
+                "queue candidate selection invariant violated"
+            )
+        row = retry_row
+        next_retry_bypass_count = 0
+        next_priority_bypass_count = 0
     now = utc_now()
     expires_at = _lease_expiry(lease_seconds)
     cursor = conn.execute(
@@ -673,7 +1086,16 @@ def _claim_job(
     )
     if int(cursor.rowcount or 0) != 1:
         return None
-    _set_queue_priority_bypass_count(conn, roles, next_bypass_count)
+    _set_queue_priority_bypass_count(
+        conn,
+        roles,
+        next_priority_bypass_count,
+    )
+    _set_queue_retry_bypass_count(
+        conn,
+        roles,
+        next_retry_bypass_count,
+    )
     job = dict(row)
     job.pop("queue_rowid", None)
     job["lease_owner"] = lease_owner
@@ -1616,7 +2038,8 @@ def _finish_job(
         f"""
         UPDATE queue_jobs
         SET status = ?, finished_at = ?, updated_at = ?, error_json = ?,
-            lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = ?
+            lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = ?,
+            retry_pending = 0, retry_order = 0
         {where_clause}
         """,
         params,
@@ -1653,11 +2076,13 @@ def _retry_owned_job(
     if not _heartbeat_job(conn, job_id, lease_owner=lease_owner, lease_seconds=lease_seconds):
         raise RuntimeError("worker lease lost before job retry")
     now = utc_now()
+    retry_order = _next_queue_retry_order(conn)
     cursor = conn.execute(
         """
         UPDATE queue_jobs
         SET status = ?, finished_at = NULL, updated_at = ?, error_json = ?,
-            lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
+            lease_owner = NULL, lease_expires_at = NULL,
+            heartbeat_at = NULL, retry_pending = 1, retry_order = ?
         WHERE id = ? AND status = ? AND lease_owner = ?
           AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
         """,
@@ -1665,6 +2090,7 @@ def _retry_owned_job(
             PENDING_JOB_STATUS,
             now,
             json_dumps({"error": None, "result": result, "retry_pending": True}),
+            retry_order,
             job_id,
             ACTIVE_JOB_STATUS,
             lease_owner,
@@ -2012,7 +2438,7 @@ def _apply_redundant_scribe_reconciliation(conn, jobs: list[dict[str, Any]]) -> 
             UPDATE queue_jobs
             SET status = 'skipped', finished_at = ?, updated_at = ?,
                 error_json = ?, lease_owner = NULL, lease_expires_at = NULL,
-                heartbeat_at = ?
+                heartbeat_at = ?, retry_pending = 0, retry_order = 0
             WHERE id = ? AND status = 'pending'
             """,
             (now, now, json_dumps({"error": None, "result": result}), now, job["id"]),
@@ -8794,12 +9220,14 @@ def _recover_failed_post_phase_sidecar_jobs(
                 "recovered_from_failed_status": True,
                 "effect_event_id": candidate["recovery_effect_key"],
             }
+            retry_order = _next_queue_retry_order(conn)
             cursor = conn.execute(
                 """
                 UPDATE queue_jobs
                 SET status = 'pending', finished_at = NULL,
                     lease_owner = NULL, lease_expires_at = NULL,
-                    heartbeat_at = NULL, updated_at = ?, error_json = ?
+                    heartbeat_at = NULL, updated_at = ?, error_json = ?,
+                    retry_pending = 1, retry_order = ?
                 WHERE rowid = ? AND id = ? AND status = 'failed'
                   AND job_type = ? AND role = ?
                   AND attempt_count = ? AND payload_json = ?
@@ -8842,6 +9270,7 @@ def _recover_failed_post_phase_sidecar_jobs(
                             "retry_pending": True,
                         }
                     ),
+                    retry_order,
                     int(candidate["queue_rowid"]),
                     candidate["id"],
                     candidate["job_type"],
@@ -9205,13 +9634,24 @@ def _run_worker_pass_with_sidecar_intent_budget(
     worker_id = unique_id("worker")
     role_set = set(roles or []) or None
     processed: list[dict[str, Any]] = []
+    deferred_job_ids: set[str] = set()
     reclaimed_expired_jobs = 0
-    for _ in range(max(1, int(limit))):
+    for pass_index in range(max(1, int(limit))):
         conn = connect(root)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            reclaimed_expired_jobs += _reclaim_expired_leases(conn, role_set)
-            job = _claim_job(conn, role_set, lease_owner=worker_id, lease_seconds=lease_seconds)
+            if pass_index == 0:
+                reclaimed_expired_jobs += _reclaim_expired_leases(
+                    conn,
+                    role_set,
+                )
+            job = _claim_job(
+                conn,
+                role_set,
+                lease_owner=worker_id,
+                lease_seconds=lease_seconds,
+                deferred_job_ids=deferred_job_ids,
+            )
             conn.commit()
         finally:
             conn.close()
@@ -9265,7 +9705,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 conn.close()
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "status": job_status, "ok": job_ok, "result": result})
             if retry_pending:
-                break
+                deferred_job_ids.add(str(job["id"]))
         except Exception as exc:
             renewer.stop()
             conn = connect(root)
@@ -9322,17 +9762,18 @@ def _run_worker_pass_with_sidecar_intent_budget(
                         "result": retry_result,
                     }
                 )
-                break
-            processed.append(
-                {
-                    "job_id": job["id"],
-                    "role": job["role"],
-                    "job_type": job["job_type"],
-                    "status": "failed",
-                    "ok": False,
-                    "error": str(exc),
-                }
-            )
+                deferred_job_ids.add(str(job["id"]))
+            else:
+                processed.append(
+                    {
+                        "job_id": job["id"],
+                        "role": job["role"],
+                        "job_type": job["job_type"],
+                        "status": "failed",
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
         finally:
             renewer.stop()
             _CURRENT_JOB_LEASE.reset(lease_token)
@@ -9366,7 +9807,22 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 recover_pending_card_sidecars=False,
             )
         )
-    processed_ok = all(item.get("ok", False) for item in processed)
+    retry_pending_count = sum(
+        1
+        for item in processed
+        if item.get("status") == PENDING_JOB_STATUS
+        and isinstance(item.get("result"), dict)
+        and item["result"].get("retry_pending") is True
+    )
+    processed_ok = all(
+        item.get("ok", False)
+        or (
+            item.get("status") == PENDING_JOB_STATUS
+            and isinstance(item.get("result"), dict)
+            and item["result"].get("retry_pending") is True
+        )
+        for item in processed
+    )
     maintenance_ok = all(
         bool(value["ok"])
         for value in maintenance_result.values()
@@ -9377,6 +9833,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
         "worker_id": worker_id,
         "lease_seconds": lease_seconds,
         "reclaimed_expired_jobs": reclaimed_expired_jobs,
+        "retry_pending_count": retry_pending_count,
         "processed_count": len(processed),
         "processed": processed,
         "maintenance": maintenance_result,
@@ -9412,6 +9869,7 @@ def serve_workers(
 ) -> dict[str, Any]:
     passes = 0
     processed = 0
+    retry_pending = 0
     maintenance_passes = 0
     maintenance_interval = max(1.0, float(maintenance_interval_seconds))
     next_maintenance_at = time.monotonic() if maintenance_on_start else time.monotonic() + maintenance_interval
@@ -9422,6 +9880,7 @@ def serve_workers(
             result = run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
             passes += 1
             processed += int(result.get("processed_count", 0))
+            retry_pending += int(result.get("retry_pending_count", 0))
             if maintenance_due:
                 maintenance_passes += 1
                 next_maintenance_at = time.monotonic() + maintenance_interval
@@ -9431,6 +9890,7 @@ def serve_workers(
                     "reason": "worker_pass_failed",
                     "passes": passes,
                     "processed_count": processed,
+                    "retry_pending_count": retry_pending,
                     "maintenance_passes": maintenance_passes,
                     "maintenance_interval_seconds": maintenance_interval,
                     "failed_pass": result,
@@ -9440,6 +9900,7 @@ def serve_workers(
                     "ok": True,
                     "passes": passes,
                     "processed_count": processed,
+                    "retry_pending_count": retry_pending,
                     "maintenance_passes": maintenance_passes,
                     "maintenance_interval_seconds": maintenance_interval,
                 }
@@ -9452,7 +9913,86 @@ def memory_health(root: Path) -> dict[str, Any]:
     config = load_config(root) if config_path(root).exists() else default_config()
     conn = connect_existing(root)
     try:
+        queue_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(queue_jobs)"
+            ).fetchall()
+        }
+        retry_markers = {
+            key: conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+            for key in (
+                QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+            )
+        }
+        retry_authority_triggers_ready = (
+            {"retry_pending", "retry_order"}.issubset(queue_columns)
+            and _queue_retry_authority_triggers_ready(conn)
+        )
+        retry_order_counter_ready = (
+            retry_authority_triggers_ready
+            and _queue_retry_order_counter_ready(conn)
+        )
+        missing_retry_authority: list[str] = []
+        for column in ("retry_pending", "retry_order"):
+            if column not in queue_columns:
+                missing_retry_authority.append(
+                    f"queue_jobs.{column}"
+                )
+        for marker_key, marker_value in (
+            (
+                QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
+                QUEUE_RETRY_PENDING_BACKFILL_META_VALUE,
+            ),
+            (
+                QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
+                QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
+            ),
+        ):
+            marker = retry_markers[marker_key]
+            if (
+                marker is None
+                or str(marker["value"]) != marker_value
+            ):
+                missing_retry_authority.append(marker_key)
+        if not retry_order_counter_ready:
+            missing_retry_authority.append(
+                QUEUE_RETRY_ORDER_META_KEY
+            )
+        if (
+            {"retry_pending", "retry_order"}.issubset(queue_columns)
+            and not retry_authority_triggers_ready
+        ):
+            missing_retry_authority.append(
+                "queue_jobs.retry_authority_triggers"
+            )
+        if missing_retry_authority:
+            return {
+                "ok": False,
+                "initialized": True,
+                "root": str(root),
+                "reason": "schema_migration_required",
+                "missing_schema_authority": missing_retry_authority,
+                "checks": [
+                    {
+                        "name": "queue_retry_authority_ready",
+                        "ok": False,
+                        "missing": missing_retry_authority,
+                    }
+                ],
+            }
         pending_jobs = conn.execute("SELECT count(*) AS n FROM queue_jobs WHERE status = 'pending'").fetchone()["n"]
+        retry_pending_jobs = conn.execute(
+            """
+            SELECT count(*) AS n
+            FROM queue_jobs
+            WHERE status = 'pending' AND retry_pending = 1
+            """
+        ).fetchone()["n"]
         failed_jobs = conn.execute("SELECT count(*) AS n FROM queue_jobs WHERE status = 'failed'").fetchone()["n"]
         pending_cards = conn.execute("SELECT count(*) AS n FROM cards WHERE status = 'pending_librarian_review'").fetchone()["n"]
         pruned_edges = conn.execute("SELECT count(*) AS n FROM graph_edges WHERE status = 'pruned'").fetchone()["n"]
@@ -9555,6 +10095,7 @@ def memory_health(root: Path) -> dict[str, Any]:
             "root": str(root),
             "last_scroll_event_at": last_event,
             "pending_jobs": pending_jobs,
+            "retry_pending_jobs": retry_pending_jobs,
             "failed_jobs": failed_jobs,
             "pending_librarian_cards": pending_cards,
             "pruned_graph_edges": pruned_edges,

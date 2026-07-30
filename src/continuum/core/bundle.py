@@ -37,6 +37,7 @@ from .store import (
     unique_id,
     utc_now,
 )
+from .writer_claim import claim_writer, writer_claim_path
 
 
 BUNDLE_MANIFEST_SCHEMA = "epic_continuum.root_bundle_manifest.v1"
@@ -1867,6 +1868,26 @@ def _copy_root_to_stage(
     }
 
 
+def _claim_disposable_bundle_root(root: Path) -> dict[str, Any]:
+    """Give an isolated staging/extraction root temporary verification authority."""
+    marker = writer_claim_path(root)
+    if os.path.lexists(marker):
+        raise ValueError(
+            "disposable bundle root unexpectedly contains a writer claim"
+        )
+    result = claim_writer(root)
+    if (
+        not result.get("ok")
+        or not result.get("claimed")
+        or not result.get("compatible")
+        or result.get("changed") is not True
+    ):
+        raise ValueError(
+            "disposable bundle root could not acquire exclusive verification authority"
+        )
+    return result
+
+
 def _file_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
     entries: list[dict[str, Any]] = []
     total_bytes = 0
@@ -3361,6 +3382,16 @@ def _audit_extracted_root(
                     "actual": actual_redaction_profile,
                 }
             )
+
+        try:
+            _claim_disposable_bundle_root(embedded_root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return [
+                {
+                    "error": "embedded_root_disposable_writer_claim_failed",
+                    "detail": redact_text_secrets(str(exc)),
+                }
+            ]
 
         proof_count = _proof_pack_count(embedded_root)
         try:
@@ -4860,6 +4891,7 @@ def pack_root(
                 f"{unsupported_count} unsupported file type(s)"
             )
 
+        _claim_disposable_bundle_root(stage_root)
         staged_proof_count = _proof_pack_count(stage_root)
         staged_verification = verify_root(
             stage_root,

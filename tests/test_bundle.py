@@ -20,6 +20,7 @@ from continuum.cli import main as cli_main
 from continuum.core.bundle import (
     BUNDLE_MANIFEST_NAME,
     BUNDLE_ROOT_NAME,
+    _claim_disposable_bundle_root,
     _is_transient,
     _manifest_hash,
     _write_zip_member,
@@ -34,6 +35,7 @@ from continuum.core.operations import recover_stale_operations, start_operation,
 from continuum.core.permissions import secure_file, secure_mkdir, secure_sqlite_files, secure_tree, secure_write_text
 from continuum.core.store import audit_secrets, file_sha256, init_db
 from continuum.core.store import append_scroll_event
+from continuum.core.writer_claim import claim_writer
 
 
 def _write_private_bytes(path: Path, data: bytes) -> None:
@@ -108,6 +110,84 @@ def _make_link_like_dir(testcase: unittest.TestCase, link: Path, target: Path) -
 
 
 class RootBundleTest(unittest.TestCase):
+    def test_pack_root_uses_only_disposable_writer_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            output = base / "continuum.zip"
+            init_db(root)
+            source_claim = root / "config" / "writer-claim.json"
+            source_claim_before = source_claim.read_bytes()
+
+            result = pack_root(
+                root,
+                out_path=output,
+                run_restore_drill=False,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(source_claim.read_bytes(), source_claim_before)
+            self.assertTrue(verify_root_bundle(output)["ok"])
+            with zipfile.ZipFile(output) as archive:
+                names = set(archive.namelist())
+                manifest = json.loads(
+                    archive.read(f"{BUNDLE_ROOT_NAME}/{BUNDLE_MANIFEST_NAME}")
+                )
+            self.assertNotIn(
+                f"{BUNDLE_ROOT_NAME}/config/writer-claim.json",
+                names,
+            )
+            self.assertNotIn(
+                "config/writer-claim.json",
+                {entry["path"] for entry in manifest["files"]},
+            )
+            self.assertIn(
+                {
+                    "path": "config/writer-claim.json",
+                    "path_redacted": False,
+                    "reason": "transient_excluded",
+                },
+                manifest["copy"]["skipped"],
+            )
+
+    def test_disposable_bundle_claim_refuses_preexisting_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            marker = root / "config" / "writer-claim.json"
+            before = marker.read_bytes()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "unexpectedly contains a writer claim",
+            ):
+                _claim_disposable_bundle_root(root)
+
+            self.assertEqual(marker.read_bytes(), before)
+
+    def test_disposable_bundle_claim_refuses_compatible_race_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+
+            def race_then_observe(path: Path) -> dict[str, object]:
+                race_winner = claim_writer(path)
+                self.assertIs(race_winner["changed"], True)
+                return claim_writer(path)
+
+            with (
+                patch(
+                    "continuum.core.bundle.claim_writer",
+                    side_effect=race_then_observe,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "exclusive verification authority",
+                ),
+            ):
+                _claim_disposable_bundle_root(root)
+
+            self.assertTrue((root / "config" / "writer-claim.json").exists())
+
     def test_all_sqlite_sidecar_variants_are_transient(self) -> None:
         transient = (
             "catalog/catalog.sqlite3-wal",
@@ -440,6 +520,19 @@ class RootBundleTest(unittest.TestCase):
             source.unlink()
             extracted_root = extract_parent / "epic-continuum-root"
             secure_tree(extracted_root)
+            unclaimed_verification = verify_root(
+                extracted_root,
+                strict=True,
+                verify_recent_proof_packs=20,
+                run_restore_drill=False,
+                scan_secrets=True,
+            )
+            self.assertFalse(unclaimed_verification["ok"], unclaimed_verification)
+            self.assertEqual(
+                unclaimed_verification["reason"],
+                "writer_claim_unclaimed_read_only_diagnostic",
+            )
+            claim_writer(extracted_root)
             extracted_verification = verify_root(
                 extracted_root,
                 strict=True,

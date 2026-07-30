@@ -3640,6 +3640,7 @@ def _run_extracted_root_audit(
             sys.executable,
             "-I",
             "-S",
+            "-B",
             "-c",
             worker_code,
             source_root,

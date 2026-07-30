@@ -410,6 +410,38 @@ class BundleResourceLimitsTest(unittest.TestCase):
             "embedded_root_audit_worker_start_failed",
         )
 
+    def test_semantic_worker_disables_bytecode_writes_at_interpreter(self) -> None:
+        embedded_root = self.base / "worker-bytecode-root"
+        embedded_root.mkdir(exist_ok=True)
+        budget = _BundleVerificationBudget(
+            deadline=time.monotonic() + 5,
+            max_work_bytes=1,
+        )
+        with patch.object(
+            bundle_module.subprocess,
+            "Popen",
+            side_effect=OSError("capture command without starting worker"),
+        ) as popen:
+            errors = _run_extracted_root_audit(
+                embedded_root,
+                {},
+                budget=budget,
+                temp_parent=self.base,
+            )
+
+        self.assertEqual(
+            errors[0]["error"],
+            "embedded_root_audit_worker_start_failed",
+        )
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:5], [sys.executable, "-I", "-S", "-B", "-c"])
+        self.assertFalse(
+            any(
+                str(key).upper().startswith("PYTHON")
+                for key in popen.call_args.kwargs["env"]
+            )
+        )
+
     def test_semantic_worker_ignores_cwd_and_python_startup_shadowing(self) -> None:
         hostile = self.base / "hostile-worker-startup"
         hostile_package = hostile / "continuum"

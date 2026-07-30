@@ -7704,7 +7704,7 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                     0,
                 )
 
-    def test_init_repairs_partition_aliases_added_after_migration_marker(
+    def test_init_repairs_partition_aliases_added_after_marker_on_restart(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7743,7 +7743,12 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                 )
                 conn.commit()
 
-            self.assertIn(str(root.resolve(strict=False)), _INIT_DB_CACHE)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            # A fresh process/cache miss performs the one-time legacy scan.
+            # Warm calls deliberately avoid rescanning the whole live catalog.
+            _INIT_DB_CACHE.discard(cache_key)
             init_db(root)
 
             with closing(connect_catalog(root)) as conn:
@@ -7768,6 +7773,87 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                     marker["value"],
                     store_module.PARTITION_ALIASES_BACKFILL_META_VALUE,
                 )
+
+    def test_cached_init_db_is_bounded_on_large_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            cache_key = str(root.resolve(strict=False))
+            self.addCleanup(_INIT_DB_CACHE.discard, cache_key)
+            with closing(store_module.connect(root)) as conn:
+                conn.execute(
+                    """
+                    WITH RECURSIVE n(x) AS (
+                        VALUES(1)
+                        UNION ALL
+                        SELECT x + 1 FROM n WHERE x < 50000
+                    )
+                    INSERT INTO scroll_events(
+                        id,
+                        session_id,
+                        seq,
+                        event_type,
+                        role,
+                        content,
+                        token_estimate,
+                        content_hash,
+                        visibility_scope,
+                        project_id,
+                        metadata_json,
+                        created_at
+                    )
+                    SELECT
+                        printf('event_%06d', x),
+                        'session_hot_path',
+                        x,
+                        'message',
+                        'user',
+                        'payload',
+                        1,
+                        'hash',
+                        'project',
+                        'project_hot_path',
+                        '{}',
+                        '2026-01-01T00:00:00+00:00'
+                    FROM n
+                    """
+                )
+                conn.commit()
+
+            self.assertIn(cache_key, _INIT_DB_CACHE)
+            real_connect_existing = store_module.connect_existing
+            sqlite_steps = 0
+
+            def instrumented_connect(path: Path) -> sqlite3.Connection:
+                nonlocal sqlite_steps
+                conn = real_connect_existing(path)
+
+                def count_step() -> int:
+                    nonlocal sqlite_steps
+                    sqlite_steps += 1
+                    return 0
+
+                conn.set_progress_handler(count_step, 1)
+                return conn
+
+            started = time.perf_counter()
+            with patch.object(
+                store_module,
+                "connect_existing",
+                side_effect=instrumented_connect,
+            ), patch.object(
+                store_module,
+                "_partition_alias_anomaly_exists",
+                side_effect=AssertionError(
+                    "warm init must not scan partition columns"
+                ),
+            ):
+                init_db(root)
+            elapsed = time.perf_counter() - started
+
+            self.assertLess(sqlite_steps, 50000)
+            self.assertLess(elapsed, 2.0)
+            self.assertIn(cache_key, _INIT_DB_CACHE)
 
     def test_init_skips_completed_legacy_backfills_after_restart(
         self,

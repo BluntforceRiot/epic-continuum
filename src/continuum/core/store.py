@@ -10860,7 +10860,11 @@ def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
     )
 
 
-def _init_db_durable_ready(root: Path) -> bool:
+def _init_db_durable_ready(
+    root: Path,
+    *,
+    check_partition_alias_anomalies: bool = True,
+) -> bool:
     if not is_initialized(root) or not config_path(root).exists():
         return False
     try:
@@ -10954,7 +10958,10 @@ def _init_db_durable_ready(root: Path) -> bool:
                     "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
                 ).fetchone()
                 is not None
-                or _partition_alias_anomaly_exists(conn)
+                or (
+                    check_partition_alias_anomalies
+                    and _partition_alias_anomaly_exists(conn)
+                )
             ):
                 return False
         finally:
@@ -10973,7 +10980,15 @@ def init_db(
     ensure_writer_claim(root)
     cache_key = str(root.resolve(strict=False))
     if cache_key in _INIT_DB_CACHE:
-        if _init_db_durable_ready(root):
+        # A cache miss runs apply_schema_migrations(), whose one-time recovery
+        # pass scans for legacy partition aliases.  Repeating those unbounded
+        # DISTINCT scans on every API/tool call makes a warm init proportional
+        # to the live catalog size.  The cached path still checks all bounded
+        # durable readiness, sidecar, reservation, and queue authorities.
+        if _init_db_durable_ready(
+            root,
+            check_partition_alias_anomalies=False,
+        ):
             return
         _INIT_DB_CACHE.discard(cache_key)
     init_layout(root)
@@ -11075,7 +11090,10 @@ def init_db(
     if not recover_pending_card_sidecars:
         # Queue-owning operations still need structural upgrades, but must
         # observe or fence the pending sidecar work themselves.
-        if _init_db_durable_ready(root):
+        if _init_db_durable_ready(
+            root,
+            check_partition_alias_anomalies=False,
+        ):
             _INIT_DB_CACHE.add(cache_key)
         else:
             _INIT_DB_CACHE.discard(cache_key)
@@ -11096,7 +11114,10 @@ def init_db(
         and (sidecar_sync is None or sidecar_sync.get("ok") is True)
         and not _card_sidecar_outbox_pending(root)
         and not final_intent_recovery.get("pending")
-        and _init_db_durable_ready(root)
+        and _init_db_durable_ready(
+            root,
+            check_partition_alias_anomalies=False,
+        )
     )
     if recovery_clean:
         _INIT_DB_CACHE.add(cache_key)

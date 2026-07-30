@@ -35,6 +35,10 @@ from continuum.core.store import (
     sync_card_sidecars_after_commit,
 )
 from continuum.core.workers import MAX_PRUNE_MEMORY_LIMIT
+from continuum.core.writer_claim import (
+    WRITER_AUTHORITY_ENV,
+    WRITER_CLAIM_AUTHORITY_SCHEMA,
+)
 import continuum.mcp_server as mcp_server_module
 from continuum.mcp_server import MAX_MCP_REQUEST_BYTES, TOOLS, dispatch
 
@@ -133,6 +137,25 @@ def tree_fingerprint(root: Path) -> str:
     return digest.hexdigest()
 
 
+def exact_filesystem_tree_fingerprint(root: Path) -> str:
+    rows: list[dict[str, object]] = []
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]:
+        item_stat = path.lstat()
+        row: dict[str, object] = {
+            "path": "." if path == root else path.relative_to(root).as_posix(),
+            "kind": "directory" if path.is_dir() else "file",
+            "mode": item_stat.st_mode,
+            "size": item_stat.st_size,
+            "mtime_ns": item_stat.st_mtime_ns,
+        }
+        if path.is_file():
+            row["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        rows.append(row)
+    return hashlib.sha256(
+        json.dumps(rows, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def valid_initialize_params() -> dict[str, Any]:
     return {
         "protocolVersion": mcp_server_module.PROTOCOL_VERSION,
@@ -154,6 +177,76 @@ def stdio_handshake_requests(*, initialize_id: int = 900) -> list[dict[str, Any]
 
 
 class EpicContinuumMcpServerTest(unittest.TestCase):
+    def test_fenced_public_doctor_and_verify_root_do_not_mutate_any_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            claim_path = root / "config" / "writer-claim.json"
+            original_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            claim_path.write_text(
+                json.dumps(
+                    {
+                        "schema": WRITER_CLAIM_AUTHORITY_SCHEMA,
+                        "runtime": original_claim["runtime"],
+                        "host": original_claim["host"],
+                        "claimed_at": original_claim["claimed_at"],
+                        "authority_id": "a" * 64,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            before = exact_filesystem_tree_fingerprint(root)
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "CONTINUUM_ALLOWED_ROOTS": tmp,
+                    WRITER_AUTHORITY_ENV: "b" * 64,
+                },
+            ):
+                doctor_result = call_tool(
+                    "continuum_doctor",
+                    {
+                        "root": str(root),
+                        "verify_recent_proof_packs": 0,
+                        "scan_secrets": False,
+                    },
+                )
+                verify_result = call_tool(
+                    "continuum_verify_root",
+                    {
+                        "root": str(root),
+                        "strict": True,
+                        "verify_recent_proof_packs": 0,
+                        "run_restore_drill": True,
+                        "scan_secrets": False,
+                    },
+                )
+
+            self.assertEqual(exact_filesystem_tree_fingerprint(root), before)
+            self.assertFalse(doctor_result["ok"])
+            self.assertFalse(doctor_result["complete"])
+            self.assertFalse(doctor_result["writability_verified"])
+            self.assertEqual(
+                doctor_result["write_probe_mode"],
+                "disabled_read_only_contract",
+            )
+            self.assertEqual(
+                doctor_result["diagnostic_mode"],
+                "read_only_writer_claim_fenced",
+            )
+            self.assertFalse(verify_result["ok"])
+            self.assertFalse(verify_result["complete"])
+            self.assertFalse(verify_result["writability_verified"])
+            self.assertFalse(verify_result["run_restore_drill"])
+            self.assertEqual(
+                verify_result["diagnostic_mode"],
+                "read_only_writer_claim_fenced",
+            )
+
     def test_run_workers_wrapper_succeeds_for_incomplete_lease_attempt(
         self,
     ) -> None:

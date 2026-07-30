@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import tempfile
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 from continuum.cli import main as cli_main
 from continuum.core.bundle import _is_transient
-from continuum.core.operations import start_operation, verify_root
+from continuum.core.operations import doctor, start_operation, verify_root
 from continuum.core.store import append_scroll_event, connect, connect_existing, init_db, status
 from continuum.core.workers import run_worker_pass
 from continuum.core.writer_claim import (
@@ -55,6 +56,26 @@ class WriterClaimTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _tree_state(root: Path) -> str:
+        rows: list[dict[str, object]] = []
+        paths = [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]
+        for path in paths:
+            item_stat = path.lstat()
+            row: dict[str, object] = {
+                "path": "." if path == root else path.relative_to(root).as_posix(),
+                "kind": "directory" if path.is_dir() else "file",
+                "mode": item_stat.st_mode,
+                "size": item_stat.st_size,
+                "mtime_ns": item_stat.st_mtime_ns,
+            }
+            if path.is_file():
+                row["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            rows.append(row)
+        return hashlib.sha256(
+            json.dumps(rows, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def test_runtime_detection_distinguishes_windows_wsl_linux_and_macos(self) -> None:
         self.assertEqual(
@@ -338,6 +359,125 @@ class WriterClaimTests(unittest.TestCase):
             self.assertTrue(transferred["changed"])
             self.assertEqual(transferred["claim"]["schema"], WRITER_CLAIM_SCHEMA)
             self.assertEqual(transferred["previous_claim"]["schema"], WRITER_CLAIM_AUTHORITY_SCHEMA)
+
+    def test_fenced_doctor_and_verify_are_full_tree_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                self._write_authority_claim(root)
+
+                before_doctor = self._tree_state(root)
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: ""}):
+                    doctor_result = doctor(
+                        root,
+                        verify_recent_proof_packs=0,
+                        scan_secrets=False,
+                    )
+                after_doctor = self._tree_state(root)
+
+                self.assertEqual(after_doctor, before_doctor)
+                self.assertFalse(doctor_result["ok"])
+                self.assertFalse(doctor_result["complete"])
+                self.assertEqual(
+                    doctor_result["diagnostic_mode"],
+                    "read_only_writer_claim_fenced",
+                )
+                writable_checks = [
+                    check
+                    for check in doctor_result["checks"]
+                    if str(check["name"]).startswith("writable:")
+                ]
+                self.assertEqual(writable_checks, [])
+                self.assertFalse(doctor_result["writability_verified"])
+                self.assertEqual(
+                    doctor_result["write_probe_mode"],
+                    "disabled_read_only_contract",
+                )
+
+                before_verify = self._tree_state(root)
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: NORMAL_AUTHORITY}):
+                    verify_result = verify_root(
+                        root,
+                        strict=True,
+                        run_restore_drill=True,
+                        verify_recent_proof_packs=0,
+                        scan_secrets=False,
+                    )
+                after_verify = self._tree_state(root)
+
+                self.assertEqual(after_verify, before_verify)
+                self.assertFalse(verify_result["ok"])
+                self.assertFalse(verify_result["complete"])
+                self.assertFalse(verify_result["writability_verified"])
+                self.assertFalse(verify_result["run_restore_drill"])
+                self.assertTrue(verify_result["sections"]["restore_drill"]["skipped"])
+                self.assertEqual(
+                    verify_result["diagnostic_mode"],
+                    "read_only_writer_claim_fenced",
+                )
+
+    def test_verify_honors_doctor_observed_fence_transition(self) -> None:
+        compatible_claim = {
+            "ok": True,
+            "claimed": True,
+            "compatible": True,
+            "root_has_existing_state": True,
+            "claim": {
+                "schema": WRITER_CLAIM_SCHEMA,
+                "runtime": "windows",
+                "host": "continuum-host",
+            },
+        }
+        fenced_claim = {
+            "ok": True,
+            "claimed": True,
+            "compatible": False,
+            "root_has_existing_state": True,
+            "claim": {
+                "schema": WRITER_CLAIM_AUTHORITY_SCHEMA,
+                "runtime": "windows",
+                "host": "continuum-host",
+                "authority_id": PROMOTION_AUTHORITY,
+            },
+        }
+        doctor_result = {
+            "ok": False,
+            "complete": False,
+            "diagnostic_mode": "read_only_writer_claim_fenced",
+            "reason": "writer_claim_incompatible_read_only_diagnostic",
+            "check_count": 1,
+            "checks": [],
+            "writer_claim": fenced_claim,
+            "status": {"writer_claim": fenced_claim},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with (
+                patch("continuum.core.operations.doctor", return_value=doctor_result),
+                patch(
+                    "continuum.core.operations.writer_claim_status",
+                    return_value=compatible_claim,
+                ),
+                patch("continuum.core.operations.audit_search_index") as search_audit,
+                patch("continuum.core.operations.restore_drill") as restore,
+            ):
+                result = verify_root(
+                    root,
+                    strict=True,
+                    run_restore_drill=True,
+                    verify_recent_proof_packs=0,
+                    scan_secrets=False,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["complete"])
+            self.assertEqual(
+                result["diagnostic_mode"],
+                "read_only_writer_claim_fenced",
+            )
+            search_audit.assert_not_called()
+            restore.assert_not_called()
 
     def test_strict_verify_degrades_to_read_only_on_runtime_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

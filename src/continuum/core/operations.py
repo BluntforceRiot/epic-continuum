@@ -2296,6 +2296,12 @@ def doctor(
     def add(name: str, ok: bool, **detail: Any) -> None:
         checks.append({"name": name, "ok": ok, **detail})
 
+    writer_claim = writer_claim_status(root)
+    read_only_writer_claim = bool(
+        not writer_claim.get("ok")
+        or (writer_claim.get("claimed") and not writer_claim.get("compatible"))
+        or (writer_claim.get("root_has_existing_state") and not writer_claim.get("claimed"))
+    )
     add("package_config_default", (SCHEMA_PATH.parents[1] / "config.default.json").exists())
     add("package_schema_sql", SCHEMA_PATH.exists(), path=str(SCHEMA_PATH))
     try:
@@ -2314,6 +2320,61 @@ def doctor(
         )
     except Exception as exc:
         add("private_permissions", False, error=str(exc))
+    if read_only_writer_claim:
+        reason = "writer_claim_incompatible_read_only_diagnostic"
+        if not writer_claim.get("ok"):
+            reason = "writer_claim_unreadable_read_only_diagnostic"
+        elif not writer_claim.get("claimed"):
+            reason = "writer_claim_unclaimed_read_only_diagnostic"
+        root_status = {
+            "root": str(root),
+            "initialized": is_initialized(root),
+            "schema_version": SCHEMA_VERSION,
+            "writer_claim": writer_claim,
+            "config": {
+                "path": str(config_path(root)),
+                "exists": config_path(root).exists(),
+            },
+            "read_only_limited": True,
+            "reason": reason,
+        }
+        add(
+            "status_read_only_limited",
+            True,
+            initialized=root_status["initialized"],
+            reason=reason,
+        )
+        add("config_exists", config_path(root).exists(), path=str(config_path(root)))
+        for name in (
+            "sqlite_open",
+            "search_index_consistent",
+            "semantic_integrity_clean",
+            "artifact_ledger_portable_and_hashes_match",
+        ):
+            add(name, True, skipped=True, reason=reason)
+        if scan_secrets:
+            add("secret_audit_clean", True, skipped=True, reason=reason)
+        add(
+            "write_capability_not_part_of_read_only_doctor",
+            True,
+            skipped=True,
+            reason=reason,
+        )
+        add("diagnostic_complete", False, reason=reason)
+        return {
+            "ok": all(check["ok"] for check in checks),
+            "complete": False,
+            "diagnostic_mode": "read_only_writer_claim_fenced",
+            "write_probe_mode": "disabled_read_only_contract",
+            "writability_verified": False,
+            "reason": reason,
+            "root": str(root),
+            "check_count": len(checks),
+            "checks": checks,
+            "status": root_status,
+            "writer_claim": writer_claim,
+            "verified_proof_packs": [],
+        }
     proof_dir = root / "exports" / "proof_packs"
     proof_results: list[dict[str, Any]] = []
     if proof_dir.exists() and verify_recent_proof_packs > 0:
@@ -2405,19 +2466,19 @@ def doctor(
     else:
         add("sqlite_open", False, error="root is not initialized")
 
-    for rel in ("run/operations", "run/operation_events", "exports/operation_receipts", "exports/operation_events", "exports/proof_packs", "snapshots"):
-        target = root / rel
-        try:
-            secure_mkdir(target)
-            probe = target / f".doctor_{unique_id('probe')}.tmp"
-            atomic_write_text(probe, "ok\n")
-            probe.unlink(missing_ok=True)
-            add(f"writable:{rel}", True, path=str(target))
-        except Exception as exc:
-            add(f"writable:{rel}", False, path=str(target), error=str(exc))
+    add(
+        "write_capability_not_part_of_read_only_doctor",
+        True,
+        skipped=True,
+        reason="doctor_is_non_mutating",
+    )
 
     return {
         "ok": all(check["ok"] for check in checks),
+        "complete": True,
+        "diagnostic_mode": "writer_claim_compatible",
+        "write_probe_mode": "disabled_read_only_contract",
+        "writability_verified": False,
         "root": str(root),
         "check_count": len(checks),
         "checks": checks,
@@ -5551,9 +5612,39 @@ def verify_root(
         allow_missing_alias_key=allow_missing_alias_key,
     )
     sections["doctor"] = doctor_result
-    add("doctor", bool(doctor_result.get("ok")), check_count=doctor_result.get("check_count"))
+    add(
+        "doctor",
+        bool(doctor_result.get("ok")),
+        complete=doctor_result.get("complete", True),
+        diagnostic_mode=doctor_result.get("diagnostic_mode"),
+        check_count=doctor_result.get("check_count"),
+    )
 
     claim_result = writer_claim_status(root)
+    doctor_writer_claim = doctor_result.get("writer_claim")
+    if not isinstance(doctor_writer_claim, dict):
+        doctor_writer_claim = (doctor_result.get("status") or {}).get("writer_claim")
+    read_only_writer_claim = bool(
+        doctor_result.get("complete") is False
+        or doctor_result.get("diagnostic_mode") == "read_only_writer_claim_fenced"
+        or not claim_result.get("ok")
+        or (claim_result.get("claimed") and not claim_result.get("compatible"))
+        or (claim_result.get("root_has_existing_state") and not claim_result.get("claimed"))
+        or (
+            isinstance(doctor_writer_claim, dict)
+            and (
+                not doctor_writer_claim.get("ok")
+                or (
+                    doctor_writer_claim.get("claimed")
+                    and not doctor_writer_claim.get("compatible")
+                )
+                or (
+                    doctor_writer_claim.get("root_has_existing_state")
+                    and not doctor_writer_claim.get("claimed")
+                )
+            )
+        )
+    )
     sections["writer_claim"] = claim_result
     add(
         "writer_claim_readable",
@@ -5562,6 +5653,53 @@ def verify_root(
         compatible=claim_result.get("compatible"),
         error=claim_result.get("error"),
     )
+    if read_only_writer_claim:
+        reason = str(
+            doctor_result.get("reason")
+            or "writer_claim_incompatible_read_only_verification"
+        )
+        for section_name in (
+            "search_index",
+            "private_permissions",
+            "secret_audit",
+            "artifact_ledger",
+            "proof_packs",
+            "stale_operations",
+        ):
+            sections[section_name] = {
+                "ok": True,
+                "skipped": True,
+                "reason": reason,
+            }
+            add(f"{section_name}_skipped", True, reason=reason)
+        sections["restore_drill"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "writer_claim_incompatible_read_only_verification",
+            "writer_claim": claim_result,
+        }
+        add(
+            "restore_drill_skipped_read_only_runtime",
+            True,
+            reason="writer_claim_incompatible_read_only_verification",
+        )
+        return {
+            "schema": "epic_continuum.verify_root.v1",
+            "ok": all(check["ok"] for check in checks),
+            "complete": False,
+            "diagnostic_mode": "read_only_writer_claim_fenced",
+            "writability_verified": False,
+            "reason": reason,
+            "root": str(root),
+            "strict": strict,
+            "verify_recent_proof_packs": verify_recent_proof_packs,
+            "run_restore_drill": False,
+            "restore_drill_requested": bool(strict and run_restore_drill),
+            "scan_secrets": scan_secrets,
+            "check_count": len(checks),
+            "checks": checks,
+            "sections": sections,
+        }
 
     search_result = audit_search_index(root, create=False)
     sections["search_index"] = search_result
@@ -5696,6 +5834,9 @@ def verify_root(
     return {
         "schema": "epic_continuum.verify_root.v1",
         "ok": all(check["ok"] for check in checks),
+        "complete": True,
+        "diagnostic_mode": "writer_claim_compatible",
+        "writability_verified": False,
         "root": str(root),
         "strict": strict,
         "verify_recent_proof_packs": verify_recent_proof_packs,
@@ -6291,6 +6432,7 @@ def restore_drill(
     retain_drill_root: bool = True,
 ) -> dict[str, Any]:
     """Run a restore drill and clean exceptional disposable roots."""
+    ensure_writer_claim(root)
     created_drill_root: Path | None = None
     created_drill_root_reservation: _RestoreDrillRootReservation | None = None
 

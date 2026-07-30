@@ -440,8 +440,10 @@ class ReleaseHardeningTest(unittest.TestCase):
             self.assertEqual(duplicate.read_bytes(), before)
 
     def test_sdist_tar_modes_are_normalized(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
+        source_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            shutil.copytree(source_root, repo_root)
             proc = subprocess.run(
                 [sys.executable, "setup.py", "sdist", "--dist-dir", tmp],
                 cwd=repo_root,
@@ -479,10 +481,12 @@ class ReleaseHardeningTest(unittest.TestCase):
         self.assertTrue(any(".egg-info/" in name for name in normalized_metadata))
 
     def test_built_wheel_has_canonical_archive_metadata(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
+        source_root = Path(__file__).resolve().parents[1]
         epoch = 1_700_000_001
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
+            repo_root = base / "repo"
+            shutil.copytree(source_root, repo_root)
             dist_dir = base / "dist"
             env = os.environ.copy()
             env["SOURCE_DATE_EPOCH"] = str(epoch)
@@ -529,11 +533,13 @@ class ReleaseHardeningTest(unittest.TestCase):
                         self.assertNotIn(b"\r", wheel.read(info), info.filename)
 
     def test_sdist_is_reproducible_with_source_date_epoch(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
+        source_root = Path(__file__).resolve().parents[1]
         epoch = 1_700_000_000
         payloads: list[bytes] = []
 
         with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            shutil.copytree(source_root, repo_root)
             for build_number in range(2):
                 dist_dir = Path(tmp) / f"dist-{build_number}"
                 dist_dir.mkdir()
@@ -1090,7 +1096,7 @@ version = "9.9.9"
                 encoding="utf-8",
             )
             readme = source / "README.md"
-            readme.write_text("before\n", encoding="utf-8")
+            readme.write_bytes(b"before\n")
             subprocess.run(["git", "init"], cwd=source, check=True, stdout=subprocess.DEVNULL)
             subprocess.run(["git", "add", "."], cwd=source, check=True)
             subprocess.run(
@@ -1123,7 +1129,7 @@ version = "9.9.9"
                 nonlocal mutated
                 if not mutated and arcname.endswith("/README.md"):
                     self.assertEqual(data, b"before\n")
-                    readme.write_text("after\n", encoding="utf-8")
+                    readme.write_bytes(b"after\n")
                     mutated = True
                 return original_write_member(
                     zf,

@@ -442,6 +442,40 @@ class BundleResourceLimitsTest(unittest.TestCase):
             )
         )
 
+    def test_real_semantic_worker_keeps_import_source_cache_free(self) -> None:
+        worker_source = self.base / "worker-import-source"
+        shutil.copytree(
+            Path(bundle_module.__file__).resolve().parents[1],
+            worker_source / "continuum",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        embedded_root = self.base / "real-worker-bytecode-root"
+        embedded_root.mkdir(exist_ok=True)
+        budget = _BundleVerificationBudget(
+            deadline=time.monotonic() + 10,
+            max_work_bytes=1,
+        )
+
+        with patch.object(
+            bundle_module,
+            "__file__",
+            str(worker_source / "continuum" / "core" / "bundle.py"),
+        ):
+            errors = _run_extracted_root_audit(
+                embedded_root,
+                {},
+                budget=budget,
+                temp_parent=self.base,
+            )
+
+        self.assertTrue(errors)
+        self.assertNotEqual(
+            errors[0].get("error"),
+            "embedded_root_audit_worker_failed",
+        )
+        self.assertEqual(list(worker_source.rglob("*.pyc")), [])
+        self.assertEqual(list(worker_source.rglob("__pycache__")), [])
+
     def test_semantic_worker_ignores_cwd_and_python_startup_shadowing(self) -> None:
         hostile = self.base / "hostile-worker-startup"
         hostile_package = hostile / "continuum"

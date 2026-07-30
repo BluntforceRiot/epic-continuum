@@ -15,8 +15,9 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from typing import Callable, Iterator
 from unittest.mock import patch
 
 import continuum.core.store as store_module
@@ -1514,6 +1515,191 @@ class OperationLedgerTest(unittest.TestCase):
             run_receipt_before = Path(summary["run_receipt_uri"]).read_bytes()
             self.assertTrue(verify_proof_pack(Path(item["proof_pack_uri"]))["ok"])
             self.assertEqual(run_receipt_before, Path(summary["run_receipt_uri"]).read_bytes())
+
+    def _recover_stale_after_owner_action(
+        self,
+        root: Path,
+        operation_id: str,
+        owner_action: Callable[[], dict],
+    ) -> tuple[dict, dict]:
+        lock_attempted = threading.Event()
+        real_operation_lock = operations_module.operation_lock
+
+        @contextmanager
+        def synchronized_operation_lock(
+            lock_root: Path,
+            lock_operation_id: str,
+            *,
+            timeout_seconds: float = 60.0,
+        ) -> Iterator[None]:
+            if (
+                threading.current_thread().name.startswith("stale-operation-recovery")
+                and lock_operation_id == operation_id
+            ):
+                lock_attempted.set()
+            with real_operation_lock(
+                lock_root,
+                lock_operation_id,
+                timeout_seconds=timeout_seconds,
+            ):
+                yield
+
+        with patch.object(operations_module, "operation_lock", synchronized_operation_lock):
+            with ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="stale-operation-recovery",
+            ) as executor:
+                with real_operation_lock(root, operation_id):
+                    future = executor.submit(
+                        recover_stale_operations,
+                        root,
+                        older_than_seconds=60,
+                        mark=True,
+                    )
+                    self.assertTrue(
+                        lock_attempted.wait(timeout=5),
+                        "recovery did not select the stale receipt before trying to mark it",
+                    )
+                    owner_result = owner_action()
+                recovered = future.result(timeout=30)
+        return recovered, owner_result
+
+    def test_recover_stale_operations_preserves_fresh_owner_progress_before_mark_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            stale_time = "2000-01-01T00:00:00+00:00"
+            with patch.object(operations_module, "utc_now", return_value=stale_time):
+                started = start_operation(root, operation_type="stale_race", title="Stale race")
+            operation_id = started["operation_id"]
+
+            def owner_progress_action() -> dict:
+                with patch.object(operations_module, "utc_now", return_value=stale_time):
+                    return record_operation_progress(
+                        root,
+                        operation_id,
+                        phase="owner",
+                        message="owner is still active",
+                    )
+
+            recovered, owner_progress = self._recover_stale_after_owner_action(
+                root,
+                operation_id,
+                owner_progress_action,
+            )
+
+            self.assertEqual(recovered["recovered"], [])
+            self.assertEqual(owner_progress["status"], "running")
+            self.assertEqual(owner_progress["updated_at"], started["updated_at"])
+            self.assertNotEqual(owner_progress["receipt_hash"], started["receipt_hash"])
+            summary = operation_summary(root, operation_id)
+            self.assertEqual(summary["status"], "running")
+            self.assertEqual(summary["last_progress"]["message"], "owner is still active")
+            self.assertIsNone(summary.get("recovery_packet_uri"))
+            self.assertIsNone(summary.get("proof_pack_uri"))
+
+    def test_recover_stale_operations_preserves_owner_terminal_result_before_mark_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="terminal_race", title="Terminal race")
+            operation_id = started["operation_id"]
+
+            recovered, owner_result = self._recover_stale_after_owner_action(
+                root,
+                operation_id,
+                lambda: finish_operation(
+                    root,
+                    operation_id,
+                    status="succeeded",
+                    result={"owner": "completed"},
+                ),
+            )
+
+            self.assertEqual(recovered["recovered"], [])
+            self.assertEqual(owner_result["status"], "succeeded")
+            summary = operation_summary(root, operation_id)
+            self.assertEqual(summary["status"], "succeeded")
+            self.assertEqual(summary["result"], {"owner": "completed"})
+            self.assertIsNone(summary.get("recovery_packet_uri"))
+
+    def test_recover_stale_operations_publishes_recovery_atomically_against_competing_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="proof_race", title="Proof race")
+            operation_id = started["operation_id"]
+            publication_started = threading.Event()
+            competing_proof_started = threading.Event()
+            competing_proof_finished = threading.Event()
+            real_write_recovery_packet = operations_module._write_operation_recovery_packet
+
+            def synchronized_write_recovery_packet(
+                packet_root: Path,
+                receipt: dict,
+                *,
+                reason: str,
+            ) -> dict:
+                publication_started.set()
+                self.assertTrue(
+                    competing_proof_started.wait(timeout=5),
+                    "competing proof did not start",
+                )
+                if not operations_module.operation_lock_is_held(packet_root, operation_id):
+                    self.assertTrue(
+                        competing_proof_finished.wait(timeout=5),
+                        "competing proof did not finish through an exposed post-finish lock gap",
+                    )
+                return real_write_recovery_packet(packet_root, receipt, reason=reason)
+
+            def create_competing_proof() -> dict:
+                competing_proof_started.set()
+                try:
+                    return create_proof_pack(root, operation_id)
+                finally:
+                    competing_proof_finished.set()
+
+            with (
+                patch.object(
+                    operations_module,
+                    "_write_operation_recovery_packet",
+                    synchronized_write_recovery_packet,
+                ),
+                ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="stale-operation-recovery",
+                ) as recovery_executor,
+                ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="competing-proof",
+                ) as proof_executor,
+            ):
+                recovery_future = recovery_executor.submit(
+                    recover_stale_operations,
+                    root,
+                    older_than_seconds=60,
+                    mark=True,
+                )
+                self.assertTrue(
+                    publication_started.wait(timeout=5),
+                    "recovery did not begin recovery packet publication",
+                )
+                proof_future = proof_executor.submit(create_competing_proof)
+                recovered = recovery_future.result(timeout=30)
+                with self.assertRaisesRegex(ValueError, "proof pack already exists"):
+                    proof_future.result(timeout=30)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            item = recovered["recovered"][0]
+            self.assertEqual(item["status"], "interrupted")
+            self.assertTrue(Path(item["recovery_packet_uri"]).is_file())
+            self.assertTrue(Path(item["recovery_packet_json_uri"]).is_file())
+            self.assertTrue(Path(item["proof_pack_uri"]).is_file())
+            verification = verify_proof_pack(Path(item["proof_pack_uri"]))
+            self.assertTrue(verification["ok"], verification["errors"])
+            summary = operation_summary(root, operation_id)
+            self.assertEqual(summary["recovery_packet_uri"], item["recovery_packet_uri"])
+            self.assertEqual(summary["recovery_packet_json_uri"], item["recovery_packet_json_uri"])
+            self.assertEqual(summary["proof_pack_uri"], item["proof_pack_uri"])
 
     def test_proof_pack_uses_root_relative_paths_for_internal_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5240,6 +5426,1472 @@ class OperationLedgerTest(unittest.TestCase):
                 finish_operation(root, started["operation_id"], status="failed", error={"late": True})
 
             self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+
+    def test_recover_stale_operations_repairs_packet_publication_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="packet_retry", title="Packet retry")
+            operation_id = started["operation_id"]
+            packet_path = operations_module.operation_recovery_path(root, operation_id)
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected recovery packet publication failure")
+                real_atomic_write_json(path, payload)
+
+            with patch.object(operations_module, "atomic_write_json", fail_first_packet_json):
+                with self.assertRaisesRegex(OSError, "injected recovery packet publication failure"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            interrupted = read_operation(root, operation_id)
+            marker = interrupted.get("stale_recovery")
+            self.assertEqual(interrupted["status"], "interrupted")
+            self.assertIsInstance(marker, dict)
+            self.assertEqual(
+                marker["schema"],
+                operations_module.STALE_OPERATION_RECOVERY_MARKER_SCHEMA,
+            )
+            self.assertEqual(marker["selected_receipt_hash"], started["receipt_hash"])
+            self.assertIsNone(interrupted.get("proof_pack_uri"))
+            self.assertEqual(
+                interrupted["progress"][-1]["phase"],
+                "stale_recovery_publication_failed",
+            )
+            self.assertTrue(packet_path.is_file())
+            self.assertFalse(packet_json_path.exists())
+            self.assertFalse(proof_path.exists())
+            replayed = replay_operation_event_log(
+                operations_module.operation_event_paths(root, operation_id)["run"],
+                operation_id=operation_id,
+            )
+            self.assertEqual(replayed["status"], "interrupted")
+            self.assertIn("stale_recovery_publication_failed", replayed["event_types"])
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            item = recovered["recovered"][0]
+            self.assertTrue(Path(item["recovery_packet_uri"]).is_file())
+            self.assertTrue(Path(item["recovery_packet_json_uri"]).is_file())
+            verification = verify_proof_pack(Path(item["proof_pack_uri"]))
+            self.assertTrue(verification["ok"], verification["errors"])
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_repairs_proof_publication_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="proof_retry", title="Proof retry")
+            operation_id = started["operation_id"]
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+            real_create_proof_pack = operations_module.create_proof_pack
+            failure_injected = False
+
+            def fail_after_first_proof(*args, **kwargs) -> dict:
+                nonlocal failure_injected
+                proof = real_create_proof_pack(*args, **kwargs)
+                if not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected proof publication failure")
+                return proof
+
+            with patch.object(operations_module, "create_proof_pack", fail_after_first_proof):
+                with self.assertRaisesRegex(OSError, "injected proof publication failure"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            interrupted = read_operation(root, operation_id)
+            self.assertEqual(interrupted["status"], "interrupted")
+            self.assertIsNone(interrupted.get("proof_pack_uri"))
+            self.assertFalse(proof_path.exists())
+            self.assertEqual(
+                interrupted["progress"][-1]["phase"],
+                "stale_recovery_publication_failed",
+            )
+            conn = connect_existing(root)
+            try:
+                proof_artifact_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM artifacts
+                        WHERE operation_id = ?
+                          AND source_type = 'proof_pack'
+                        """,
+                        (operation_id,),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(proof_artifact_count, 0)
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            item = recovered["recovered"][0]
+            repaired = read_operation(root, operation_id)
+            self.assertEqual(repaired["proof_pack_uri"], root_uri(root, proof_path))
+            verification = verify_proof_pack(Path(item["proof_pack_uri"]))
+            self.assertTrue(verification["ok"], verification["errors"])
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            self.assertEqual(proof["schema"], operations_module.PROOF_PACK_SCHEMA)
+            artifact_ledger = _verify_artifact_ledger(root)
+            self.assertTrue(artifact_ledger["ok"], artifact_ledger)
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_completes_crashed_proof_artifact_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="proof_crash", title="Proof crash")
+            operation_id = started["operation_id"]
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+
+            with patch.object(
+                operations_module,
+                "_record_proof_artifacts",
+                side_effect=SystemExit("injected process death after proof write"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "injected process death"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertTrue(proof_path.is_file())
+            interrupted_verification = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(interrupted_verification["ok"])
+            self.assertEqual(
+                {error["check"] for error in interrupted_verification["errors"]},
+                {"artifact_ledger_proof_pack_bound"},
+            )
+            conn = connect_existing(root)
+            try:
+                failed_attempt_rows = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM artifacts
+                        WHERE operation_id = ?
+                          AND source_type = 'proof_pack'
+                        """,
+                        (operation_id,),
+                    ).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(failed_attempt_rows, 0)
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            self.assertEqual(recovered["recovered"][0]["proof_pack_uri"], str(proof_path))
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+            artifact_ledger = _verify_artifact_ledger(root)
+            self.assertTrue(artifact_ledger["ok"], artifact_ledger)
+            conn = connect_existing(root)
+            try:
+                proof_binding = conn.execute(
+                    """
+                    SELECT 1
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, root_uri(root, proof_path)),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(proof_binding)
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_does_not_rewrite_generic_interrupted_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            started = start_operation(root, operation_type="generic_interrupt", title="Generic interrupt")
+            finish_operation(
+                root,
+                started["operation_id"],
+                status="interrupted",
+                error={"type": "InterruptedOperation", "message": "owner interrupted operation"},
+            )
+            paths = operations_module.operation_paths(root, started["operation_id"])
+            before = {name: path.read_bytes() for name, path in paths.items()}
+
+            recovered = recover_stale_operations(root, older_than_seconds=-1, mark=True)
+
+            self.assertEqual(recovered["recovered"], [])
+            self.assertEqual(
+                before,
+                {name: path.read_bytes() for name, path in paths.items()},
+            )
+            summary = operation_summary(root, started["operation_id"])
+            self.assertIsNone(summary.get("recovery_packet_uri"))
+            self.assertIsNone(summary.get("proof_pack_uri"))
+
+    def test_recover_stale_operations_preserves_ambiguous_preexisting_proof_on_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="ambiguous_proof", title="Ambiguous proof")
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected packet failure before ambiguous proof")
+                real_atomic_write_json(path, payload)
+
+            with patch.object(operations_module, "atomic_write_json", fail_first_packet_json):
+                with self.assertRaisesRegex(OSError, "injected packet failure"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            ambiguous_payload = {
+                "schema": "external.ambiguous.proof",
+                "operation_id": operation_id,
+            }
+            real_atomic_write_json(proof_path, ambiguous_payload)
+            proof_bytes = proof_path.read_bytes()
+            init_db(root)
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="proof_pack",
+                    uri=root_uri(root, proof_path),
+                    sha256=hashlib.sha256(proof_bytes).hexdigest(),
+                    size_bytes=len(proof_bytes),
+                    operation_id=operation_id,
+                    immutable=True,
+                    source_type="proof_pack",
+                    trust_level="local_artifact",
+                    metadata={"schema": "external.ambiguous.proof"},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            receipt_paths = operations_module.operation_paths(root, operation_id)
+            receipt_bytes = {name: path.read_bytes() for name, path in receipt_paths.items()}
+
+            with self.assertRaisesRegex(ValueError, "pre-existing canonical proof"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(proof_path.read_bytes(), proof_bytes)
+            self.assertEqual(
+                receipt_bytes,
+                {name: path.read_bytes() for name, path in receipt_paths.items()},
+            )
+            conn = connect_existing(root)
+            try:
+                preserved = conn.execute(
+                    """
+                    SELECT sha256, source_type
+                    FROM artifacts
+                    WHERE operation_id = ?
+                      AND uri = ?
+                    """,
+                    (operation_id, root_uri(root, proof_path)),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(
+                [(str(row["sha256"]), str(row["source_type"])) for row in preserved],
+                [(hashlib.sha256(proof_bytes).hexdigest(), "proof_pack")],
+            )
+
+    def test_recover_stale_operations_preserves_ambiguous_ledger_row_when_proof_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="ambiguous_ledger", title="Ambiguous ledger")
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected packet failure before ambiguous ledger evidence")
+                real_atomic_write_json(path, payload)
+
+            with patch.object(operations_module, "atomic_write_json", fail_first_packet_json):
+                with self.assertRaisesRegex(OSError, "injected packet failure"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertFalse(proof_path.exists())
+            init_db(root)
+            ambiguous_sha256 = "a" * 64
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="proof_pack",
+                    uri=root_uri(root, proof_path),
+                    sha256=ambiguous_sha256,
+                    size_bytes=1,
+                    operation_id=operation_id,
+                    immutable=True,
+                    source_type="proof_pack",
+                    trust_level="local_artifact",
+                    metadata={"schema": "ambiguous.missing.proof"},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            receipt_paths = operations_module.operation_paths(root, operation_id)
+            receipt_bytes = {name: path.read_bytes() for name, path in receipt_paths.items()}
+
+            with self.assertRaisesRegex(ValueError, "pre-existing proof artifact ledger evidence"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                receipt_bytes,
+                {name: path.read_bytes() for name, path in receipt_paths.items()},
+            )
+            conn = connect_existing(root)
+            try:
+                preserved = conn.execute(
+                    """
+                    SELECT sha256
+                    FROM artifacts
+                    WHERE operation_id = ?
+                      AND source_type = 'proof_pack'
+                    """,
+                    (operation_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual([str(row["sha256"]) for row in preserved], [ambiguous_sha256])
+
+    def test_recover_stale_operations_skips_malformed_generic_terminal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="valid_stale", title="Valid stale")
+            malformed_path = root / "run" / "operations" / "malformed-terminal.json"
+            malformed = {
+                "schema": operations_module.OPERATION_SCHEMA,
+                "status": "interrupted",
+                "updated_at": "2000-01-01T00:00:00+00:00",
+            }
+            operations_module.atomic_write_json(malformed_path, malformed)
+            malformed_bytes = malformed_path.read_bytes()
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                [item["operation_id"] for item in recovered["recovered"]],
+                [started["operation_id"]],
+            )
+            self.assertEqual(malformed_path.read_bytes(), malformed_bytes)
+
+    def test_recover_stale_operations_repairs_hashless_active_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="hashless_stale", title="Hashless stale")
+            operation_id = started["operation_id"]
+            hashless_receipt = read_operation(root, operation_id)
+            hashless_receipt.pop("receipt_hash")
+            selected_hash = _stable_json_hash(hashless_receipt)
+            for path in operations_module.operation_paths(root, operation_id).values():
+                operations_module.atomic_write_json(path, hashless_receipt)
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            repaired = read_operation(root, operation_id)
+            self.assertEqual(
+                repaired["stale_recovery"]["selected_receipt_hash"],
+                selected_hash,
+            )
+            self.assertTrue(verify_proof_pack(Path(recovered["recovered"][0]["proof_pack_uri"]))["ok"])
+
+    def test_recover_stale_operations_repairs_partial_interrupted_event_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="event_retry", title="Event retry")
+            operation_id = started["operation_id"]
+            event_paths = operations_module.operation_event_paths(root, operation_id)
+            real_append_jsonl = operations_module.append_jsonl
+            failure_injected = False
+
+            def fail_first_interrupted_export(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if (
+                    Path(path) == event_paths["export"]
+                    and payload.get("event_type") == "interrupted"
+                    and not failure_injected
+                ):
+                    failure_injected = True
+                    raise OSError("injected interrupted event mirror failure")
+                real_append_jsonl(path, payload)
+
+            with patch.object(operations_module, "append_jsonl", fail_first_interrupted_export):
+                with self.assertRaisesRegex(OSError, "injected interrupted event mirror failure"):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                replay_operation_event_log(event_paths["run"], operation_id=operation_id)["status"],
+                "interrupted",
+            )
+            self.assertEqual(
+                replay_operation_event_log(event_paths["export"], operation_id=operation_id)["status"],
+                "running",
+            )
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(len(recovered["recovered"]), 1)
+            run_replay = replay_operation_event_log(event_paths["run"], operation_id=operation_id)
+            export_replay = replay_operation_event_log(event_paths["export"], operation_id=operation_id)
+            self.assertTrue(run_replay["ok"], run_replay["verification"]["errors"])
+            self.assertTrue(export_replay["ok"], export_replay["verification"]["errors"])
+            self.assertEqual(run_replay["status"], "interrupted")
+            self.assertEqual(export_replay["status"], "interrupted")
+            self.assertEqual(run_replay["last_event_hash"], export_replay["last_event_hash"])
+
+    def test_recover_stale_operations_cleanup_crash_boundaries_converge(self) -> None:
+        for crash_point in ("before_rows", "after_rows", "orphan_rows"):
+            with self.subTest(crash_point=crash_point), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                    started = start_operation(root, operation_type=crash_point, title=crash_point)
+                operation_id = started["operation_id"]
+                proof_path = operations_module.proof_pack_path(root, operation_id)
+                real_create_proof_pack = operations_module.create_proof_pack
+                real_remove_rows = operations_module._remove_proof_artifact_rows
+
+                def fail_after_proof(*args, **kwargs) -> dict:
+                    real_create_proof_pack(*args, **kwargs)
+                    raise OSError("injected post-proof failure")
+
+                if crash_point == "after_rows":
+                    def crash_during_cleanup(*args, **kwargs) -> int:
+                        real_remove_rows(*args, **kwargs)
+                        raise SystemExit("injected process death after row cleanup")
+                else:
+                    def crash_during_cleanup(*args, **kwargs) -> int:
+                        raise SystemExit("injected process death before row cleanup")
+
+                with (
+                    patch.object(operations_module, "create_proof_pack", fail_after_proof),
+                    patch.object(
+                        operations_module,
+                        "_remove_proof_artifact_rows",
+                        crash_during_cleanup,
+                    ),
+                    self.assertRaisesRegex(SystemExit, "injected process death"),
+                ):
+                    recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+                conn = connect_existing(root)
+                try:
+                    row_count = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM artifacts
+                            WHERE operation_id = ?
+                              AND source_type = 'proof_pack'
+                            """,
+                            (operation_id,),
+                        ).fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                self.assertTrue(proof_path.is_file())
+                if crash_point == "after_rows":
+                    self.assertEqual(row_count, 0)
+                else:
+                    self.assertGreater(row_count, 0)
+                if crash_point == "orphan_rows":
+                    proof_path.unlink()
+
+                recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+                self.assertEqual(len(recovered["recovered"]), 1)
+                self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+                artifact_ledger = _verify_artifact_ledger(root)
+                self.assertTrue(artifact_ledger["ok"], artifact_ledger)
+
+    def test_recover_stale_operations_fails_closed_on_artifact_query_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(root, operation_type="artifact_query", title="Artifact query")
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected packet failure before artifact query")
+                real_atomic_write_json(path, payload)
+
+            with (
+                patch.object(operations_module, "atomic_write_json", fail_first_packet_json),
+                self.assertRaisesRegex(OSError, "injected packet failure"),
+            ):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            init_db(root)
+            receipt_paths = operations_module.operation_paths(root, operation_id)
+            receipt_bytes = {name: path.read_bytes() for name, path in receipt_paths.items()}
+            with (
+                patch.object(
+                    operations_module,
+                    "_proof_artifact_ids_for_operation",
+                    side_effect=sqlite3.OperationalError("injected artifact query failure"),
+                ),
+                self.assertRaisesRegex(sqlite3.OperationalError, "injected artifact query failure"),
+            ):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                receipt_bytes,
+                {name: path.read_bytes() for name, path in receipt_paths.items()},
+            )
+
+    def test_recover_stale_operations_repairs_stale_sealed_proof_artifact_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="stale_sealed_binding",
+                    title="Stale sealed binding",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof_uri = root_uri(root, proof_path)
+            actual_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+            stale_sha256 = "a" * 64 if actual_sha256 != "a" * 64 else "b" * 64
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET sha256 = ?
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (stale_sha256, operation_id, proof_uri),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            broken = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(broken["ok"])
+            self.assertIn(
+                "artifact_ledger_proof_pack_hash_matches",
+                {error["check"] for error in broken["errors"]},
+            )
+
+            repaired = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                [item["operation_id"] for item in repaired["recovered"]],
+                [operation_id],
+            )
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT sha256, metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, proof_uri),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["sha256"]), actual_sha256)
+            metadata = json.loads(str(row["metadata_json"]))
+            seal = metadata.get("stale_recovery_publication_seal")
+            self.assertEqual(
+                seal["schema"],
+                operations_module.STALE_OPERATION_RECOVERY_PUBLICATION_SEAL_SCHEMA,
+            )
+            self.assertEqual(seal["proof_sha256"], actual_sha256)
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_does_not_seal_wrong_recovery_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="wrong_recovery_semantics",
+                    title="Wrong recovery semantics",
+                )
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected failure before wrong recovery proof")
+                real_atomic_write_json(path, payload)
+
+            with (
+                patch.object(operations_module, "atomic_write_json", fail_first_packet_json),
+                self.assertRaisesRegex(OSError, "injected failure"),
+            ):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            receipt = read_operation(root, operation_id)
+            marker = receipt["stale_recovery"]
+            proof_path = operations_module.proof_pack_path(root, operation_id)
+            packet_receipt = dict(receipt)
+            packet_receipt["proof_pack_uri"] = str(proof_path)
+            packet = operations_module._write_operation_recovery_packet(
+                root,
+                packet_receipt,
+                reason=marker["reason"],
+            )
+            create_proof_pack(
+                root,
+                operation_id,
+                touched_paths=[packet["packet_uri"], packet["packet_json_uri"]],
+                extra={
+                    "recovery_reason": "different recovery reason",
+                    "recovery_packet_hash": packet["packet_hash"],
+                },
+            )
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+            proof_bytes = proof_path.read_bytes()
+            receipt_paths = operations_module.operation_paths(root, operation_id)
+            receipt_bytes = {name: path.read_bytes() for name, path in receipt_paths.items()}
+
+            with self.assertRaisesRegex(ValueError, "pre-existing canonical proof"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(proof_path.read_bytes(), proof_bytes)
+            self.assertEqual(
+                receipt_bytes,
+                {name: path.read_bytes() for name, path in receipt_paths.items()},
+            )
+            conn = connect_existing(root)
+            try:
+                metadata_json = conn.execute(
+                    """
+                    SELECT metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, root_uri(root, proof_path)),
+                ).fetchone()["metadata_json"]
+            finally:
+                conn.close()
+            metadata = json.loads(str(metadata_json))
+            self.assertNotIn("stale_recovery_publication_seal", metadata)
+
+    def test_recover_stale_operations_repairs_missing_start_event_history(self) -> None:
+        for missing_state in ("both", "export"):
+            with self.subTest(missing_state=missing_state), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "epic-continuum"
+                with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                    if missing_state == "both":
+                        with (
+                            patch.object(
+                                operations_module,
+                                "_append_operation_event_unlocked",
+                                side_effect=SystemExit("injected process death before started event"),
+                            ),
+                            self.assertRaisesRegex(SystemExit, "before started event"),
+                        ):
+                            start_operation(
+                                root,
+                                operation_type="missing_start_history",
+                                title="Missing start history",
+                            )
+                        receipt_path = next((root / "run" / "operations").glob("*.json"))
+                        started = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    else:
+                        started = start_operation(
+                            root,
+                            operation_type="missing_export_history",
+                            title="Missing export history",
+                        )
+                        operations_module.operation_event_paths(
+                            root,
+                            started["operation_id"],
+                        )["export"].unlink()
+                operation_id = started["operation_id"]
+
+                recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+                self.assertEqual(
+                    [item["operation_id"] for item in recovered["recovered"]],
+                    [operation_id],
+                )
+                event_paths = operations_module.operation_event_paths(root, operation_id)
+                run_replay = replay_operation_event_log(
+                    event_paths["run"],
+                    operation_id=operation_id,
+                )
+                export_replay = replay_operation_event_log(
+                    event_paths["export"],
+                    operation_id=operation_id,
+                )
+                self.assertTrue(run_replay["ok"], run_replay["verification"]["errors"])
+                self.assertTrue(export_replay["ok"], export_replay["verification"]["errors"])
+                self.assertEqual(run_replay["event_types"][0], "started")
+                self.assertEqual(run_replay["event_types"], export_replay["event_types"])
+                self.assertEqual(run_replay["last_event_hash"], export_replay["last_event_hash"])
+                self.assertTrue(
+                    verify_proof_pack(
+                        Path(recovered["recovered"][0]["proof_pack_uri"]),
+                        root=root,
+                    )["ok"]
+                )
+
+    def test_recover_stale_operations_reconciles_durable_failure_progress_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="failure_event_reconcile",
+                    title="Failure event reconcile",
+                )
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            real_append_operation_event = operations_module._append_operation_event_unlocked
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected publication failure before event crash")
+                real_atomic_write_json(path, payload)
+
+            def crash_before_failure_event(*args, **kwargs) -> dict:
+                if kwargs.get("event_type") == "stale_recovery_publication_failed":
+                    raise SystemExit("injected process death before failure event")
+                return real_append_operation_event(*args, **kwargs)
+
+            with (
+                patch.object(operations_module, "atomic_write_json", fail_first_packet_json),
+                patch.object(
+                    operations_module,
+                    "_append_operation_event_unlocked",
+                    crash_before_failure_event,
+                ),
+                self.assertRaisesRegex(SystemExit, "before failure event"),
+            ):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            interrupted = read_operation(root, operation_id)
+            failure_progress = [
+                item
+                for item in interrupted["progress"]
+                if item.get("phase") == "stale_recovery_publication_failed"
+            ]
+            self.assertEqual(len(failure_progress), 1)
+            event_paths = operations_module.operation_event_paths(root, operation_id)
+            self.assertFalse(
+                any(
+                    event.get("event_type") == "stale_recovery_publication_failed"
+                    for event in operations_module._operation_events(event_paths["run"])
+                )
+            )
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                [item["operation_id"] for item in recovered["recovered"]],
+                [operation_id],
+            )
+            for path in event_paths.values():
+                matching_events = [
+                    event
+                    for event in operations_module._operation_events(path)
+                    if event.get("event_type") == "stale_recovery_publication_failed"
+                    and event.get("payload") == failure_progress[0]
+                ]
+                self.assertEqual(len(matching_events), 1)
+            self.assertTrue(
+                verify_proof_pack(
+                    Path(recovered["recovered"][0]["proof_pack_uri"]),
+                    root=root,
+                )["ok"]
+            )
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_preserves_proof_content_tamper_after_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="sealed_proof_content_tamper",
+                    title="Sealed proof content tamper",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            proof["created_at"] = "2002-02-02T02:02:02+00:00"
+            proof["proof_pack_hash"] = _proof_pack_hash(proof)
+            operations_module.atomic_write_json(proof_path, proof)
+            tampered_bytes = proof_path.read_bytes()
+            receipt_paths = operations_module.operation_paths(root, operation_id)
+            receipt_bytes = {name: path.read_bytes() for name, path in receipt_paths.items()}
+            conn = connect_existing(root)
+            try:
+                row_before = dict(
+                    conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        """,
+                        (operation_id, root_uri(root, proof_path)),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            broken = verify_proof_pack(proof_path, root=root)
+            self.assertFalse(broken["ok"])
+            self.assertEqual(
+                {error["check"] for error in broken["errors"]},
+                {"artifact_ledger_proof_pack_hash_matches"},
+            )
+
+            with self.assertRaisesRegex(ValueError, "ambiguous pre-existing proof artifact"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(proof_path.read_bytes(), tampered_bytes)
+            self.assertEqual(
+                receipt_bytes,
+                {name: path.read_bytes() for name, path in receipt_paths.items()},
+            )
+            conn = connect_existing(root)
+            try:
+                row_after = dict(
+                    conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        """,
+                        (operation_id, root_uri(root, proof_path)),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(row_after, row_before)
+
+    def test_recover_stale_operations_preserves_conflicting_seal_on_stale_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="conflicting_stale_seal",
+                    title="Conflicting stale seal",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof_uri = root_uri(root, proof_path)
+            conn = connect(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT id, sha256, size_bytes, metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, proof_uri),
+                ).fetchone()
+                metadata = json.loads(str(row["metadata_json"]))
+                metadata["stale_recovery_publication_seal"]["reason"] = "conflicting durable reason"
+                stale_sha256 = "a" * 64 if str(row["sha256"]) != "a" * 64 else "b" * 64
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET sha256 = ?, metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        stale_sha256,
+                        json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                        str(row["id"]),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            conn = connect_existing(root)
+            try:
+                row_before = dict(
+                    conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(ValueError, "ambiguous pre-existing proof artifact"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            conn = connect_existing(root)
+            try:
+                row_after = dict(
+                    conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            self.assertEqual(row_after, row_before)
+            self.assertTrue(proof_path.is_file())
+
+    def test_recover_stale_operations_rejects_second_conflicting_canonical_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="second_conflicting_row",
+                    title="Second conflicting row",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof_uri = root_uri(root, proof_path)
+            conn = connect(root)
+            try:
+                valid_row = conn.execute(
+                    """
+                    SELECT sha256, size_bytes, metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, proof_uri),
+                ).fetchone()
+                metadata = json.loads(str(valid_row["metadata_json"]))
+                metadata["stale_recovery_publication_seal"]["reason"] = "second conflicting reason"
+                stale_sha256 = (
+                    "a" * 64
+                    if str(valid_row["sha256"]) != "a" * 64
+                    else "b" * 64
+                )
+                record_artifact(
+                    conn,
+                    kind="proof_pack",
+                    uri=proof_uri,
+                    sha256=stale_sha256,
+                    size_bytes=int(valid_row["size_bytes"]),
+                    operation_id=operation_id,
+                    immutable=True,
+                    source_type="proof_pack",
+                    trust_level="local_artifact",
+                    metadata=metadata,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            conn = connect_existing(root)
+            try:
+                rows_before = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        ORDER BY id
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(len(rows_before), 2)
+
+            with self.assertRaisesRegex(ValueError, "ambiguous pre-existing proof artifact"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            conn = connect_existing(root)
+            try:
+                rows_after = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        ORDER BY id
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(rows_after, rows_before)
+            self.assertTrue(proof_path.is_file())
+
+    def test_recover_stale_operations_rejects_malformed_second_canonical_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="malformed_second_row",
+                    title="Malformed second row",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof_uri = root_uri(root, proof_path)
+            conn = connect(root)
+            try:
+                valid_row = conn.execute(
+                    """
+                    SELECT sha256, size_bytes
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, proof_uri),
+                ).fetchone()
+                stale_sha256 = (
+                    "a" * 64
+                    if str(valid_row["sha256"]) != "a" * 64
+                    else "b" * 64
+                )
+                record_artifact(
+                    conn,
+                    kind="proof_pack",
+                    uri=proof_uri,
+                    sha256=stale_sha256,
+                    size_bytes=int(valid_row["size_bytes"]),
+                    operation_id=operation_id,
+                    immutable=True,
+                    source_type="proof_pack",
+                    trust_level="local_artifact",
+                    metadata={"schema": operations_module.PROOF_PACK_SCHEMA},
+                )
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET metadata_json = ?
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                      AND sha256 = ?
+                    """,
+                    ("{malformed", operation_id, proof_uri, stale_sha256),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            conn = connect_existing(root)
+            try:
+                rows_before = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        ORDER BY id
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(len(rows_before), 2)
+
+            with self.assertRaisesRegex(ValueError, "ambiguous pre-existing proof artifact"):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            conn = connect_existing(root)
+            try:
+                rows_after = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, sha256, size_bytes, metadata_json
+                        FROM artifacts
+                        WHERE kind = 'proof_pack'
+                          AND operation_id = ?
+                          AND source_type = 'proof_pack'
+                          AND uri = ?
+                        ORDER BY id
+                        """,
+                        (operation_id, proof_uri),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(rows_after, rows_before)
+            self.assertTrue(proof_path.is_file())
+
+    def test_recover_stale_operations_reconciles_duplicate_failure_event_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="duplicate_failure_events",
+                    title="Duplicate failure events",
+                )
+            operation_id = started["operation_id"]
+            packet_json_path = operations_module.operation_recovery_json_path(root, operation_id)
+            real_atomic_write_json = operations_module.atomic_write_json
+            failure_injected = False
+
+            def fail_first_packet_json(path: Path, payload: dict) -> None:
+                nonlocal failure_injected
+                if Path(path) == packet_json_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected duplicate failure fixture")
+                real_atomic_write_json(path, payload)
+
+            with (
+                patch.object(operations_module, "atomic_write_json", fail_first_packet_json),
+                self.assertRaisesRegex(OSError, "duplicate failure fixture"),
+            ):
+                recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            interrupted = read_operation(root, operation_id)
+            failure_progress = interrupted["progress"][-1]
+            self.assertEqual(
+                failure_progress["phase"],
+                "stale_recovery_publication_failed",
+            )
+            interrupted["progress"].append(dict(failure_progress))
+            write_operation(root, interrupted)
+
+            recovered = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                [item["operation_id"] for item in recovered["recovered"]],
+                [operation_id],
+            )
+            for path in operations_module.operation_event_paths(root, operation_id).values():
+                matching_events = [
+                    event
+                    for event in operations_module._operation_events(path)
+                    if event.get("event_type") == "stale_recovery_publication_failed"
+                    and event.get("payload") == failure_progress
+                ]
+                self.assertEqual(len(matching_events), 2)
+            self.assertTrue(
+                verify_proof_pack(
+                    Path(recovered["recovered"][0]["proof_pack_uri"]),
+                    root=root,
+                )["ok"]
+            )
+
+    def test_recover_stale_operations_preserves_ambiguously_committed_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="ambiguous_seal_commit",
+                    title="Ambiguous seal commit",
+                )
+            operation_id = started["operation_id"]
+            real_seal = operations_module._seal_completed_stale_recovery_publication
+            failure_injected = False
+
+            def fail_after_seal_commit(*args, **kwargs) -> bool:
+                nonlocal failure_injected
+                written = real_seal(*args, **kwargs)
+                if not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected exception after durable seal commit")
+                return written
+
+            with patch.object(
+                operations_module,
+                "_seal_completed_stale_recovery_publication",
+                fail_after_seal_commit,
+            ):
+                recovered = recover_stale_operations(
+                    root,
+                    older_than_seconds=60,
+                    mark=True,
+                )
+
+            self.assertEqual(
+                [item["operation_id"] for item in recovered["recovered"]],
+                [operation_id],
+            )
+            receipt = read_operation(root, operation_id)
+            self.assertFalse(
+                any(
+                    item.get("phase") == "stale_recovery_publication_failed"
+                    for item in receipt["progress"]
+                )
+            )
+            proof_path = Path(recovered["recovered"][0]["proof_pack_uri"])
+            self.assertTrue(proof_path.is_file())
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+            conn = connect_existing(root)
+            try:
+                proof_rows = conn.execute(
+                    """
+                    SELECT metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                    """,
+                    (operation_id, root_uri(root, proof_path)),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(proof_rows), 1)
+            metadata = json.loads(str(proof_rows[0]["metadata_json"]))
+            self.assertIn("stale_recovery_publication_seal", metadata)
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_repairs_exact_clobbered_seal_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                started = start_operation(
+                    root,
+                    operation_type="clobbered_seal_metadata",
+                    title="Clobbered seal metadata",
+                )
+            operation_id = started["operation_id"]
+            first = recover_stale_operations(root, older_than_seconds=60, mark=True)
+            proof_path = Path(first["recovered"][0]["proof_pack_uri"])
+            proof_uri = root_uri(root, proof_path)
+            proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+            proof_size_bytes = proof_path.stat().st_size
+            conn = connect(root)
+            try:
+                record_artifact(
+                    conn,
+                    kind="proof_pack",
+                    uri=proof_uri,
+                    sha256=proof_sha256,
+                    size_bytes=proof_size_bytes,
+                    operation_id=operation_id,
+                    immutable=True,
+                    source_type="proof_pack",
+                    trust_level="local_artifact",
+                    metadata={"schema": "generic.metadata.clobber"},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(verify_proof_pack(proof_path, root=root)["ok"])
+
+            repaired = recover_stale_operations(root, older_than_seconds=60, mark=True)
+
+            self.assertEqual(
+                [item["operation_id"] for item in repaired["recovered"]],
+                [operation_id],
+            )
+            conn = connect_existing(root)
+            try:
+                metadata_json = conn.execute(
+                    """
+                    SELECT metadata_json
+                    FROM artifacts
+                    WHERE kind = 'proof_pack'
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND uri = ?
+                      AND sha256 = ?
+                      AND size_bytes = ?
+                    """,
+                    (
+                        operation_id,
+                        proof_uri,
+                        proof_sha256,
+                        proof_size_bytes,
+                    ),
+                ).fetchone()["metadata_json"]
+            finally:
+                conn.close()
+            metadata = json.loads(str(metadata_json))
+            self.assertEqual(metadata["schema"], operations_module.PROOF_PACK_SCHEMA)
+            seal = metadata.get("stale_recovery_publication_seal")
+            self.assertEqual(
+                seal["schema"],
+                operations_module.STALE_OPERATION_RECOVERY_PUBLICATION_SEAL_SCHEMA,
+            )
+            self.assertEqual(seal["final_receipt_hash"], read_operation(root, operation_id)["receipt_hash"])
+            self.assertEqual(
+                recover_stale_operations(root, older_than_seconds=60, mark=True)["recovered"],
+                [],
+            )
+
+    def test_recover_stale_operations_skips_sealed_history_before_limited_active_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            with patch.object(operations_module, "utc_now", return_value="2000-01-01T00:00:00+00:00"):
+                historical = [
+                    start_operation(
+                        root,
+                        operation_type=f"sealed_history_{index}",
+                        title=f"Sealed history {index}",
+                    )
+                    for index in range(5)
+                ]
+                sealed = recover_stale_operations(
+                    root,
+                    older_than_seconds=60,
+                    mark=True,
+                    limit=10,
+                )
+            sealed_ids = {item["operation_id"] for item in sealed["recovered"]}
+            self.assertEqual(
+                sealed_ids,
+                {item["operation_id"] for item in historical},
+            )
+
+            with patch.object(operations_module, "utc_now", return_value="2001-01-01T00:00:00+00:00"):
+                active = start_operation(
+                    root,
+                    operation_type="active_after_sealed_history",
+                    title="Active after sealed history",
+                )
+            active_id = active["operation_id"]
+            real_verify_proof_pack = operations_module.verify_proof_pack
+            real_publish_recovery = operations_module._publish_stale_operation_recovery
+            verified_ids: list[str] = []
+            published_ids: list[str] = []
+
+            def verify_only_active(path: Path, *args, **kwargs) -> dict:
+                operation_id = Path(path).stem
+                if operation_id in sealed_ids:
+                    raise AssertionError(f"sealed history was strictly verified: {operation_id}")
+                verified_ids.append(operation_id)
+                return real_verify_proof_pack(path, *args, **kwargs)
+
+            def publish_only_active(root_path: Path, operation_id: str) -> tuple[dict, dict, bool]:
+                if operation_id in sealed_ids:
+                    raise AssertionError(f"sealed history reached publication: {operation_id}")
+                published_ids.append(operation_id)
+                return real_publish_recovery(root_path, operation_id)
+
+            with (
+                patch.object(operations_module, "verify_proof_pack", verify_only_active),
+                patch.object(
+                    operations_module,
+                    "_publish_stale_operation_recovery",
+                    publish_only_active,
+                ),
+            ):
+                recovered = recover_stale_operations(
+                    root,
+                    older_than_seconds=60,
+                    mark=True,
+                    limit=1,
+                )
+
+            self.assertEqual(
+                [item["operation_id"] for item in recovered["recovered"]],
+                [active_id],
+            )
+            self.assertEqual(published_ids, [active_id])
+            self.assertTrue(verified_ids)
+            self.assertEqual(set(verified_ids), {active_id})
 
 
 

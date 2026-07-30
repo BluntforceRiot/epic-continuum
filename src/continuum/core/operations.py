@@ -293,6 +293,10 @@ OPERATION_EVENT_SCHEMA = "epic_continuum.operation_event.v1"
 PROOF_PACK_SCHEMA = "epic_continuum.proof_pack.v1"
 CATALOG_STATE_SCHEMA = "epic_continuum.catalog_state.v1"
 OPERATION_RECOVERY_SCHEMA = "epic_continuum.operation_recovery.v1"
+STALE_OPERATION_RECOVERY_MARKER_SCHEMA = "epic_continuum.stale_operation_recovery_marker.v1"
+STALE_OPERATION_RECOVERY_PUBLICATION_SEAL_SCHEMA = (
+    "epic_continuum.stale_operation_recovery_publication_seal.v1"
+)
 RECOVERY_DRILL_SCHEMA = "epic_continuum.recovery_drill.v1"
 RESTORE_DRILL_SCHEMA = "epic_continuum.restore_drill.v1"
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
@@ -2624,8 +2628,8 @@ def _write_operation_recovery_packet(
     atomic_write_json(packet_json_path, machine_packet)
 
     stored_receipt = read_operation(root, operation_id)
-    stored_receipt["recovery_packet_uri"] = packet_uri
-    stored_receipt["recovery_packet_json_uri"] = packet_json_uri
+    stored_receipt["recovery_packet_uri"] = str(packet_path)
+    stored_receipt["recovery_packet_json_uri"] = str(packet_json_path)
     write_operation(root, stored_receipt)
     return {
         "operation_id": operation_id,
@@ -2634,6 +2638,1204 @@ def _write_operation_recovery_packet(
         "packet_hash": content_hash(packet_text),
         "reason": reason,
     }
+
+
+def _stale_operation_recovery_marker(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    marker = receipt.get("stale_recovery")
+    error = receipt.get("error")
+    operation_id = receipt.get("operation_id")
+    if (
+        receipt.get("status") != "interrupted"
+        or not isinstance(operation_id, str)
+        or not isinstance(marker, dict)
+        or marker.get("schema") != STALE_OPERATION_RECOVERY_MARKER_SCHEMA
+        or marker.get("operation_id") != operation_id
+        or not isinstance(marker.get("reason"), str)
+        or not marker.get("reason")
+        or not isinstance(marker.get("selected_receipt_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", marker["selected_receipt_hash"]) is None
+        or not isinstance(marker.get("selected_updated_at"), str)
+        or not marker.get("selected_updated_at")
+        or not isinstance(marker.get("marked_at"), str)
+        or not marker.get("marked_at")
+        or receipt.get("finished_at") != marker.get("marked_at")
+        or not isinstance(error, dict)
+        or error.get("type") != "InterruptedOperation"
+        or error.get("message") != marker.get("reason")
+        or error.get("updated_at") != marker.get("selected_updated_at")
+    ):
+        return None
+    try:
+        validate_operation_id(operation_id)
+        for field in ("selected_updated_at", "marked_at"):
+            parsed = dt.datetime.fromisoformat(str(marker[field]).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+    except (TypeError, ValueError):
+        return None
+    return marker
+
+
+def _receipt_selection_hash(receipt: dict[str, Any]) -> str:
+    stored_hash = receipt.get("receipt_hash")
+    if isinstance(stored_hash, str) and re.fullmatch(r"[0-9a-f]{64}", stored_hash):
+        return stored_hash
+    return _stable_json_hash(receipt)
+
+
+def _stale_recovery_publication_material(
+    root: Path,
+    receipt: dict[str, Any],
+    marker: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str, int] | None:
+    operation_id = validate_operation_id(str(receipt["operation_id"]))
+    packet_path = operation_recovery_path(root, operation_id)
+    packet_json_path = operation_recovery_json_path(root, operation_id)
+    proof_path = proof_pack_path(root, operation_id)
+    publication_paths = (packet_path, packet_json_path, proof_path)
+    if any(path.is_symlink() or not path.is_file() for path in publication_paths):
+        return None
+
+    try:
+        packet_text = packet_path.read_text(encoding="utf-8")
+        machine_packet = json.loads(packet_json_path.read_text(encoding="utf-8"))
+        proof_bytes = proof_path.read_bytes()
+        stored_proof = json.loads(proof_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(machine_packet, dict) or not isinstance(stored_proof, dict):
+        return None
+
+    packet_hash = content_hash(packet_text)
+    packet_uri = _stored_root_uri(root, packet_path)
+    packet_json_uri = _stored_root_uri(root, packet_json_path)
+    proof_uri = _stored_root_uri(root, proof_path)
+    expected_path_uris = {packet_uri, packet_json_uri}
+    proof_extra = stored_proof.get("extra")
+    receipt_proof_uri = _resolve_root_uri(root, receipt.get("proof_pack_uri"))
+    receipt_packet_uri = _resolve_root_uri(root, receipt.get("recovery_packet_uri"))
+    receipt_packet_json_uri = _resolve_root_uri(root, receipt.get("recovery_packet_json_uri"))
+    if (
+        machine_packet.get("schema") != OPERATION_RECOVERY_SCHEMA
+        or machine_packet.get("operation_id") != operation_id
+        or machine_packet.get("status") != "interrupted"
+        or machine_packet.get("reason") != marker["reason"]
+        or machine_packet.get("packet_hash") != packet_hash
+        or machine_packet.get("packet_uri") != packet_uri
+        or machine_packet.get("packet_json_uri") != packet_json_uri
+        or machine_packet.get("proof_pack_uri") != proof_uri
+        or stored_proof.get("schema") != PROOF_PACK_SCHEMA
+        or stored_proof.get("operation_id") != operation_id
+        or stored_proof.get("status") != "interrupted"
+        or stored_proof.get("proof_pack_uri") != proof_uri
+        or not isinstance(proof_extra, dict)
+        or proof_extra.get("recovery_reason") != marker["reason"]
+        or proof_extra.get("recovery_packet_hash") != packet_hash
+        or not expected_path_uris.issubset(_proof_path_uris(stored_proof))
+        or receipt_proof_uri is None
+        or Path(receipt_proof_uri).resolve(strict=False) != proof_path.resolve(strict=False)
+        or receipt_packet_uri is None
+        or Path(receipt_packet_uri).resolve(strict=False) != packet_path.resolve(strict=False)
+        or receipt_packet_json_uri is None
+        or Path(receipt_packet_json_uri).resolve(strict=False) != packet_json_path.resolve(strict=False)
+    ):
+        return None
+
+    packet = {
+        "operation_id": operation_id,
+        "packet_uri": str(packet_path),
+        "packet_json_uri": str(packet_json_path),
+        "packet_hash": packet_hash,
+        "reason": marker["reason"],
+    }
+    proof = dict(stored_proof)
+    proof["root"] = str(root)
+    proof["proof_pack_uri"] = str(proof_path)
+    return packet, proof, hashlib.sha256(proof_bytes).hexdigest(), len(proof_bytes)
+
+
+def _stale_recovery_marker_hash(marker: dict[str, Any]) -> str:
+    return content_hash(
+        json.dumps(
+            marker,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+
+
+def _stale_recovery_publication_seal_payload(
+    root: Path,
+    receipt: dict[str, Any],
+    marker: dict[str, Any],
+) -> dict[str, Any] | None:
+    operation_id = validate_operation_id(str(receipt["operation_id"]))
+    receipt_paths = operation_paths(root, operation_id)
+    try:
+        run_receipt = _load_receipt(receipt_paths["run"])
+        export_receipt = _load_receipt(receipt_paths["export"])
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    final_receipt_hash = receipt.get("receipt_hash")
+    if (
+        not isinstance(final_receipt_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", final_receipt_hash) is None
+        or run_receipt.get("receipt_hash") != final_receipt_hash
+        or export_receipt.get("receipt_hash") != final_receipt_hash
+    ):
+        return None
+    packet_path = operation_recovery_path(root, operation_id)
+    packet_json_path = operation_recovery_json_path(root, operation_id)
+    proof_path = proof_pack_path(root, operation_id)
+    if any(
+        path.is_symlink() or not path.is_file()
+        for path in (packet_path, packet_json_path, proof_path)
+    ):
+        return None
+    try:
+        packet_bytes = packet_path.read_bytes()
+        packet_text = packet_bytes.decode("utf-8")
+        packet_json_bytes = packet_json_path.read_bytes()
+        proof_bytes = proof_path.read_bytes()
+    except (OSError, UnicodeError):
+        return None
+    return {
+        "schema": STALE_OPERATION_RECOVERY_PUBLICATION_SEAL_SCHEMA,
+        "operation_id": operation_id,
+        "final_receipt_hash": final_receipt_hash,
+        "proof_pack_uri": _stored_root_uri(root, proof_path),
+        "proof_sha256": hashlib.sha256(proof_bytes).hexdigest(),
+        "proof_size_bytes": len(proof_bytes),
+        "recovery_packet_uri": _stored_root_uri(root, packet_path),
+        "recovery_packet_hash": content_hash(packet_text),
+        "recovery_packet_size_bytes": len(packet_bytes),
+        "recovery_packet_json_uri": _stored_root_uri(root, packet_json_path),
+        "recovery_packet_json_sha256": hashlib.sha256(packet_json_bytes).hexdigest(),
+        "recovery_packet_json_size_bytes": len(packet_json_bytes),
+        "stale_recovery_marker_hash": _stale_recovery_marker_hash(marker),
+        "selected_receipt_hash": marker["selected_receipt_hash"],
+        "reason": marker["reason"],
+    }
+
+
+def _stale_recovery_proof_seal_bindings(
+    root: Path,
+) -> dict[
+    tuple[str, str],
+    list[tuple[str, int, dict[str, Any] | None]],
+]:
+    if not is_initialized(root):
+        return {}
+    conn = connect_existing(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT operation_id, uri, sha256, size_bytes, metadata_json
+            FROM artifacts
+            WHERE kind = 'proof_pack'
+              AND source_type = 'proof_pack'
+            """
+        ).fetchall()
+        bindings: dict[
+            tuple[str, str],
+            list[tuple[str, int, dict[str, Any] | None]],
+        ] = {}
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata_json"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = None
+            if not isinstance(metadata, dict):
+                metadata = None
+            bindings.setdefault(
+                (str(row["operation_id"]), str(row["uri"])),
+                [],
+            ).append(
+                (
+                    str(row["sha256"]),
+                    int(row["size_bytes"]),
+                    metadata,
+                )
+            )
+        return bindings
+    finally:
+        conn.close()
+
+
+def _stale_recovery_publication_is_sealed(
+    root: Path,
+    receipt: dict[str, Any],
+    *,
+    proof_seal_bindings: (
+        dict[
+            tuple[str, str],
+            list[tuple[str, int, dict[str, Any] | None]],
+        ]
+        | None
+    ) = None,
+) -> bool:
+    marker = _stale_operation_recovery_marker(receipt)
+    if marker is None:
+        return False
+    operation_id = str(receipt["operation_id"])
+    packet_path = operation_recovery_path(root, operation_id)
+    packet_json_path = operation_recovery_json_path(root, operation_id)
+    proof_path = proof_pack_path(root, operation_id)
+    canonical_bindings = {
+        "recovery_packet_uri": _stored_root_uri(root, packet_path),
+        "recovery_packet_json_uri": _stored_root_uri(root, packet_json_path),
+        "proof_pack_uri": _stored_root_uri(root, proof_path),
+    }
+    if any(
+        not isinstance(receipt.get(key), str)
+        or Path(str(receipt[key])).is_absolute()
+        or Path(str(receipt[key])).as_posix() != uri
+        for key, uri in canonical_bindings.items()
+    ):
+        return False
+    if any(
+        path.is_symlink() or not path.is_file()
+        for path in (packet_path, packet_json_path, proof_path)
+    ):
+        return False
+    expected_seal = _stale_recovery_publication_seal_payload(root, receipt, marker)
+    if expected_seal is None:
+        return False
+    if proof_seal_bindings is not None:
+        candidate_rows = proof_seal_bindings.get(
+            (operation_id, canonical_bindings["proof_pack_uri"]),
+            [],
+        )
+    else:
+        if not is_initialized(root):
+            return False
+        conn = connect_existing(root)
+        try:
+            rows = conn.execute(
+                """
+                SELECT sha256, size_bytes, metadata_json
+                FROM artifacts
+                WHERE kind = 'proof_pack'
+                  AND operation_id = ?
+                  AND source_type = 'proof_pack'
+                  AND uri = ?
+                """,
+                (operation_id, canonical_bindings["proof_pack_uri"]),
+            ).fetchall()
+        finally:
+            conn.close()
+        candidate_rows = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata_json"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = None
+            if not isinstance(metadata, dict):
+                metadata = None
+            candidate_rows.append(
+                (
+                    str(row["sha256"]),
+                    int(row["size_bytes"]),
+                    metadata,
+                )
+            )
+    return (
+        len(candidate_rows) == 1
+        and isinstance(candidate_rows[0][2], dict)
+        and candidate_rows[0][2].get("schema") == PROOF_PACK_SCHEMA
+        and candidate_rows[0][0] == expected_seal["proof_sha256"]
+        and candidate_rows[0][1] == expected_seal["proof_size_bytes"]
+        and candidate_rows[0][2].get("stale_recovery_publication_seal")
+        == expected_seal
+    )
+
+
+def _operation_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise ValueError(f"operation event must be an object: {path}")
+        events.append(event)
+    return events
+
+
+def _operation_event_log_is_absent_or_empty(path: Path) -> bool:
+    if path.is_symlink():
+        return False
+    if not path.exists():
+        return True
+    if not path.is_file():
+        return False
+    return not path.read_text(encoding="utf-8").strip()
+
+
+def _stale_recovery_can_bootstrap_started_event(receipt: dict[str, Any]) -> bool:
+    return (
+        _stale_operation_recovery_marker(receipt) is not None
+        and receipt.get("cursor") is None
+        and not receipt.get("preflight_snapshots")
+        and not receipt.get("progress")
+        and receipt.get("result") is None
+        and not receipt.get("proof_pack_uri")
+        and not receipt.get("recovery_packet_uri")
+        and not receipt.get("recovery_packet_json_uri")
+    )
+
+
+def _append_preserved_operation_events(path: Path, events: list[dict[str, Any]]) -> None:
+    for event in events:
+        append_jsonl(path, event)
+        _remember_operation_event_hash(path, str(event["event_hash"]))
+
+
+def _reconcile_operation_event_mirrors(
+    root: Path,
+    operation_id: str,
+    receipt: dict[str, Any],
+) -> None:
+    paths = operation_event_paths(root, operation_id)
+    run_empty = _operation_event_log_is_absent_or_empty(paths["run"])
+    export_empty = _operation_event_log_is_absent_or_empty(paths["export"])
+    if run_empty and export_empty:
+        if not _stale_recovery_can_bootstrap_started_event(receipt):
+            raise ValueError(
+                f"cannot bootstrap missing stale recovery event logs for {operation_id}"
+            )
+        _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type="started",
+            payload={
+                "operation_type": receipt.get("operation_type"),
+                "title": receipt.get("title"),
+                "actor": receipt.get("actor"),
+                "intent": receipt.get("intent") or {},
+            },
+        )
+        return
+
+    run_verification = verify_operation_event_log(paths["run"], operation_id=operation_id)
+    export_verification = verify_operation_event_log(paths["export"], operation_id=operation_id)
+    if run_empty and export_verification.get("ok"):
+        export_events = _operation_events(paths["export"])
+        if not export_events or export_events[0].get("event_type") != "started":
+            raise ValueError(
+                f"cannot repair stale recovery from non-canonical export event log for {operation_id}"
+            )
+        _append_preserved_operation_events(paths["run"], export_events)
+        return
+    if export_empty and run_verification.get("ok"):
+        run_events = _operation_events(paths["run"])
+        if not run_events or run_events[0].get("event_type") != "started":
+            raise ValueError(
+                f"cannot repair stale recovery from non-canonical run event log for {operation_id}"
+            )
+        _append_preserved_operation_events(paths["export"], run_events)
+        return
+    if not run_verification.get("ok") or not export_verification.get("ok"):
+        raise ValueError(f"cannot repair stale recovery with invalid operation event log for {operation_id}")
+    run_events = _operation_events(paths["run"])
+    export_events = _operation_events(paths["export"])
+    run_hashes = [event.get("event_hash") for event in run_events]
+    export_hashes = [event.get("event_hash") for event in export_events]
+    if run_hashes == export_hashes:
+        return
+    if run_hashes[: len(export_hashes)] == export_hashes:
+        destination = paths["export"]
+        missing_events = run_events[len(export_events) :]
+    elif export_hashes[: len(run_hashes)] == run_hashes:
+        destination = paths["run"]
+        missing_events = export_events[len(run_events) :]
+    else:
+        raise ValueError(f"operation event mirrors diverged for {operation_id}")
+    _append_preserved_operation_events(destination, missing_events)
+
+
+def _ensure_stale_recovery_publication_failure_events(
+    root: Path,
+    operation_id: str,
+    receipt: dict[str, Any],
+) -> None:
+    paths = operation_event_paths(root, operation_id)
+    events = _operation_events(paths["run"])
+    consumed_event_indexes: set[int] = set()
+    for progress in receipt.get("progress") or []:
+        if not isinstance(progress, dict) or progress.get("phase") != "stale_recovery_publication_failed":
+            continue
+        matching_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if index not in consumed_event_indexes
+                and event.get("event_type") == "stale_recovery_publication_failed"
+                and event.get("payload") == progress
+            ),
+            None,
+        )
+        if matching_index is not None:
+            consumed_event_indexes.add(matching_index)
+            continue
+        event = _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type="stale_recovery_publication_failed",
+            payload=progress,
+        )
+        events.append(event)
+        consumed_event_indexes.add(len(events) - 1)
+
+
+def _ensure_stale_recovery_interrupted_event(
+    root: Path,
+    operation_id: str,
+    marker: dict[str, Any],
+) -> None:
+    receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+    _reconcile_operation_event_mirrors(root, operation_id, receipt)
+    paths = operation_event_paths(root, operation_id)
+    expected_error = {
+        "type": "InterruptedOperation",
+        "message": marker["reason"],
+        "updated_at": marker["selected_updated_at"],
+    }
+    has_interrupted_event = False
+    for event in _operation_events(paths["run"]):
+        payload = event.get("payload")
+        if (
+            event.get("event_type") == "interrupted"
+            and isinstance(payload, dict)
+            and payload.get("result") is None
+            and payload.get("error") == expected_error
+        ):
+            has_interrupted_event = True
+            break
+    if not has_interrupted_event:
+        _append_operation_event_unlocked(
+            root,
+            operation_id,
+            event_type="interrupted",
+            payload={"result": None, "error": expected_error},
+        )
+    _ensure_stale_recovery_publication_failure_events(
+        root,
+        operation_id,
+        receipt,
+    )
+
+
+def _completed_stale_operation_recovery_publication(
+    root: Path,
+    receipt: dict[str, Any],
+    marker: dict[str, Any],
+    *,
+    allow_artifact_ledger_repair: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    material = _stale_recovery_publication_material(root, receipt, marker)
+    if material is None:
+        return None
+    packet, proof, _, _ = material
+    proof_path = proof_pack_path(root, str(receipt["operation_id"]))
+    verification = verify_proof_pack(proof_path, root=root)
+    if not verification.get("ok"):
+        error_checks = {
+            str(error.get("check"))
+            for error in verification.get("errors") or []
+            if isinstance(error, dict)
+        }
+        repairable_checks = {
+            "artifact_ledger_proof_pack_bound",
+            "artifact_ledger_proof_pack_hash_matches",
+        }
+        if (
+            not allow_artifact_ledger_repair
+            or not error_checks
+            or not error_checks.issubset(repairable_checks)
+        ):
+            return None
+    return packet, proof
+
+
+def _proof_artifact_ids_for_operation(root: Path, operation_id: str) -> set[str]:
+    if not is_initialized(root):
+        return set()
+    conn = connect_existing(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM artifacts
+            WHERE operation_id = ?
+              AND source_type = 'proof_pack'
+            """,
+            (operation_id,),
+        ).fetchall()
+        return {str(row["id"]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _stale_recovery_orphan_proof_artifact_ids(
+    root: Path,
+    operation_id: str,
+    proof_path: Path,
+) -> set[str]:
+    if not is_initialized(root):
+        return set()
+    proof_uri = _proof_path_identity(proof_path, root)["uri"]
+    conn = connect_existing(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, kind, uri, metadata_json
+            FROM artifacts
+            WHERE operation_id = ?
+              AND source_type = 'proof_pack'
+            """,
+            (operation_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    exact_ids: set[str] = set()
+    unexpected: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except json.JSONDecodeError:
+            metadata = None
+        kind = str(row["kind"])
+        uri = str(row["uri"])
+        exact_proof = (
+            kind == "proof_pack"
+            and uri == proof_uri
+            and isinstance(metadata, dict)
+            and metadata.get("schema") == PROOF_PACK_SCHEMA
+        )
+        exact_input = (
+            kind == "proof_input"
+            and isinstance(metadata, dict)
+            and metadata.get("proof_pack_uri") == proof_uri
+        )
+        if exact_proof or exact_input:
+            exact_ids.add(str(row["id"]))
+        else:
+            unexpected.append((kind, uri))
+    if unexpected:
+        raise ValueError(
+            f"ambiguous pre-existing proof artifact ledger evidence for {operation_id}: {unexpected}"
+        )
+    return exact_ids
+
+
+def _remove_proof_artifact_rows(
+    root: Path,
+    operation_id: str,
+    *,
+    preserve_ids: set[str],
+) -> int:
+    removable = _proof_artifact_ids_for_operation(root, operation_id) - preserve_ids
+    if not removable:
+        return 0
+    conn = connect(root)
+    try:
+        conn.executemany(
+            """
+            DELETE FROM artifacts
+            WHERE id = ?
+              AND operation_id = ?
+              AND source_type = 'proof_pack'
+            """,
+            [(artifact_id, operation_id) for artifact_id in sorted(removable)],
+        )
+        conn.commit()
+        return len(removable)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _ensure_completed_stale_recovery_proof_artifacts(
+    root: Path,
+    operation_id: str,
+    proof_path: Path,
+    stored_proof: dict[str, Any],
+    *,
+    receipt: dict[str, Any],
+    marker: dict[str, Any],
+) -> bool:
+    if not operation_lock_is_held(root, operation_id):
+        raise RuntimeError("proof artifact repair requires the per-operation lock")
+    if not operation_lock_is_held(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+        raise RuntimeError("proof artifact repair requires the proof mutation lock")
+    expected_inputs = {
+        (str(item.get("uri") or item.get("path") or ""), str(item["sha256"]))
+        for item in stored_proof.get("paths") or []
+        if (
+            isinstance(item, dict)
+            and item.get("kind") == "file"
+            and item.get("exists")
+            and isinstance(item.get("sha256"), str)
+        )
+    }
+    proof_uri = _proof_path_identity(proof_path, root)["uri"]
+    proof_sha256 = file_sha256(proof_path)
+    proof_size_bytes = proof_path.stat().st_size
+    expected_seal = _stale_recovery_publication_seal_payload(
+        root,
+        receipt,
+        marker,
+    )
+    if expected_seal is None:
+        raise ValueError(
+            f"cannot repair proof binding without complete recovery evidence for {operation_id}"
+        )
+    repairable_stale_rows: list[tuple[str, str, int, str]] = []
+    metadata_repair_rows: list[tuple[str, str, int, str, str]] = []
+    canonical_current_ids: set[str] = set()
+    conn = connect_existing(root)
+    try:
+        existing_rows = conn.execute(
+            """
+            SELECT id, kind, uri, sha256, size_bytes, metadata_json
+            FROM artifacts
+            WHERE operation_id = ?
+              AND source_type = 'proof_pack'
+            """,
+            (operation_id,),
+        ).fetchall()
+        unexpected: list[tuple[str, str, str]] = []
+        for row in existing_rows:
+            artifact_id = str(row["id"])
+            kind = str(row["kind"])
+            uri = str(row["uri"])
+            sha256 = str(row["sha256"])
+            size_bytes = int(row["size_bytes"])
+            metadata_json = str(row["metadata_json"] or "{}")
+            try:
+                metadata = json.loads(metadata_json)
+            except json.JSONDecodeError:
+                metadata = None
+            exact_input = kind == "proof_input" and (uri, sha256) in expected_inputs
+            if exact_input:
+                continue
+            canonical_proof_identity = kind == "proof_pack" and uri == proof_uri
+            current_proof_bytes = (
+                sha256 == proof_sha256
+                and size_bytes == proof_size_bytes
+            )
+            recognizable_proof = (
+                canonical_proof_identity
+                and isinstance(metadata, dict)
+                and metadata.get("schema") == PROOF_PACK_SCHEMA
+            )
+            existing_seal = (
+                metadata.get("stale_recovery_publication_seal")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if recognizable_proof and current_proof_bytes:
+                canonical_current_ids.add(artifact_id)
+                continue
+            if (
+                canonical_proof_identity
+                and current_proof_bytes
+                and isinstance(metadata, dict)
+                and existing_seal is None
+            ):
+                repaired_metadata = dict(metadata)
+                repaired_metadata["schema"] = PROOF_PACK_SCHEMA
+                metadata_repair_rows.append(
+                    (
+                        artifact_id,
+                        sha256,
+                        size_bytes,
+                        metadata_json,
+                        json.dumps(repaired_metadata, ensure_ascii=True, sort_keys=True),
+                    )
+                )
+                canonical_current_ids.add(artifact_id)
+                continue
+            seal_matches_current_proof = (
+                existing_seal is None
+                or existing_seal == expected_seal
+            )
+            if recognizable_proof and seal_matches_current_proof:
+                repairable_stale_rows.append(
+                    (artifact_id, sha256, size_bytes, metadata_json)
+                )
+                continue
+            unexpected.append((kind, uri, sha256))
+        if unexpected:
+            raise ValueError(
+                f"ambiguous pre-existing proof artifact ledger evidence for {operation_id}: {unexpected}"
+            )
+        input_bindings_complete = all(
+            conn.execute(
+                "SELECT 1 FROM artifacts WHERE uri = ? AND sha256 = ? LIMIT 1",
+                (uri, sha256),
+            ).fetchone()
+            is not None
+            for uri, sha256 in expected_inputs
+        )
+        proof_binding_rows = conn.execute(
+            """
+            SELECT id
+            FROM artifacts
+            WHERE uri = ?
+              AND sha256 = ?
+              AND size_bytes = ?
+            """,
+            (proof_uri, proof_sha256, proof_size_bytes),
+        ).fetchall()
+        proof_binding_ids = {str(row["id"]) for row in proof_binding_rows}
+        if (
+            len(canonical_current_ids) > 1
+            or proof_binding_ids != canonical_current_ids
+        ):
+            raise ValueError(
+                f"ambiguous pre-existing proof-pack URI/hash ledger binding for {operation_id}"
+            )
+        proof_binding_complete = len(canonical_current_ids) == 1
+    finally:
+        conn.close()
+    changed = False
+    if repairable_stale_rows or metadata_repair_rows:
+        conn = connect(root)
+        try:
+            for artifact_id, sha256, size_bytes, metadata_json in sorted(
+                repairable_stale_rows
+            ):
+                deleted = conn.execute(
+                    """
+                    DELETE FROM artifacts
+                    WHERE id = ?
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND kind = 'proof_pack'
+                      AND uri = ?
+                      AND sha256 = ?
+                      AND size_bytes = ?
+                      AND metadata_json = ?
+                    """,
+                    (
+                        artifact_id,
+                        operation_id,
+                        proof_uri,
+                        sha256,
+                        size_bytes,
+                        metadata_json,
+                    ),
+                )
+                if deleted.rowcount != 1:
+                    raise ValueError(
+                        f"stale proof binding changed before repair for {operation_id}"
+                    )
+            for (
+                artifact_id,
+                sha256,
+                size_bytes,
+                metadata_json,
+                repaired_metadata_json,
+            ) in sorted(metadata_repair_rows):
+                updated = conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET metadata_json = ?
+                    WHERE id = ?
+                      AND operation_id = ?
+                      AND source_type = 'proof_pack'
+                      AND kind = 'proof_pack'
+                      AND uri = ?
+                      AND sha256 = ?
+                      AND size_bytes = ?
+                      AND metadata_json = ?
+                    """,
+                    (
+                        repaired_metadata_json,
+                        artifact_id,
+                        operation_id,
+                        proof_uri,
+                        sha256,
+                        size_bytes,
+                        metadata_json,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(
+                        f"proof metadata changed before repair for {operation_id}"
+                    )
+            conn.commit()
+            changed = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    if input_bindings_complete and proof_binding_complete:
+        return changed
+
+    _record_proof_artifacts(
+        root,
+        operation_id,
+        proof_path,
+        [item for item in stored_proof.get("paths") or [] if isinstance(item, dict)],
+    )
+    conn = connect_existing(root)
+    try:
+        input_bindings_complete = all(
+            conn.execute(
+                "SELECT 1 FROM artifacts WHERE uri = ? AND sha256 = ? LIMIT 1",
+                (uri, sha256),
+            ).fetchone()
+            is not None
+            for uri, sha256 in expected_inputs
+        )
+        proof_rows = conn.execute(
+            """
+            SELECT metadata_json
+            FROM artifacts
+            WHERE kind = 'proof_pack'
+              AND uri = ?
+              AND sha256 = ?
+              AND size_bytes = ?
+              AND operation_id = ?
+              AND source_type = 'proof_pack'
+            """,
+            (proof_uri, proof_sha256, proof_size_bytes, operation_id),
+        ).fetchall()
+        proof_binding_complete = False
+        if len(proof_rows) == 1:
+            try:
+                proof_metadata = json.loads(str(proof_rows[0]["metadata_json"] or "{}"))
+            except json.JSONDecodeError:
+                proof_metadata = None
+            proof_binding_complete = (
+                isinstance(proof_metadata, dict)
+                and proof_metadata.get("schema") == PROOF_PACK_SCHEMA
+            )
+    finally:
+        conn.close()
+    if not input_bindings_complete or not proof_binding_complete:
+        raise ValueError(f"could not complete proof artifact ledger binding for {operation_id}")
+    return True
+
+
+def _seal_completed_stale_recovery_publication(
+    root: Path,
+    operation_id: str,
+    receipt: dict[str, Any],
+    marker: dict[str, Any],
+    packet: dict[str, Any],
+) -> bool:
+    if not operation_lock_is_held(root, operation_id):
+        raise RuntimeError("stale recovery sealing requires the per-operation lock")
+    if not operation_lock_is_held(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+        raise RuntimeError("stale recovery sealing requires the proof mutation lock")
+    seal = _stale_recovery_publication_seal_payload(root, receipt, marker)
+    if seal is None or seal["recovery_packet_hash"] != packet.get("packet_hash"):
+        raise ValueError(f"cannot seal incomplete stale recovery publication for {operation_id}")
+    proof_uri = str(seal["proof_pack_uri"])
+    proof_sha256 = str(seal["proof_sha256"])
+    proof_size_bytes = int(seal["proof_size_bytes"])
+    conn = connect(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, sha256, size_bytes, metadata_json
+            FROM artifacts
+            WHERE kind = 'proof_pack'
+              AND operation_id = ?
+              AND source_type = 'proof_pack'
+              AND uri = ?
+            """,
+            (operation_id, proof_uri),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError(
+                f"stale recovery publication has ambiguous canonical proof binding for {operation_id}"
+            )
+        row = rows[0]
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"stale recovery publication has invalid proof metadata for {operation_id}"
+            ) from exc
+        if (
+            str(row["sha256"]) != proof_sha256
+            or int(row["size_bytes"]) != proof_size_bytes
+            or not isinstance(metadata, dict)
+            or metadata.get("schema") != PROOF_PACK_SCHEMA
+        ):
+            raise ValueError(
+                f"stale recovery publication proof binding is not sealable for {operation_id}"
+            )
+        existing_seal = metadata.get("stale_recovery_publication_seal")
+        if existing_seal == seal:
+            return False
+        if existing_seal is not None:
+            raise ValueError(
+                f"stale recovery publication has a conflicting durable seal for {operation_id}"
+            )
+        metadata["stale_recovery_publication_seal"] = seal
+        updated = conn.execute(
+            """
+            UPDATE artifacts
+            SET metadata_json = ?
+            WHERE id = ?
+              AND kind = 'proof_pack'
+              AND operation_id = ?
+              AND source_type = 'proof_pack'
+              AND uri = ?
+              AND sha256 = ?
+              AND size_bytes = ?
+            """,
+            (
+                json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                str(row["id"]),
+                operation_id,
+                proof_uri,
+                proof_sha256,
+                proof_size_bytes,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError(
+                f"stale recovery publication proof binding changed before seal for {operation_id}"
+            )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _record_stale_recovery_publication_failure(
+    root: Path,
+    operation_id: str,
+    exc: BaseException,
+    *,
+    preserve_artifact_ids: set[str],
+) -> dict[str, Any]:
+    if not operation_lock_is_held(root, operation_id):
+        raise RuntimeError("stale recovery failure recording requires the per-operation lock")
+    proof_path = proof_pack_path(root, operation_id)
+    proof_removed = False
+    artifact_rows_removed = 0
+    with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+        artifact_rows_removed = _remove_proof_artifact_rows(
+            root,
+            operation_id,
+            preserve_ids=preserve_artifact_ids,
+        )
+        if proof_path.exists() or proof_path.is_symlink():
+            if proof_path.is_dir() and not proof_path.is_symlink():
+                raise ValueError(f"current stale recovery proof path is not a file: {proof_path}")
+            proof_path.unlink()
+            proof_removed = True
+
+    receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+    receipt["proof_pack_uri"] = None
+    receipt.pop("proof_pack_hash", None)
+    event = {
+        "at": utc_now(),
+        "phase": "stale_recovery_publication_failed",
+        "message": str(exc),
+        "detail": {
+            "error_type": type(exc).__name__,
+            "proof_removed": proof_removed,
+            "artifact_rows_removed": artifact_rows_removed,
+            "cleanup_errors": [],
+        },
+    }
+    receipt.setdefault("progress", []).append(event)
+    written = _write_operation_unlocked(root, receipt)
+    _append_operation_event_unlocked(
+        root,
+        operation_id,
+        event_type="stale_recovery_publication_failed",
+        payload=event,
+    )
+    return written
+
+
+def _publish_stale_operation_recovery(
+    root: Path,
+    operation_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    operation_id = validate_operation_id(operation_id)
+    if not operation_lock_is_held(root, operation_id):
+        raise RuntimeError("stale recovery publication requires the per-operation lock")
+
+    receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+    marker = _stale_operation_recovery_marker(receipt)
+    if marker is None:
+        raise ValueError("operation is not eligible for stale recovery publication repair")
+    completed = _completed_stale_operation_recovery_publication(root, receipt, marker)
+    if completed is not None:
+        packet, proof = completed
+        with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+            artifact_binding_repaired = _ensure_completed_stale_recovery_proof_artifacts(
+                root,
+                operation_id,
+                proof_pack_path(root, operation_id),
+                proof,
+                receipt=receipt,
+                marker=marker,
+            )
+            seal_written = _seal_completed_stale_recovery_publication(
+                root,
+                operation_id,
+                receipt,
+                marker,
+                packet,
+            )
+        return packet, proof, artifact_binding_repaired or seal_written
+
+    proof_path = proof_pack_path(root, operation_id)
+    ledger_repair_candidate = _completed_stale_operation_recovery_publication(
+        root,
+        receipt,
+        marker,
+        allow_artifact_ledger_repair=True,
+    )
+    if ledger_repair_candidate is not None:
+        packet, proof = ledger_repair_candidate
+        with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+            _ensure_completed_stale_recovery_proof_artifacts(
+                root,
+                operation_id,
+                proof_path,
+                proof,
+                receipt=receipt,
+                marker=marker,
+            )
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        completed = _completed_stale_operation_recovery_publication(root, receipt, marker)
+        if completed is None:
+            raise ValueError(f"stale recovery proof artifact ledger repair failed for {operation_id}")
+        packet, proof = completed
+        with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+            _seal_completed_stale_recovery_publication(
+                root,
+                operation_id,
+                receipt,
+                marker,
+                packet,
+            )
+        return packet, proof, True
+
+    if proof_path.exists() or proof_path.is_symlink():
+        raise ValueError(
+            f"cannot safely repair stale recovery with a pre-existing canonical proof: {proof_path}"
+        )
+
+    _ensure_stale_recovery_interrupted_event(root, operation_id, marker)
+    with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+        orphan_artifact_ids = _stale_recovery_orphan_proof_artifact_ids(
+            root,
+            operation_id,
+            proof_path,
+        )
+        if orphan_artifact_ids:
+            _remove_proof_artifact_rows(root, operation_id, preserve_ids=set())
+        preserve_artifact_ids = _proof_artifact_ids_for_operation(root, operation_id)
+        if preserve_artifact_ids:
+            raise ValueError(
+                f"cannot safely repair stale recovery with pre-existing proof artifact ledger evidence: "
+                f"{operation_id}"
+            )
+
+    receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+    if receipt.get("proof_pack_uri") is not None or "proof_pack_hash" in receipt:
+        receipt["proof_pack_uri"] = None
+        receipt.pop("proof_pack_hash", None)
+        receipt = _write_operation_unlocked(root, receipt)
+    packet_receipt = dict(receipt)
+    packet_receipt["proof_pack_uri"] = str(proof_path)
+    try:
+        packet = _write_operation_recovery_packet(
+            root,
+            packet_receipt,
+            reason=str(marker["reason"]),
+        )
+        create_proof_pack(
+            root,
+            operation_id,
+            touched_paths=[packet["packet_uri"], packet["packet_json_uri"]],
+            extra={"recovery_reason": marker["reason"], "recovery_packet_hash": packet["packet_hash"]},
+        )
+        receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+        completed = _completed_stale_operation_recovery_publication(root, receipt, marker)
+        if completed is None:
+            raise ValueError(f"stale recovery publication verification failed for {operation_id}")
+        packet, proof = completed
+        with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+            _ensure_completed_stale_recovery_proof_artifacts(
+                root,
+                operation_id,
+                proof_path,
+                proof,
+                receipt=receipt,
+                marker=marker,
+            )
+            _seal_completed_stale_recovery_publication(
+                root,
+                operation_id,
+                receipt,
+                marker,
+                packet,
+            )
+        return packet, proof, True
+    except Exception as exc:
+        try:
+            durable_receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+            durable_marker = _stale_operation_recovery_marker(durable_receipt)
+            durable_completion: tuple[dict[str, Any], dict[str, Any]] | None = None
+            if durable_marker is not None:
+                with operation_lock(root, PROOF_ARTIFACT_MUTATION_LOCK_OPERATION_ID):
+                    durable_completion = _completed_stale_operation_recovery_publication(
+                        root,
+                        durable_receipt,
+                        durable_marker,
+                    )
+                    durable_sealed = (
+                        durable_completion is not None
+                        and _stale_recovery_publication_is_sealed(
+                            root,
+                            durable_receipt,
+                        )
+                    )
+                if durable_completion is not None and durable_sealed:
+                    durable_packet, durable_proof = durable_completion
+                    return durable_packet, durable_proof, True
+        except Exception as seal_check_exc:
+            exc.add_note(
+                "stale recovery durable seal check failed before cleanup: "
+                f"{type(seal_check_exc).__name__}: {seal_check_exc}"
+            )
+            raise exc from seal_check_exc
+        try:
+            _record_stale_recovery_publication_failure(
+                root,
+                operation_id,
+                exc,
+                preserve_artifact_ids=preserve_artifact_ids,
+            )
+        except Exception as cleanup_exc:
+            exc.add_note(
+                "stale recovery publication failure cleanup also failed: "
+                f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+            )
+        raise
 
 
 def recover_stale_operations(
@@ -2656,38 +3858,77 @@ def recover_stale_operations(
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             skipped.append({"path": str(path), "error": str(exc)})
             continue
+    if mark and any(_stale_operation_recovery_marker(receipt) is not None for receipt in receipts):
+        proof_seal_bindings = _stale_recovery_proof_seal_bindings(root)
+        receipts = [
+            receipt
+            for receipt in receipts
+            if not _stale_recovery_publication_is_sealed(
+                root,
+                receipt,
+                proof_seal_bindings=proof_seal_bindings,
+            )
+        ]
     for receipt in sorted(receipts, key=lambda item: _safe_timestamp(item.get("updated_at"))):
-        if receipt.get("status") not in ACTIVE_STATUSES:
-            continue
-        updated = _parse_timestamp(receipt.get("updated_at"))
-        if updated > cutoff:
-            continue
-        operation_id = str(receipt["operation_id"])
-        if older_than_seconds <= 0:
-            reason = "operation selected for immediate recovery"
+        marker = _stale_operation_recovery_marker(receipt) if mark else None
+        repair_publication = marker is not None
+        if marker is not None:
+            operation_id = str(receipt["operation_id"])
+            reason = str(marker["reason"])
         else:
-            reason = f"operation remained running for at least {older_than_seconds} seconds"
+            if receipt.get("status") not in ACTIVE_STATUSES:
+                continue
+            updated = _parse_timestamp(receipt.get("updated_at"))
+            if updated > cutoff:
+                continue
+            operation_id = str(receipt["operation_id"])
+            if older_than_seconds <= 0:
+                reason = "operation selected for immediate recovery"
+            else:
+                reason = f"operation remained running for at least {older_than_seconds} seconds"
         if mark:
-            receipt = finish_operation(
-                root,
-                operation_id,
-                status="interrupted",
-                error={
-                    "type": "InterruptedOperation",
-                    "message": reason,
-                    "updated_at": receipt.get("updated_at"),
-                },
-            )
-            receipt["proof_pack_uri"] = str(proof_pack_path(root, operation_id))
-            receipt = write_operation(root, receipt)
-            packet = _write_operation_recovery_packet(root, receipt, reason=reason)
-            proof = create_proof_pack(
-                root,
-                operation_id,
-                touched_paths=[packet["packet_uri"], packet["packet_json_uri"]],
-                extra={"recovery_reason": reason, "recovery_packet_hash": packet["packet_hash"]},
-            )
-            receipt = read_operation(root, operation_id)
+            selected_receipt_hash = _receipt_selection_hash(receipt)
+            with operation_lock(root, operation_id):
+                current_receipt = _load_receipt(operation_paths(root, operation_id)["run"])
+                current_marker = _stale_operation_recovery_marker(current_receipt)
+                if repair_publication:
+                    if current_marker is None:
+                        continue
+                    if _stale_recovery_publication_is_sealed(root, current_receipt):
+                        continue
+                    reason = str(current_marker["reason"])
+                else:
+                    if (
+                        current_receipt.get("operation_id") != operation_id
+                        or _receipt_selection_hash(current_receipt) != selected_receipt_hash
+                        or current_receipt.get("status") not in ACTIVE_STATUSES
+                        or _parse_timestamp(current_receipt.get("updated_at")) > cutoff
+                    ):
+                        continue
+                    selected_updated_at = current_receipt.get("updated_at")
+                    marked_at = utc_now()
+                    error = {
+                        "type": "InterruptedOperation",
+                        "message": reason,
+                        "updated_at": selected_updated_at,
+                    }
+                    current_receipt["status"] = "interrupted"
+                    current_receipt["finished_at"] = marked_at
+                    current_receipt["result"] = None
+                    current_receipt["error"] = error
+                    current_receipt["stale_recovery"] = {
+                        "schema": STALE_OPERATION_RECOVERY_MARKER_SCHEMA,
+                        "operation_id": operation_id,
+                        "reason": reason,
+                        "selected_receipt_hash": selected_receipt_hash,
+                        "selected_updated_at": selected_updated_at,
+                        "marked_at": marked_at,
+                    }
+                    _write_operation_unlocked(root, current_receipt)
+                packet, proof, published = _publish_stale_operation_recovery(root, operation_id)
+                if not published:
+                    continue
+                receipt = read_operation(root, operation_id)
         else:
             packet = {
                 "packet_uri": None,

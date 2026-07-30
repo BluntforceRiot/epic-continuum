@@ -58,10 +58,12 @@ sessions, ingest files, snapshot the catalog, and optimize hardware budgets.
 The checked-in `.mcp.json` uses a tiny plugin-local runner. The runner adds
 `<repo-root>/src` when the portable source tree is present and otherwise falls
 back to an installed Python package, using the server's default `~/.continuum`
-root. The installer scripts create a staged marketplace copy with generated
-local source/root paths before Codex caches the plugin; they do not rewrite the
-tracked checkout. Treat `.codex-plugin` packaging as a convenience wrapper, not
-the durable memory contract itself.
+ root. The installer scripts create a staged marketplace copy with generated
+ local source/root paths and any configured `CONTINUUM_ALLOWED_ROOTS` before
+ Codex caches the plugin; they do not rewrite the tracked checkout. Those values
+ participate in the generated plugin version, so changing the allowed-root
+ boundary forces a new cache identity. Treat `.codex-plugin` packaging as a
+ convenience wrapper, not the durable memory contract itself.
 
 Mutating MCP tools return their normal JSON payload plus an `_operation` object
 with the operation receipt and proof-pack paths.
@@ -86,12 +88,19 @@ MCP process can import `continuum`.
 If you want the plugin wrapper too, install it with:
 
 ```powershell
-.\scripts\install_codex_plugin.ps1 -Root "$env:CONTINUUM_ROOT"
+.\scripts\install_codex_plugin.ps1 `
+  -Root "$env:CONTINUUM_ROOT" `
+  -AllowedRoots "$env:CONTINUUM_ALLOWED_ROOTS"
 ```
 
 ```bash
-./scripts/install_codex_plugin.sh --root "$CONTINUUM_ROOT"
+./scripts/install_codex_plugin.sh \
+  --root "$CONTINUUM_ROOT" \
+  --allowed-roots "$CONTINUUM_ALLOWED_ROOTS"
 ```
+
+Pass `-Codex <path>` on PowerShell or `--codex <path>` in the shell wrapper
+when the intended Codex CLI is not the executable resolved from `PATH`.
 
 The portable repo includes `.agents/plugins/marketplace.json`. The installer
 stages that marketplace before registration so generated local paths do not
@@ -102,19 +111,19 @@ modify the source checkout. The staged marketplace path is stable:
 ```
 
 Only the generated plugin version changes when the Continuum root, Python path,
-or plugin content changes. That keeps Codex's marketplace source stable while
-still forcing its plugin cache to refresh. Manual registration should therefore
-use the staged path printed by the installer or helper, not the tracked repo
-root:
+allowed-root boundary, or plugin content changes. That keeps Codex's marketplace
+source stable while still forcing its plugin cache to refresh. Manual
+registration should therefore use the staged path printed by the installer or
+helper, not the tracked repo root:
 
 ```powershell
-$stage = python .\scripts\stage_codex_plugin.py --repo-root "$PWD" --root "$env:CONTINUUM_ROOT" --python python --stage-base "$HOME\.cache\epic-continuum\codex-marketplace"
+$stage = python .\scripts\stage_codex_plugin.py --repo-root "$PWD" --root "$env:CONTINUUM_ROOT" --python python --stage-base "$HOME\.cache\epic-continuum\codex-marketplace" --allowed-roots "$env:CONTINUUM_ALLOWED_ROOTS"
 codex plugin marketplace add $stage
 codex plugin add continuum@epic-continuum
 ```
 
 ```bash
-stage="$(python3 ./scripts/stage_codex_plugin.py --repo-root "$PWD" --root "$CONTINUUM_ROOT" --python python3 --stage-base "$HOME/.cache/epic-continuum/codex-marketplace")"
+stage="$(python3 ./scripts/stage_codex_plugin.py --repo-root "$PWD" --root "$CONTINUUM_ROOT" --python python3 --stage-base "$HOME/.cache/epic-continuum/codex-marketplace" --allowed-roots "$CONTINUUM_ALLOWED_ROOTS")"
 codex plugin marketplace add "$stage"
 codex plugin add continuum@epic-continuum
 ```

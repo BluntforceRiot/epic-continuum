@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,337 @@ class ScribeBacklogTest(unittest.TestCase):
                 [(1, 2), (3, 4), (5, 6)],
             )
             self.assertEqual({row["status"]: row["n"] for row in final_states}, {"succeeded": 2})
+
+    def test_normal_65_event_drain_keeps_retry_beside_continuation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _root_with_threshold(tmp, threshold=1)
+            source_job_id = _append_events(
+                root,
+                session_id="normal-65-event-retry-transfer",
+                count=65,
+            )[0]
+
+            first = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["retry_pending_count"], 1)
+            first_attempt = first["processed"][0]
+            self.assertEqual(first_attempt["job_id"], source_job_id)
+            self.assertEqual(first_attempt["status"], "skipped")
+            self.assertTrue(first_attempt["result"]["retry_transferred"])
+            continuation_job_id = first_attempt["result"]["retry_job_id"]
+            self.assertNotEqual(continuation_job_id, source_job_id)
+
+            conn = connect(root)
+            try:
+                mid_rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, retry_pending, retry_order,
+                               dedupe_key
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (source_job_id, continuation_job_id),
+                    ).fetchall()
+                }
+                segment_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM scroll_segments
+                        WHERE session_id = ?
+                        """,
+                        ("normal-65-event-retry-transfer",),
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(segment_count, 64)
+            self.assertEqual(
+                (
+                    mid_rows[source_job_id]["status"],
+                    mid_rows[source_job_id]["retry_pending"],
+                    mid_rows[source_job_id]["dedupe_key"],
+                ),
+                (
+                    "skipped",
+                    0,
+                    mid_rows[continuation_job_id]["dedupe_key"],
+                ),
+            )
+            self.assertEqual(
+                mid_rows[source_job_id]["retry_order"],
+                0,
+            )
+            self.assertEqual(
+                (
+                    mid_rows[continuation_job_id]["status"],
+                    mid_rows[continuation_job_id]["retry_pending"],
+                ),
+                ("pending", 1),
+            )
+            self.assertGreater(
+                mid_rows[continuation_job_id]["retry_order"],
+                0,
+            )
+            self.assertIsNotNone(
+                mid_rows[continuation_job_id]["dedupe_key"]
+            )
+
+            preview = worker_module.reconcile_worker_backlog(
+                root,
+                dry_run=True,
+            )
+            reconciled = worker_module.reconcile_worker_backlog(
+                root,
+                dry_run=False,
+            )
+            self.assertEqual(preview["queue"]["redundant_before"], 0)
+            self.assertEqual(reconciled["queue"]["changed"], 0)
+
+            second = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(
+                second["processed"][0]["job_id"],
+                continuation_job_id,
+            )
+            self.assertEqual(
+                second["processed"][0]["status"],
+                "succeeded",
+            )
+
+            final_service = worker_module.serve_workers(
+                root,
+                roles=["scribe"],
+                limit=1,
+                interval_seconds=0.1,
+                maintenance_interval_seconds=3600.0,
+                maintenance_on_start=False,
+            )
+            self.assertTrue(final_service["ok"], final_service)
+
+            conn = connect(root)
+            try:
+                final_rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, retry_pending, retry_order
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (source_job_id, continuation_job_id),
+                    ).fetchall()
+                }
+                final_segment_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM scroll_segments
+                        WHERE session_id = ?
+                        """,
+                        ("normal-65-event-retry-transfer",),
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(final_segment_count, 65)
+            self.assertEqual(final_rows[source_job_id]["status"], "skipped")
+            self.assertEqual(
+                final_rows[continuation_job_id]["status"],
+                "succeeded",
+            )
+            for job_id in (source_job_id, continuation_job_id):
+                self.assertEqual(final_rows[job_id]["retry_pending"], 0)
+                self.assertEqual(final_rows[job_id]["retry_order"], 0)
+
+    def test_continuation_refresh_preserves_transferred_retry_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _root_with_threshold(tmp, threshold=1)
+            session_id = "scribe-transferred-refresh-authority"
+            source_job_id = _append_events(
+                root,
+                session_id=session_id,
+                count=65,
+            )[0]
+
+            first = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=1,
+                maintenance=False,
+            )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["processed_count"], 1)
+            self.assertEqual(first["retry_pending_count"], 1)
+            first_attempt = first["processed"][0]
+            self.assertEqual(first_attempt["job_id"], source_job_id)
+            self.assertEqual(first_attempt["status"], "skipped")
+            self.assertTrue(first_attempt["result"]["retry_transferred"])
+            continuation_job_id = first_attempt["result"]["retry_job_id"]
+
+            conn = connect(root)
+            try:
+                before = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, error_json,
+                               dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            before_receipt = json.loads(before["error_json"])
+            self.assertEqual(before["status"], "pending")
+            self.assertEqual(before["retry_pending"], 1)
+            self.assertGreater(before["retry_order"], 0)
+            self.assertIsNotNone(before["dedupe_key"])
+            self.assertTrue(
+                before_receipt["result"]["retry_transferred"]
+            )
+            self.assertEqual(
+                before_receipt["result"]["retry_source_job_id"],
+                source_job_id,
+            )
+            self.assertEqual(
+                before_receipt["result"]["retry_job_id"],
+                continuation_job_id,
+            )
+
+            real_enqueue_job = worker_module.enqueue_job
+            with patch.object(
+                worker_module,
+                "enqueue_job",
+                wraps=real_enqueue_job,
+            ) as enqueue_spy:
+                refreshed = worker_module._ensure_scribe_continuation(
+                    root,
+                    session_id=session_id,
+                    threshold=1,
+                )
+
+            self.assertEqual(
+                refreshed["continuation_job_id"],
+                continuation_job_id,
+            )
+            self.assertTrue(
+                any(
+                    call.kwargs.get("replace_pending") is True
+                    for call in enqueue_spy.call_args_list
+                ),
+                enqueue_spy.call_args_list,
+            )
+            conn = connect(root)
+            try:
+                after = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, error_json,
+                               dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+                pending_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND dedupe_key = ?
+                        ORDER BY id
+                        """,
+                        (before["dedupe_key"],),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(after, before)
+            self.assertEqual(pending_ids, [continuation_job_id])
+
+            claimed = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=2,
+                maintenance=False,
+            )
+            idle = run_worker_pass(
+                root,
+                roles=["scribe"],
+                limit=2,
+                maintenance=False,
+            )
+
+            self.assertTrue(claimed["ok"], claimed)
+            self.assertEqual(claimed["processed_count"], 1, claimed)
+            self.assertEqual(
+                claimed["processed"][0]["job_id"],
+                continuation_job_id,
+            )
+            self.assertEqual(
+                claimed["processed"][0]["status"],
+                "succeeded",
+            )
+            self.assertTrue(idle["ok"], idle)
+            self.assertEqual(idle["processed_count"], 0, idle)
+
+            conn = connect(root)
+            try:
+                final = dict(
+                    conn.execute(
+                        """
+                        SELECT status, attempt_count, retry_pending, retry_order
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+                segment_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM scroll_segments
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(
+                final,
+                {
+                    "status": "succeeded",
+                    "attempt_count": 1,
+                    "retry_pending": 0,
+                    "retry_order": 0,
+                },
+            )
+            self.assertEqual(segment_count, 65)
 
     def test_existing_pending_continuation_is_refreshed_to_parent_priority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

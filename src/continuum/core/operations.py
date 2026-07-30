@@ -123,7 +123,16 @@ def _thread_operation_lock(key: str) -> threading.RLock:
         return _OPERATION_LOCKS.setdefault(key, threading.RLock())
 
 
-def _lock_file_handle(handle: Any, *, timeout_seconds: float) -> None:
+def _operation_lock_remaining(*, deadline: float, nonblocking: bool) -> float:
+    if nonblocking:
+        return 0.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise TimeoutError("timed out waiting for operation lock")
+    return remaining
+
+
+def _lock_file_handle(handle: Any, *, deadline: float, nonblocking: bool) -> None:
     if os.name == "nt":
         import msvcrt
 
@@ -134,33 +143,41 @@ def _lock_file_handle(handle: Any, *, timeout_seconds: float) -> None:
             handle.write(b"\0")
             handle.flush()
             os.fsync(handle.fileno())
-        deadline = time.monotonic() + timeout_seconds
         while True:
+            _operation_lock_remaining(deadline=deadline, nonblocking=nonblocking)
             handle.seek(0)
             try:
                 locking(handle.fileno(), lock_nonblocking, 1)
                 return
             except OSError:
-                if time.monotonic() >= deadline:
+                if nonblocking:
                     raise TimeoutError("timed out waiting for operation lock") from None
-                time.sleep(0.05)
+                remaining = _operation_lock_remaining(
+                    deadline=deadline,
+                    nonblocking=False,
+                )
+                time.sleep(min(0.05, remaining))
     else:
         import fcntl
 
         flock = getattr(fcntl, "flock")
         lock_ex = getattr(fcntl, "LOCK_EX")
         lock_nb = getattr(fcntl, "LOCK_NB")
-        deadline = time.monotonic() + timeout_seconds
         while True:
+            _operation_lock_remaining(deadline=deadline, nonblocking=nonblocking)
             try:
                 flock(handle.fileno(), lock_ex | lock_nb)
                 return
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
-                if time.monotonic() >= deadline:
+                if nonblocking:
                     raise TimeoutError("timed out waiting for operation lock") from None
-                time.sleep(0.05)
+                remaining = _operation_lock_remaining(
+                    deadline=deadline,
+                    nonblocking=False,
+                )
+                time.sleep(min(0.05, remaining))
 
 
 def _unlock_file_handle(handle: Any) -> None:
@@ -215,12 +232,16 @@ def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60
     safe_id = validate_operation_id(operation_id)
     lock_path = root / "run" / "locks" / "operations" / f"{safe_id}.lock"
     key = str(lock_path.resolve(strict=False))
-    bounded_timeout = max(0.0, float(timeout_seconds))
-    deadline = time.monotonic() + bounded_timeout
     thread_lock = _thread_operation_lock(key)
     held: dict[str, int] = getattr(_OPERATION_LOCK_STATE, "held", {})
     _OPERATION_LOCK_STATE.held = held
-    remaining = max(0.0, deadline - time.monotonic())
+    bounded_timeout = max(0.0, float(timeout_seconds))
+    nonblocking = bounded_timeout == 0.0
+    deadline = time.monotonic() + bounded_timeout
+    remaining = _operation_lock_remaining(
+        deadline=deadline,
+        nonblocking=nonblocking,
+    )
     if not thread_lock.acquire(timeout=remaining):
         raise TimeoutError("timed out waiting for operation lock")
     try:
@@ -233,22 +254,38 @@ def operation_lock(root: Path, operation_id: str, *, timeout_seconds: float = 60
             return
         secure_mkdir(lock_path.parent)
         handle = _open_operation_lock_file(lock_path)
-        secure_file(lock_path)
+        file_locked = False
         try:
+            secure_file(lock_path)
             _lock_file_handle(
                 handle,
-                timeout_seconds=max(0.0, deadline - time.monotonic()),
+                deadline=deadline,
+                nonblocking=nonblocking,
             )
+            file_locked = True
             held[key] = 1
             try:
                 yield
             finally:
                 held.pop(key, None)
-                _unlock_file_handle(handle)
         finally:
-            handle.close()
+            try:
+                if file_locked:
+                    _unlock_file_handle(handle)
+            finally:
+                handle.close()
     finally:
         thread_lock.release()
+
+
+def operation_lock_is_held(root: Path, operation_id: str) -> bool:
+    """Return whether this thread holds the exact per-root operation lock."""
+
+    safe_id = validate_operation_id(operation_id)
+    lock_path = root / "run" / "locks" / "operations" / f"{safe_id}.lock"
+    key = str(lock_path.resolve(strict=False))
+    held: dict[str, int] = getattr(_OPERATION_LOCK_STATE, "held", {})
+    return held.get(key, 0) > 0
 
 
 OPERATION_SCHEMA = "epic_continuum.operation_receipt.v1"

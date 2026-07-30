@@ -27,6 +27,69 @@ from continuum.core.store import (
 
 
 class ResumeCliTests(unittest.TestCase):
+    def test_run_workers_cli_succeeds_for_truthful_incomplete_lease_attempt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            worker_result = {
+                "ok": True,
+                "processed_count": 1,
+                "retry_pending_count": 0,
+                "incomplete_attempt_count": 1,
+                "processed": [
+                    {
+                        "job_id": "job_cli_lost_lease",
+                        "status": "incomplete",
+                        "ok": True,
+                        "attempt_completed": False,
+                        "reason": "worker_lease_lost",
+                        "authoritative_job_ok": True,
+                        "authoritative_job": {
+                            "exists": True,
+                            "status": "running",
+                        },
+                    }
+                ],
+                "maintenance": {},
+            }
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"CONTINUUM_ALLOWED_ROOTS": tmp},
+                ),
+                patch(
+                    "continuum.cli.run_worker_pass",
+                    return_value=worker_result,
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli_main(
+                    [
+                        "run-workers",
+                        "--root",
+                        str(root),
+                        "--limit",
+                        "1",
+                        "--no-maintenance",
+                    ]
+                )
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["incomplete_attempt_count"], 1)
+            self.assertEqual(
+                result["processed"][0]["status"],
+                "incomplete",
+            )
+            self.assertEqual(
+                result["_operation"]["status"],
+                "succeeded",
+            )
+
     def test_run_workers_cli_preserves_queue_ownership_and_failure_receipts(
         self,
     ) -> None:

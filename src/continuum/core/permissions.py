@@ -364,6 +364,117 @@ def set_windows_delete_disposition(handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
+def retire_exact_windows_file(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int, int],
+) -> bool:
+    """Delete one exact Windows file object by handle, never by final pathname.
+
+    ``False`` means the caller is on a non-Windows platform and must use its
+    bounded non-deleting retirement slot.
+    """
+
+    if os.name != "nt":
+        return False
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    generic_read = 0x80000000
+    file_read_attributes = 0x00000080
+    delete_access = 0x00010000
+    share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    raw_handle = kernel32.CreateFileW(
+        str(path),
+        generic_read | file_read_attributes | delete_access,
+        share_read,
+        None,
+        open_existing,
+        file_attribute_normal | open_reparse_point,
+        None,
+    )
+    handle_value = int(getattr(raw_handle, "value", raw_handle) or 0)
+    if handle_value in {0, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    fd = -1
+    try:
+        fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            handle_value,
+            os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
+        )
+        handle_value = 0
+        opened = os.fstat(fd)
+        reparse_flag = int(
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or bool(
+                int(getattr(opened, "st_file_attributes", 0))
+                & reparse_flag
+            )
+            or int(opened.st_dev) != expected_identity[0]
+            or int(opened.st_ino) != expected_identity[1]
+            or stat.S_IFMT(opened.st_mode) != expected_identity[2]
+            or int(opened.st_size) != expected_identity[3]
+            or int(opened.st_mtime_ns) != expected_identity[4]
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "exact Windows retirement handle identity changed",
+                str(path),
+            )
+        current = os.lstat(path)
+        current_identity = (
+            int(current.st_dev),
+            int(current.st_ino),
+            stat.S_IFMT(current.st_mode),
+            int(current.st_size),
+            int(current.st_mtime_ns),
+            int(current.st_ctime_ns),
+        )
+        if current_identity != expected_identity:
+            raise OSError(
+                errno.ESTALE,
+                "exact Windows retirement namespace identity changed",
+                str(path),
+            )
+        set_windows_delete_disposition(
+            int(msvcrt.get_osfhandle(fd)),  # type: ignore[attr-defined]
+        )
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        elif handle_value not in {0, invalid_handle}:
+            kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+    if os.path.lexists(path):
+        raise OSError(
+            errno.ESTALE,
+            "exact Windows retirement path remained after handle deletion",
+            str(path),
+        )
+    return True
+
+
 def _probe_directory(path: Path | None = None) -> Path | None:
     candidate = Path(tempfile.gettempdir()) if path is None else Path(path)
     if candidate.exists() and candidate.is_file():
@@ -611,9 +722,23 @@ def _flush_posix_path_strict(
             )
 
 
-def _flush_path_strict(path: Path, *, require_directory: bool) -> None:
+def _flush_path_strict(
+    path: Path,
+    *,
+    require_directory: bool,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     absolute = path.absolute()
     expected = _durability_stat(absolute, require_directory=require_directory)
+    if (
+        expected_identity is not None
+        and _durability_identity(expected) != expected_identity
+    ):
+        raise OSError(
+            errno.ESTALE,
+            "durability target identity changed before flush",
+            str(absolute),
+        )
     if os.name == "nt":
         _flush_windows_path_strict(
             absolute,
@@ -639,10 +764,18 @@ def _flush_path_strict(path: Path, *, require_directory: bool) -> None:
         raise OSError(errno.ESTALE, "durability target size changed after flush", str(absolute))
 
 
-def flush_file_strict(path: Path) -> None:
+def flush_file_strict(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     """Fail unless one plain regular file is durably flushed."""
 
-    _flush_path_strict(Path(path), require_directory=False)
+    _flush_path_strict(
+        Path(path),
+        require_directory=False,
+        expected_identity=expected_identity,
+    )
 
 
 def flush_directory_strict(path: Path) -> None:

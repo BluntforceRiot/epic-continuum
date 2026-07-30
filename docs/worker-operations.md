@@ -69,13 +69,16 @@ An artifact registrar never needs to acquire the operation lock while holding a
 database writer.
 
 Crash-left publisher temporary files are inventoried with exact path identities
-while a short SQLite writer fence waits out transaction-bound publishers. The
-fence is committed before those identities are retired and their directories
-are flushed; a same-name replacement fails the identity check. Specifically,
-neither post-commit YAML publication and its file/directory flushes nor
-publisher-temp retirement and its flushes run while these paths hold a SQLite
-writer transaction. Worker sidecar jobs use this same after-commit path rather
-than writing files from their effect transaction.
+under the per-root sidecar operation lock. Reconciliation alternates across the
+active-intent and retirement namespaces within an explicit entry limit, then
+retires only the captured publisher-temporary identities; a same-name
+replacement fails the identity check. Nonempty selected-Card passes perform a
+second bounded, read-only inventory before declaring completion so authority
+that appeared reentrantly during processing remains visible as pending. Results
+report the initial and postflight observation limits and counts separately.
+Inventory, publisher-temporary retirement, and their directory flushes do not
+hold a SQLite writer transaction. Worker sidecar jobs use this same
+after-commit path rather than writing files from their effect transaction.
 
 Normal post-write reconciliation captures Cards, sidecar outbox rows, immutable
 artifact authority, their two monotonic epochs, and the SQLite schema authority
@@ -90,12 +93,28 @@ authority. After that commit, reconciliation reopens the exact file identities,
 durably publishes the receipt, and retires the intent. A crash between the
 compare-and-swap and receipt publication therefore leaves the intent replayable.
 
-Only a destructive quarantine decision is rerun under a fresh writer snapshot.
-That exceptional path may move and flush an unreferenced file while holding its
-writer fence so it cannot quarantine newly committed Card or artifact authority.
-Normal adoption, immutable preservation, no-file completion, receipt replay,
-and terminal receipt publication perform their filesystem work outside the
-writer transaction. Reconciliation adopts only bytes bound to the committed
+Only a destructive quarantine decision receives a separate durable reservation.
+A short `BEGIN IMMEDIATE` compare-and-swap binds the full Card/outbox/artifact
+authority token, exact raw intent evidence, target identity and hash, and the
+target/recovery names. Exact triggers then reject Card and sidecar-outbox
+inserts, updates, and deletes plus every immutable-artifact insert, transition,
+URI update, or delete until that reservation is released. Queue, Scroll, audit,
+and mutable-artifact-only writers remain available. The target move, file and
+directory flushes, recovery receipt publication, and intent retirement all run
+after the reservation commits and with no SQLite transaction open. A final
+short transaction compare-deletes the exact reservation only after the durable
+intent-bound quarantine receipt exists.
+
+The next sidecar-operation-lock holder resumes a crash before the move from the
+reserved target identity, a crash after the move from the exact recovery
+identity, or a crash after receipt publication by replaying the receipt and
+intent retirement. A malformed reservation, changed intent, target or recovery
+identity drift, both names existing, or both names missing remains fenced and
+fails closed for operator-visible recovery; it is never guessed away. Trigger
+repair likewise refuses to rewrite a nonexact protected set while a reservation
+is active. Normal adoption, immutable preservation, no-file completion, receipt
+replay, and terminal receipt publication perform their filesystem work outside
+writer transactions. Reconciliation adopts only bytes bound to the committed
 Card, preserves immutable bytes, quarantines uncommitted bytes without deleting
 them, and requeues any incomplete result.
 

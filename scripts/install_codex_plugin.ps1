@@ -5,6 +5,8 @@ param(
   [string]$Root = $(if ($env:CONTINUUM_ROOT) { $env:CONTINUUM_ROOT } else { Join-Path $HOME ".continuum" }),
   [string]$Python = $(if ($env:CONTINUUM_PYTHON) { $env:CONTINUUM_PYTHON } else { "python" }),
   [string]$StageRoot = $(if ($env:CONTINUUM_CODEX_MARKETPLACE_STAGE) { $env:CONTINUUM_CODEX_MARKETPLACE_STAGE } else { Join-Path $HOME ".cache\epic-continuum\codex-marketplace" }),
+  [string]$AllowedRoots = $(if ($env:CONTINUUM_ALLOWED_ROOTS) { $env:CONTINUUM_ALLOWED_ROOTS } else { "" }),
+  [string]$Codex = $(if ($env:CONTINUUM_CODEX_CLI) { $env:CONTINUUM_CODEX_CLI } else { "codex" }),
   [switch]$SkipLocalMcpConfig,
   [switch]$StageOnly
 )
@@ -29,6 +31,9 @@ $stageArgs = @(
 if ($SkipLocalMcpConfig) {
   $stageArgs += "--skip-local-mcp-config"
 }
+if ($AllowedRoots) {
+  $stageArgs += @("--allowed-roots", $AllowedRoots)
+}
 
 $StageMarketplaceRoot = (& $Python @stageArgs | Select-Object -Last 1)
 if ($LASTEXITCODE -ne 0) {
@@ -38,11 +43,11 @@ $StageMarketplaceRoot = [string]$StageMarketplaceRoot
 $StageMarketplaceRoot = $StageMarketplaceRoot.Trim()
 
 if (-not $StageOnly) {
-  codex plugin marketplace add $StageMarketplaceRoot
+  & $Codex plugin marketplace add $StageMarketplaceRoot
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
-  codex plugin add continuum@epic-continuum
+  & $Codex plugin add continuum@epic-continuum
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }

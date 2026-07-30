@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
@@ -2261,6 +2264,196 @@ class ResumeLatestTests(unittest.TestCase):
                     conn.close()
                 self.assertEqual(status, "historical")
 
+    def test_repair_sidecar_planning_does_not_hold_sqlite_writer_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            damaged = record_project_state(
+                root,
+                session_id="repair-contention-session",
+                agent_id="repair-contention-agent",
+                project_id="repair-contention-project",
+            )
+            conn = connect(root)
+            try:
+                conn.execute(
+                    "UPDATE cards SET summary = summary || ' damaged' "
+                    "WHERE id = ?",
+                    (damaged["card_id"],),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(
+                root,
+                [str(damaged["card_id"])],
+            )
+            sidecar_read_entered = threading.Event()
+            allow_sidecar_read = threading.Event()
+            repair_result: dict[str, object] = {}
+            real_read_text = Path.read_text
+
+            def paused_sidecar_read(path: Path, *args, **kwargs):
+                if (
+                    not sidecar_read_entered.is_set()
+                    and path.parent.name == "cards"
+                    and path.suffix.casefold() in {".yaml", ".yml"}
+                ):
+                    sidecar_read_entered.set()
+                    self.assertTrue(
+                        allow_sidecar_read.wait(timeout=10)
+                    )
+                return real_read_text(path, *args, **kwargs)
+
+            def run_repair() -> None:
+                try:
+                    repair_result.update(
+                        store_module
+                        .repair_invalid_project_state_checkpoints(
+                            root,
+                            project_id="repair-contention-project",
+                            dry_run=False,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - assertion payload
+                    repair_result["error"] = repr(exc)
+
+            with patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=paused_sidecar_read,
+            ):
+                thread = threading.Thread(target=run_repair)
+                thread.start()
+                self.assertTrue(sidecar_read_entered.wait(timeout=10))
+                competing_writer = sqlite3.connect(
+                    root / "catalog" / "catalog.sqlite3",
+                    timeout=0.2,
+                )
+                try:
+                    competing_writer.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) "
+                        "VALUES (?, ?)",
+                        ("repair_contention_probe", "committed"),
+                    )
+                    competing_writer.commit()
+                finally:
+                    competing_writer.close()
+                allow_sidecar_read.set()
+                thread.join(timeout=30)
+
+            self.assertFalse(thread.is_alive())
+            self.assertNotIn("error", repair_result)
+            self.assertTrue(
+                repair_result.get("catalog_repair_committed"),
+                repair_result,
+            )
+            self.assertTrue(repair_result.get("ok"), repair_result)
+
+    def test_repair_quarantines_adjacent_invalid_chain_members(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            first = record_project_state(
+                root,
+                session_id="adjacent-repair-a",
+                agent_id="adjacent-repair-agent",
+                project_id="adjacent-repair-project",
+                objective="First valid checkpoint",
+            )
+            middle = record_project_state(
+                root,
+                session_id="adjacent-repair-b",
+                agent_id="adjacent-repair-agent",
+                project_id="adjacent-repair-project",
+                objective="Middle checkpoint",
+            )
+            newest = record_project_state(
+                root,
+                session_id="adjacent-repair-c",
+                agent_id="adjacent-repair-agent",
+                project_id="adjacent-repair-project",
+                objective="Newest checkpoint",
+            )
+            damaged_ids = [
+                str(middle["card_id"]),
+                str(newest["card_id"]),
+            ]
+            conn = connect(root)
+            try:
+                conn.execute(
+                    """
+                    UPDATE cards
+                    SET summary = summary || ' damaged'
+                    WHERE id IN (?, ?)
+                    """,
+                    damaged_ids,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            sync_card_sidecars_after_commit(root, damaged_ids)
+
+            preview = (
+                store_module.repair_invalid_project_state_checkpoints(
+                    root,
+                    project_id="adjacent-repair-project",
+                    dry_run=True,
+                )
+            )
+            repaired = (
+                store_module.repair_invalid_project_state_checkpoints(
+                    root,
+                    project_id="adjacent-repair-project",
+                    dry_run=False,
+                )
+            )
+
+            self.assertTrue(preview["ok"], preview)
+            self.assertEqual(preview["quarantined_count"], 2)
+            self.assertTrue(repaired["ok"], repaired)
+            self.assertEqual(repaired["quarantined_count"], 2)
+            self.assertEqual(
+                {
+                    record["card_id"]
+                    for record in repaired["quarantined"]
+                },
+                set(damaged_ids),
+            )
+            conn = connect(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, supersedes_card_id,
+                               superseded_by_card_id, conflict_group
+                        FROM cards
+                        WHERE id IN (?, ?, ?)
+                        """,
+                        (
+                            str(first["card_id"]),
+                            *damaged_ids,
+                        ),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            for card_id in damaged_ids:
+                self.assertEqual(rows[card_id]["status"], "historical")
+                self.assertIsNone(rows[card_id]["supersedes_card_id"])
+                self.assertIsNone(rows[card_id]["superseded_by_card_id"])
+                self.assertIsNone(rows[card_id]["conflict_group"])
+            self.assertIsNone(
+                rows[str(first["card_id"])]["superseded_by_card_id"]
+            )
+            self.assertTrue(
+                store_module.semantic_integrity_report(root)["ok"]
+            )
+
     def test_resume_fails_closed_when_discovered_checkpoint_becomes_contested(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -2416,6 +2609,251 @@ class ResumeLatestTests(unittest.TestCase):
 
             self.assertEqual(none["recent_event_count"], 0)
             self.assertEqual(one["recent_event_count"], 1)
+
+    def test_recovery_audit_binds_exact_packet_file_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            record_project_state(
+                root,
+                session_id="packet-authority-session",
+                agent_id="packet-authority-agent",
+                project_id="packet-authority-project",
+                objective="Bind the exact recovery packet file",
+            )
+
+            recovered = recover_thread(
+                root,
+                session_id="packet-authority-session",
+                project_id="packet-authority-project",
+            )
+
+            packet_path = Path(recovered["packet_uri"])
+            packet_metadata = os.lstat(packet_path)
+            conn = connect(root)
+            try:
+                audit_row = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM audit_events
+                    WHERE action = 'recover_thread'
+                    ORDER BY rowid DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+            payload = json.loads(audit_row["payload_json"])
+            authority = payload["packet_file_authority"]
+            self.assertEqual(payload["packet_hash"], recovered["packet_hash"])
+            self.assertEqual(
+                store_module.file_sha256(packet_path),
+                recovered["packet_hash"],
+            )
+            self.assertEqual(
+                authority,
+                {
+                    "device": int(packet_metadata.st_dev),
+                    "inode": int(packet_metadata.st_ino),
+                    "size_bytes": int(packet_metadata.st_size),
+                    "mtime_ns": int(packet_metadata.st_mtime_ns),
+                    "ctime_ns": int(packet_metadata.st_ctime_ns),
+                },
+            )
+
+    def test_uncommitted_packet_cleanup_preserves_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            packet_path = parent / "packet.md"
+            packet_path.write_bytes(b"owned recovery packet")
+            packet_metadata = os.lstat(packet_path)
+            packet_identity = (
+                int(packet_metadata.st_dev),
+                int(packet_metadata.st_ino),
+                stat.S_IFMT(packet_metadata.st_mode),
+                int(packet_metadata.st_size),
+                int(packet_metadata.st_mtime_ns),
+                int(packet_metadata.st_ctime_ns),
+            )
+            packet_hash = store_module.file_sha256(packet_path)
+            preserved_original = parent / "preserved-original.md"
+            cleanup_slot = (
+                parent / ".continuum-recovery-packet-cleanup-slot.md"
+            )
+            real_replace = os.replace
+            replacement_moved = False
+
+            def replace_before_retirement(
+                source_path: Path,
+                destination_path: Path,
+            ) -> None:
+                nonlocal replacement_moved
+                if (
+                    source_path == packet_path
+                    and destination_path == cleanup_slot
+                ):
+                    replacement_moved = True
+                    real_replace(source_path, preserved_original)
+                    source_path.write_bytes(b"replacement packet")
+                real_replace(source_path, destination_path)
+
+            with (
+                patch.object(
+                    store_module,
+                    "retire_exact_windows_file",
+                    return_value=False,
+                ),
+                patch.object(
+                    store_module.os,
+                    "replace",
+                    side_effect=replace_before_retirement,
+                ),
+            ):
+                result = (
+                    store_module._retire_uncommitted_recovery_packet(
+                        packet_path,
+                        recovery_id="replacement-race",
+                        packet_identity=packet_identity,
+                        packet_hash=packet_hash,
+                    )
+                )
+
+            self.assertTrue(replacement_moved)
+            self.assertFalse(result["retired"], result)
+            self.assertEqual(
+                result["reason"],
+                "packet_replaced_during_retirement",
+            )
+            self.assertEqual(
+                preserved_original.read_bytes(),
+                b"owned recovery packet",
+            )
+            preserved_replacement = Path(result["preserved_path"])
+            self.assertEqual(preserved_replacement, cleanup_slot)
+            self.assertEqual(
+                preserved_replacement.read_bytes(),
+                b"replacement packet",
+            )
+            self.assertFalse(
+                list(parent.glob(".continuum-recovery-packet-retire.*"))
+            )
+
+    def test_uncommitted_packet_crash_boundary_uses_one_cleanup_slot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            cleanup_slot = (
+                parent / ".continuum-recovery-packet-cleanup-slot.md"
+            )
+
+            for index in range(6):
+                packet_path = parent / f"packet-{index}.md"
+                packet_bytes = f"sensitive packet {index}".encode()
+                packet_path.write_bytes(packet_bytes)
+                packet_hash = store_module.file_sha256(packet_path)
+                packet_metadata = os.lstat(packet_path)
+                packet_identity = (
+                    int(packet_metadata.st_dev),
+                    int(packet_metadata.st_ino),
+                    stat.S_IFMT(packet_metadata.st_mode),
+                    int(packet_metadata.st_size),
+                    int(packet_metadata.st_mtime_ns),
+                    int(packet_metadata.st_ctime_ns),
+                )
+                with (
+                    patch.object(
+                        store_module,
+                        "retire_exact_windows_file",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        store_module,
+                        "flush_directory_strict",
+                        side_effect=RuntimeError(
+                            "simulated crash after packet retirement"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "simulated crash",
+                    ),
+                ):
+                    store_module._retire_uncommitted_recovery_packet(
+                        packet_path,
+                        recovery_id=f"crash-{index}",
+                        packet_identity=packet_identity,
+                        packet_hash=packet_hash,
+                    )
+                self.assertFalse(packet_path.exists())
+                self.assertEqual(cleanup_slot.read_bytes(), packet_bytes)
+
+            self.assertFalse(
+                list(parent.glob(".continuum-recovery-packet-retire.*"))
+            )
+            self.assertEqual(
+                [path for path in parent.iterdir() if path.is_file()],
+                [cleanup_slot],
+            )
+
+    def test_uncommitted_packet_terminal_delete_refuses_replacement(
+        self,
+    ) -> None:
+        if os.name != "nt":
+            self.skipTest("exact-handle terminal deletion is Windows-specific")
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            packet_path = parent / "packet.md"
+            packet_path.write_bytes(b"owned recovery packet")
+            packet_metadata = os.lstat(packet_path)
+            packet_identity = (
+                int(packet_metadata.st_dev),
+                int(packet_metadata.st_ino),
+                stat.S_IFMT(packet_metadata.st_mode),
+                int(packet_metadata.st_size),
+                int(packet_metadata.st_mtime_ns),
+                int(packet_metadata.st_ctime_ns),
+            )
+            packet_hash = store_module.file_sha256(packet_path)
+            preserved_original = parent / "held-packet.md"
+            replacement_path: Path | None = None
+            real_retire = store_module.retire_exact_windows_file
+
+            def replace_before_handle_delete(
+                path: Path,
+                *,
+                expected_identity,
+            ) -> bool:
+                nonlocal replacement_path
+                replacement_path = path
+                os.replace(path, preserved_original)
+                path.write_bytes(b"terminal packet replacement")
+                return real_retire(
+                    path,
+                    expected_identity=expected_identity,
+                )
+
+            with patch.object(
+                store_module,
+                "retire_exact_windows_file",
+                side_effect=replace_before_handle_delete,
+            ):
+                with self.assertRaises(OSError):
+                    store_module._retire_uncommitted_recovery_packet(
+                        packet_path,
+                        recovery_id="terminal-replacement-race",
+                        packet_identity=packet_identity,
+                        packet_hash=packet_hash,
+                    )
+
+            self.assertEqual(
+                preserved_original.read_bytes(),
+                b"owned recovery packet",
+            )
+            self.assertIsNotNone(replacement_path)
+            self.assertEqual(
+                replacement_path.read_bytes(),
+                b"terminal packet replacement",
+            )
 
     def test_resume_packet_budget_bounds_complete_packet_without_raw_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

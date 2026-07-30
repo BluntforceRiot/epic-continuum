@@ -3299,26 +3299,6 @@ def _commit_phase_envelope(
     with closing(connect(root)) as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS protect_review_phase_artifact_updates
-                BEFORE UPDATE ON artifacts
-                WHEN OLD.kind = 'review_phase_envelope'
-                BEGIN
-                    SELECT RAISE(ABORT, 'review phase artifacts are immutable');
-                END
-                """
-            )
-            conn.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS protect_review_phase_artifact_deletes
-                BEFORE DELETE ON artifacts
-                WHEN OLD.kind = 'review_phase_envelope'
-                BEGIN
-                    SELECT RAISE(ABORT, 'review phase artifacts are immutable');
-                END
-                """
-            )
             rows = conn.execute(
                 "SELECT * FROM artifacts WHERE uri = ? ORDER BY id",
                 (uri,),
@@ -7138,6 +7118,8 @@ def quarantine_legacy_review_job(
         raise ReviewBridgeError(
             "legacy review quarantine replacement job does not pass integrity"
         )
+    if not dry_run:
+        init_db(root)
     with ExitStack() as locks:
         if not dry_run:
             for locked_job_id in sorted({safe_job_id, safe_replacement_job_id}):
@@ -7438,26 +7420,6 @@ def quarantine_legacy_review_job(
                     raise ReviewBridgeError(
                         "legacy review quarantine replacement job changed before commit"
                     )
-                conn.execute(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS protect_review_legacy_quarantine_updates
-                    BEFORE UPDATE ON artifacts
-                    WHEN OLD.kind = 'review_legacy_quarantine_receipt'
-                    BEGIN
-                        SELECT RAISE(ABORT, 'review legacy quarantine artifacts are immutable');
-                    END
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS protect_review_legacy_quarantine_deletes
-                    BEFORE DELETE ON artifacts
-                    WHEN OLD.kind = 'review_legacy_quarantine_receipt'
-                    BEGIN
-                        SELECT RAISE(ABORT, 'review legacy quarantine artifacts are immutable');
-                    END
-                    """
-                )
                 conn.execute(
                     """
                     INSERT INTO artifacts(

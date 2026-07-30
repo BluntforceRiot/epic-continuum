@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 root="${CONTINUUM_ROOT:-$HOME/.continuum}"
 python_cmd="${CONTINUUM_PYTHON:-python3}"
 stage_base="${CONTINUUM_CODEX_MARKETPLACE_STAGE:-$HOME/.cache/epic-continuum/codex-marketplace}"
+allowed_roots="${CONTINUUM_ALLOWED_ROOTS:-}"
+codex_cmd="${CONTINUUM_CODEX_CLI:-codex}"
 skip_local_mcp_config=0
 stage_only=0
 
@@ -24,6 +26,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stage-root)
       stage_base="$2"
+      shift 2
+      ;;
+    --allowed-roots)
+      allowed_roots="$2"
+      shift 2
+      ;;
+    --codex)
+      codex_cmd="$2"
       shift 2
       ;;
     --skip-local-mcp-config)
@@ -51,12 +61,15 @@ stage_args=(
 if [[ "$skip_local_mcp_config" == "1" ]]; then
   stage_args+=(--skip-local-mcp-config)
 fi
+if [[ -n "$allowed_roots" ]]; then
+  stage_args+=(--allowed-roots "$allowed_roots")
+fi
 
 stage_root="$("$python_cmd" "${stage_args[@]}")"
 
 if [[ "$stage_only" == "0" ]]; then
-  codex plugin marketplace add "$stage_root"
-  codex plugin add continuum@epic-continuum
+  "$codex_cmd" plugin marketplace add "$stage_root"
+  "$codex_cmd" plugin add continuum@epic-continuum
 fi
 
 printf 'Epic Continuum Codex plugin installed from staged marketplace: %s\n' "$stage_root/.agents/plugins/marketplace.json"

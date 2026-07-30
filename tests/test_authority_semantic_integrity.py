@@ -65,8 +65,12 @@ def _record_two_states(
 
 
 def _sync_cards(root: Path, conn: sqlite3.Connection, *card_ids: str) -> None:
-    for card_id in card_ids:
+    if conn.in_transaction:
+        conn.commit()
+    for card_id in dict.fromkeys(card_ids):
         sync_card_sidecar(root, conn, card_id)
+        if conn.in_transaction:
+            conn.commit()
 
 
 def _make_cycle(

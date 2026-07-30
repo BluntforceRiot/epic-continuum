@@ -33,16 +33,25 @@ def _plugin_tree_digest(plugin_source: Path) -> str:
     return digest.hexdigest()
 
 
-def _local_mcp_payload(*, command: str, continuum_src: Path, root: Path) -> dict[str, Any]:
+def _local_mcp_payload(
+    *,
+    command: str,
+    continuum_src: Path,
+    root: Path,
+    allowed_roots: str | None = None,
+) -> dict[str, Any]:
+    environment = {
+        "PYTHONPATH": str(continuum_src),
+        "CONTINUUM_ROOT": str(root),
+    }
+    if allowed_roots:
+        environment["CONTINUUM_ALLOWED_ROOTS"] = allowed_roots
     return {
         "mcpServers": {
             "continuum": {
                 "command": command,
                 "args": ["-m", "continuum.mcp_server"],
-                "env": {
-                    "PYTHONPATH": str(continuum_src),
-                    "CONTINUUM_ROOT": str(root),
-                },
+                "env": environment,
             }
         }
     }
@@ -94,6 +103,7 @@ def stage_codex_plugin(
     python_cmd: str,
     stage_base: Path,
     skip_local_mcp_config: bool = False,
+    allowed_roots: str | None = None,
 ) -> Path:
     repo_root = repo_root.resolve()
     marketplace_json = repo_root / ".agents" / "plugins" / "marketplace.json"
@@ -109,6 +119,7 @@ def stage_codex_plugin(
         command=python_cmd,
         continuum_src=continuum_src,
         root=root,
+        allowed_roots=allowed_roots,
     )
     cache = _cachebuster(plugin_source=plugin_source, mcp_payload=mcp_payload)
     stage_base.mkdir(parents=True, exist_ok=True)
@@ -146,6 +157,7 @@ def main() -> int:
     parser.add_argument("--python", default="python")
     parser.add_argument("--stage-base", type=Path, required=True)
     parser.add_argument("--skip-local-mcp-config", action="store_true")
+    parser.add_argument("--allowed-roots")
     args = parser.parse_args()
 
     stage_root = stage_codex_plugin(
@@ -154,6 +166,7 @@ def main() -> int:
         python_cmd=args.python,
         stage_base=args.stage_base,
         skip_local_mcp_config=args.skip_local_mcp_config,
+        allowed_roots=args.allowed_roots,
     )
     print(stage_root)
     return 0

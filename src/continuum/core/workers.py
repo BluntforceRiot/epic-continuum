@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 import contextvars
+import hashlib
 import math
 import os
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -13,7 +15,20 @@ from typing import Any, Callable, Iterator
 
 from .config import config_path, default_config, load_config, retention_policy
 from .operations import operation_lock
-from .permissions import secure_move_file
+from .permissions import (
+    fsync_parent,
+    replace_file_noclobber,
+    retire_exact_windows_file,
+    secure_file,
+    secure_mkdir,
+)
+from .proof_archive import (
+    ProofArchiveError,
+    _assert_no_link_components as _assert_storage_tier_no_link_components,
+    _hash_regular_file as _hash_storage_tier_file,
+    _link_like_reason as _storage_tier_link_like_reason,
+    _verify_file as _verify_storage_tier_file,
+)
 from .temporal_authority import (
     conflict_boundary as _conflict_boundary,
     conflict_component_fingerprint as _conflict_component_fingerprint,
@@ -23,10 +38,14 @@ from .temporal_authority import (
 from .store import (
     _card_sidecar_intent_reconciliation_budget,
     _card_sidecar_intent_reconciliation_limit,
+    _card_sidecar_db_authority_token,
     _current_card_sidecar_intent_reconciliation_budget,
     _project_state_card_integrity_error,
+    _queue_job_fairness_table_ready,
+    _queue_job_fairness_triggers_ready,
     _queue_retry_authority_triggers_ready,
     _queue_retry_order_counter_ready,
+    CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
     add_graph_edge,
     audit_event,
     canonical_partition_identifier,
@@ -45,6 +64,7 @@ from .store import (
     mark_card_sidecar_outbox,
     MAX_QUEUE_RETRY_ORDER,
     NON_CURRENT_CARD_STATUSES,
+    QUEUE_JOB_FAIRNESS_TABLE_NAME,
     QUEUE_RETRY_ORDER_META_KEY,
     QUEUE_RETRY_ORDER_BACKFILL_META_KEY,
     QUEUE_RETRY_ORDER_BACKFILL_META_VALUE,
@@ -87,8 +107,6 @@ POST_COMMIT_SIDECAR_RETRY_REASON = "post_commit_sidecar_retry_pending"
 POST_COMMIT_EXCEPTION_RETRY_REASON = "post_commit_exception_retry_pending"
 MAX_CONSECUTIVE_PRIORITY_BYPASSES = 8
 MAX_CONSECUTIVE_RETRY_BYPASSES = 8
-_QUEUE_FAIRNESS_META_PREFIX = "worker_queue_priority_burst_v1:"
-_QUEUE_RETRY_FAIRNESS_META_PREFIX = "worker_queue_retry_burst_v1:"
 # A single notification may represent an arbitrarily large per-session backlog
 # because Scroll appends deliberately deduplicate pending Scribe jobs. Drain more
 # than one window, but yield after a bounded amount of work and leave a durable
@@ -210,7 +228,6 @@ def _charge_worker_sidecar_intent_budget(
         charge = allowance
     else:
         charge = max(
-            max(0, int(result.get("enumerated", 0))),
             max(0, int(result.get("inspected", 0))),
             max(0, int(result.get("selected", 0))),
             max(0, int(result.get("processed", 0))),
@@ -433,7 +450,8 @@ def _expired_lease_candidates(
     now: str,
 ) -> list[Any]:
     columns = """
-        id, preemptible, retry_pending, dedupe_key, lease_expires_at
+        id, role, job_type, preemptible, retry_pending, retry_order,
+        dedupe_key, error_json, lease_expires_at
     """
     if not roles:
         return conn.execute(
@@ -484,7 +502,120 @@ def _expired_lease_candidates(
     return candidates[:WORKER_EXPIRED_LEASE_RECLAIM_LIMIT]
 
 
-def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
+def _pending_dedupe_successor(
+    conn,
+    *,
+    source_job_id: str,
+    source_role: str,
+    source_job_type: str,
+    dedupe_key: str | None,
+) -> Any | None:
+    if dedupe_key is None:
+        return None
+    return conn.execute(
+        """
+        SELECT id, retry_pending, retry_order, error_json
+        FROM queue_jobs
+        WHERE status = ?
+          AND dedupe_key = ?
+          AND role = ?
+          AND job_type = ?
+          AND id != ?
+        LIMIT 1
+        """,
+        (
+            PENDING_JOB_STATUS,
+            dedupe_key,
+            source_role,
+            source_job_type,
+            source_job_id,
+        ),
+    ).fetchone()
+
+
+def _transferred_retry_result(
+    *,
+    result: dict[str, Any],
+    source_job_id: str,
+    successor_job_id: str,
+) -> dict[str, Any]:
+    return {
+        **result,
+        "retry_pending": True,
+        "retry_transferred": True,
+        "retry_source_job_id": source_job_id,
+        "retry_job_id": successor_job_id,
+        "retry_dedupe_successor_job_id": successor_job_id,
+    }
+
+
+def _promote_pending_dedupe_successor_to_retry(
+    conn,
+    *,
+    source_job_id: str,
+    source_role: str,
+    source_job_type: str,
+    dedupe_key: str,
+    successor_job_id: str,
+    retry_order: int,
+    result: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    transferred_result = _transferred_retry_result(
+        result=result,
+        source_job_id=source_job_id,
+        successor_job_id=successor_job_id,
+    )
+    cursor = conn.execute(
+        """
+        UPDATE queue_jobs
+        SET finished_at = NULL, updated_at = ?, error_json = ?,
+            lease_owner = NULL, lease_expires_at = NULL,
+            heartbeat_at = NULL, retry_pending = 1, retry_order = ?
+        WHERE id = ? AND status = ?
+          AND role = ? AND job_type = ? AND dedupe_key = ?
+          AND EXISTS (
+              SELECT 1
+              FROM queue_jobs AS source
+              WHERE source.id = ?
+                AND source.status = ?
+                AND source.role = queue_jobs.role
+                AND source.job_type = queue_jobs.job_type
+                AND source.dedupe_key = queue_jobs.dedupe_key
+          )
+        """,
+        (
+            now,
+            json_dumps(
+                {
+                    "error": None,
+                    "result": transferred_result,
+                    "retry_pending": True,
+                }
+            ),
+            retry_order,
+            successor_job_id,
+            PENDING_JOB_STATUS,
+            source_role,
+            source_job_type,
+            dedupe_key,
+            source_job_id,
+            ACTIVE_JOB_STATUS,
+        ),
+    )
+    if int(cursor.rowcount or 0) != 1:
+        raise RuntimeError(
+            "pending dedupe successor changed before retry transfer"
+        )
+    return transferred_result
+
+
+def _reclaim_expired_leases(
+    conn,
+    roles: set[str] | None = None,
+    *,
+    public_results: list[dict[str, Any]] | None = None,
+) -> int:
     now = utc_now()
     candidates = _expired_lease_candidates(
         conn,
@@ -496,25 +627,6 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
         for row in candidates
         if int(row["preemptible"]) == 1
         and int(row["retry_pending"]) == 1
-        and not (
-            row["dedupe_key"] is not None
-            and conn.execute(
-                """
-                SELECT 1
-                FROM queue_jobs
-                WHERE status = ?
-                  AND dedupe_key = ?
-                  AND id != ?
-                LIMIT 1
-                """,
-                (
-                    PENDING_JOB_STATUS,
-                    row["dedupe_key"],
-                    row["id"],
-                ),
-            ).fetchone()
-            is not None
-        )
     ]
     retry_order_start = (
         _reserve_queue_retry_orders(conn, len(retry_candidates))
@@ -531,69 +643,142 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
         preemptible = int(row["preemptible"])
         retry_pending = int(row["retry_pending"])
         dedupe_key = row["dedupe_key"]
-        superseded = bool(
-            preemptible == 1
-            and dedupe_key is not None
-            and conn.execute(
-                """
-                SELECT 1
-                FROM queue_jobs
-                WHERE status = ?
-                  AND dedupe_key = ?
-                  AND id != ?
-                LIMIT 1
-                """,
-                (
-                    PENDING_JOB_STATUS,
-                    dedupe_key,
-                    job_id,
-                ),
-            ).fetchone()
-            is not None
+        successor = _pending_dedupe_successor(
+            conn,
+            source_job_id=job_id,
+            source_role=str(row["role"]),
+            source_job_type=str(row["job_type"]),
+            dedupe_key=(
+                str(dedupe_key)
+                if dedupe_key is not None
+                else None
+            ),
         )
-        if superseded:
-            cursor = conn.execute(
-                """
-                UPDATE queue_jobs
-                SET status = 'skipped', finished_at = ?,
-                    lease_owner = NULL, lease_expires_at = NULL,
-                    heartbeat_at = NULL, updated_at = ?, error_json = ?,
-                    retry_pending = 0, retry_order = 0
-                WHERE id = ? AND status = ?
-                  AND preemptible = 1
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= ?
-                  AND dedupe_key = ?
-                  AND EXISTS (
-                      SELECT 1
-                      FROM queue_jobs AS pending
-                      WHERE pending.status = ?
-                        AND pending.dedupe_key = queue_jobs.dedupe_key
-                        AND pending.id != queue_jobs.id
-                  )
-                """,
-                (
-                    now,
-                    now,
-                    json_dumps(
-                        {
-                            "error": None,
-                            "result": {
-                                "skipped": True,
-                                "reason": (
-                                    "expired_lease_superseded_by_"
-                                    "pending_dedupe_job"
-                                ),
-                            },
-                        }
+        if preemptible == 1 and successor is not None:
+            if retry_pending == 1:
+                error_payload = json_loads(row["error_json"], {})
+                prior_result_value = (
+                    error_payload.get("result")
+                    if isinstance(error_payload, dict)
+                    else None
+                )
+                prior_result: dict[str, Any] = (
+                    dict(prior_result_value)
+                    if isinstance(prior_result_value, dict)
+                    else {
+                        "ok": False,
+                        "reason": "expired_retry_lease_pending",
+                        "retry_pending": True,
+                    }
+                )
+                successor_job_id = str(successor["id"])
+                transferred_result = (
+                    _promote_pending_dedupe_successor_to_retry(
+                        conn,
+                        source_job_id=job_id,
+                        source_role=str(row["role"]),
+                        source_job_type=str(row["job_type"]),
+                        dedupe_key=str(dedupe_key),
+                        successor_job_id=successor_job_id,
+                        retry_order=retry_orders[job_id],
+                        result=prior_result,
+                        now=now,
+                    )
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'skipped', finished_at = ?,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        heartbeat_at = NULL, updated_at = ?,
+                        error_json = ?, retry_pending = 0,
+                        retry_order = 0
+                    WHERE id = ? AND status = ?
+                      AND preemptible = 1
+                      AND retry_pending = 1
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                      AND dedupe_key = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM queue_jobs AS pending
+                          WHERE pending.id = ?
+                            AND pending.status = ?
+                            AND pending.retry_pending = 1
+                            AND pending.dedupe_key = queue_jobs.dedupe_key
+                            AND pending.role = queue_jobs.role
+                            AND pending.job_type = queue_jobs.job_type
+                      )
+                    """,
+                    (
+                        now,
+                        now,
+                        json_dumps(
+                            {
+                                "error": None,
+                                "result": transferred_result,
+                                "retry_pending": False,
+                            }
+                        ),
+                        job_id,
+                        ACTIVE_JOB_STATUS,
+                        now,
+                        dedupe_key,
+                        successor_job_id,
+                        PENDING_JOB_STATUS,
                     ),
-                    job_id,
-                    ACTIVE_JOB_STATUS,
-                    now,
-                    dedupe_key,
-                    PENDING_JOB_STATUS,
-                ),
-            )
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    raise RuntimeError(
+                        "expired worker lease or pending dedupe successor "
+                        "changed before retry transfer"
+                    )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET status = 'skipped', finished_at = ?,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        heartbeat_at = NULL, updated_at = ?, error_json = ?,
+                        retry_pending = 0, retry_order = 0
+                    WHERE id = ? AND status = ?
+                      AND preemptible = 1
+                      AND retry_pending = 0
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                      AND dedupe_key = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM queue_jobs AS pending
+                          WHERE pending.status = ?
+                            AND pending.dedupe_key = queue_jobs.dedupe_key
+                            AND pending.role = queue_jobs.role
+                            AND pending.job_type = queue_jobs.job_type
+                            AND pending.id != queue_jobs.id
+                      )
+                    """,
+                    (
+                        now,
+                        now,
+                        json_dumps(
+                            {
+                                "error": None,
+                                "result": {
+                                    "skipped": True,
+                                    "reason": (
+                                        "expired_lease_superseded_by_"
+                                        "pending_dedupe_job"
+                                    ),
+                                },
+                            }
+                        ),
+                        job_id,
+                        ACTIVE_JOB_STATUS,
+                        now,
+                        dedupe_key,
+                        PENDING_JOB_STATUS,
+                    ),
+                )
         elif preemptible == 1 and retry_pending == 1:
             cursor = conn.execute(
                 """
@@ -676,23 +861,30 @@ def _reclaim_expired_leases(conn, roles: set[str] | None = None) -> int:
                     now,
                 ),
             )
+            if int(cursor.rowcount or 0) == 1 and public_results is not None:
+                authority = _queue_job_authority_snapshot(conn, job_id)
+                public_results.append(
+                    {
+                        "job_id": job_id,
+                        "role": str(row["role"]),
+                        "job_type": str(row["job_type"]),
+                        "status": "failed",
+                        "ok": False,
+                        "attempt_completed": False,
+                        "reason": (
+                            "non_preemptible_worker_lease_expired"
+                        ),
+                        "error": (
+                            "non-preemptible worker lease expired and "
+                            "cannot be reclaimed"
+                        ),
+                        "authoritative_job": authority,
+                    }
+                )
         else:
             continue
         reclaimed += int(cursor.rowcount or 0)
     return reclaimed
-
-
-def _queue_fairness_meta_key(roles: set[str] | None) -> str:
-    lane = ["*"] if not roles else sorted(roles)
-    return _QUEUE_FAIRNESS_META_PREFIX + content_hash(json_dumps(lane))[:32]
-
-
-def _queue_retry_fairness_meta_key(roles: set[str] | None) -> str:
-    lane = ["*"] if not roles else sorted(roles)
-    return (
-        _QUEUE_RETRY_FAIRNESS_META_PREFIX
-        + content_hash(json_dumps(lane))[:32]
-    )
 
 
 def _reserve_queue_retry_orders(conn, count: int) -> int:
@@ -730,77 +922,72 @@ def _next_queue_retry_order(conn) -> int:
     return _reserve_queue_retry_orders(conn, 1)
 
 
-def _queue_bypass_count(conn, key: str) -> int:
+def _queue_job_bypass_count(
+    conn,
+    job_id: str,
+    *,
+    lane: str,
+) -> int:
+    if lane not in {"priority", "retry"}:
+        raise ValueError("invalid queue fairness lane")
     row = conn.execute(
-        "SELECT value FROM meta WHERE key = ?",
-        (key,),
+        """
+        SELECT bypass_count
+        FROM queue_job_fairness
+        WHERE job_id = ? AND lane = ?
+        """,
+        (str(job_id), lane),
     ).fetchone()
     if row is None:
         return 0
-    try:
-        return max(0, int(row["value"]))
-    except (TypeError, ValueError):
-        return 0
+    return max(0, int(row["bypass_count"]))
 
 
-def _set_queue_bypass_count(
+def _set_queue_job_bypass_count(
     conn,
-    key: str,
-    value: int,
+    job_id: str,
     *,
+    lane: str,
+    value: int,
     maximum: int,
 ) -> None:
+    if lane not in {"priority", "retry"}:
+        raise ValueError("invalid queue fairness lane")
     bounded_value = max(
         0,
         min(int(value), int(maximum)),
     )
-    if bounded_value == 0:
-        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+    expected_retry_pending = 1 if lane == "retry" else 0
+    job = conn.execute(
+        """
+        SELECT status, retry_pending
+        FROM queue_jobs
+        WHERE id = ?
+        """,
+        (str(job_id),),
+    ).fetchone()
+    if (
+        bounded_value == 0
+        or job is None
+        or str(job["status"]) != PENDING_JOB_STATUS
+        or int(job["retry_pending"]) != expected_retry_pending
+    ):
+        conn.execute(
+            """
+            DELETE FROM queue_job_fairness
+            WHERE job_id = ? AND lane = ?
+            """,
+            (str(job_id), lane),
+        )
         return
     conn.execute(
         """
-        INSERT INTO meta(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        INSERT INTO queue_job_fairness(job_id, lane, bypass_count)
+        VALUES(?, ?, ?)
+        ON CONFLICT(job_id, lane) DO UPDATE
+        SET bypass_count = excluded.bypass_count
         """,
-        (key, str(bounded_value)),
-    )
-
-
-def _queue_priority_bypass_count(conn, roles: set[str] | None) -> int:
-    return _queue_bypass_count(conn, _queue_fairness_meta_key(roles))
-
-
-def _set_queue_priority_bypass_count(
-    conn,
-    roles: set[str] | None,
-    value: int,
-) -> None:
-    _set_queue_bypass_count(
-        conn,
-        _queue_fairness_meta_key(roles),
-        value,
-        maximum=MAX_CONSECUTIVE_PRIORITY_BYPASSES,
-    )
-
-
-def _queue_retry_bypass_count(conn, roles: set[str] | None) -> int:
-    return _queue_bypass_count(
-        conn,
-        _queue_retry_fairness_meta_key(roles),
-    )
-
-
-def _set_queue_retry_bypass_count(
-    conn,
-    roles: set[str] | None,
-    value: int,
-) -> None:
-    _set_queue_bypass_count(
-        conn,
-        _queue_retry_fairness_meta_key(roles),
-        value,
-        maximum=MAX_CONSECUTIVE_RETRY_BYPASSES,
+        (str(job_id), lane, bounded_value),
     )
 
 
@@ -1012,13 +1199,12 @@ def _claim_job(
         retry_rotation=True,
     )
     if fresh_priority_row is None and retry_row is None:
-        _set_queue_priority_bypass_count(conn, roles, 0)
-        _set_queue_retry_bypass_count(conn, roles, 0)
         return None
 
-    priority_bypass_count = 0
-    next_priority_bypass_count = 0
     fresh_row = fresh_priority_row
+    oldest_fresh_row: sqlite3.Row | None = None
+    priority_bypass_count = 0
+    real_priority_bypass = False
     if fresh_priority_row is not None:
         oldest_fresh_row = _eligible_job_candidate(
             conn,
@@ -1028,9 +1214,10 @@ def _claim_job(
             retry_pending=False,
         )
         if oldest_fresh_row is not None:
-            priority_bypass_count = _queue_priority_bypass_count(
+            priority_bypass_count = _queue_job_bypass_count(
                 conn,
-                roles,
+                str(oldest_fresh_row["id"]),
+                lane="priority",
             )
             real_priority_bypass = (
                 str(fresh_priority_row["id"])
@@ -1042,36 +1229,29 @@ def _claim_job(
                 >= MAX_CONSECUTIVE_PRIORITY_BYPASSES
             ):
                 fresh_row = oldest_fresh_row
-            else:
-                next_priority_bypass_count = (
-                    priority_bypass_count + 1
-                    if real_priority_bypass
-                    else 0
-                )
 
+    retry_bypass_count = 0
     if fresh_row is not None and retry_row is not None:
-        retry_bypass_count = _queue_retry_bypass_count(conn, roles)
+        retry_bypass_count = _queue_job_bypass_count(
+            conn,
+            str(retry_row["id"]),
+            lane="retry",
+        )
         if (
             retry_bypass_count
             >= MAX_CONSECUTIVE_RETRY_BYPASSES
         ):
             row = retry_row
-            next_retry_bypass_count = 0
-            next_priority_bypass_count = priority_bypass_count
         else:
             row = fresh_row
-            next_retry_bypass_count = retry_bypass_count + 1
     elif fresh_row is not None:
         row = fresh_row
-        next_retry_bypass_count = 0
     else:
         if retry_row is None:
             raise RuntimeError(
                 "queue candidate selection invariant violated"
             )
         row = retry_row
-        next_retry_bypass_count = 0
-        next_priority_bypass_count = 0
     now = utc_now()
     expires_at = _lease_expiry(lease_seconds)
     cursor = conn.execute(
@@ -1086,16 +1266,36 @@ def _claim_job(
     )
     if int(cursor.rowcount or 0) != 1:
         return None
-    _set_queue_priority_bypass_count(
-        conn,
-        roles,
-        next_priority_bypass_count,
+    claimed_job_id = str(row["id"])
+    selected_fresh = (
+        fresh_row is not None
+        and claimed_job_id == str(fresh_row["id"])
     )
-    _set_queue_retry_bypass_count(
-        conn,
-        roles,
-        next_retry_bypass_count,
-    )
+    if (
+        selected_fresh
+        and real_priority_bypass
+        and oldest_fresh_row is not None
+        and claimed_job_id != str(oldest_fresh_row["id"])
+    ):
+        _set_queue_job_bypass_count(
+            conn,
+            str(oldest_fresh_row["id"]),
+            lane="priority",
+            value=priority_bypass_count + 1,
+            maximum=MAX_CONSECUTIVE_PRIORITY_BYPASSES,
+        )
+    if (
+        selected_fresh
+        and retry_row is not None
+        and claimed_job_id != str(retry_row["id"])
+    ):
+        _set_queue_job_bypass_count(
+            conn,
+            str(retry_row["id"]),
+            lane="retry",
+            value=retry_bypass_count + 1,
+            maximum=MAX_CONSECUTIVE_RETRY_BYPASSES,
+        )
     job = dict(row)
     job.pop("queue_rowid", None)
     job["lease_owner"] = lease_owner
@@ -2047,6 +2247,136 @@ def _finish_job(
     return int(cursor.rowcount or 0) == 1
 
 
+def _queue_job_authority_snapshot(
+    conn,
+    job_id: str,
+) -> dict[str, Any]:
+    checked_at = utc_now()
+    row = conn.execute(
+        """
+        SELECT status, preemptible, lease_owner, lease_expires_at,
+               retry_pending, retry_order, finished_at, updated_at
+        FROM queue_jobs
+        WHERE id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "exists": False,
+            "status": None,
+            "preemptible": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "lease_valid": False,
+            "reclaimable": False,
+            "recoverable": False,
+            "authority_ok": False,
+            "authority_state": "missing",
+            "checked_at": checked_at,
+            "retry_pending": False,
+            "retry_order": 0,
+            "finished_at": None,
+            "updated_at": None,
+        }
+    status = str(row["status"])
+    preemptible = int(row["preemptible"]) == 1
+    lease_owner = (
+        str(row["lease_owner"]).strip()
+        if row["lease_owner"] is not None
+        else ""
+    )
+    lease_expires_at = (
+        str(row["lease_expires_at"])
+        if row["lease_expires_at"] is not None
+        else None
+    )
+    parsed_expiry: dt.datetime | None = None
+    if lease_expires_at is not None:
+        try:
+            parsed_expiry = _parse_utc_timestamp(lease_expires_at)
+        except (TypeError, ValueError, OverflowError):
+            parsed_expiry = None
+    checked_at_timestamp = _parse_utc_timestamp(checked_at)
+    lease_valid = bool(
+        status == ACTIVE_JOB_STATUS
+        and lease_owner
+        and parsed_expiry is not None
+        and parsed_expiry > checked_at_timestamp
+    )
+    reclaimable = bool(
+        status == ACTIVE_JOB_STATUS
+        and preemptible
+        and parsed_expiry is not None
+        and parsed_expiry <= checked_at_timestamp
+    )
+    recoverable = bool(
+        status == PENDING_JOB_STATUS
+        or status == ACTIVE_JOB_STATUS
+        and (lease_valid or reclaimable)
+    )
+    terminal_success = status in {"succeeded", "skipped"}
+    authority_ok = bool(recoverable or terminal_success)
+    if status == PENDING_JOB_STATUS:
+        authority_state = "pending_recoverable"
+    elif status == ACTIVE_JOB_STATUS and lease_valid:
+        authority_state = "running_live_owner"
+    elif status == ACTIVE_JOB_STATUS and reclaimable:
+        authority_state = "running_preemptible_reclaimable"
+    elif status == ACTIVE_JOB_STATUS and not preemptible:
+        authority_state = "running_non_preemptible_unrecoverable"
+    elif status == ACTIVE_JOB_STATUS:
+        authority_state = "running_invalid_lease_unrecoverable"
+    elif terminal_success:
+        authority_state = "terminal_success"
+    elif status == "failed":
+        authority_state = "terminal_failure"
+    else:
+        authority_state = "unsupported_status"
+    return {
+        "exists": True,
+        "status": status,
+        "preemptible": preemptible,
+        "lease_owner": lease_owner or None,
+        "lease_expires_at": lease_expires_at,
+        "lease_valid": lease_valid,
+        "reclaimable": reclaimable,
+        "recoverable": recoverable,
+        "authority_ok": authority_ok,
+        "authority_state": authority_state,
+        "checked_at": checked_at,
+        "retry_pending": int(row["retry_pending"]) == 1,
+        "retry_order": int(row["retry_order"]),
+        "finished_at": (
+            str(row["finished_at"])
+            if row["finished_at"] is not None
+            else None
+        ),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def _lost_lease_processed_result(
+    *,
+    job: dict[str, Any],
+    error: Exception,
+    authority: dict[str, Any],
+) -> dict[str, Any]:
+    durable_authority_ok = authority.get("authority_ok") is True
+    return {
+        "job_id": job["id"],
+        "role": job["role"],
+        "job_type": job["job_type"],
+        "status": "incomplete",
+        "ok": durable_authority_ok,
+        "authoritative_job_ok": durable_authority_ok,
+        "attempt_completed": False,
+        "reason": "worker_lease_lost",
+        "error": str(error),
+        "authoritative_job": authority,
+    }
+
+
 def _finish_owned_job(
     conn,
     job_id: str,
@@ -2070,13 +2400,110 @@ def _retry_owned_job(
     lease_owner: str,
     lease_seconds: int,
     result: dict[str, Any],
-) -> None:
-    """Release an owned lease back to pending without recording a failure."""
+) -> dict[str, Any]:
+    """Keep one pending retry authority, merging into a dedupe successor."""
 
     if not _heartbeat_job(conn, job_id, lease_owner=lease_owner, lease_seconds=lease_seconds):
         raise RuntimeError("worker lease lost before job retry")
     now = utc_now()
+    source_job = conn.execute(
+        """
+        SELECT role, job_type, dedupe_key
+        FROM queue_jobs
+        WHERE id = ? AND status = ? AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+        """,
+        (
+            job_id,
+            ACTIVE_JOB_STATUS,
+            lease_owner,
+            now,
+        ),
+    ).fetchone()
+    if source_job is None:
+        raise RuntimeError("worker lease lost before job retry")
+    successor = _pending_dedupe_successor(
+        conn,
+        source_job_id=job_id,
+        source_role=str(source_job["role"]),
+        source_job_type=str(source_job["job_type"]),
+        dedupe_key=(
+            str(source_job["dedupe_key"])
+            if source_job["dedupe_key"] is not None
+            else None
+        ),
+    )
     retry_order = _next_queue_retry_order(conn)
+    if successor is not None:
+        successor_job_id = str(successor["id"])
+        transferred_result = _promote_pending_dedupe_successor_to_retry(
+            conn,
+            source_job_id=job_id,
+            source_role=str(source_job["role"]),
+            source_job_type=str(source_job["job_type"]),
+            dedupe_key=str(source_job["dedupe_key"]),
+            successor_job_id=successor_job_id,
+            retry_order=retry_order,
+            result=result,
+            now=now,
+        )
+        cursor = conn.execute(
+            """
+            UPDATE queue_jobs
+            SET status = 'skipped', finished_at = ?, updated_at = ?,
+                error_json = ?, lease_owner = NULL,
+                lease_expires_at = NULL, heartbeat_at = NULL,
+                retry_pending = 0, retry_order = 0
+            WHERE id = ? AND status = ? AND lease_owner = ?
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
+              AND dedupe_key = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM queue_jobs AS pending
+                  WHERE pending.id = ?
+                    AND pending.status = ?
+                    AND pending.retry_pending = 1
+                    AND pending.dedupe_key = queue_jobs.dedupe_key
+                    AND pending.role = queue_jobs.role
+                    AND pending.job_type = queue_jobs.job_type
+              )
+            """,
+            (
+                now,
+                now,
+                json_dumps(
+                    {
+                        "error": None,
+                        "result": transferred_result,
+                        "retry_pending": False,
+                    }
+                ),
+                job_id,
+                ACTIVE_JOB_STATUS,
+                lease_owner,
+                now,
+                source_job["dedupe_key"],
+                successor_job_id,
+                PENDING_JOB_STATUS,
+            ),
+        )
+        if int(cursor.rowcount or 0) != 1:
+            raise RuntimeError(
+                "worker lease or pending dedupe successor changed "
+                "before retry transfer"
+            )
+        return {
+            "job_status": "skipped",
+            "job_ok": bool(transferred_result.get("ok", True)),
+            "retry_pending": True,
+            "retry_transferred": True,
+            "retry_job_id": successor_job_id,
+            "retry_source_job_id": job_id,
+            "dedupe_successor_job_id": successor_job_id,
+            "result": transferred_result,
+        }
+
     cursor = conn.execute(
         """
         UPDATE queue_jobs
@@ -2099,6 +2526,14 @@ def _retry_owned_job(
     )
     if int(cursor.rowcount or 0) != 1:
         raise RuntimeError("worker lease lost before job retry")
+    return {
+        "job_status": PENDING_JOB_STATUS,
+        "job_ok": bool(result.get("ok", True)),
+        "retry_pending": True,
+        "retry_transferred": False,
+        "retry_job_id": job_id,
+        "result": result,
+    }
 
 
 def _bounded_reconcile_limit(value: int, *, field: str) -> int:
@@ -2118,7 +2553,9 @@ WITH base AS (
                 ELSE NULL
            END AS session_id
     FROM queue_jobs
-    WHERE status = 'pending' AND job_type = 'scroll_event_ingested'
+    WHERE status = 'pending'
+      AND retry_pending = 0
+      AND job_type = 'scroll_event_ingested'
 ), ranked AS (
     SELECT id, created_at, session_id,
            first_value(id) OVER (
@@ -2440,6 +2877,7 @@ def _apply_redundant_scribe_reconciliation(conn, jobs: list[dict[str, Any]]) -> 
                 error_json = ?, lease_owner = NULL, lease_expires_at = NULL,
                 heartbeat_at = ?, retry_pending = 0, retry_order = 0
             WHERE id = ? AND status = 'pending'
+              AND retry_pending = 0
             """,
             (now, now, json_dumps({"error": None, "result": result}), now, job["id"]),
         )
@@ -3341,9 +3779,13 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
         prior = _begin_worker_effect(conn, lease)
         if prior is not None:
             return prior
-        row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+        row = conn.execute(
+            "SELECT rowid AS book_rowid, * FROM books WHERE id = ?",
+            (book_id,),
+        ).fetchone()
         if row is None:
             return {"ok": False, "reason": "book_missing", "book_id": book_id}
+        expected_book_authority = content_hash(json_dumps(dict(row)))
         expected = content_hash_value or row["content_hash"]
         original_uri = row["original_uri"]
         reader_uri = row["reader_uri"]
@@ -3353,14 +3795,24 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
         reason = "original_missing"
         actual_original_hash: str | None = None
         actual_reader_hash: str | None = None
-        if original_path and original_path.exists():
+        checked_original = False
+        checked_reader = False
+        if original_path is not None and original_path.exists():
+            checked_original = True
             actual_original_hash = file_sha256(original_path)
             ok = actual_original_hash == expected
             reason = "ok" if ok else "original_hash_mismatch"
-        elif reader_path and reader_path.exists():
-            # Legacy roots may have a reader edition but no original archive. Reader
-            # hashes are text-normalized and are only authoritative as a fallback.
-            actual_reader_hash = content_hash(reader_path.read_text(encoding="utf-8", errors="replace"))
+        elif reader_path is not None and reader_path.exists():
+            checked_reader = True
+            # Legacy roots may have a reader edition but no original archive.
+            # Reader hashes are text-normalized and are authoritative only as
+            # a fallback.
+            actual_reader_hash = content_hash(
+                reader_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            )
             ok = actual_reader_hash == expected
             reason = "ok" if ok else "reader_hash_mismatch"
         else:
@@ -3381,6 +3833,22 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
         if prior is not None:
             conn.commit()
             return prior
+        current_row = conn.execute(
+            "SELECT rowid AS book_rowid, * FROM books WHERE id = ?",
+            (book_id,),
+        ).fetchone()
+        if (
+            current_row is None
+            or content_hash(json_dumps(dict(current_row)))
+            != expected_book_authority
+        ):
+            conn.rollback()
+            return {
+                "ok": False,
+                "reason": "book_changed_during_verification",
+                "book_id": book_id,
+                "retry_pending": True,
+            }
         conn.execute(
             """
             UPDATE books
@@ -3394,14 +3862,18 @@ def verify_book_integrity(root: Path, *, book_id: str, content_hash_value: str |
             action="archivist_verify_book",
             target_type="book",
             target_id=book_id,
-            payload={"ok": ok, "reason": reason, "checked_original": bool(original_path and original_path.exists())},
+            payload={
+                "ok": ok,
+                "reason": reason,
+                "checked_original": checked_original,
+            },
         )
         result = {
             "ok": ok,
             "book_id": book_id,
             "reason": reason,
-            "checked_original": bool(original_path and original_path.exists()),
-            "checked_reader": bool((not original_path or not original_path.exists()) and reader_path and reader_path.exists()),
+            "checked_original": checked_original,
+            "checked_reader": checked_reader,
         }
         _record_worker_effect(
             conn,
@@ -3639,66 +4111,6 @@ MAX_CONFLICT_COMPARISONS = 130816  # 512 choose 2
 MAX_CONFLICT_CARD_MUTATIONS = 512
 MAX_CONFLICT_COMPONENT_MEMBERS = 512
 MAX_CONFLICT_TRANSACTION_SECONDS = 5.0
-
-
-def _ensure_conflict_indexes(root: Path) -> None:
-    """Install additive indexes before opening the bounded writer transaction."""
-    conn = connect(root)
-    try:
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_conflict_group
-            ON cards(conflict_group)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary
-            ON cards(lower(trim(title)), visibility_scope, project_id, session_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_conflict_title_boundary_normalized
-            ON cards(
-                lower(trim(title)),
-                coalesce(visibility_scope, 'session'),
-                coalesce(project_id, ''),
-                coalesce(session_id, '')
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary
-            ON cards(
-                coalesce(visibility_scope, 'session'),
-                coalesce(project_id, ''),
-                coalesce(session_id, '')
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_conflict_boundary_direct
-            ON cards(visibility_scope, project_id, session_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cards_supersedes_card_id
-            ON cards(supersedes_card_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_audit_events_action_target
-            ON audit_events(action, target_type, target_id, created_at)
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 class _ConflictWorkBudget:
@@ -4778,9 +5190,9 @@ def detect_conflicts(
         root,
         recover_pending_card_sidecars=recover_pending_card_sidecars,
     )
-    index_setup_started = time.monotonic()
-    _ensure_conflict_indexes(root)
-    index_setup_seconds = round(time.monotonic() - index_setup_started, 6)
+    # init_db owns live schema provisioning. Conflict detection itself performs
+    # no DDL, so it cannot invalidate a crash-left sidecar reservation.
+    index_setup_seconds = 0.0
     budget.start_transaction()
     candidate_conn = connect(root)
     try:
@@ -5697,6 +6109,744 @@ def resolve_conflict(
     }
 
 
+def _storage_tier_file_identity(path: Path) -> tuple[int, str]:
+    try:
+        sha256, size_bytes, _metadata = _hash_storage_tier_file(path)
+    except (OSError, ProofArchiveError) as exc:
+        raise ValueError(
+            f"storage-tier source is not a stable plain file: {path}"
+        ) from exc
+    return int(size_bytes), sha256
+
+
+def _storage_tier_file_matches(
+    path: Path,
+    *,
+    size_bytes: int,
+    sha256: str,
+) -> bool:
+    try:
+        _assert_storage_tier_no_link_components(path)
+        _verify_storage_tier_file(
+            path,
+            size_bytes=int(size_bytes),
+            sha256=sha256,
+        )
+        return True
+    except (OSError, ProofArchiveError):
+        return False
+
+
+def _storage_tier_owned_temp_paths(
+    destination: Path,
+    *,
+    stage_id: str,
+) -> list[Path]:
+    """Return the one deterministic temporary owned by this stage."""
+
+    temporary = destination.parent / (
+        f".continuum-storage-tier.{stage_id}.tmp"
+    )
+    try:
+        os.lstat(temporary)
+    except FileNotFoundError:
+        return []
+    return [temporary]
+
+
+def _retire_storage_tier_owned_temps(
+    destination: Path,
+    *,
+    stage_id: str,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> int:
+    """Bounded cleanup after an exact canonical destination is durable."""
+
+    retired = 0
+    for temporary in _storage_tier_owned_temp_paths(
+        destination,
+        stage_id=stage_id,
+    ):
+        try:
+            before = os.lstat(temporary)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or _storage_tier_link_like_reason(temporary)
+            ):
+                continue
+            identity = (
+                int(before.st_dev),
+                int(before.st_ino),
+                stat.S_IFMT(before.st_mode),
+                int(before.st_size),
+                int(before.st_mtime_ns),
+                int(before.st_ctime_ns),
+            )
+            if (
+                expected_identity is not None
+                and identity[:3] != expected_identity
+            ):
+                raise RuntimeError(
+                    "storage-tier owned temporary identity changed before "
+                    "retirement"
+                )
+            if retire_exact_windows_file(
+                temporary,
+                expected_identity=identity,
+            ):
+                retired += 1
+                continue
+            cleanup_slot = temporary.parent / (
+                ".continuum-storage-tier-temp-cleanup-slot.tmp"
+            )
+            _assert_storage_tier_no_link_components(cleanup_slot)
+            os.replace(temporary, cleanup_slot)
+            fsync_parent(cleanup_slot)
+            slot = os.lstat(cleanup_slot)
+            slot_identity = (
+                int(slot.st_dev),
+                int(slot.st_ino),
+                stat.S_IFMT(slot.st_mode),
+                int(slot.st_size),
+                int(slot.st_mtime_ns),
+            )
+            if (
+                slot_identity != identity[:5]
+                or os.path.lexists(temporary)
+            ):
+                raise RuntimeError(
+                    "storage-tier temporary was replaced during portable "
+                    f"retirement; replacement preserved at {cleanup_slot}"
+                )
+            retired += 1
+        except FileNotFoundError:
+            continue
+    return retired
+
+
+def _storage_tier_descriptor_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_size),
+    )
+
+
+def _storage_tier_stable_descriptor_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        *_storage_tier_descriptor_identity(metadata),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _copy_verified_storage_tier_file(
+    source: Path,
+    destination: Path,
+    *,
+    sha256: str,
+    size_bytes: int,
+    stage_id: str,
+) -> str:
+    """Publish one exact tier copy without ever exposing partial canonical bytes."""
+
+    if _storage_tier_file_matches(
+        destination,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    ):
+        secure_file(destination)
+        fsync_parent(destination)
+        _retire_storage_tier_owned_temps(
+            destination,
+            stage_id=stage_id,
+        )
+        return "reused_verified_destination"
+    try:
+        os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError(
+            "storage-tier canonical destination exists but is not the exact "
+            f"plain source: {destination}"
+        )
+
+    _assert_storage_tier_no_link_components(destination.parent)
+    secure_mkdir(destination.parent)
+    _assert_storage_tier_no_link_components(destination)
+    temporary = destination.parent / (
+        f".continuum-storage-tier.{stage_id}.tmp"
+    )
+    _retire_storage_tier_owned_temps(
+        destination,
+        stage_id=stage_id,
+    )
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        destination_flags |= os.O_BINARY
+        source_flags |= os.O_BINARY
+    destination_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_flags |= getattr(os, "O_NONBLOCK", 0)
+    destination_fd = os.open(str(temporary), destination_flags, 0o600)
+    destination_identity = _storage_tier_descriptor_identity(
+        os.fstat(destination_fd)
+    )
+    source_fd = -1
+    published = False
+    try:
+        _assert_storage_tier_no_link_components(source)
+        source_fd = os.open(str(source), source_flags)
+        initial_source = os.fstat(source_fd)
+        if not stat.S_ISREG(initial_source.st_mode):
+            raise RuntimeError(
+                f"storage-tier source is not a regular file: {source}"
+            )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(destination_fd, remaining)
+                if written <= 0:
+                    raise OSError(
+                        "storage-tier copy made no forward write progress"
+                    )
+                remaining = remaining[written:]
+            digest.update(chunk)
+            copied += len(chunk)
+        final_source = os.fstat(source_fd)
+        if _storage_tier_stable_descriptor_identity(
+            initial_source
+        ) != _storage_tier_stable_descriptor_identity(final_source):
+            raise RuntimeError(
+                "storage-tier source changed while it was copied"
+            )
+        if _storage_tier_descriptor_identity(
+            os.lstat(source)
+        ) != _storage_tier_descriptor_identity(final_source):
+            raise RuntimeError(
+                "storage-tier source path changed while it was copied"
+            )
+        os.fsync(destination_fd)
+        final_temporary = os.fstat(destination_fd)
+        if (
+            not stat.S_ISREG(final_temporary.st_mode)
+            or int(final_temporary.st_size) != copied
+            or _storage_tier_descriptor_identity(final_temporary)
+            != (
+                destination_identity[0],
+                destination_identity[1],
+                destination_identity[2],
+                copied,
+            )
+        ):
+            raise RuntimeError(
+                "storage-tier owned temporary changed while it was copied"
+            )
+        if copied != int(size_bytes) or digest.hexdigest() != sha256:
+            raise RuntimeError(
+                "storage-tier source changed from its planned identity"
+            )
+        os.close(source_fd)
+        source_fd = -1
+        os.close(destination_fd)
+        destination_fd = -1
+        try:
+            replace_file_noclobber(temporary, destination)
+            published = True
+        except FileExistsError:
+            if not _storage_tier_file_matches(
+                destination,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            ):
+                raise RuntimeError(
+                    "storage-tier concurrent canonical destination conflicts "
+                    f"with the exact source: {destination}"
+                )
+        secure_file(destination)
+        fsync_parent(destination)
+        if not _storage_tier_file_matches(
+            destination,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier canonical publication failed exact verification"
+            )
+    finally:
+        for descriptor in (source_fd, destination_fd):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _retire_storage_tier_owned_temps(
+            destination,
+            stage_id=stage_id,
+            expected_identity=destination_identity[:3],
+        )
+    _retire_storage_tier_owned_temps(
+        destination,
+        stage_id=stage_id,
+    )
+    return (
+        "copied_verified_destination"
+        if published
+        else "reused_verified_destination"
+    )
+
+
+def _stage_storage_tier_file(
+    root: Path,
+    *,
+    field: str,
+    base: Path,
+    uri: str,
+    target_tier: str,
+    dry_run: bool,
+) -> tuple[dict[str, Any], str]:
+    source_path = resolve_stored_uri(root, uri)
+    destination = base / target_tier / source_path.name
+    target_uri = continuum_uri(root, destination)
+    detail: dict[str, Any] = {
+        "field": field,
+        "from_uri": str(uri),
+        "to_uri": target_uri,
+        "moved": False,
+        "staged": False,
+    }
+    try:
+        same_path = (
+            source_path.resolve(strict=False)
+            == destination.resolve(strict=False)
+        )
+        inside_root = source_path.resolve(strict=False).is_relative_to(
+            root.resolve(strict=False)
+        )
+    except OSError:
+        same_path = False
+        inside_root = False
+    if same_path:
+        detail["reason"] = "already_in_target_tier"
+        return detail, target_uri
+    if not inside_root:
+        detail["reason"] = "external_uri_not_moved"
+        return detail, str(uri)
+    if not source_path.is_file():
+        detail["reason"] = "source_missing"
+        return detail, str(uri)
+
+    size_bytes, sha256 = _storage_tier_file_identity(source_path)
+    detail["size_bytes"] = size_bytes
+    detail["sha256"] = sha256
+    stage_id = content_hash(
+        json_dumps(
+            {
+                "field": field,
+                "from_uri": str(uri),
+                "to_uri": target_uri,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+            }
+        )
+    )[:24]
+    detail["publisher_stage_id"] = stage_id
+    if dry_run:
+        detail["reason"] = "copy_planned"
+    else:
+        try:
+            publication = _copy_verified_storage_tier_file(
+                source_path,
+                destination,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                stage_id=stage_id,
+            )
+        except ProofArchiveError as exc:
+            raise RuntimeError(
+                "storage-tier destination conflicts with the exact source: "
+                f"{destination}"
+            ) from exc
+        if not _storage_tier_file_matches(
+            destination,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier staged copy failed exact verification: "
+                f"{destination}"
+            )
+        detail["reason"] = publication
+        detail["staged"] = True
+        detail["retired_publisher_temps"] = _retire_storage_tier_owned_temps(
+            destination,
+            stage_id=stage_id,
+        )
+    detail["moved"] = True
+    return detail, target_uri
+
+
+def _finish_storage_tier_retirement(
+    retirement: Path,
+    *,
+    size_bytes: int,
+    sha256: str,
+) -> str:
+    if not _storage_tier_file_matches(
+        retirement,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    ):
+        raise RuntimeError(
+            "storage-tier retirement object changed before final cleanup"
+        )
+    metadata = os.lstat(retirement)
+    identity = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+    if retire_exact_windows_file(
+        retirement,
+        expected_identity=identity,
+    ):
+        return "windows_exact_handle"
+    cleanup_slot = retirement.parent / (
+        ".continuum-storage-tier-source-cleanup-slot"
+    )
+    os.replace(retirement, cleanup_slot)
+    fsync_parent(cleanup_slot)
+    slot = os.lstat(cleanup_slot)
+    slot_identity = (
+        int(slot.st_dev),
+        int(slot.st_ino),
+        stat.S_IFMT(slot.st_mode),
+        int(slot.st_size),
+        int(slot.st_mtime_ns),
+    )
+    if (
+        slot_identity != identity[:5]
+        or os.path.lexists(retirement)
+        or not _storage_tier_file_matches(
+            cleanup_slot,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+    ):
+        raise RuntimeError(
+            "storage-tier source cleanup slot changed during portable "
+            "retirement"
+        )
+    return "portable_bounded_slot"
+
+
+def _retire_storage_tier_source(
+    root: Path,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    result = dict(detail)
+    if not detail.get("moved"):
+        result["cleanup"] = "not_required"
+        return result
+    sha256 = detail.get("sha256")
+    size_bytes = detail.get("size_bytes")
+    if not isinstance(sha256, str) or not isinstance(size_bytes, int):
+        result["cleanup"] = "legacy_identity_unavailable"
+        return result
+    source = resolve_stored_uri(root, str(detail["from_uri"]))
+    destination = resolve_stored_uri(root, str(detail["to_uri"]))
+    stage_id = str(detail.get("publisher_stage_id") or "")
+    if len(stage_id) != 24 or any(
+        character not in "0123456789abcdef" for character in stage_id
+    ):
+        stage_id = content_hash(
+            json_dumps(
+                {
+                    "field": str(detail.get("field") or ""),
+                    "from_uri": str(detail["from_uri"]),
+                    "to_uri": str(detail["to_uri"]),
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                }
+            )
+        )[:24]
+    if not _storage_tier_file_matches(
+        destination,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    ):
+        if not _storage_tier_file_matches(
+            source,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier cleanup has no exact source or destination"
+            )
+        try:
+            _copy_verified_storage_tier_file(
+                source,
+                destination,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                stage_id=stage_id,
+            )
+        except ProofArchiveError as exc:
+            raise RuntimeError(
+                "storage-tier cleanup could not restore its exact destination"
+            ) from exc
+    retirement = source.parent / (
+        f".continuum-storage-tier-retire.{stage_id}.{source.name}"
+    )
+    try:
+        retirement_metadata = os.lstat(retirement)
+    except FileNotFoundError:
+        retirement_metadata = None
+    if retirement_metadata is not None:
+        if os.path.lexists(source):
+            raise RuntimeError(
+                "storage-tier cleanup found both source and owned retirement "
+                f"objects: {source}"
+            )
+        if not _storage_tier_file_matches(
+            retirement,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier owned retirement object does not match the "
+                f"committed canonical bytes: {retirement}"
+            )
+        if not _storage_tier_file_matches(
+            destination,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier canonical destination drifted before retirement "
+                "recovery"
+            )
+        result["retirement_disposition"] = (
+            _finish_storage_tier_retirement(
+                retirement,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
+        )
+    if os.path.lexists(source):
+        if not _storage_tier_file_matches(
+            source,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier cleanup source drifted after catalog commit"
+            )
+        source_identity = _storage_tier_descriptor_identity(
+            os.lstat(source)
+        )
+        _assert_storage_tier_no_link_components(retirement)
+        replace_file_noclobber(source, retirement)
+        fsync_parent(retirement)
+        moved_identity = _storage_tier_descriptor_identity(
+            os.lstat(retirement)
+        )
+        if moved_identity != source_identity:
+            raise RuntimeError(
+                "storage-tier source identity changed during retirement; "
+                f"preserved at {retirement}"
+            )
+        if not _storage_tier_file_matches(
+            retirement,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier source content changed during retirement; "
+                f"preserved at {retirement}"
+            )
+        if not _storage_tier_file_matches(
+            destination,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise RuntimeError(
+                "storage-tier canonical destination drifted during source "
+                f"retirement; source preserved at {retirement}"
+            )
+        result["retirement_disposition"] = (
+            _finish_storage_tier_retirement(
+                retirement,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
+        )
+    if not _storage_tier_file_matches(
+        destination,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    ):
+        raise RuntimeError(
+            "storage-tier cleanup destination failed exact verification"
+        )
+    result["cleanup"] = "complete"
+    return result
+
+
+def _storage_tier_cleanup_binding(
+    detail: dict[str, Any],
+) -> tuple[str, str, str, int, str, str]:
+    raw_size = detail.get("size_bytes")
+    return (
+        str(detail.get("field") or ""),
+        str(detail.get("from_uri") or ""),
+        str(detail.get("to_uri") or ""),
+        int(raw_size) if isinstance(raw_size, int) else -1,
+        str(detail.get("sha256") or ""),
+        str(detail.get("publisher_stage_id") or ""),
+    )
+
+
+def _mark_storage_tier_cleanup_complete(
+    root: Path,
+    *,
+    book_id: str,
+    completed: list[dict[str, Any]],
+) -> int:
+    completed_bindings = {
+        _storage_tier_cleanup_binding(detail)
+        for detail in completed
+        if detail.get("cleanup") == "complete"
+    }
+    if not completed_bindings:
+        return 0
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT original_uri, reader_uri, metadata_json
+            FROM books
+            WHERE id = ?
+            """,
+            (book_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return 0
+        metadata = json_loads(row["metadata_json"], {})
+        history = metadata.get("tier_history", [])
+        if not isinstance(history, list):
+            conn.rollback()
+            return 0
+        completed_at = utc_now()
+        marked = 0
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            files = entry.get("files", [])
+            if not isinstance(files, list):
+                continue
+            for raw_detail in files:
+                if not isinstance(raw_detail, dict):
+                    continue
+                field = str(raw_detail.get("field") or "")
+                if field not in {"original_uri", "reader_uri"}:
+                    continue
+                if str(row[field] or "") != str(
+                    raw_detail.get("to_uri") or ""
+                ):
+                    continue
+                if (
+                    _storage_tier_cleanup_binding(raw_detail)
+                    not in completed_bindings
+                    or raw_detail.get("cleanup") == "complete"
+                ):
+                    continue
+                raw_detail["cleanup"] = "complete"
+                raw_detail["cleanup_completed_at"] = completed_at
+                marked += 1
+        if not marked:
+            conn.rollback()
+            return 0
+        updated = conn.execute(
+            """
+            UPDATE books
+            SET metadata_json = ?
+            WHERE id = ?
+              AND metadata_json IS ?
+            """,
+            (json_dumps(metadata), book_id, row["metadata_json"]),
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise RuntimeError(
+                "storage-tier cleanup authority changed before completion "
+                "was recorded"
+            )
+        conn.commit()
+        return marked
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _reconcile_storage_tier_history(
+    root: Path,
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    metadata = json_loads(row["metadata_json"], {})
+    history = metadata.get("tier_history", [])
+    if not isinstance(history, list):
+        return []
+    reconciled: list[dict[str, Any]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        files = entry.get("files", [])
+        if not isinstance(files, list):
+            continue
+        for raw_detail in files:
+            if not isinstance(raw_detail, dict):
+                continue
+            if raw_detail.get("cleanup") == "complete":
+                continue
+            field = raw_detail.get("field")
+            if field not in {"original_uri", "reader_uri"}:
+                continue
+            if str(row.get(field) or "") != str(
+                raw_detail.get("to_uri") or ""
+            ):
+                continue
+            result = _retire_storage_tier_source(root, raw_detail)
+            if result.get("cleanup") == "complete":
+                reconciled.append(result)
+    _mark_storage_tier_cleanup_complete(
+        root,
+        book_id=str(row["id"]),
+        completed=reconciled,
+    )
+    return reconciled
+
+
 def apply_storage_tiering(
     root: Path,
     *,
@@ -5712,28 +6862,47 @@ def apply_storage_tiering(
     hot_days = int(policy.get("raw_scroll_hot_days", 30))
     warm_days = int(policy.get("raw_scroll_warm_days", 180))
     actions: list[dict[str, Any]] = []
-    conn = connect(root)
-    try:
-        rows = conn.execute(
-            """
-            SELECT id, title, storage_tier, original_uri, reader_uri, location_uri, updated_at, metadata_json
-            FROM books
-            WHERE status = 'active'
-            ORDER BY updated_at ASC
-            LIMIT ?
-            """,
-            (max(1, int(limit)),),
-        ).fetchall()
+    reconciled_cleanup: list[dict[str, Any]] = []
+    with operation_lock(
+        root,
+        "archivist-storage-tiering",
+        timeout_seconds=60.0,
+    ):
+        conn = connect_existing(root)
+        try:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, title, storage_tier, original_uri, reader_uri,
+                           location_uri, updated_at, metadata_json
+                    FROM books
+                    WHERE status = 'active'
+                    ORDER BY updated_at ASC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
         now = utc_now()
         now_dt = dt.datetime.now(dt.UTC).replace(microsecond=0)
         for row in rows:
+            if not dry_run:
+                reconciled_cleanup.extend(
+                    _reconcile_storage_tier_history(root, row)
+                )
             age_days = 9999
             try:
                 updated = _parse_utc_timestamp(row["updated_at"])
-                age_days = max(0, int((now_dt - updated).total_seconds() // 86400))
+                age_days = max(
+                    0,
+                    int((now_dt - updated).total_seconds() // 86400),
+                )
             except Exception:
                 pass
-            tier = row["storage_tier"]
+            tier = str(row["storage_tier"])
             target = tier
             if tier == "hot" and age_days >= hot_days:
                 target = "warm"
@@ -5741,70 +6910,139 @@ def apply_storage_tiering(
                 target = "cold"
             if target == tier:
                 continue
-            action = {"book_id": row["id"], "from": tier, "to": target, "age_days": age_days}
+
+            action: dict[str, Any] = {
+                "book_id": row["id"],
+                "from": tier,
+                "to": target,
+                "age_days": age_days,
+            }
             original_uri = row["original_uri"]
             reader_uri = row["reader_uri"]
-            moved_files: list[dict[str, Any]] = []
+            staged_files: list[dict[str, Any]] = []
             for field, base, uri, target_tier in (
-                ("original_uri", root / "archive" / "originals", original_uri, target),
-                ("reader_uri", root / "archive" / "reader_editions", reader_uri, "cold" if target == "vault" else target),
+                (
+                    "original_uri",
+                    root / "archive" / "originals",
+                    original_uri,
+                    target,
+                ),
+                (
+                    "reader_uri",
+                    root / "archive" / "reader_editions",
+                    reader_uri,
+                    "cold" if target == "vault" else target,
+                ),
             ):
                 if not uri:
                     continue
-                source_path = resolve_stored_uri(root, uri)
-                destination = base / target_tier / source_path.name
-                target_uri = continuum_uri(root, destination)
-                move_detail = {
-                    "field": field,
-                    "from_uri": str(uri),
-                    "to_uri": target_uri,
-                    "moved": False,
-                }
-                try:
-                    same_path = source_path.resolve(strict=False) == destination.resolve(strict=False)
-                    inside_root = source_path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
-                except OSError:
-                    same_path = False
-                    inside_root = False
-                if same_path:
-                    move_detail["reason"] = "already_in_target_tier"
-                elif not inside_root:
-                    move_detail["reason"] = "external_uri_not_moved"
-                elif not source_path.exists():
-                    move_detail["reason"] = "source_missing"
+                detail, staged_uri = _stage_storage_tier_file(
+                    root,
+                    field=field,
+                    base=base,
+                    uri=str(uri),
+                    target_tier=target_tier,
+                    dry_run=dry_run,
+                )
+                staged_files.append(detail)
+                if field == "original_uri":
+                    original_uri = staged_uri
                 else:
-                    if not dry_run:
-                        secure_move_file(source_path, destination)
-                    move_detail["moved"] = True
-                if field == "original_uri" and (move_detail["moved"] or same_path):
-                    original_uri = target_uri
-                if field == "reader_uri" and (move_detail["moved"] or same_path):
-                    reader_uri = target_uri
-                moved_files.append(move_detail)
-            action["files"] = moved_files
-            actions.append(action)
+                    reader_uri = staged_uri
+            action["files"] = staged_files
             if dry_run:
+                actions.append(action)
                 continue
+
             metadata = json_loads(row["metadata_json"], {})
             metadata.setdefault("tier_history", []).append(
-                {"from": tier, "to": target, "at": now, "reason": "retention_age", "files": moved_files}
+                {
+                    "from": tier,
+                    "to": target,
+                    "at": now,
+                    "reason": "retention_age",
+                    "files": staged_files,
+                }
             )
-            location_uri = original_uri if row["location_uri"] == row["original_uri"] else row["location_uri"]
-            conn.execute(
-                """
-                UPDATE books
-                SET storage_tier = ?, original_uri = ?, reader_uri = ?, location_uri = ?,
-                    last_tiered_at = ?, metadata_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (target, original_uri, reader_uri, location_uri, now, json_dumps(metadata), now, row["id"]),
+            location_uri = (
+                original_uri
+                if row["location_uri"] == row["original_uri"]
+                else row["location_uri"]
             )
-        if not dry_run:
-            audit_event(conn, action="archivist_apply_storage_tiering", target_type="books", target_id=None, payload={"actions": actions})
-            conn.commit()
-        return {"ok": True, "dry_run": dry_run, "action_count": len(actions), "actions": actions}
-    finally:
-        conn.close()
+            writer = connect(root)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                updated_row = writer.execute(
+                    """
+                    UPDATE books
+                    SET storage_tier = ?, original_uri = ?, reader_uri = ?,
+                        location_uri = ?, last_tiered_at = ?,
+                        metadata_json = ?, updated_at = ?
+                    WHERE id = ?
+                      AND storage_tier IS ?
+                      AND original_uri IS ?
+                      AND reader_uri IS ?
+                      AND location_uri IS ?
+                      AND updated_at IS ?
+                      AND metadata_json IS ?
+                    """,
+                    (
+                        target,
+                        original_uri,
+                        reader_uri,
+                        location_uri,
+                        now,
+                        json_dumps(metadata),
+                        now,
+                        row["id"],
+                        row["storage_tier"],
+                        row["original_uri"],
+                        row["reader_uri"],
+                        row["location_uri"],
+                        row["updated_at"],
+                        row["metadata_json"],
+                    ),
+                )
+                if int(updated_row.rowcount or 0) != 1:
+                    raise RuntimeError(
+                        "storage-tier catalog row changed after file staging; "
+                        "retry"
+                    )
+                audit_event(
+                    writer,
+                    action="archivist_apply_storage_tiering",
+                    target_type="book",
+                    target_id=str(row["id"]),
+                    payload={"action": action},
+                )
+                writer.commit()
+            except Exception:
+                if writer.in_transaction:
+                    writer.rollback()
+                raise
+            finally:
+                writer.close()
+
+            action["files"] = [
+                _retire_storage_tier_source(root, detail)
+                for detail in staged_files
+            ]
+            action["cleanup_marked_count"] = (
+                _mark_storage_tier_cleanup_complete(
+                    root,
+                    book_id=str(row["id"]),
+                    completed=action["files"],
+                )
+            )
+            actions.append(action)
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "action_count": len(actions),
+        "actions": actions,
+        "reconciled_cleanup_count": len(reconciled_cleanup),
+        "reconciled_cleanup": reconciled_cleanup,
+    }
 
 
 _PRUNE_MEMORY_PROTECTED_CARD_SQL = """
@@ -5934,80 +7172,104 @@ def _restore_prune_memory_rows(
 ) -> dict[str, Any]:
     card_ids = [str(row["id"]) for row in original_rows]
     original_by_id = {str(row["id"]): row for row in original_rows}
-    conn = connect(root)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        cas_mismatches: list[str] = []
-        for expected in expected_rows:
-            current = conn.execute(
-                """
-                SELECT card.status, card.metadata_json, card.updated_at,
-                       card.location_uri, outbox.generation AS sidecar_generation
-                FROM cards AS card
-                LEFT JOIN card_sidecar_outbox AS outbox ON outbox.card_id = card.id
-                WHERE card.id = ?
-                """,
-                (expected["id"],),
-            ).fetchone()
-            if current is None or any(
-                current[field] != expected[field]
-                for field in (
-                    "status",
-                    "metadata_json",
-                    "updated_at",
-                    "location_uri",
-                    "sidecar_generation",
-                )
-            ):
-                cas_mismatches.append(str(expected["id"]))
-        if cas_mismatches:
-            conn.rollback()
-            return {
-                "ok": False,
-                "restored": False,
-                "cas_mismatch_card_ids": sorted(cas_mismatches),
-                "reason": "Card state changed after prune commit",
-            }
-
-        registered_cleanup_intents = register_card_sidecar_compensation_intents(
-            root,
-            cleanup_candidates or [],
-            conn=conn,
-        )
-
-        for card_id in card_ids:
-            row = original_by_id[card_id]
-            restored = conn.execute(
-                """
-                UPDATE cards
-                SET status = ?, metadata_json = ?, updated_at = ?, location_uri = ?
-                WHERE id = ?
-                """,
-                (
-                    row["status"],
-                    row["metadata_json"],
-                    row["updated_at"],
-                    row["location_uri"],
-                    row["id"],
-                ),
+    with operation_lock(
+        root,
+        CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+        timeout_seconds=60.0,
+    ):
+        # Publish and fsync compensation authority before taking SQLite's
+        # writer lock.  While this operation lock is held, reconciliation
+        # cannot terminalize those intents between publication and the DB CAS.
+        # A crash before the restore commit leaves the still-pruned DB state
+        # authoritative; a crash after commit leaves the intent authoritative
+        # for cleanup.
+        registered_cleanup_intents = (
+            register_card_sidecar_compensation_intents(
+                root,
+                cleanup_candidates or [],
             )
-            if restored.rowcount != 1:
-                raise RuntimeError(f"unable to restore pruned Card row: {row['id']}")
-        audit_event(
-            conn,
-            action="librarian_prune_memory_rolled_back",
-            target_type="cards",
-            target_id=None,
-            payload={"card_ids": card_ids, "failure_reason": failure_reason},
         )
-        mark_card_sidecar_outbox(conn, card_ids, reason="memory_prune_rolled_back")
-        conn.commit()
-    except Exception:
-        if conn.in_transaction:
-            conn.rollback()
-        raise
-    finally:
-        conn.close()
+        conn = connect(root)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cas_mismatches: list[str] = []
+            for expected in expected_rows:
+                current = conn.execute(
+                    """
+                    SELECT card.status, card.metadata_json, card.updated_at,
+                           card.location_uri,
+                           outbox.generation AS sidecar_generation
+                    FROM cards AS card
+                    LEFT JOIN card_sidecar_outbox AS outbox
+                      ON outbox.card_id = card.id
+                    WHERE card.id = ?
+                    """,
+                    (expected["id"],),
+                ).fetchone()
+                if current is None or any(
+                    current[field] != expected[field]
+                    for field in (
+                        "status",
+                        "metadata_json",
+                        "updated_at",
+                        "location_uri",
+                        "sidecar_generation",
+                    )
+                ):
+                    cas_mismatches.append(str(expected["id"]))
+            if cas_mismatches:
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "restored": False,
+                    "cas_mismatch_card_ids": sorted(cas_mismatches),
+                    "reason": "Card state changed after prune commit",
+                    "registered_cleanup_intents": registered_cleanup_intents,
+                }
+
+            for card_id in card_ids:
+                row = original_by_id[card_id]
+                restored = conn.execute(
+                    """
+                    UPDATE cards
+                    SET status = ?, metadata_json = ?, updated_at = ?,
+                        location_uri = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        row["status"],
+                        row["metadata_json"],
+                        row["updated_at"],
+                        row["location_uri"],
+                        row["id"],
+                    ),
+                )
+                if restored.rowcount != 1:
+                    raise RuntimeError(
+                        f"unable to restore pruned Card row: {row['id']}"
+                    )
+            audit_event(
+                conn,
+                action="librarian_prune_memory_rolled_back",
+                target_type="cards",
+                target_id=None,
+                payload={
+                    "card_ids": card_ids,
+                    "failure_reason": failure_reason,
+                },
+            )
+            mark_card_sidecar_outbox(
+                conn,
+                card_ids,
+                reason="memory_prune_rolled_back",
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     sidecar_sync = _sync_worker_card_sidecars(root, card_ids)
     cleanup_reconciliation = _reconcile_worker_sidecar_intents_with_budget(
@@ -6045,7 +7307,63 @@ def prune_memory(
     validated_limit = validate_prune_memory_limit(limit)
     match_sql, match_params = _prune_memory_match_sql(normalized_topic)
     init_db(root, recover_pending_card_sidecars=False)
-    conn = connect(root)
+    preflight_conn: sqlite3.Connection | None = None
+    preflight_data_version: int | None = None
+    preflight_authority: tuple[int, int, int] | None = None
+    preflight_integrity: dict[str, Any] | None = None
+    if not dry_run:
+        preflight_conn = connect_existing(root)
+        try:
+            for _attempt in range(2):
+                data_version_before = int(
+                    preflight_conn.execute(
+                        "PRAGMA data_version"
+                    ).fetchone()[0]
+                )
+                preflight_conn.execute("BEGIN")
+                try:
+                    candidate_authority = (
+                        _card_sidecar_db_authority_token(preflight_conn)
+                    )
+                    candidate_integrity = semantic_integrity_report(
+                        root,
+                        create=False,
+                        conn=preflight_conn,
+                    )
+                    preflight_conn.commit()
+                except Exception:
+                    if preflight_conn.in_transaction:
+                        preflight_conn.rollback()
+                    raise
+                data_version_after = int(
+                    preflight_conn.execute(
+                        "PRAGMA data_version"
+                    ).fetchone()[0]
+                )
+                if data_version_before == data_version_after:
+                    preflight_data_version = data_version_after
+                    preflight_authority = candidate_authority
+                    preflight_integrity = candidate_integrity
+                    break
+            if preflight_integrity is None:
+                raise RuntimeError(
+                    "prune-memory catalog changed during semantic preflight; "
+                    "retry"
+                )
+            if not preflight_integrity.get("ok"):
+                raise ValueError(
+                    "prune-memory preflight failed: semantic integrity is not "
+                    f"clean: {preflight_integrity.get('failing')}"
+                )
+        except Exception:
+            preflight_conn.close()
+            raise
+    try:
+        conn = connect(root)
+    except Exception:
+        if preflight_conn is not None:
+            preflight_conn.close()
+        raise
     transaction_started = False
     original_rows: list[dict[str, Any]] = []
     applied_rows: list[dict[str, Any]] = []
@@ -6053,11 +7371,22 @@ def prune_memory(
         if not dry_run:
             conn.execute("BEGIN IMMEDIATE")
             transaction_started = True
-            preflight_integrity = semantic_integrity_report(root, create=False, conn=conn)
-            if not preflight_integrity.get("ok"):
-                raise ValueError(
-                    "prune-memory preflight failed: semantic integrity is not clean: "
-                    f"{preflight_integrity.get('failing')}"
+            if (
+                preflight_conn is None
+                or preflight_data_version is None
+                or preflight_authority is None
+                or int(
+                    preflight_conn.execute(
+                        "PRAGMA data_version"
+                    ).fetchone()[0]
+                )
+                != preflight_data_version
+                or _card_sidecar_db_authority_token(conn)
+                != preflight_authority
+            ):
+                raise RuntimeError(
+                    "prune-memory catalog authority changed after semantic "
+                    "preflight; retry"
                 )
 
         rows = conn.execute(
@@ -6181,16 +7510,33 @@ def prune_memory(
                 eligible_ids,
             ).fetchall()
         ]
-        catalog_postcondition = semantic_integrity_report(
-            root,
-            create=False,
-            conn=conn,
-            check_card_sidecars=False,
-        )
-        if not catalog_postcondition.get("ok"):
+        applied_by_id = {
+            str(row["id"]): row
+            for row in applied_rows
+        }
+        expected_prune_entry = {
+            "action": action,
+            "topic": normalized_topic,
+            "matching_mode": matching_mode,
+            "at": now,
+        }
+        if (
+            set(applied_by_id) != set(eligible_ids)
+            or any(
+                str(applied_by_id[card_id]["status"]) != target_status
+                or str(applied_by_id[card_id]["updated_at"]) != now
+                or applied_by_id[card_id]["sidecar_generation"] is None
+                or json_loads(
+                    applied_by_id[card_id]["metadata_json"],
+                    {},
+                ).get("prune_history", [])[-1:]
+                != [expected_prune_entry]
+                for card_id in eligible_ids
+            )
+        ):
             raise RuntimeError(
-                "prune-memory postcondition failed before commit: "
-                f"{catalog_postcondition.get('failing')}"
+                "prune-memory targeted database postcondition failed before "
+                "commit"
             )
         conn.commit()
         transaction_started = False
@@ -6200,6 +7546,8 @@ def prune_memory(
         raise
     finally:
         conn.close()
+        if preflight_conn is not None:
+            preflight_conn.close()
 
     try:
         sidecar_sync = _sync_worker_card_sidecars(root, eligible_ids)
@@ -9636,6 +10984,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
     processed: list[dict[str, Any]] = []
     deferred_job_ids: set[str] = set()
     reclaimed_expired_jobs = 0
+    reclaimed_public_results: list[dict[str, Any]] = []
     for pass_index in range(max(1, int(limit))):
         conn = connect(root)
         try:
@@ -9644,6 +10993,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 reclaimed_expired_jobs += _reclaim_expired_leases(
                     conn,
                     role_set,
+                    public_results=reclaimed_public_results,
                 )
             job = _claim_job(
                 conn,
@@ -9655,6 +11005,8 @@ def _run_worker_pass_with_sidecar_intent_budget(
             conn.commit()
         finally:
             conn.close()
+        if pass_index == 0 and reclaimed_public_results:
+            processed.extend(reclaimed_public_results)
         if job is None:
             break
         lease = _JobLease(root, str(job["id"]), worker_id, lease_seconds)
@@ -9671,6 +11023,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
             renewer.stop()
             job_ok = bool(result.get("ok", True))
             retry_pending = bool(result.get("retry_pending"))
+            retry_outcome: dict[str, Any] | None = None
             job_status = (
                 "pending"
                 if retry_pending
@@ -9683,12 +11036,18 @@ def _run_worker_pass_with_sidecar_intent_budget(
             conn = connect(root)
             try:
                 if retry_pending:
-                    _retry_owned_job(
+                    retry_outcome = _retry_owned_job(
                         conn,
                         job["id"],
                         lease_owner=worker_id,
                         lease_seconds=lease_seconds,
                         result=result,
+                    )
+                    result = dict(retry_outcome["result"])
+                    job_status = str(retry_outcome["job_status"])
+                    job_ok = bool(retry_outcome["job_ok"])
+                    retry_pending = bool(
+                        retry_outcome["retry_pending"]
                     )
                 else:
                     _finish_owned_job(
@@ -9704,13 +11063,17 @@ def _run_worker_pass_with_sidecar_intent_budget(
             finally:
                 conn.close()
             processed.append({"job_id": job["id"], "role": job["role"], "job_type": job["job_type"], "status": job_status, "ok": job_ok, "result": result})
-            if retry_pending:
-                deferred_job_ids.add(str(job["id"]))
+            if retry_outcome is not None:
+                deferred_job_ids.add(
+                    str(retry_outcome["retry_job_id"])
+                )
         except Exception as exc:
             renewer.stop()
             conn = connect(root)
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                retry_outcome = None
+                lost_lease_result: dict[str, Any] | None = None
                 post_commit_authority = (
                     _running_job_post_commit_authority(conn, job)
                 )
@@ -9732,7 +11095,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
                             f"{type(exc).__name__}:{exc}"
                         ),
                     }
-                    _retry_owned_job(
+                    retry_outcome = _retry_owned_job(
                         conn,
                         job["id"],
                         lease_owner=worker_id,
@@ -9741,28 +11104,52 @@ def _run_worker_pass_with_sidecar_intent_budget(
                     )
                 else:
                     post_commit_authority = None
-                    _finish_job(
+                    failure_recorded = _finish_job(
                         conn,
                         job["id"],
                         status="failed",
                         error=str(exc),
                         lease_owner=worker_id,
                     )
+                    if not failure_recorded:
+                        lost_lease_result = _lost_lease_processed_result(
+                            job=job,
+                            error=exc,
+                            authority=_queue_job_authority_snapshot(
+                                conn,
+                                str(job["id"]),
+                            ),
+                        )
                 conn.commit()
             finally:
                 conn.close()
             if post_commit_authority is not None:
+                if retry_outcome is None:
+                    raise RuntimeError(
+                        "post-commit retry outcome is unavailable"
+                    )
                 processed.append(
                     {
                         "job_id": job["id"],
                         "role": job["role"],
                         "job_type": job["job_type"],
-                        "status": "pending",
-                        "ok": False,
-                        "result": retry_result,
+                        "status": str(
+                            retry_outcome["job_status"]
+                        ),
+                        "ok": bool(retry_outcome["job_ok"]),
+                        "result": dict(retry_outcome["result"]),
                     }
                 )
-                deferred_job_ids.add(str(job["id"]))
+                deferred_job_ids.add(
+                    str(retry_outcome["retry_job_id"])
+                )
+            elif lost_lease_result is not None:
+                processed.append(lost_lease_result)
+                if (
+                    lost_lease_result["authoritative_job"].get("status")
+                    == PENDING_JOB_STATUS
+                ):
+                    deferred_job_ids.add(str(job["id"]))
             else:
                 processed.append(
                     {
@@ -9810,9 +11197,26 @@ def _run_worker_pass_with_sidecar_intent_budget(
     retry_pending_count = sum(
         1
         for item in processed
-        if item.get("status") == PENDING_JOB_STATUS
-        and isinstance(item.get("result"), dict)
-        and item["result"].get("retry_pending") is True
+        if isinstance(item.get("result"), dict)
+        and (
+            (
+                item.get("status") == PENDING_JOB_STATUS
+                and item["result"].get("retry_pending") is True
+            )
+            or item["result"].get("retry_transferred") is True
+        )
+    )
+    incomplete_attempt_count = sum(
+        1
+        for item in processed
+        if item.get("attempt_completed") is False
+        and item.get("reason") == "worker_lease_lost"
+    )
+    expired_non_preemptible_failure_count = sum(
+        1
+        for item in processed
+        if item.get("reason")
+        == "non_preemptible_worker_lease_expired"
     )
     processed_ok = all(
         item.get("ok", False)
@@ -9820,6 +11224,11 @@ def _run_worker_pass_with_sidecar_intent_budget(
             item.get("status") == PENDING_JOB_STATUS
             and isinstance(item.get("result"), dict)
             and item["result"].get("retry_pending") is True
+        )
+        or (
+            item.get("status") == "skipped"
+            and isinstance(item.get("result"), dict)
+            and item["result"].get("retry_transferred") is True
         )
         for item in processed
     )
@@ -9834,6 +11243,10 @@ def _run_worker_pass_with_sidecar_intent_budget(
         "lease_seconds": lease_seconds,
         "reclaimed_expired_jobs": reclaimed_expired_jobs,
         "retry_pending_count": retry_pending_count,
+        "incomplete_attempt_count": incomplete_attempt_count,
+        "expired_non_preemptible_failure_count": (
+            expired_non_preemptible_failure_count
+        ),
         "processed_count": len(processed),
         "processed": processed,
         "maintenance": maintenance_result,
@@ -9870,6 +11283,8 @@ def serve_workers(
     passes = 0
     processed = 0
     retry_pending = 0
+    incomplete_attempts = 0
+    expired_non_preemptible_failures = 0
     maintenance_passes = 0
     maintenance_interval = max(1.0, float(maintenance_interval_seconds))
     next_maintenance_at = time.monotonic() if maintenance_on_start else time.monotonic() + maintenance_interval
@@ -9881,6 +11296,15 @@ def serve_workers(
             passes += 1
             processed += int(result.get("processed_count", 0))
             retry_pending += int(result.get("retry_pending_count", 0))
+            incomplete_attempts += int(
+                result.get("incomplete_attempt_count", 0)
+            )
+            expired_non_preemptible_failures += int(
+                result.get(
+                    "expired_non_preemptible_failure_count",
+                    0,
+                )
+            )
             if maintenance_due:
                 maintenance_passes += 1
                 next_maintenance_at = time.monotonic() + maintenance_interval
@@ -9891,6 +11315,10 @@ def serve_workers(
                     "passes": passes,
                     "processed_count": processed,
                     "retry_pending_count": retry_pending,
+                    "incomplete_attempt_count": incomplete_attempts,
+                    "expired_non_preemptible_failure_count": (
+                        expired_non_preemptible_failures
+                    ),
                     "maintenance_passes": maintenance_passes,
                     "maintenance_interval_seconds": maintenance_interval,
                     "failed_pass": result,
@@ -9901,6 +11329,10 @@ def serve_workers(
                     "passes": passes,
                     "processed_count": processed,
                     "retry_pending_count": retry_pending,
+                    "incomplete_attempt_count": incomplete_attempts,
+                    "expired_non_preemptible_failure_count": (
+                        expired_non_preemptible_failures
+                    ),
                     "maintenance_passes": maintenance_passes,
                     "maintenance_interval_seconds": maintenance_interval,
                 }
@@ -9970,19 +11402,56 @@ def memory_health(root: Path) -> dict[str, Any]:
             missing_retry_authority.append(
                 "queue_jobs.retry_authority_triggers"
             )
-        if missing_retry_authority:
+        fairness_table = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_schema
+            WHERE type = 'table' AND name = ?
+            """,
+            (QUEUE_JOB_FAIRNESS_TABLE_NAME,),
+        ).fetchone()
+        fairness_table_ready = (
+            fairness_table is not None
+            and _queue_job_fairness_table_ready(conn)
+        )
+        fairness_triggers_ready = (
+            _queue_job_fairness_triggers_ready(conn)
+        )
+        missing_fairness_authority: list[str] = []
+        if fairness_table is None:
+            missing_fairness_authority.append(
+                QUEUE_JOB_FAIRNESS_TABLE_NAME
+            )
+        elif not fairness_table_ready:
+            missing_fairness_authority.append(
+                f"{QUEUE_JOB_FAIRNESS_TABLE_NAME}.schema"
+            )
+        if not fairness_triggers_ready:
+            missing_fairness_authority.append(
+                f"{QUEUE_JOB_FAIRNESS_TABLE_NAME}.cleanup_trigger"
+            )
+        missing_schema_authority = [
+            *missing_retry_authority,
+            *missing_fairness_authority,
+        ]
+        if missing_schema_authority:
             return {
                 "ok": False,
                 "initialized": True,
                 "root": str(root),
                 "reason": "schema_migration_required",
-                "missing_schema_authority": missing_retry_authority,
+                "missing_schema_authority": missing_schema_authority,
                 "checks": [
                     {
                         "name": "queue_retry_authority_ready",
-                        "ok": False,
+                        "ok": not missing_retry_authority,
                         "missing": missing_retry_authority,
-                    }
+                    },
+                    {
+                        "name": "queue_job_fairness_authority_ready",
+                        "ok": not missing_fairness_authority,
+                        "missing": missing_fairness_authority,
+                    },
                 ],
             }
         pending_jobs = conn.execute("SELECT count(*) AS n FROM queue_jobs WHERE status = 'pending'").fetchone()["n"]

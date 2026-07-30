@@ -22,7 +22,7 @@ from continuum.core.store import (
     roll_scroll_segment,
     semantic_integrity_report,
     snapshot,
-    sync_card_sidecar,
+    sync_card_sidecars_after_commit,
 )
 from continuum.core.workers import run_worker_pass
 
@@ -421,10 +421,14 @@ class ProjectStateLimitTests(unittest.TestCase):
                     "UPDATE cards SET title = title || ' changed' WHERE id = ?",
                     (invalid["card_id"],),
                 )
-                sync_card_sidecar(root, conn, str(invalid["card_id"]))
                 conn.commit()
             finally:
                 conn.close()
+            sidecar_sync = sync_card_sidecars_after_commit(
+                root,
+                [str(invalid["card_id"])],
+            )
+            self.assertTrue(sidecar_sync["ok"], sidecar_sync)
             divergent = semantic_integrity_report(root)
             self.assertFalse(divergent["ok"], divergent)
             self.assertEqual(

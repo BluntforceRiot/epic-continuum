@@ -1554,6 +1554,18 @@ version = "9.9.9"
             sentinel = stage_base / "keep.txt"
             sentinel.write_text("keep\n", encoding="utf-8")
             script = repo_root / "scripts" / "stage_codex_plugin.py"
+            allowed_roots_a = os.pathsep.join(
+                (
+                    str(Path(tmp) / "workspace-a"),
+                    str(Path(tmp) / "evidence-a"),
+                )
+            )
+            allowed_roots_b = os.pathsep.join(
+                (
+                    str(Path(tmp) / "workspace-b"),
+                    str(Path(tmp) / "evidence-b"),
+                )
+            )
 
             proc = subprocess.run(
                 [
@@ -1567,6 +1579,8 @@ version = "9.9.9"
                     sys.executable,
                     "--stage-base",
                     str(stage_base),
+                    "--allowed-roots",
+                    allowed_roots_a,
                 ],
                 text=True,
                 capture_output=True,
@@ -1583,7 +1597,13 @@ version = "9.9.9"
 
             mcp_bytes = (stage_root / "plugins" / "continuum" / ".mcp.json").read_bytes()
             self.assertFalse(mcp_bytes.startswith(b"\xef\xbb\xbf"))
-            json.loads(mcp_bytes.decode("utf-8"))
+            mcp_payload = json.loads(mcp_bytes.decode("utf-8"))
+            self.assertEqual(
+                mcp_payload["mcpServers"]["continuum"]["env"][
+                    "CONTINUUM_ALLOWED_ROOTS"
+                ],
+                allowed_roots_a,
+            )
 
             manifest = json.loads((stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text())
             self.assertIn(".local.", manifest["version"])
@@ -1604,6 +1624,8 @@ version = "9.9.9"
                     sys.executable,
                     "--stage-base",
                     str(stage_base),
+                    "--allowed-roots",
+                    allowed_roots_a,
                 ],
                 text=True,
                 capture_output=True,
@@ -1617,6 +1639,54 @@ version = "9.9.9"
                 (second_stage_root / "plugins" / "continuum" / ".codex-plugin" / "plugin.json").read_text()
             )
             self.assertNotEqual(first_manifest_version, second_manifest["version"])
+
+            third = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--repo-root",
+                    str(repo_root),
+                    "--root",
+                    str(second_root),
+                    "--python",
+                    sys.executable,
+                    "--stage-base",
+                    str(stage_base),
+                    "--allowed-roots",
+                    allowed_roots_b,
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+            third_stage_root = Path(third.stdout.strip())
+            third_manifest = json.loads(
+                (
+                    third_stage_root
+                    / "plugins"
+                    / "continuum"
+                    / ".codex-plugin"
+                    / "plugin.json"
+                ).read_text()
+            )
+            self.assertNotEqual(
+                second_manifest["version"],
+                third_manifest["version"],
+            )
+            third_mcp_payload = json.loads(
+                (
+                    third_stage_root
+                    / "plugins"
+                    / "continuum"
+                    / ".mcp.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                third_mcp_payload["mcpServers"]["continuum"]["env"][
+                    "CONTINUUM_ALLOWED_ROOTS"
+                ],
+                allowed_roots_b,
+            )
 
     def test_codex_stage_helper_refuses_unowned_existing_stage_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

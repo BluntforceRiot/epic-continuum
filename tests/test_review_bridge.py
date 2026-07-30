@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import shutil
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -359,7 +360,7 @@ def pending_derived_paths(root: Path, job: dict, stored_status: dict) -> tuple[P
 
 def strip_phase_authority_for_legacy_fixture(root: Path, job_dir: Path) -> None:
     """Turn a current test job into a pre-phase legacy fixture explicitly."""
-    conn = connect(root)
+    conn = sqlite3.connect(str(root / "catalog" / "catalog.sqlite3"))
     try:
         conn.execute("DROP TRIGGER IF EXISTS protect_review_phase_artifact_updates")
         conn.execute("DROP TRIGGER IF EXISTS protect_review_phase_artifact_deletes")

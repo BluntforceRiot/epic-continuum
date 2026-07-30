@@ -36,6 +36,7 @@ from .permissions import (
     secure_write_text,
     secure_write_text_exclusive,
     set_windows_delete_disposition,
+    retire_exact_windows_file,
     replace_file_noclobber,
 )
 from .project_state import (
@@ -133,6 +134,41 @@ QUEUE_RETRY_AUTHORITY_TRIGGER_ERROR = (
 )
 QUEUE_RUNNING_DEDUPE_INDEX_NAME = "idx_queue_running_dedupe"
 QUEUE_PENDING_DEDUPE_INDEX_NAME = "idx_queue_pending_dedupe_key"
+CONFLICT_INDEX_NAMES = frozenset(
+    {
+        "idx_cards_conflict_group",
+        "idx_cards_conflict_title_boundary",
+        "idx_cards_conflict_title_boundary_normalized",
+        "idx_cards_conflict_boundary",
+        "idx_cards_conflict_boundary_direct",
+        "idx_cards_supersedes_card_id",
+        "idx_audit_events_action_target",
+    }
+)
+REVIEW_ARTIFACT_IMMUTABILITY_TRIGGER_NAMES = frozenset(
+    {
+        "protect_review_phase_artifact_updates",
+        "protect_review_phase_artifact_deletes",
+        "protect_review_legacy_quarantine_updates",
+        "protect_review_legacy_quarantine_deletes",
+        "protect_review_artifact_replace_conflicts",
+        "protect_review_artifact_update_conflicts",
+    }
+)
+QUEUE_JOB_FAIRNESS_TABLE_NAME = "queue_job_fairness"
+QUEUE_JOB_FAIRNESS_TABLE_SQL = """
+    CREATE TABLE queue_job_fairness (
+        job_id TEXT NOT NULL
+            REFERENCES queue_jobs(id) ON DELETE CASCADE,
+        lane TEXT NOT NULL CHECK(lane IN ('priority', 'retry')),
+        bypass_count INTEGER NOT NULL
+            CHECK(
+                typeof(bypass_count) = 'integer'
+                AND bypass_count > 0
+            ),
+        PRIMARY KEY(job_id, lane)
+    )
+"""
 QUEUE_ROLE_PRIORITY_INDEX_SQL = """
     CREATE INDEX idx_queue_role_priority
     ON queue_jobs(role, status, retry_pending, priority, created_at)
@@ -862,6 +898,7 @@ SNAPSHOT_DURABLE_TABLES = (
     "chunks",
     "cards",
     "queue_jobs",
+    QUEUE_JOB_FAIRNESS_TABLE_NAME,
     "graph_nodes",
     "graph_edges",
     "graph_edge_sources",
@@ -877,6 +914,7 @@ SNAPSHOT_V2_ADDITIVE_COUNT_TABLES = frozenset(
     {
         "conflict_resolution_receipts",
         "conflict_resolution_members",
+        "queue_job_fairness",
     }
 )
 
@@ -2964,6 +3002,105 @@ def truncate_to_token_budget(text: str, token_budget: int) -> tuple[str, bool]:
     return text[: char_limit - len(suffix)].rstrip() + suffix, True
 
 
+def _live_catalog_schema_mutation_requires_sidecar_lock(
+    action_code: int,
+    argument_one: str | None,
+    argument_two: str | None,
+) -> bool:
+    protected_tables = {"artifacts", "card_sidecar_outbox", "cards", "meta"}
+    protected_triggers = (
+        CARD_SIDECAR_DB_AUTHORITY_TRIGGER_NAMES
+        | CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_NAMES
+        | CARD_SIDECAR_QUARANTINE_RESERVATION_TRIGGER_NAMES
+        | REVIEW_ARTIFACT_IMMUTABILITY_TRIGGER_NAMES
+    )
+    first = str(argument_one or "").lower()
+    second = str(argument_two or "").lower()
+    if action_code == sqlite3.SQLITE_DROP_TRIGGER:
+        return first in {name.lower() for name in protected_triggers}
+    if action_code == sqlite3.SQLITE_DROP_TABLE:
+        return first in protected_tables
+    if action_code == sqlite3.SQLITE_ALTER_TABLE:
+        return first in protected_tables or second in protected_tables
+    if action_code == sqlite3.SQLITE_CREATE_VTABLE:
+        return first == "chunks_fts" or second == "chunks_fts"
+    return bool(
+        action_code == sqlite3.SQLITE_PRAGMA
+        and first in {"schema_version", "writable_schema"}
+        and argument_two is not None
+    )
+
+
+_LIVE_CATALOG_SCHEMA_MUTATION_ROOTS: contextvars.ContextVar[
+    frozenset[str]
+] = contextvars.ContextVar(
+    "continuum_live_catalog_schema_mutation_roots",
+    default=frozenset(),
+)
+
+
+def _claim_live_catalog_schema_mutation_authority(
+    root: Path,
+) -> contextvars.Token[frozenset[str]]:
+    from .operations import operation_lock_is_held
+
+    if not operation_lock_is_held(
+        root,
+        CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+    ):
+        raise RuntimeError(
+            "live catalog schema mutation requires the sidecar operation lock"
+        )
+    root_key = str(root.resolve(strict=False))
+    return _LIVE_CATALOG_SCHEMA_MUTATION_ROOTS.set(
+        _LIVE_CATALOG_SCHEMA_MUTATION_ROOTS.get() | {root_key}
+    )
+
+
+def _release_live_catalog_schema_mutation_authority(
+    token: contextvars.Token[frozenset[str]],
+) -> None:
+    _LIVE_CATALOG_SCHEMA_MUTATION_ROOTS.reset(token)
+
+
+def _install_live_catalog_schema_authorizer(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> None:
+    """Require the sidecar lock before protected live-catalog DDL."""
+
+    from .operations import operation_lock_is_held
+
+    root_key = str(root.resolve(strict=False))
+
+    def authorize(
+        action_code: int,
+        argument_one: str | None,
+        argument_two: str | None,
+        _database_name: str | None,
+        _trigger_name: str | None,
+    ) -> int:
+        if (
+            _live_catalog_schema_mutation_requires_sidecar_lock(
+                action_code,
+                argument_one,
+                argument_two,
+            )
+            and (
+                root_key
+                not in _LIVE_CATALOG_SCHEMA_MUTATION_ROOTS.get()
+                or not operation_lock_is_held(
+                    root,
+                    CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+                )
+            )
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorize)
+
+
 def connect(root: Path) -> sqlite3.Connection:
     # This is the single live-catalog write connection factory. Keep the claim
     # check here so direct library callers cannot bypass the runtime boundary.
@@ -2973,6 +3110,7 @@ def connect(root: Path) -> sqlite3.Connection:
     secure_mkdir(db_path.parent, secure_existing=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    _install_live_catalog_schema_authorizer(root, conn)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -3321,6 +3459,7 @@ def _open_regular_file_evidence_fd(path: Path) -> int:
         nofollow = int(getattr(os, "O_NOFOLLOW", 0))
         if nofollow:
             flags |= nofollow
+        flags |= int(getattr(os, "O_NONBLOCK", 0))
         return os.open(path, flags)
 
     import msvcrt
@@ -4122,6 +4261,12 @@ CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_SCHEMA = (
 CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY = (
     "card_sidecar_artifact_write_reservation"
 )
+CARD_SIDECAR_QUARANTINE_RESERVATION_SCHEMA = (
+    "continuum.card_sidecar_quarantine_reservation.v1"
+)
+CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY = (
+    "card_sidecar_quarantine_reservation"
+)
 IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY = (
     "immutable_artifact_path_index_epoch"
 )
@@ -4142,6 +4287,9 @@ CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR = (
     "immutable artifact registration blocked by active Card sidecar write "
     "reservation"
 )
+CARD_SIDECAR_QUARANTINE_RESERVATION_TRIGGER_ERROR = (
+    "Card sidecar authority mutation blocked by active quarantine reservation"
+)
 
 
 class CardSidecarArtifactWriteReservationError(RuntimeError):
@@ -4157,6 +4305,19 @@ CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_NAMES = frozenset(
         "advance_immutable_artifact_path_index_epoch_after_delete",
     }
 )
+CARD_SIDECAR_QUARANTINE_RESERVATION_TRIGGER_NAMES = frozenset(
+    {
+        "fence_card_sidecar_quarantine_card_insert",
+        "fence_card_sidecar_quarantine_card_update",
+        "fence_card_sidecar_quarantine_card_delete",
+        "fence_card_sidecar_quarantine_outbox_insert",
+        "fence_card_sidecar_quarantine_outbox_update",
+        "fence_card_sidecar_quarantine_outbox_delete",
+        "fence_card_sidecar_quarantine_immutable_artifact_insert",
+        "fence_card_sidecar_quarantine_immutable_artifact_update",
+        "fence_card_sidecar_quarantine_immutable_artifact_delete",
+    }
+)
 MAX_CARD_SIDECAR_ARTIFACT_INDEX_STABILITY_ATTEMPTS = 8
 MAX_CARD_SIDECAR_RECONCILIATION_SNAPSHOT_ATTEMPTS = 8
 MAX_CARD_SIDECAR_WRITE_INTENTS = 10000
@@ -4166,6 +4327,12 @@ MAX_CARD_SIDECAR_RESOLVED_INTENT_BYTES = (
 )
 _CARD_SIDECAR_WRITE_INTENT_PUBLISHER_TEMP_RE = re.compile(
     r"\.card_sidecar_write_intent_[0-9a-f]{24}\.json\.[a-z0-9_]{8}\.tmp"
+)
+_CARD_SIDECAR_WRITE_INTENT_FILENAME_RE = re.compile(
+    r"card_sidecar_write_intent_[0-9a-f]{24}\.json"
+)
+_CARD_SIDECAR_PUBLISHER_TEMP_CLEANUP_SLOT_NAME = (
+    ".card_sidecar_publisher_temp_cleanup.slot"
 )
 _CARD_SIDECAR_INTENT_RECONCILIATION_LIMIT: contextvars.ContextVar[
     int | None
@@ -4234,10 +4401,30 @@ def _current_card_sidecar_intent_reconciliation_budget(
 def _card_sidecar_artifact_write_reservation_value(
     conn: sqlite3.Connection,
 ) -> str | None:
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key = ?",
-        (CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: meta" in str(exc).lower():
+            return None
+        raise
+    return str(row["value"]) if row is not None else None
+
+
+def _card_sidecar_quarantine_reservation_value(
+    conn: sqlite3.Connection,
+) -> str | None:
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: meta" in str(exc).lower():
+            return None
+        raise
     return str(row["value"]) if row is not None else None
 
 
@@ -4332,6 +4519,10 @@ def _immutable_artifact_authority_token(
         raise RuntimeError(
             "immutable artifact authority triggers are not exact"
         )
+    if not _card_sidecar_quarantine_reservation_triggers_ready(conn):
+        raise RuntimeError(
+            "Card sidecar quarantine authority triggers are not exact"
+        )
     return (
         _immutable_artifact_path_index_epoch(conn),
         _sqlite_schema_authority_version(conn),
@@ -4369,6 +4560,10 @@ def _capture_card_sidecar_reconciliation_snapshot(
         ):
             raise RuntimeError(
                 "immutable artifact authority triggers are not exact"
+            )
+        if not _card_sidecar_quarantine_reservation_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar quarantine authority triggers are not exact"
             )
         artifact_epoch = _immutable_artifact_path_index_epoch(conn)
         sidecar_epoch = _card_sidecar_db_authority_epoch(conn)
@@ -4580,6 +4775,11 @@ def _reserve_card_sidecar_artifact_write(
                 "Card sidecar artifact write reservation already exists while "
                 "the operation lock is held"
             )
+        if _card_sidecar_quarantine_reservation_value(conn) is not None:
+            raise RuntimeError(
+                "Card sidecar quarantine reservation conflicts with artifact "
+                "publication"
+            )
         conn.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?)",
             (
@@ -4612,6 +4812,406 @@ def _release_card_sidecar_artifact_write_reservation(
         )
 
 
+def _card_sidecar_quarantine_reservation_payload(
+    root: Path,
+    reservation_value: str,
+) -> dict[str, Any]:
+    try:
+        parsed = json.loads(reservation_value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(
+            "Card sidecar quarantine reservation is not valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "Card sidecar quarantine reservation must be an object"
+        )
+    intent = parsed.get("intent")
+    intent_entry = parsed.get("intent_entry")
+    target_entry = parsed.get("target_entry")
+    authority = parsed.get("authority")
+    if (
+        parsed.get("schema") != CARD_SIDECAR_QUARANTINE_RESERVATION_SCHEMA
+        or re.fullmatch(
+            r"sidecar_quarantine_\d{8}T\d{6}Z_[0-9a-f]{16}",
+            str(parsed.get("reservation_id") or ""),
+        )
+        is None
+        or not isinstance(intent, dict)
+        or not isinstance(intent_entry, dict)
+        or not isinstance(target_entry, dict)
+        or not isinstance(authority, dict)
+    ):
+        raise ValueError(
+            "Card sidecar quarantine reservation envelope is invalid"
+        )
+    card_id = str(intent.get("card_id") or "")
+    target_uri = str(intent.get("target_uri") or "")
+    expected_state_hash = str(intent.get("expected_state_hash") or "")
+    mode = str(intent.get("mode") or "write")
+    attempt_id = str(intent.get("attempt_id") or "")
+    intent_id = str(intent.get("intent_id") or "")
+    if (
+        intent.get("schema") != CARD_SIDECAR_WRITE_INTENT_SCHEMA
+        or mode not in {"write", "compensation_cleanup"}
+        or not _is_canonical_card_id(card_id)
+        or not target_uri
+        or re.fullmatch(r"[0-9a-f]{64}", expected_state_hash) is None
+        or re.fullmatch(
+            r"card_sidecar_attempt_\d{8}T\d{6}Z_[0-9a-f]{16}",
+            attempt_id,
+        )
+        is None
+        or intent_id
+        != stable_id(
+            "card_sidecar_write_intent",
+            mode,
+            card_id,
+            target_uri,
+            expected_state_hash,
+            attempt_id,
+        )
+        or parsed.get("intent_id") != intent_id
+        or parsed.get("card_id") != card_id
+        or parsed.get("target_uri") != target_uri
+    ):
+        raise ValueError(
+            "Card sidecar quarantine reservation intent binding is invalid"
+        )
+    integer_fields = (
+        (intent_entry, "device_id"),
+        (intent_entry, "file_id"),
+        (intent_entry, "size_bytes"),
+        (intent_entry, "mtime_ns"),
+        (intent_entry, "ctime_ns"),
+        (target_entry, "device_id"),
+        (target_entry, "file_id"),
+        (target_entry, "size_bytes"),
+        (target_entry, "mtime_ns"),
+        (target_entry, "ctime_ns"),
+        (authority, "artifact_epoch"),
+        (authority, "sidecar_epoch"),
+        (authority, "sqlite_schema_version"),
+    )
+    if any(
+        isinstance(item.get(key), bool)
+        or not isinstance(item.get(key), int)
+        or int(item[key]) < 0
+        for item, key in integer_fields
+    ):
+        raise ValueError(
+            "Card sidecar quarantine reservation numeric authority is invalid"
+        )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(intent_entry.get("sha256") or ""))
+        is None
+        or
+        re.fullmatch(r"[0-9a-f]{64}", str(target_entry.get("sha256") or ""))
+        is None
+        or not isinstance(parsed.get("created_at"), str)
+    ):
+        raise ValueError(
+            "Card sidecar quarantine reservation file evidence is invalid"
+        )
+    target_path = resolve_stored_uri(root, target_uri)
+    default_path = _configured_card_sidecar_path(root, card_id)
+    managed_target_path = _resolved_managed_card_sidecar_path(
+        default_path,
+        target_path,
+        card_id=card_id,
+    )
+    if managed_target_path is None:
+        raise ValueError(
+            "Card sidecar quarantine reservation target is unmanaged"
+        )
+    recovery_path = managed_target_path.with_name(
+        f".{managed_target_path.name}.{intent_id}.uncommitted"
+    )
+    if parsed.get("recovery_uri") != continuum_uri(root, recovery_path):
+        raise ValueError(
+            "Card sidecar quarantine reservation recovery binding is invalid"
+        )
+    return parsed
+
+
+def _card_sidecar_quarantine_target_evidence(
+    reservation: dict[str, Any],
+    target_path: Path,
+) -> StableRegularFileEvidence:
+    target_entry = reservation["target_entry"]
+    identity = _sidecar_nofollow_path_identity(target_path, allow_missing=True)
+    if identity is None:
+        raise ValueError(
+            "Card sidecar quarantine target namespace is unavailable"
+        )
+    return (
+        (
+            identity[0],
+            (
+                int(target_entry["device_id"]),
+                int(target_entry["file_id"]),
+            ),
+        ),
+        (
+            int(target_entry["size_bytes"]),
+            int(target_entry["mtime_ns"]),
+            int(target_entry["ctime_ns"]),
+        ),
+        str(target_entry["sha256"]),
+    )
+
+
+def _open_card_sidecar_quarantine_intent_binding(
+    reservation: dict[str, Any],
+    intent_path: Path,
+) -> tuple[StableRegularFileEvidence, int]:
+    """Open and bind the exact intent bytes recorded by a reservation."""
+
+    intent_entry = reservation["intent_entry"]
+    evidence, fd, raw_bytes = _open_stable_regular_file_hash_evidence(
+        intent_path,
+        max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+        capture_bytes=True,
+    )
+    expected_file_identity = (
+        int(intent_entry["device_id"]),
+        int(intent_entry["file_id"]),
+    )
+    expected_fingerprint = (
+        int(intent_entry["size_bytes"]),
+        int(intent_entry["mtime_ns"]),
+        int(intent_entry["ctime_ns"]),
+    )
+    try:
+        parsed_intent = (
+            json.loads(raw_bytes.decode("utf-8"))
+            if raw_bytes is not None
+            else None
+        )
+        if (
+            evidence[0][1] != expected_file_identity
+            or evidence[1] != expected_fingerprint
+            or evidence[2] != str(intent_entry["sha256"])
+            or parsed_intent != reservation["intent"]
+            or not _held_regular_file_evidence_is_current(
+                intent_path,
+                evidence,
+                fd,
+            )
+        ):
+            raise ValueError(
+                "Card sidecar quarantine intent does not match its reservation"
+            )
+        return evidence, fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _reserve_card_sidecar_quarantine(
+    root: Path,
+    conn: sqlite3.Connection,
+    *,
+    intent: dict[str, Any],
+    intent_entry_identity: tuple[int, int],
+    expected_intent_evidence: StableRegularFileEvidence,
+    expected_intent_bytes: bytes,
+    target_path: Path,
+    recovery_path: Path,
+    target_evidence: StableRegularFileEvidence,
+    expected_authority: CardSidecarDbAuthorityToken,
+) -> str | None:
+    """Commit a DB-authority fence before destructive filesystem work."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar quarantine reservation requires no active transaction"
+        )
+    target_file_identity = target_evidence[0][1]
+    if target_file_identity is None:
+        raise ValueError(
+            "Card sidecar quarantine target identity is unavailable"
+        )
+    intent_path = (
+        _card_sidecar_write_intent_dir(root) / f"{intent['intent_id']}.json"
+    )
+    intent_fd = -1
+    current_intent_evidence, intent_fd, current_intent_bytes = (
+        _open_stable_regular_file_hash_evidence(
+            intent_path,
+            max_bytes=MAX_CARD_SIDECAR_WRITE_INTENT_BYTES,
+            capture_bytes=True,
+        )
+    )
+    if (
+        expected_intent_evidence[0][1] != intent_entry_identity
+        or current_intent_evidence != expected_intent_evidence
+        or current_intent_bytes != expected_intent_bytes
+    ):
+        os.close(intent_fd)
+        raise ValueError(
+            "Card sidecar quarantine intent changed before reservation"
+        )
+    try:
+        current_intent = json.loads(expected_intent_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        os.close(intent_fd)
+        raise ValueError(
+            "Card sidecar quarantine intent bytes are invalid"
+        ) from exc
+    if (
+        current_intent != intent
+        or not _held_regular_file_evidence_is_current(
+            intent_path,
+            expected_intent_evidence,
+            intent_fd,
+        )
+    ):
+        os.close(intent_fd)
+        raise ValueError(
+            "Card sidecar quarantine intent payload changed before reservation"
+        )
+    if resolve_stored_uri(root, str(intent["target_uri"])) != target_path:
+        os.close(intent_fd)
+        raise ValueError(
+            "Card sidecar quarantine target path does not match its intent"
+        )
+    if recovery_path != target_path.with_name(
+        f".{target_path.name}.{intent['intent_id']}.uncommitted"
+    ):
+        os.close(intent_fd)
+        raise ValueError(
+            "Card sidecar quarantine recovery path does not match its intent"
+        )
+    reservation_value = json_dumps(
+        {
+            "schema": CARD_SIDECAR_QUARANTINE_RESERVATION_SCHEMA,
+            "reservation_id": unique_id("sidecar_quarantine"),
+            "intent_id": str(intent["intent_id"]),
+            "card_id": str(intent["card_id"]),
+            "target_uri": str(intent["target_uri"]),
+            "recovery_uri": continuum_uri(root, recovery_path),
+            "intent": intent,
+            "intent_entry": {
+                "device_id": int(intent_entry_identity[0]),
+                "file_id": int(intent_entry_identity[1]),
+                "size_bytes": int(expected_intent_evidence[1][0]),
+                "mtime_ns": int(expected_intent_evidence[1][1]),
+                "ctime_ns": int(expected_intent_evidence[1][2]),
+                "sha256": str(expected_intent_evidence[2]),
+            },
+            "target_entry": {
+                "device_id": int(target_file_identity[0]),
+                "file_id": int(target_file_identity[1]),
+                "size_bytes": int(target_evidence[1][0]),
+                "mtime_ns": int(target_evidence[1][1]),
+                "ctime_ns": int(target_evidence[1][2]),
+                "sha256": str(target_evidence[2]),
+            },
+            "authority": {
+                "artifact_epoch": int(expected_authority[0]),
+                "sidecar_epoch": int(expected_authority[1]),
+                "sqlite_schema_version": int(expected_authority[2]),
+            },
+            "created_at": utc_now(),
+        }
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            not _card_sidecar_quarantine_reservation_triggers_ready(conn)
+            or not _card_sidecar_db_authority_triggers_ready(conn)
+            or not _card_sidecar_artifact_write_reservation_triggers_ready(
+                conn
+            )
+        ):
+            raise RuntimeError(
+                "Card sidecar quarantine authority triggers are not exact at "
+                "reservation"
+            )
+        if _card_sidecar_db_authority_token(conn) != expected_authority:
+            conn.rollback()
+            return None
+        if _card_sidecar_quarantine_reservation_value(conn) is not None:
+            raise RuntimeError(
+                "Card sidecar quarantine reservation already exists while the "
+                "operation lock is held"
+            )
+        if _card_sidecar_artifact_write_reservation_value(conn) is not None:
+            raise RuntimeError(
+                "Card sidecar artifact-write reservation conflicts with "
+                "quarantine"
+            )
+        if not _held_regular_file_evidence_is_current(
+            intent_path,
+            expected_intent_evidence,
+            intent_fd,
+        ):
+            raise ValueError(
+                "Card sidecar quarantine intent changed while reserving"
+            )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            (
+                CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY,
+                reservation_value,
+            ),
+        )
+        conn.commit()
+        if not _held_regular_file_evidence_is_current(
+            intent_path,
+            expected_intent_evidence,
+            intent_fd,
+        ):
+            raise ValueError(
+                "Card sidecar quarantine intent changed after reservation"
+            )
+        return reservation_value
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        os.close(intent_fd)
+
+
+def _release_card_sidecar_quarantine_reservation(
+    conn: sqlite3.Connection,
+    reservation_value: str,
+    expected_authority: CardSidecarDbAuthorityToken,
+) -> bool:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar quarantine release requires no active transaction"
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _card_sidecar_quarantine_authority_is_current(
+            conn,
+            expected_authority,
+            reservation_value,
+        ):
+            conn.rollback()
+            return False
+        deleted = conn.execute(
+            "DELETE FROM meta WHERE key = ? AND value = ?",
+            (
+                CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY,
+                reservation_value,
+            ),
+        ).rowcount
+        if deleted != 1:
+            raise RuntimeError(
+                "Card sidecar quarantine reservation changed before release"
+            )
+        conn.commit()
+        return True
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def _charge_card_sidecar_intent_reconciliation_budget(
     budget: dict[str, int],
     *,
@@ -4624,7 +5224,6 @@ def _charge_card_sidecar_intent_reconciliation_budget(
         charge = allowance
     else:
         charge = max(
-            max(0, int(result.get("enumerated", 0))),
             max(0, int(result.get("inspected", 0))),
             max(0, int(result.get("selected", 0))),
             max(0, int(result.get("processed", 0))),
@@ -4671,8 +5270,9 @@ def _bounded_card_sidecar_state_paths(
     directory: Path,
     *,
     entry_limit: int | None = None,
+    include_all: bool = False,
 ) -> tuple[list[Path], bool, int]:
-    """Collect bounded JSON paths with one all-entry truncation sentinel."""
+    """Collect bounded state paths with one all-entry truncation sentinel."""
 
     bounded_entry_limit = (
         MAX_CARD_SIDECAR_WRITE_INTENTS
@@ -4690,7 +5290,7 @@ def _bounded_card_sidecar_state_paths(
             if enumerated > bounded_entry_limit:
                 truncated = True
                 break
-            if not entry.name.endswith(".json"):
+            if not include_all and not entry.name.endswith(".json"):
                 continue
             collected.append(Path(entry.path))
     collected.sort(key=lambda path: path.name)
@@ -4710,12 +5310,15 @@ def _bounded_card_sidecar_intent_inventory(
     retirement_dir: Path | None,
     *,
     entry_limit: int,
-    publisher_temp_candidates: (
-        list[tuple[Path, tuple[int, int]]] | None
-    ) = None,
-    publisher_temp_inventory_state: CardSidecarStateDir | None = None,
+    publisher_temp_candidates: list[tuple[Path, tuple[int, int]]],
+    inventory_failures: list[dict[str, Any]],
 ) -> tuple[list[Path], list[Path], bool, int]:
-    """Fairly inventory both queues under one shared all-entry allowance."""
+    """Inventory both queues under one shared physical-entry allowance.
+
+    Exact crash-left publisher temporaries are the only entries eligible for
+    automatic cleanup. Other noncanonical active entries are surfaced
+    fail-closed without consuming the valid-intent work allowance.
+    """
 
     bounded_entry_limit = max(0, int(entry_limit))
     retirement_paths: list[Path] = []
@@ -4746,38 +5349,85 @@ def _bounded_card_sidecar_intent_inventory(
             if enumerated > bounded_entry_limit:
                 truncated = True
                 break
+            entry_path = Path(entry.path)
             if (
                 namespace == "intent"
-                and publisher_temp_candidates is not None
+                and entry.name
+                == _CARD_SIDECAR_PUBLISHER_TEMP_CLEANUP_SLOT_NAME
+            ):
+                try:
+                    _bounded_card_sidecar_publisher_temp_identity(
+                        entry_path,
+                        label="publisher temporary cleanup slot",
+                    )
+                except (OSError, ValueError) as exc:
+                    inventory_failures.append(
+                        {
+                            "intent_uri": str(entry_path),
+                            "error": (
+                                f"{type(exc).__name__}: "
+                                f"{str(exc)[:512]}"
+                            ),
+                            "reason": (
+                                "unsafe_publisher_temp_cleanup_slot"
+                            ),
+                        }
+                    )
+                turn = (scanner_index + 1) % len(scanners)
+                continue
+            if (
+                namespace == "intent"
                 and _CARD_SIDECAR_WRITE_INTENT_PUBLISHER_TEMP_RE.fullmatch(
                     entry.name
                 )
             ):
-                temp_path = Path(entry.path)
-                if publisher_temp_inventory_state is None:
-                    raise ValueError(
-                        "Card sidecar publisher temporary retirement is unfenced"
+                try:
+                    expected_identity = (
+                        _bounded_card_sidecar_publisher_temp_identity(
+                            entry_path,
+                            label="publisher temporary",
+                        )
                     )
-                expected_identity = _plain_card_sidecar_state_path_identity(
-                    temp_path,
-                    directory=False,
-                )
-                publisher_temp_candidates.append(
-                    (temp_path, expected_identity)
-                )
+                    publisher_temp_candidates.append(
+                        (entry_path, expected_identity)
+                    )
+                except (OSError, ValueError) as exc:
+                    inventory_failures.append(
+                        {
+                            "intent_uri": str(entry_path),
+                            "error": (
+                                f"{type(exc).__name__}: "
+                                f"{str(exc)[:512]}"
+                            ),
+                            "reason": "unsafe_card_sidecar_debris",
+                        }
+                    )
                 turn = (scanner_index + 1) % len(scanners)
                 continue
-            if entry.name.endswith(".json"):
-                if namespace == "intent":
-                    intent_paths.append(Path(entry.path))
-                else:
-                    retirement_paths.append(Path(entry.path))
+            if namespace == "retirement":
+                retirement_paths.append(entry_path)
+            elif _CARD_SIDECAR_WRITE_INTENT_FILENAME_RE.fullmatch(
+                entry.name
+            ):
+                intent_paths.append(entry_path)
+            else:
+                inventory_failures.append(
+                    {
+                        "intent_uri": str(entry_path),
+                        "error": (
+                            "Noncanonical Card sidecar intent namespace "
+                            "entry requires operator review"
+                        ),
+                        "reason": "noncanonical_card_sidecar_intent_entry",
+                    }
+                )
             turn = (scanner_index + 1) % len(scanners)
     finally:
         for _namespace, scanner in scanners:
             scanner.close()
     intent_paths.sort(key=lambda path: path.name)
     retirement_paths.sort(key=lambda path: path.name)
+    publisher_temp_candidates.sort(key=lambda item: item[0].name)
     return (
         intent_paths,
         retirement_paths,
@@ -4814,6 +5464,36 @@ def _plain_card_sidecar_state_path_identity(
     return int(metadata.st_dev), int(metadata.st_ino)
 
 
+def _bounded_card_sidecar_publisher_temp_identity(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[int, int]:
+    identity = _plain_card_sidecar_state_path_identity(
+        path,
+        directory=False,
+    )
+    metadata = os.lstat(path)
+    reparse_flag = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or bool(
+            int(getattr(metadata, "st_file_attributes", 0))
+            & reparse_flag
+        )
+        or (int(metadata.st_dev), int(metadata.st_ino)) != identity
+        or int(metadata.st_size) > MAX_CARD_SIDECAR_WRITE_INTENT_BYTES
+    ):
+        raise ValueError(
+            f"Card sidecar {label} is unsafe or exceeds "
+            f"{MAX_CARD_SIDECAR_WRITE_INTENT_BYTES} bytes"
+        )
+    return identity
+
+
 def _validated_card_sidecar_state_dir(
     root: Path,
     *,
@@ -4825,10 +5505,6 @@ def _validated_card_sidecar_state_dir(
         "receipt": ("exports", "card_sidecar_recovery_receipts"),
         "resolved_intent": ("exports", "card_sidecar_resolved_intents"),
         "retirement_intent": ("run", "card_sidecar_retirement_intents"),
-        "publisher_temp_retirement": (
-            "run",
-            "card_sidecar_publisher_temp_retirements",
-        ),
     }
     components = components_by_purpose.get(purpose)
     if components is None:
@@ -4873,36 +5549,104 @@ def _assert_card_sidecar_state_dir_unchanged(state: CardSidecarStateDir) -> None
         raise ValueError(f"Card sidecar state directory changed during use: {path}")
 
 
+def _retire_card_sidecar_publisher_temp_posix(
+    intent_state: CardSidecarStateDir,
+    temp_path: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> str:
+    """Replace one bounded non-authoritative slot without path deletion."""
+
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    intent_dir = intent_state[0]
+    cleanup_path = (
+        intent_dir / _CARD_SIDECAR_PUBLISHER_TEMP_CLEANUP_SLOT_NAME
+    )
+    if temp_path.parent != intent_dir:
+        raise ValueError(
+            "Card sidecar publisher temporary escaped its intent namespace"
+        )
+    if (
+        _bounded_card_sidecar_publisher_temp_identity(
+            temp_path,
+            label="publisher temporary",
+        )
+        != expected_identity
+    ):
+        raise ValueError(
+            "Card sidecar publisher temporary identity changed before cleanup"
+        )
+    if os.path.lexists(cleanup_path):
+        _bounded_card_sidecar_publisher_temp_identity(
+            cleanup_path,
+            label="publisher temporary cleanup slot",
+        )
+
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    os.replace(temp_path, cleanup_path)
+    if (
+        _bounded_card_sidecar_publisher_temp_identity(
+            cleanup_path,
+            label="publisher temporary cleanup slot",
+        )
+        != expected_identity
+    ):
+        raise ValueError(
+            "Card sidecar publisher temporary changed during cleanup replace"
+        )
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    if os.path.lexists(temp_path):
+        raise ValueError(
+            "Card sidecar publisher temporary source was replaced during cleanup"
+        )
+    flush_directory_strict(intent_dir)
+    _assert_card_sidecar_state_dir_unchanged(intent_state)
+    if (
+        _bounded_card_sidecar_publisher_temp_identity(
+            cleanup_path,
+            label="publisher temporary cleanup slot",
+        )
+        != expected_identity
+    ):
+        raise ValueError(
+            "Card sidecar publisher temporary cleanup slot changed during flush"
+        )
+    return (
+        f"posix-slot:{cleanup_path.name}:"
+        f"{expected_identity[0]:x}:{expected_identity[1]:x}"
+    )
+
+
 def _retire_card_sidecar_publisher_temp(
     intent_state: CardSidecarStateDir,
     temp_path: Path,
     *,
     expected_identity: tuple[int, int],
 ) -> str:
-    """Retire one exact crash-left publisher temp without path-only deletion."""
+    """Remove one exact crash-left publisher temp without retaining debris."""
 
     _assert_card_sidecar_state_dir_unchanged(intent_state)
-    intent_dir, _intent_identity, _purpose, root = intent_state
+    intent_dir, _intent_identity, _purpose, _root = intent_state
     if temp_path.parent != intent_dir:
         raise ValueError(
             "Card sidecar publisher temporary escaped its intent namespace"
         )
     if (
-        _plain_card_sidecar_state_path_identity(
+        _bounded_card_sidecar_publisher_temp_identity(
             temp_path,
-            directory=False,
+            label="publisher temporary",
         )
         != expected_identity
     ):
         raise ValueError(
-            "Card sidecar publisher temporary identity changed before retirement"
+            "Card sidecar publisher temporary identity changed before cleanup"
         )
 
     if os.name == "nt":
         import msvcrt
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL(
             "kernel32",
             use_last_error=True,
         )
@@ -4936,9 +5680,7 @@ def _retire_card_sidecar_publisher_temp(
         )
         handle_value = int(getattr(raw_handle, "value", raw_handle) or 0)
         if handle_value in {0, invalid_handle}:
-            raise ctypes.WinError(  # type: ignore[attr-defined]
-                ctypes.get_last_error()
-            )
+            raise ctypes.WinError(ctypes.get_last_error())
         fd = -1
         try:
             fd = msvcrt.open_osfhandle(
@@ -4988,113 +5730,61 @@ def _retire_card_sidecar_publisher_temp(
         if os.path.lexists(temp_path):
             raise ValueError(
                 "Card sidecar publisher temporary remained after exact-handle "
-                "retirement"
+                "cleanup"
             )
         return (
             f"windows-delete:{temp_path.name}:"
             f"{expected_identity[0]:x}:{expected_identity[1]:x}"
         )
 
-    retirement_state = _validated_card_sidecar_state_dir(
-        root,
-        purpose="publisher_temp_retirement",
-        create=True,
+    return _retire_card_sidecar_publisher_temp_posix(
+        intent_state,
+        temp_path,
+        expected_identity=expected_identity,
     )
-    if retirement_state is None:
-        raise ValueError(
-            "Card sidecar publisher temporary retirement directory is unavailable"
-        )
-    retirement_path = retirement_state[0] / (
-        stable_id(
-            "card_sidecar_publisher_temp_retirement",
-            temp_path.name,
-            str(expected_identity[0]),
-            str(expected_identity[1]),
-        )
-        + ".retired"
-    )
-    _assert_card_sidecar_state_dir_unchanged(intent_state)
-    _assert_card_sidecar_state_dir_unchanged(retirement_state)
-    replace_file_noclobber(temp_path, retirement_path)
-    moved_identity = _plain_card_sidecar_state_path_identity(
-        retirement_path,
-        directory=False,
-    )
-    if moved_identity != expected_identity:
-        # Preserve a racing replacement in quarantine and fail nonterminal.
-        raise ValueError(
-            "Card sidecar publisher temporary changed during quarantine"
-        )
-    flush_file_strict(retirement_path)
-    flush_directory_strict(intent_dir)
-    flush_directory_strict(retirement_state[0])
-    _assert_card_sidecar_state_dir_unchanged(intent_state)
-    _assert_card_sidecar_state_dir_unchanged(retirement_state)
-    if (
-        os.path.lexists(temp_path)
-        or _plain_card_sidecar_state_path_identity(
-            retirement_path,
-            directory=False,
-        )
-        != expected_identity
-    ):
-        raise ValueError(
-            "Card sidecar publisher temporary quarantine did not remain bound"
-        )
-    return continuum_uri(root, retirement_path)
 
 
 def _retire_captured_card_sidecar_publisher_temps(
     intent_state: CardSidecarStateDir,
     candidates: Iterable[tuple[Path, tuple[int, int]]],
+    *,
+    allowance: int,
     retirements: list[str],
-) -> None:
-    """Retire DB-fenced identities after releasing SQLite's writer lock."""
+    failures: list[dict[str, Any]],
+) -> tuple[int, bool]:
+    """Attempt bounded cleanup without blocking valid intent work."""
 
+    bounded_allowance = max(0, int(allowance))
+    attempted = 0
+    truncated = False
     retirement_start = len(retirements)
     for temp_path, expected_identity in candidates:
-        retirements.append(
-            _retire_card_sidecar_publisher_temp(
-                intent_state,
-                temp_path,
-                expected_identity=expected_identity,
+        if attempted >= bounded_allowance:
+            truncated = True
+            break
+        attempted += 1
+        try:
+            retirements.append(
+                _retire_card_sidecar_publisher_temp(
+                    intent_state,
+                    temp_path,
+                    expected_identity=expected_identity,
+                )
             )
-        )
-    if len(retirements) > retirement_start:
-        # Windows delete disposition and POSIX quarantine both need the source
-        # namespace boundary durable before cleanup is reported. This flush is
-        # deliberately outside SQLite's writer transaction.
+        except (OSError, ValueError) as exc:
+            failures.append(
+                {
+                    "intent_uri": lexical_continuum_uri(
+                        intent_state[3],
+                        temp_path,
+                    ),
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                    "reason": "publisher_temp_cleanup_failed",
+                }
+            )
+    if len(retirements) > retirement_start and os.name == "nt":
         flush_directory_strict(intent_state[0])
-
-
-def _prove_card_sidecar_intent_writer_fence(
-    conn: sqlite3.Connection,
-) -> None:
-    """Upgrade a deferred transaction before it substitutes for the sidecar lock."""
-
-    if not conn.in_transaction:
-        raise RuntimeError(
-            "Card sidecar intent publication requires an active transaction"
-        )
-    try:
-        proof = conn.execute(
-            """
-            UPDATE meta
-            SET value = value
-            WHERE key = 'schema_version'
-            """
-        )
-    except sqlite3.Error as exc:
-        raise RuntimeError(
-            "Card sidecar intent publication could not prove a SQLite writer "
-            "fence"
-        ) from exc
-    if proof.rowcount != 1:
-        raise RuntimeError(
-            "Card sidecar intent publication requires an initialized SQLite "
-            "writer fence"
-        )
-
+    return attempted, truncated
 
 def _write_card_sidecar_write_intent(
     root: Path,
@@ -5105,16 +5795,12 @@ def _write_card_sidecar_write_intent(
     mode: str = "write",
     conn: sqlite3.Connection | None = None,
 ) -> tuple[str, Path]:
-    """Publish under either the caller's DB fence or the reconciler lock."""
+    """Publish under the reconciler lock and never inside a DB transaction."""
 
     if conn is not None and conn.in_transaction:
-        _prove_card_sidecar_intent_writer_fence(conn)
-        return _write_card_sidecar_write_intent_fenced(
-            root,
-            card_id=card_id,
-            target_uri=target_uri,
-            expected_state_hash=expected_state_hash,
-            mode=mode,
+        raise RuntimeError(
+            "Card sidecar intent publication cannot perform filesystem "
+            "durability work inside an active SQLite transaction"
         )
     from .operations import operation_lock
 
@@ -6188,8 +6874,12 @@ def _resolve_card_sidecar_write_intent(
     artifact_index: ImmutableArtifactPathIndex,
     batch_index: CardIntentBatchIndex,
     defer_terminal_publication: bool = False,
-    allow_quarantine: bool = True,
 ) -> dict[str, Any]:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar intent resolution cannot inspect or mutate "
+            "filesystem state inside an active SQLite transaction"
+        )
     card_id = str(intent.get("card_id") or "")
     target_uri = str(intent.get("target_uri") or "")
     expected_state_hash = str(intent.get("expected_state_hash") or "")
@@ -6476,71 +7166,373 @@ def _resolve_card_sidecar_write_intent(
                 "intent_uri": continuum_uri(root, intent_path),
             }
 
-    if not allow_quarantine:
+    return {
+        "ok": True,
+        "status": "quarantine_reservation_planned",
+        "intent_uri": continuum_uri(root, intent_path),
+        "_quarantine_plan": {
+            "intent_path": intent_path,
+            "intent": intent,
+            "intent_entry_identity": intent_entry_identity,
+            "target_path": target_path,
+            "recovery_path": recovery_path,
+            "target_evidence": target_evidence,
+        },
+    }
+
+
+def _card_sidecar_quarantine_authority_is_current(
+    conn: sqlite3.Connection,
+    expected_authority: CardSidecarDbAuthorityToken,
+    reservation_value: str,
+) -> bool:
+    return bool(
+        _card_sidecar_quarantine_reservation_triggers_ready(conn)
+        and _card_sidecar_db_authority_triggers_ready(conn)
+        and _card_sidecar_artifact_write_reservation_triggers_ready(conn)
+        and _card_sidecar_artifact_write_reservation_value(conn) is None
+        and _card_sidecar_quarantine_reservation_value(conn)
+        == reservation_value
+        and _card_sidecar_db_authority_token(conn) == expected_authority
+    )
+
+
+def _execute_card_sidecar_quarantine_reservation(
+    root: Path,
+    conn: sqlite3.Connection,
+    *,
+    reservation_value: str,
+    reservation: dict[str, Any],
+) -> dict[str, Any]:
+    """Resume one exact quarantine state machine with its DB fence active."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar quarantine filesystem work cannot run in a SQLite "
+            "transaction"
+        )
+    if (
+        _card_sidecar_quarantine_reservation_value(conn)
+        != reservation_value
+    ):
+        raise RuntimeError(
+            "Card sidecar quarantine reservation changed before filesystem work"
+        )
+    intent = reservation["intent"]
+    intent_entry = reservation["intent_entry"]
+    intent_entry_identity = (
+        int(intent_entry["device_id"]),
+        int(intent_entry["file_id"]),
+    )
+    intent_state = _validated_card_sidecar_state_dir(
+        root,
+        purpose="intent",
+        create=False,
+    )
+    if intent_state is None:
         return {
-            "ok": True,
-            "status": "quarantine_requires_writer_fence",
-            "intent_uri": continuum_uri(root, intent_path),
-            "_quarantine_writer_fallback": True,
+            "ok": False,
+            "status": "quarantine_intent_namespace_missing",
+            "intent_uri": str(
+                _card_sidecar_write_intent_dir(root)
+                / f"{intent['intent_id']}.json"
+            ),
+            "reservation_retained": True,
+        }
+    intent_path = intent_state[0] / f"{intent['intent_id']}.json"
+    intent_uri = continuum_uri(root, intent_path)
+
+    authority = reservation["authority"]
+    expected_authority: CardSidecarDbAuthorityToken = (
+        int(authority["artifact_epoch"]),
+        int(authority["sidecar_epoch"]),
+        int(authority["sqlite_schema_version"]),
+    )
+    if not _card_sidecar_quarantine_authority_is_current(
+        conn,
+        expected_authority,
+        reservation_value,
+    ):
+        return {
+            "ok": False,
+            "status": "quarantine_database_authority_drift",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
         }
 
-    quarantine_check_fd = -1
+    # A committed receipt is terminal only while the reservation's complete
+    # database authority is still exact.
+    committed = _finish_intent_from_committed_receipt(
+        root,
+        intent_path=intent_path,
+        intent=intent,
+        intent_entry_identity=intent_entry_identity,
+        expected_status="quarantined",
+    )
+    if committed is not None:
+        if not _card_sidecar_quarantine_authority_is_current(
+            conn,
+            expected_authority,
+            reservation_value,
+        ):
+            return {
+                **committed,
+                "ok": False,
+                "status": (
+                    "quarantine_database_authority_drift_after_receipt"
+                ),
+                "reservation_retained": True,
+            }
+        if not _release_card_sidecar_quarantine_reservation(
+            conn,
+            reservation_value,
+            expected_authority,
+        ):
+            return {
+                **committed,
+                "ok": False,
+                "status": (
+                    "quarantine_database_authority_drift_after_receipt"
+                ),
+                "reservation_retained": True,
+            }
+        return {
+            **committed,
+            "quarantine_reservation_recovered": True,
+        }
+
+    intent_fd = -1
     try:
-        _quarantine_payload, quarantine_evidence, quarantine_check_fd = (
-            _open_validated_card_sidecar_payload(
-                target_path,
-                card_id=card_id,
+        _intent_evidence, intent_fd = (
+            _open_card_sidecar_quarantine_intent_binding(
+                reservation,
+                intent_path,
             )
         )
     except (OSError, UnicodeError, ValueError):
         return {
             "ok": False,
-            "status": "target_changed_before_quarantine",
-            "intent_uri": str(intent_path),
+            "status": "quarantine_intent_content_drift",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
         }
     finally:
-        if quarantine_check_fd >= 0:
-            os.close(quarantine_check_fd)
-    if quarantine_evidence != target_evidence:
+        if intent_fd >= 0:
+            os.close(intent_fd)
+    if (
+        _plain_card_sidecar_state_path_identity(
+            intent_path,
+            directory=False,
+        )
+        != intent_entry_identity
+    ):
         return {
             "ok": False,
-            "status": "target_changed_before_quarantine",
-            "intent_uri": str(intent_path),
+            "status": "quarantine_intent_identity_drift",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
         }
-    try:
-        replace_file_noclobber(target_path, recovery_path)
-        flush_file_strict(recovery_path)
-        flush_directory_strict(recovery_path.parent)
-        recovery_identity = _sidecar_nofollow_path_identity(recovery_path)
-        if (
-            recovery_identity is None
-            or target_identity[1] is None
-            or recovery_identity[1] != target_identity[1]
-            or os.path.lexists(target_path)
-        ):
-            raise OSError("Card sidecar quarantine identity changed during move")
-    except OSError as exc:
+
+    target_path = resolve_stored_uri(root, str(reservation["target_uri"]))
+    managed_target_path = _resolved_managed_card_sidecar_path(
+        _configured_card_sidecar_path(root, str(reservation["card_id"])),
+        target_path,
+        card_id=str(reservation["card_id"]),
+    )
+    if managed_target_path is None:
         return {
             "ok": False,
-            "status": "quarantine_failed",
-            "intent_uri": str(intent_path),
-            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            "status": "quarantine_target_unmanaged",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
         }
+    target_path = managed_target_path
+    recovery_path = target_path.with_name(
+        f".{target_path.name}.{intent['intent_id']}.uncommitted"
+    )
+    if reservation["recovery_uri"] != continuum_uri(root, recovery_path):
+        return {
+            "ok": False,
+            "status": "quarantine_recovery_binding_drift",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
+        }
+
+    target_exists = os.path.lexists(target_path)
+    recovery_exists = os.path.lexists(recovery_path)
+    if target_exists == recovery_exists:
+        return {
+            "ok": False,
+            "status": (
+                "quarantine_target_and_recovery_both_exist"
+                if target_exists
+                else "quarantine_target_and_recovery_both_missing"
+            ),
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
+        }
+
+    expected_target_evidence = _card_sidecar_quarantine_target_evidence(
+        reservation,
+        target_path,
+    )
     recovery_fd = -1
-    try:
-        _recovery_payload, recovery_evidence, recovery_fd = (
-            _open_validated_card_sidecar_payload(
+    if recovery_exists:
+        try:
+            flush_file_strict(recovery_path)
+            flush_directory_strict(recovery_path.parent)
+            (
+                _recovery_payload,
+                recovery_evidence,
+                recovery_fd,
+            ) = _open_validated_card_sidecar_payload(
                 recovery_path,
-                card_id=card_id,
+                card_id=str(intent["card_id"]),
+                expected_state_hash=str(intent["expected_state_hash"]),
+            )
+            if (
+                recovery_evidence[0][1]
+                != expected_target_evidence[0][1]
+                or recovery_evidence[1][0]
+                != expected_target_evidence[1][0]
+                or recovery_evidence[2] != expected_target_evidence[2]
+            ):
+                return {
+                    "ok": False,
+                    "status": "quarantine_recovery_identity_drift",
+                    "intent_uri": intent_uri,
+                    "reservation_retained": True,
+                }
+            if not _card_sidecar_quarantine_authority_is_current(
+                conn,
+                expected_authority,
+                reservation_value,
+            ):
+                return {
+                    "ok": False,
+                    "status": "quarantine_database_authority_drift",
+                    "intent_uri": intent_uri,
+                    "reservation_retained": True,
+                }
+            intent_guard_fd = -1
+            try:
+                _intent_evidence, intent_guard_fd = (
+                    _open_card_sidecar_quarantine_intent_binding(
+                        reservation,
+                        intent_path,
+                    )
+                )
+            finally:
+                if intent_guard_fd >= 0:
+                    os.close(intent_guard_fd)
+            result = _finish_card_sidecar_write_intent(
+                root,
+                intent_path=intent_path,
+                intent=intent,
+                intent_entry_identity=intent_entry_identity,
+                status="quarantined",
+                recovery_path=recovery_path,
+                recovery_evidence=recovery_evidence,
+                recovery_fd=recovery_fd,
+            )
+        finally:
+            if recovery_fd >= 0:
+                os.close(recovery_fd)
+        if not _card_sidecar_quarantine_authority_is_current(
+            conn,
+            expected_authority,
+            reservation_value,
+        ):
+            return {
+                **result,
+                "ok": False,
+                "status": "quarantine_database_authority_drift_after_receipt",
+                "reservation_retained": True,
+            }
+        if not _release_card_sidecar_quarantine_reservation(
+            conn,
+            reservation_value,
+            expected_authority,
+        ):
+            return {
+                **result,
+                "ok": False,
+                "status": "quarantine_database_authority_drift_after_receipt",
+                "reservation_retained": True,
+            }
+        return result
+
+    target_fd = -1
+    try:
+        (
+            _target_payload,
+            current_target_evidence,
+            target_fd,
+        ) = _open_validated_card_sidecar_payload(
+            target_path,
+            card_id=str(intent["card_id"]),
+            expected_state_hash=str(intent["expected_state_hash"]),
+        )
+        if current_target_evidence != expected_target_evidence:
+            return {
+                "ok": False,
+                "status": "quarantine_target_identity_drift",
+                "intent_uri": intent_uri,
+                "reservation_retained": True,
+            }
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+
+    if not _card_sidecar_quarantine_authority_is_current(
+        conn,
+        expected_authority,
+        reservation_value,
+    ):
+        return {
+            "ok": False,
+            "status": "quarantine_database_authority_drift",
+            "intent_uri": intent_uri,
+            "reservation_retained": True,
+        }
+    intent_guard_fd = -1
+    try:
+        _intent_evidence, intent_guard_fd = (
+            _open_card_sidecar_quarantine_intent_binding(
+                reservation,
+                intent_path,
             )
         )
+        replace_file_noclobber(target_path, recovery_path)
+    finally:
+        if intent_guard_fd >= 0:
+            os.close(intent_guard_fd)
+    flush_file_strict(recovery_path)
+    flush_directory_strict(recovery_path.parent)
+    recovery_fd = -1
+    try:
+        (
+            _recovery_payload,
+            recovery_evidence,
+            recovery_fd,
+        ) = _open_validated_card_sidecar_payload(
+            recovery_path,
+            card_id=str(intent["card_id"]),
+            expected_state_hash=str(intent["expected_state_hash"]),
+        )
         if (
-            recovery_evidence[0][1] != target_identity[1]
-            or recovery_evidence[1][0] != target_evidence[1][0]
-            or recovery_evidence[2] != target_evidence[2]
+            os.path.lexists(target_path)
+            or recovery_evidence[0][1] != expected_target_evidence[0][1]
+            or recovery_evidence[1][0] != expected_target_evidence[1][0]
+            or recovery_evidence[2] != expected_target_evidence[2]
         ):
-            raise ValueError("Card sidecar quarantine bytes changed during move")
-        return _finish_card_sidecar_write_intent(
+            return {
+                "ok": False,
+                "status": "quarantine_move_identity_drift",
+                "intent_uri": intent_uri,
+                "reservation_retained": True,
+            }
+        result = _finish_card_sidecar_write_intent(
             root,
             intent_path=intent_path,
             intent=intent,
@@ -6550,16 +7542,79 @@ def _resolve_card_sidecar_write_intent(
             recovery_evidence=recovery_evidence,
             recovery_fd=recovery_fd,
         )
-    except (OSError, UnicodeError, ValueError) as exc:
-        return {
-            "ok": False,
-            "status": "quarantine_recovery_validation_failed",
-            "intent_uri": str(intent_path),
-            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
-        }
     finally:
         if recovery_fd >= 0:
             os.close(recovery_fd)
+    if not _card_sidecar_quarantine_authority_is_current(
+        conn,
+        expected_authority,
+        reservation_value,
+    ):
+        return {
+            **result,
+            "ok": False,
+            "status": "quarantine_database_authority_drift_after_receipt",
+            "reservation_retained": True,
+        }
+    if not _release_card_sidecar_quarantine_reservation(
+        conn,
+        reservation_value,
+        expected_authority,
+    ):
+        return {
+            **result,
+            "ok": False,
+            "status": "quarantine_database_authority_drift_after_receipt",
+            "reservation_retained": True,
+        }
+    return result
+
+
+def _recover_stale_card_sidecar_quarantine_reservation(
+    root: Path,
+    conn: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    """Resume a crash-left quarantine while the sidecar lock is held."""
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar quarantine recovery requires no active transaction"
+        )
+    reservation_value = _card_sidecar_quarantine_reservation_value(conn)
+    if reservation_value is None:
+        return None
+    try:
+        reservation = _card_sidecar_quarantine_reservation_payload(
+            root,
+            reservation_value,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "status": "malformed_quarantine_reservation",
+            "intent_uri": None,
+            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            "reservation_retained": True,
+        }
+    try:
+        return _execute_card_sidecar_quarantine_reservation(
+            root,
+            conn,
+            reservation_value=reservation_value,
+            reservation=reservation,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "quarantine_reservation_recovery_exception",
+            "intent_uri": (
+                str(reservation.get("target_uri"))
+                if reservation.get("target_uri")
+                else None
+            ),
+            "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+            "reservation_retained": True,
+        }
 
 
 def _commit_card_sidecar_reconciliation_authority(
@@ -6584,6 +7639,11 @@ def _commit_card_sidecar_reconciliation_authority(
             raise RuntimeError(
                 "immutable artifact authority triggers are not exact at CAS"
             )
+        if not _card_sidecar_quarantine_reservation_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar quarantine authority triggers are not exact at "
+                "CAS"
+            )
         if _card_sidecar_db_authority_token(conn) != expected_token:
             conn.rollback()
             return False
@@ -6593,43 +7653,6 @@ def _commit_card_sidecar_reconciliation_authority(
         if conn.in_transaction:
             conn.rollback()
         raise
-
-
-def _resolve_card_sidecar_quarantine_with_fresh_writer_fence(
-    root: Path,
-    *,
-    intent_path: Path,
-    intent: dict[str, Any],
-    intent_entry_identity: tuple[int, int],
-) -> dict[str, Any]:
-    """Rerun only a destructive quarantine decision under fresh authority."""
-
-    conn = connect(root)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        artifact_index = _immutable_artifact_path_index(root, conn)
-        batch_index = _card_intent_batch_index(root, conn)
-        result = _resolve_card_sidecar_write_intent(
-            root,
-            conn,
-            intent_path,
-            intent,
-            intent_entry_identity=intent_entry_identity,
-            artifact_index=artifact_index,
-            batch_index=batch_index,
-            defer_terminal_publication=True,
-            allow_quarantine=True,
-        )
-        conn.commit()
-    except Exception:
-        if conn.in_transaction:
-            conn.rollback()
-        raise
-    finally:
-        conn.close()
-    if "_terminal_plan" in result:
-        return _publish_deferred_card_sidecar_terminal(root, result)
-    return result
 
 
 def _card_sidecar_retirement_entry_binding(
@@ -6683,6 +7706,7 @@ def _bounded_card_sidecar_reconciliation_limit(
 def _empty_card_sidecar_reconciliation_result(
     *,
     bounded_limit: int,
+    scope_filtered: bool = False,
 ) -> dict[str, Any]:
     return {
         "ok": True,
@@ -6701,9 +7725,16 @@ def _empty_card_sidecar_reconciliation_result(
         "remaining_lower_bound": 0,
         "batch_truncated": False,
         "overflow": False,
-        "scope_filtered": False,
+        "scope_filtered": scope_filtered,
         "scope_complete": True,
+        "physical_limit": 2 * bounded_limit,
+        "postflight_physical_limit": 0,
+        "postflight_enumerated": 0,
+        "postflight_scan_truncated": False,
+        "postflight_authority": 0,
+        "publisher_temps_attempted": 0,
         "publisher_temps_retired": 0,
+        "publisher_temp_cleanup_truncated": False,
         "publisher_temp_retirement_evidence": [],
         "publisher_temp_retirements_authoritative": False,
     }
@@ -6756,10 +7787,26 @@ def reconcile_card_sidecar_write_intents(
     card_ids: Iterable[str] | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
+    normalized_card_ids = (
+        None
+        if card_ids is None
+        else tuple(
+            dict.fromkeys(
+                str(card_id) for card_id in card_ids if card_id
+            )
+        )
+    )
     bounded_limit = _bounded_card_sidecar_reconciliation_limit(
-        card_ids=card_ids,
+        card_ids=normalized_card_ids,
         limit=limit,
     )
+    if normalized_card_ids is not None and not normalized_card_ids:
+        empty_result = _empty_card_sidecar_reconciliation_result(
+            bounded_limit=bounded_limit,
+            scope_filtered=True,
+        )
+        empty_result["physical_limit"] = 0
+        return empty_result
     budget = _current_card_sidecar_intent_reconciliation_budget()
     if budget is not None:
         allowance = min(
@@ -6800,7 +7847,7 @@ def reconcile_card_sidecar_write_intents(
         return result
     return _reconcile_card_sidecar_write_intents_serialized(
         root,
-        card_ids=card_ids,
+        card_ids=normalized_card_ids,
         limit=limit,
     )
 
@@ -6831,6 +7878,37 @@ def _reconcile_card_sidecar_write_intents_serialized(
     ):
         recovery_conn = connect(root)
         try:
+            quarantine_recovery = (
+                _recover_stale_card_sidecar_quarantine_reservation(
+                    root,
+                    recovery_conn,
+                )
+            )
+            if (
+                quarantine_recovery is not None
+                and not quarantine_recovery.get("ok")
+            ):
+                blocked = _empty_card_sidecar_reconciliation_result(
+                    bounded_limit=_bounded_card_sidecar_reconciliation_limit(
+                        card_ids=card_ids,
+                        limit=limit,
+                    ),
+                    scope_filtered=card_ids is not None,
+                )
+                blocked.update(
+                    {
+                        "ok": False,
+                        "pending": 1,
+                        "failures": [quarantine_recovery],
+                        "results": [quarantine_recovery],
+                        "complete": False,
+                        "has_more": True,
+                        "remaining": 1,
+                        "remaining_lower_bound": 1,
+                        "remaining_is_lower_bound": True,
+                    }
+                )
+                return blocked
             _recover_stale_card_sidecar_artifact_write_reservation(
                 root,
                 recovery_conn,
@@ -6854,10 +7932,19 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         card_ids=card_ids,
         limit=limit,
     )
+    scope_filtered = card_ids is not None
     selected_card_ids = {str(card_id) for card_id in card_ids or () if card_id}
+    if scope_filtered and not selected_card_ids:
+        empty_result = _empty_card_sidecar_reconciliation_result(
+            bounded_limit=bounded_limit,
+            scope_filtered=True,
+        )
+        empty_result["physical_limit"] = 0
+        return empty_result
     if not is_initialized(root):
         return _empty_card_sidecar_reconciliation_result(
             bounded_limit=bounded_limit,
+            scope_filtered=scope_filtered,
         )
     try:
         intent_state = _validated_card_sidecar_state_dir(
@@ -6946,26 +8033,21 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             }
         return _empty_card_sidecar_reconciliation_result(
             bounded_limit=bounded_limit,
+            scope_filtered=scope_filtered,
         )
     intent_dir = intent_state[0]
     retirement_dir = retirement_state[0] if retirement_state is not None else None
-    inventory_entry_limit = (
-        MAX_CARD_SIDECAR_WRITE_INTENTS
-        if selected_card_ids
-        else bounded_limit
-    )
-    publisher_temp_retirements: list[str] = []
+    # Observe at most a small multiple of the caller's work allowance. Exact
+    # publisher temps do not consume valid-intent work, and one additional
+    # entry may be observed only as the truncation sentinel.
+    inventory_entry_limit = 2 * bounded_limit
     publisher_temp_candidates: list[
         tuple[Path, tuple[int, int]]
     ] = []
-    inventory_conn: sqlite3.Connection | None = None
+    inventory_failures: list[dict[str, Any]] = []
+    publisher_temp_retirements: list[str] = []
+    publisher_temp_failures: list[dict[str, Any]] = []
     try:
-        # Some intent publishers already hold SQLite's writer fence and
-        # deliberately bypass the operation lock.  Take the locks in the
-        # operation-lock -> DB order so no legitimate publisher can still own
-        # an exact private temp while bounded recovery retires crash debris.
-        inventory_conn = connect(root)
-        inventory_conn.execute("BEGIN IMMEDIATE")
         (
             intent_paths,
             retirement_paths,
@@ -6976,20 +8058,22 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             retirement_dir,
             entry_limit=inventory_entry_limit,
             publisher_temp_candidates=publisher_temp_candidates,
-            publisher_temp_inventory_state=intent_state,
+            inventory_failures=inventory_failures,
         )
         _assert_card_sidecar_state_dir_unchanged(intent_state)
         if retirement_state is not None:
             _assert_card_sidecar_state_dir_unchanged(retirement_state)
-        inventory_conn.commit()
-        _retire_captured_card_sidecar_publisher_temps(
+        (
+            publisher_temps_attempted,
+            publisher_temp_cleanup_truncated,
+        ) = _retire_captured_card_sidecar_publisher_temps(
             intent_state,
             publisher_temp_candidates,
-            publisher_temp_retirements,
+            allowance=bounded_limit,
+            retirements=publisher_temp_retirements,
+            failures=publisher_temp_failures,
         )
-    except (OSError, ValueError, sqlite3.Error) as exc:
-        if inventory_conn is not None and inventory_conn.in_transaction:
-            inventory_conn.rollback()
+    except (OSError, ValueError) as exc:
         return {
             "ok": False,
             "processed": 0,
@@ -7007,32 +8091,43 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             "remaining_lower_bound": 0,
             "batch_truncated": False,
             "overflow": False,
-            "publisher_temps_retired": len(publisher_temp_retirements),
+            "physical_limit": inventory_entry_limit,
+            "publisher_temps_attempted": 0,
+            "publisher_temps_retired": len(
+                publisher_temp_retirements
+            ),
+            "publisher_temp_cleanup_truncated": False,
             "publisher_temp_retirement_evidence": (
                 publisher_temp_retirements
             ),
             "publisher_temp_retirements_authoritative": False,
         }
-    finally:
-        if inventory_conn is not None:
-            inventory_conn.close()
-    initial_overflow = bool(
-        initial_scan_truncated
-        and inventory_entry_limit >= MAX_CARD_SIDECAR_WRITE_INTENTS
+    # Reserve valid-work slots for active intents before malformed retirement
+    # backlog can consume the whole caller allowance. Debris has its own
+    # independent allowance above.
+    selected_intent_paths = intent_paths[:bounded_limit]
+    retirement_work_allowance = max(
+        0,
+        bounded_limit - len(selected_intent_paths),
     )
-    if selected_card_ids:
-        selected_retirement_paths = retirement_paths
-        selected_intent_paths = intent_paths
-    else:
-        selected_retirement_paths = retirement_paths
-        selected_intent_paths = intent_paths
-    batch_truncated = bool(initial_scan_truncated)
+    selected_retirement_paths = retirement_paths[
+        :retirement_work_allowance
+    ]
+    batch_truncated = bool(
+        initial_scan_truncated or publisher_temp_cleanup_truncated
+    )
     results: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = [
+        *inventory_failures,
+        *publisher_temp_failures,
+    ]
     selected_count = 0
     inspected_count = 0
     enumerated_count = initial_enumerated
-    scope_truncated = False
+    scope_truncated = bool(
+        len(selected_intent_paths) < len(intent_paths)
+        or len(selected_retirement_paths) < len(retirement_paths)
+    )
     for retirement_path in selected_retirement_paths:
         inspected_count += 1
         retirement_fd = -1
@@ -7103,7 +8198,7 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             if retirement_fd >= 0:
                 os.close(retirement_fd)
         if (
-            selected_card_ids
+            scope_filtered
             and str(retirement_intent.get("card_id") or "")
             not in selected_card_ids
         ):
@@ -7139,7 +8234,15 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         if not retirement_result.get("ok"):
             failures.append(retirement_result)
 
-    parsed_intents: list[tuple[Path, dict[str, Any], tuple[int, int]]] = []
+    parsed_intents: list[
+        tuple[
+            Path,
+            dict[str, Any],
+            tuple[int, int],
+            StableRegularFileEvidence,
+            bytes,
+        ]
+    ] = []
     for intent_path in selected_intent_paths:
         inspected_count += 1
         intent_fd = -1
@@ -7175,7 +8278,10 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             intent_fd = -1
             # A visible intent left by a prior strict-flush failure becomes
             # authority only after its bytes and namespace are strict again.
-            flush_file_strict(intent_path)
+            flush_file_strict(
+                intent_path,
+                expected_identity=intent_entry_identity,
+            )
             flush_directory_strict(intent_dir)
             reopened_evidence, intent_fd, reopened_bytes = (
                 _open_stable_regular_file_hash_evidence(
@@ -7208,13 +8314,24 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         finally:
             if intent_fd >= 0:
                 os.close(intent_fd)
-        if selected_card_ids and str(intent.get("card_id") or "") not in selected_card_ids:
+        if (
+            scope_filtered
+            and str(intent.get("card_id") or "") not in selected_card_ids
+        ):
             continue
         if selected_count >= bounded_limit:
             scope_truncated = True
             continue
         selected_count += 1
-        parsed_intents.append((intent_path, intent, intent_entry_identity))
+        parsed_intents.append(
+            (
+                intent_path,
+                intent,
+                intent_entry_identity,
+                intent_evidence,
+                raw_bytes,
+            )
+        )
 
     conn = connect(root)
     try:
@@ -7223,7 +8340,13 @@ def _reconcile_card_sidecar_write_intents_unlocked(
             if parsed_intents
             else None
         )
-        for intent_path, intent, intent_entry_identity in parsed_intents:
+        for (
+            intent_path,
+            intent,
+            intent_entry_identity,
+            intent_evidence,
+            raw_intent_bytes,
+        ) in parsed_intents:
             if snapshot is None:
                 raise RuntimeError(
                     "Card sidecar reconciliation snapshot is unavailable"
@@ -7243,15 +8366,66 @@ def _reconcile_card_sidecar_write_intents_unlocked(
                         artifact_index=artifact_index,
                         batch_index=batch_index,
                         defer_terminal_publication=True,
-                        allow_quarantine=False,
                     )
-                    if planned.get("_quarantine_writer_fallback"):
-                        result = (
-                            _resolve_card_sidecar_quarantine_with_fresh_writer_fence(
+                    if "_quarantine_plan" in planned:
+                        quarantine_plan = planned["_quarantine_plan"]
+                        if not isinstance(quarantine_plan, dict):
+                            raise ValueError(
+                                "Card sidecar quarantine plan is malformed"
+                            )
+                        reservation_value = (
+                            _reserve_card_sidecar_quarantine(
                                 root,
-                                intent_path=intent_path,
-                                intent=intent,
-                                intent_entry_identity=intent_entry_identity,
+                                conn,
+                                intent=quarantine_plan["intent"],
+                                intent_entry_identity=quarantine_plan[
+                                    "intent_entry_identity"
+                                ],
+                                expected_intent_evidence=intent_evidence,
+                                expected_intent_bytes=raw_intent_bytes,
+                                target_path=quarantine_plan["target_path"],
+                                recovery_path=quarantine_plan[
+                                    "recovery_path"
+                                ],
+                                target_evidence=quarantine_plan[
+                                    "target_evidence"
+                                ],
+                                expected_authority=authority_token,
+                            )
+                        )
+                        if reservation_value is None:
+                            if (
+                                attempt + 1
+                                >= MAX_CARD_SIDECAR_RECONCILIATION_SNAPSHOT_ATTEMPTS
+                            ):
+                                result = {
+                                    "ok": False,
+                                    "status": "authority_snapshot_unstable",
+                                    "intent_uri": continuum_uri(
+                                        root,
+                                        intent_path,
+                                    ),
+                                }
+                                break
+                            snapshot = (
+                                _capture_card_sidecar_reconciliation_snapshot(
+                                    root,
+                                    conn,
+                                )
+                            )
+                            continue
+                        reservation = (
+                            _card_sidecar_quarantine_reservation_payload(
+                                root,
+                                reservation_value,
+                            )
+                        )
+                        result = (
+                            _execute_card_sidecar_quarantine_reservation(
+                                root,
+                                conn,
+                                reservation_value=reservation_value,
+                                reservation=reservation,
                             )
                         )
                         break
@@ -7310,6 +8484,119 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         raise
     finally:
         conn.close()
+    pending_statuses = {
+        "pending_retry",
+        "pending_compensation",
+        "quarantine_requires_writer_fence",
+    }
+    pending = sum(
+        1
+        for result in results
+        if result.get("status") in pending_statuses
+    )
+    terminal_successes = sum(
+        1
+        for result in results
+        if result.get("ok")
+        and result.get("status") not in pending_statuses
+    )
+    captured_authority = (
+        len(intent_paths)
+        + len(retirement_paths)
+        + len(publisher_temp_candidates)
+        + len(inventory_failures)
+    )
+    captured_remaining = max(
+        0,
+        captured_authority
+        - terminal_successes
+        - len(publisher_temp_retirements),
+    )
+    postflight_physical_limit = 0
+    postflight_enumerated = 0
+    postflight_scan_truncated = False
+    postflight_authority: int | None = 0
+    postflight_unavailable = False
+    if scope_filtered:
+        # A selected pass must not infer current authority solely from its
+        # pre-work inventory. Reentrant same-thread hooks may publish while
+        # the per-root operation lock is already held. Reobserve enough of the
+        # namespace to cover the known remainder plus one possible authority
+        # per selected Card, while retaining the original global scan ceiling.
+        postflight_physical_limit = min(
+            inventory_entry_limit,
+            max(1, captured_remaining + len(selected_card_ids)),
+        )
+        postflight_publisher_temps: list[
+            tuple[Path, tuple[int, int]]
+        ] = []
+        postflight_inventory_failures: list[dict[str, Any]] = []
+        try:
+            postflight_retirement_state = (
+                _validated_card_sidecar_state_dir(
+                    root,
+                    purpose="retirement_intent",
+                    create=False,
+                )
+            )
+            (
+                postflight_intent_paths,
+                postflight_retirement_paths,
+                postflight_scan_truncated,
+                postflight_enumerated,
+            ) = _bounded_card_sidecar_intent_inventory(
+                intent_dir,
+                (
+                    postflight_retirement_state[0]
+                    if postflight_retirement_state is not None
+                    else None
+                ),
+                entry_limit=postflight_physical_limit,
+                publisher_temp_candidates=postflight_publisher_temps,
+                inventory_failures=postflight_inventory_failures,
+            )
+            _assert_card_sidecar_state_dir_unchanged(intent_state)
+            if postflight_retirement_state is not None:
+                _assert_card_sidecar_state_dir_unchanged(
+                    postflight_retirement_state
+                )
+            if retirement_state is not None:
+                _assert_card_sidecar_state_dir_unchanged(retirement_state)
+            postflight_authority = (
+                len(postflight_intent_paths)
+                + len(postflight_retirement_paths)
+                + len(postflight_publisher_temps)
+                + len(postflight_inventory_failures)
+            )
+            known_failure_authority = {
+                (
+                    str(failure.get("intent_uri") or ""),
+                    str(failure.get("reason") or ""),
+                )
+                for failure in failures
+            }
+            for postflight_failure in postflight_inventory_failures:
+                failure_authority = (
+                    str(postflight_failure.get("intent_uri") or ""),
+                    str(postflight_failure.get("reason") or ""),
+                )
+                if failure_authority in known_failure_authority:
+                    continue
+                failures.append(postflight_failure)
+                known_failure_authority.add(failure_authority)
+        except (OSError, ValueError) as exc:
+            postflight_unavailable = True
+            postflight_authority = None
+            failures.append(
+                {
+                    "intent_uri": continuum_uri(root, intent_dir),
+                    "error": (
+                        "Selected Card sidecar authority postflight "
+                        f"failed: {type(exc).__name__}: {str(exc)[:512]}"
+                    ),
+                    "reason": "selected_scope_postflight_unavailable",
+                }
+            )
     progress_blocked = bool(
         initial_scan_truncated
         and selected_count == 0
@@ -7326,128 +8613,47 @@ def _reconcile_card_sidecar_write_intents_unlocked(
                 "reason": "bounded_inventory_progress_blocked",
             }
         )
-    pending = sum(
-        1
-        for result in results
-        if result.get("status") in {"pending_retry", "pending_compensation"}
-    )
-    remaining: int | None
-    remaining_is_lower_bound = False
-    remaining_overflow = False
-    postflight_conn: sqlite3.Connection | None = None
-    if initial_scan_truncated:
-        # The bounded initial inventory already proves that more authority may
-        # exist. Avoid a second traversal and report a conservative lower
-        # bound instead of pretending to know the exact queue cardinality.
-        remaining = max(
-            1,
-            pending,
-            sum(1 for result in results if not result.get("ok")),
-        )
+
+    if postflight_unavailable:
+        remaining = None
         remaining_is_lower_bound = True
-        remaining_overflow = initial_overflow
-    else:
-        postflight_publisher_temp_candidates: list[
-            tuple[Path, tuple[int, int]]
-        ] = []
-        try:
-            # The operation lock already excludes filesystem-first publishers.
-            # The writer fence waits for any transaction-bound legacy publisher
-            # and prevents another from starting until completion linearizes.
-            postflight_conn = connect(root)
-            postflight_conn.execute("BEGIN IMMEDIATE")
-            _assert_card_sidecar_state_dir_unchanged(intent_state)
-            current_retirement_state = (
-                _validated_card_sidecar_state_dir(
-                    root,
-                    purpose="retirement_intent",
-                    create=False,
-                )
-            )
-            postflight_entry_limit = max(
-                0,
-                inventory_entry_limit - enumerated_count,
-            )
-            (
-                remaining_intent_paths,
-                remaining_retirement_paths,
-                remaining_scan_truncated,
-                remaining_enumerated,
-            ) = _bounded_card_sidecar_intent_inventory(
-                intent_dir,
-                (
-                    current_retirement_state[0]
-                    if current_retirement_state is not None
-                    else None
-                ),
-                entry_limit=postflight_entry_limit,
-                publisher_temp_candidates=(
-                    postflight_publisher_temp_candidates
-                ),
-                publisher_temp_inventory_state=intent_state,
-            )
-            enumerated_count += remaining_enumerated
-            if current_retirement_state is not None:
-                _assert_card_sidecar_state_dir_unchanged(
-                    current_retirement_state
-                )
-            remaining = (
-                len(remaining_intent_paths)
-                + len(remaining_retirement_paths)
-                + (1 if remaining_scan_truncated else 0)
-            )
-            remaining_is_lower_bound = remaining_scan_truncated
-            remaining_overflow = bool(
-                remaining_scan_truncated
-                and inventory_entry_limit
-                >= MAX_CARD_SIDECAR_WRITE_INTENTS
-            )
-            batch_truncated = bool(
-                batch_truncated or remaining_scan_truncated
-            )
-            postflight_conn.commit()
-            _retire_captured_card_sidecar_publisher_temps(
-                intent_state,
-                postflight_publisher_temp_candidates,
-                publisher_temp_retirements,
-            )
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            if (
-                postflight_conn is not None
-                and postflight_conn.in_transaction
-            ):
-                postflight_conn.rollback()
-            remaining = None
+    elif scope_filtered:
+        if postflight_scan_truncated:
+            remaining = max(1, int(postflight_authority or 0))
             remaining_is_lower_bound = True
-            failures.append(
-                {
-                    "intent_uri": continuum_uri(root, intent_dir),
-                    "error": (
-                        "Card sidecar intent postflight scan failed: "
-                        f"{type(exc).__name__}: {str(exc)[:512]}"
-                    ),
-                }
-            )
-        finally:
-            if postflight_conn is not None:
-                postflight_conn.close()
-    overflow = bool(initial_overflow or remaining_overflow)
-    if overflow:
+        else:
+            remaining = int(postflight_authority or 0)
+            remaining_is_lower_bound = False
+    elif initial_scan_truncated:
+        remaining = max(1, captured_remaining)
         remaining_is_lower_bound = True
+    else:
+        remaining = captured_remaining
+        remaining_is_lower_bound = False
+    overflow = bool(initial_scan_truncated)
+    if overflow:
         failures.append(
             {
                 "intent_uri": continuum_uri(root, intent_dir),
                 "error": "Card sidecar write intent scan limit exceeded",
             }
         )
-    complete = bool(remaining == 0 and not overflow and not failures)
+    complete = bool(
+        remaining == 0
+        and not overflow
+        and not postflight_unavailable
+        and not failures
+    )
     has_more = not complete
-    batch_truncated = bool(batch_truncated or scope_truncated)
-    # A filtered pass cannot prove that matching work did not arrive after
-    # its initial inventory while any intent authority remains globally.
-    # Conservatively require the postflight namespace to be empty before a
-    # worker may treat the selected scope as complete.
+    batch_truncated = bool(
+        batch_truncated
+        or scope_truncated
+        or postflight_scan_truncated
+    )
+    # A filtered bounded pass is deliberately conservative: unrelated or
+    # unobserved authority keeps the selected scope incomplete.
     scope_complete = complete
+
     return {
         "ok": not failures,
         "processed": len(results),
@@ -7463,20 +8669,26 @@ def _reconcile_card_sidecar_write_intents_unlocked(
         "complete": complete,
         "has_more": has_more,
         "remaining_lower_bound": (
-            0
-            if remaining is None
-            else remaining
+            0 if remaining is None else remaining
         ),
         "batch_truncated": batch_truncated,
         "overflow": overflow,
         "progress_blocked": progress_blocked,
-        "scope_filtered": bool(selected_card_ids),
+        "scope_filtered": scope_filtered,
         "scope_complete": scope_complete,
+        "physical_limit": inventory_entry_limit,
+        "postflight_physical_limit": postflight_physical_limit,
+        "postflight_enumerated": postflight_enumerated,
+        "postflight_scan_truncated": postflight_scan_truncated,
+        "postflight_authority": postflight_authority,
+        "publisher_temps_attempted": publisher_temps_attempted,
         "publisher_temps_retired": len(publisher_temp_retirements),
-        "publisher_temp_retirement_evidence": publisher_temp_retirements,
-        # These paths/names prove bounded maintenance only. The retired bytes
-        # were never published as intents and are never consulted for recovery;
-        # losing the portable quarantine cannot lose sidecar authority.
+        "publisher_temp_cleanup_truncated": (
+            publisher_temp_cleanup_truncated
+        ),
+        "publisher_temp_retirement_evidence": (
+            publisher_temp_retirements
+        ),
         "publisher_temp_retirements_authoritative": False,
     }
 
@@ -7484,8 +8696,6 @@ def _reconcile_card_sidecar_write_intents_unlocked(
 def register_card_sidecar_compensation_intents(
     root: Path,
     candidates: Iterable[dict[str, Any]],
-    *,
-    conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, str]]:
     registered: list[dict[str, str]] = []
     for candidate in candidates:
@@ -7504,7 +8714,6 @@ def register_card_sidecar_compensation_intents(
             target_uri=target_uri,
             expected_state_hash=expected_state_hash,
             mode="compensation_cleanup",
-            conn=conn,
         )
         registered.append(
             {
@@ -7755,6 +8964,7 @@ def _card_sidecar_recovery_evidence_audit(root: Path) -> dict[str, int]:
 def write_card_sidecar_from_values(
     root: Path,
     *,
+    conn: sqlite3.Connection | None = None,
     card_id: str,
     card_type: str,
     title: str,
@@ -7785,6 +8995,16 @@ def write_card_sidecar_from_values(
     sidecar_path: Path | None = None,
     exclusive_create: bool = False,
 ) -> str | None:
+    if conn is None:
+        raise RuntimeError(
+            "Card sidecar filesystem publication requires explicit SQLite "
+            "transaction authority"
+        )
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar publication cannot perform filesystem durability "
+            "work inside an active SQLite transaction"
+        )
     _require_canonical_card_id(card_id)
     sidecar_path = sidecar_path or card_sidecar_path(root, card_id)
     if sidecar_path is None:
@@ -7860,11 +9080,27 @@ def sync_card_sidecar(
             artifact_index=artifact_index,
         )
     )
-    if sidecar_path is not None and _card_sidecar_matches_payload(sidecar_path, payload):
+    if sidecar_path is not None and create_only and write_observation is None:
+        # A transaction-local location_uri is not proof that the Card row will
+        # commit.  Every new filesystem target must therefore use the durable
+        # intent path, even when create_card prebound the default location.
+        raise RuntimeError(
+            "new Card sidecar targets require sync_card_sidecars_after_commit "
+            "or a durable write observation"
+        )
+    if (
+        sidecar_path is not None
+        and _card_sidecar_matches_payload(sidecar_path, payload)
+    ):
         location_uri = continuum_uri(root, sidecar_path)
         if update_location and row["location_uri"] != location_uri:
             conn.execute("UPDATE cards SET location_uri = ? WHERE id = ?", (location_uri, card_id))
         return location_uri
+    if sidecar_path is not None and conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar publication cannot perform filesystem durability "
+            "work inside an active SQLite transaction"
+        )
     target_is_link_like = bool(
         sidecar_path is not None
         and os.path.lexists(sidecar_path)
@@ -7880,14 +9116,6 @@ def sync_card_sidecar(
     expected_state_hash = str(payload.get("state_hash") or "")
     intent_id: str | None = None
     intent_path: Path | None = None
-    if sidecar_path is not None and create_only and write_observation is None:
-        # A transaction-local location_uri is not proof that the Card row will
-        # commit.  Every new filesystem target must therefore use the durable
-        # intent path, even when create_card prebound the default location.
-        raise RuntimeError(
-            "new Card sidecar targets require sync_card_sidecars_after_commit "
-            "or a durable write observation"
-        )
     if (
         sidecar_path is not None
         and create_only
@@ -7914,6 +9142,7 @@ def sync_card_sidecar(
         )
     written_location_uri = write_card_sidecar_from_values(
         root,
+        conn=conn,
         card_id=row["id"],
         card_type=row["card_type"],
         title=row["title"],
@@ -8070,11 +9299,295 @@ def _graph_edge_source_backfill_triggers_ready(
     return GRAPH_EDGE_SOURCE_BACKFILL_TRIGGER_NAMES.issubset(installed)
 
 
+def _review_artifact_immutability_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _review_artifact_immutability_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
 def _normalize_sqlite_schema_sql(sql: object) -> str:
     normalized = re.sub(r"[ \t\r\n\f\v]+", " ", str(sql or "")).strip()
     if normalized.endswith(";"):
         normalized = normalized[:-1].rstrip()
     return normalized
+
+
+def _review_artifact_immutability_trigger_sql() -> dict[str, str]:
+    return {
+        "protect_review_phase_artifact_updates": """
+            CREATE TRIGGER protect_review_phase_artifact_updates
+            BEFORE UPDATE ON artifacts
+            WHEN OLD.kind = 'review_phase_envelope'
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'review phase artifacts are immutable'
+                );
+            END
+        """,
+        "protect_review_phase_artifact_deletes": """
+            CREATE TRIGGER protect_review_phase_artifact_deletes
+            BEFORE DELETE ON artifacts
+            WHEN OLD.kind = 'review_phase_envelope'
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'review phase artifacts are immutable'
+                );
+            END
+        """,
+        "protect_review_legacy_quarantine_updates": """
+            CREATE TRIGGER protect_review_legacy_quarantine_updates
+            BEFORE UPDATE ON artifacts
+            WHEN OLD.kind = 'review_legacy_quarantine_receipt'
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'review legacy quarantine artifacts are immutable'
+                );
+            END
+        """,
+        "protect_review_legacy_quarantine_deletes": """
+            CREATE TRIGGER protect_review_legacy_quarantine_deletes
+            BEFORE DELETE ON artifacts
+            WHEN OLD.kind = 'review_legacy_quarantine_receipt'
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'review legacy quarantine artifacts are immutable'
+                );
+            END
+        """,
+        "protect_review_artifact_replace_conflicts": """
+            CREATE TRIGGER protect_review_artifact_replace_conflicts
+            BEFORE INSERT ON artifacts
+            WHEN EXISTS (
+                SELECT 1
+                FROM artifacts AS existing
+                WHERE existing.kind IN (
+                    'review_phase_envelope',
+                    'review_legacy_quarantine_receipt'
+                )
+                  AND (
+                      existing.rowid = NEW.rowid
+                      OR existing.id = NEW.id
+                      OR (
+                          existing.uri = NEW.uri
+                          AND existing.sha256 = NEW.sha256
+                      )
+                  )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'review artifacts are immutable');
+            END
+        """,
+        "protect_review_artifact_update_conflicts": """
+            CREATE TRIGGER protect_review_artifact_update_conflicts
+            BEFORE UPDATE ON artifacts
+            WHEN EXISTS (
+                SELECT 1
+                FROM artifacts AS existing
+                WHERE existing.kind IN (
+                    'review_phase_envelope',
+                    'review_legacy_quarantine_receipt'
+                )
+                  AND existing.rowid != OLD.rowid
+                  AND (
+                      existing.rowid = NEW.rowid
+                      OR existing.id = NEW.id
+                      OR (
+                          existing.uri = NEW.uri
+                          AND existing.sha256 = NEW.sha256
+                      )
+                  )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'review artifacts are immutable');
+            END
+        """,
+    }
+
+
+def _ensure_review_artifact_immutability_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "review artifact trigger installation requires no active transaction"
+        )
+    expected = _review_artifact_immutability_trigger_sql()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        installed = {
+            str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["name"]) in expected
+        }
+        for trigger_name, trigger_sql in expected.items():
+            if (
+                installed.get(trigger_name)
+                == _normalize_sqlite_schema_sql(trigger_sql)
+            ):
+                continue
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"{_quote_sqlite_identifier(trigger_name)}"
+            )
+            conn.execute(trigger_sql)
+        if not _review_artifact_immutability_triggers_ready(conn):
+            raise RuntimeError(
+                "review artifact immutability triggers did not install exactly"
+            )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _conflict_indexes_ready(conn: sqlite3.Connection) -> bool:
+    installed = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'index'"
+        ).fetchall()
+    }
+    return CONFLICT_INDEX_NAMES.issubset(installed)
+
+
+def _queue_job_fairness_trigger_sql() -> dict[str, str]:
+    return {
+        "purge_queue_job_fairness_after_job_update": """
+            CREATE TRIGGER purge_queue_job_fairness_after_job_update
+            AFTER UPDATE OF status, retry_pending ON queue_jobs
+            WHEN NEW.status != 'pending'
+                 OR OLD.retry_pending != NEW.retry_pending
+            BEGIN
+                DELETE FROM queue_job_fairness
+                WHERE job_id = NEW.id
+                  AND (
+                      NEW.status != 'pending'
+                      OR (
+                          lane = 'priority'
+                          AND NEW.retry_pending != 0
+                      )
+                      OR (
+                          lane = 'retry'
+                          AND NEW.retry_pending != 1
+                      )
+                  );
+            END
+        """,
+    }
+
+
+def _queue_job_fairness_table_ready(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT sql
+        FROM sqlite_schema
+        WHERE type = 'table' AND name = ?
+        """,
+        (QUEUE_JOB_FAIRNESS_TABLE_NAME,),
+    ).fetchone()
+    return (
+        row is not None
+        and _normalize_sqlite_schema_sql(row["sql"])
+        == _normalize_sqlite_schema_sql(QUEUE_JOB_FAIRNESS_TABLE_SQL)
+    )
+
+
+def _ensure_queue_job_fairness_table(
+    conn: sqlite3.Connection,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT type
+        FROM sqlite_schema
+        WHERE name = ?
+        """,
+        (QUEUE_JOB_FAIRNESS_TABLE_NAME,),
+    ).fetchone()
+    changed = False
+    if row is None:
+        conn.execute(QUEUE_JOB_FAIRNESS_TABLE_SQL)
+        changed = True
+    elif str(row["type"]) != "table":
+        raise RuntimeError(
+            "queue job fairness authority name is not a table"
+        )
+    if not _queue_job_fairness_table_ready(conn):
+        raise RuntimeError(
+            "queue job fairness authority table is not canonical"
+        )
+    return changed
+
+
+def _queue_job_fairness_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _queue_job_fairness_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
+def _ensure_queue_job_fairness_triggers(
+    conn: sqlite3.Connection,
+) -> bool:
+    if not _queue_job_fairness_table_ready(conn):
+        raise RuntimeError(
+            "queue job fairness authority table is unavailable"
+        )
+    expected = _queue_job_fairness_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    changed = False
+    for trigger_name, trigger_sql in expected.items():
+        if (
+            installed.get(trigger_name)
+            == _normalize_sqlite_schema_sql(trigger_sql)
+        ):
+            continue
+        conn.execute(
+            f"DROP TRIGGER IF EXISTS "
+            f"{_quote_sqlite_identifier(trigger_name)}"
+        )
+        conn.execute(trigger_sql)
+        changed = True
+    if not _queue_job_fairness_triggers_ready(conn):
+        raise RuntimeError(
+            "queue job fairness triggers did not install exactly"
+        )
+    return changed
 
 
 def _queue_retry_authority_trigger_sql() -> dict[str, str]:
@@ -8191,14 +9704,29 @@ def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
             "''",
         )
     )
+    immutable_conflict = """
+        EXISTS(
+            SELECT 1
+            FROM artifacts AS existing
+            WHERE existing.immutable = 1
+              AND (
+                  existing.rowid = NEW.rowid
+                  OR existing.id = NEW.id
+                  OR (
+                      existing.uri = NEW.uri
+                      AND existing.sha256 = NEW.sha256
+                  )
+              )
+        )
+    """
     return {
         "fence_card_sidecar_artifact_write_immutable_insert": f"""
             CREATE TRIGGER
                 fence_card_sidecar_artifact_write_immutable_insert
             BEFORE INSERT ON artifacts
-            WHEN NEW.immutable = 1
+            WHEN (NEW.immutable = 1 OR {immutable_conflict})
              AND EXISTS(
-                 SELECT 1 FROM meta WHERE key = '{reservation_key}'
+                  SELECT 1 FROM meta WHERE key = '{reservation_key}'
              )
             BEGIN
                 SELECT RAISE(ROLLBACK, '{trigger_error}');
@@ -8207,10 +9735,14 @@ def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
         "fence_card_sidecar_artifact_write_immutable_update": f"""
             CREATE TRIGGER
                 fence_card_sidecar_artifact_write_immutable_update
-            BEFORE UPDATE OF uri, immutable ON artifacts
-            WHEN NEW.immutable = 1
+            BEFORE UPDATE ON artifacts
+            WHEN (
+                  OLD.immutable = 1
+                  OR NEW.immutable = 1
+                  OR {immutable_conflict}
+            )
              AND EXISTS(
-                 SELECT 1 FROM meta WHERE key = '{reservation_key}'
+                  SELECT 1 FROM meta WHERE key = '{reservation_key}'
              )
             BEGIN
                 SELECT RAISE(ROLLBACK, '{trigger_error}');
@@ -8219,8 +9751,8 @@ def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
         "advance_immutable_artifact_path_index_epoch_after_insert": f"""
             CREATE TRIGGER
                 advance_immutable_artifact_path_index_epoch_after_insert
-            AFTER INSERT ON artifacts
-            WHEN NEW.immutable = 1
+            BEFORE INSERT ON artifacts
+            WHEN NEW.immutable = 1 OR {immutable_conflict}
             BEGIN
                 UPDATE meta
                 SET value = CAST(value AS INTEGER) + 1
@@ -8230,8 +9762,12 @@ def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
         "advance_immutable_artifact_path_index_epoch_after_update": f"""
             CREATE TRIGGER
                 advance_immutable_artifact_path_index_epoch_after_update
-            AFTER UPDATE OF uri, immutable ON artifacts
-            WHEN OLD.immutable = 1 OR NEW.immutable = 1
+            BEFORE UPDATE ON artifacts
+            WHEN (
+                OLD.immutable = 1
+                OR NEW.immutable = 1
+                OR {immutable_conflict}
+            )
             BEGIN
                 UPDATE meta
                 SET value = CAST(value AS INTEGER) + 1
@@ -8250,6 +9786,183 @@ def _card_sidecar_artifact_write_reservation_trigger_sql() -> dict[str, str]:
             END
         """,
     }
+
+
+def _card_sidecar_quarantine_reservation_trigger_sql() -> dict[str, str]:
+    reservation_key = CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY.replace(
+        "'",
+        "''",
+    )
+    trigger_error = CARD_SIDECAR_QUARANTINE_RESERVATION_TRIGGER_ERROR.replace(
+        "'",
+        "''",
+    )
+    reservation_exists = (
+        f"EXISTS(SELECT 1 FROM meta WHERE key = '{reservation_key}')"
+    )
+    immutable_conflict = """
+        EXISTS(
+            SELECT 1
+            FROM artifacts AS existing
+            WHERE existing.immutable = 1
+              AND (
+                  existing.rowid = NEW.rowid
+                  OR existing.id = NEW.id
+                  OR (
+                      existing.uri = NEW.uri
+                      AND existing.sha256 = NEW.sha256
+                  )
+              )
+        )
+    """
+
+    def fence(
+        trigger_name: str,
+        timing: str,
+        table: str,
+        *,
+        when: str | None = None,
+    ) -> str:
+        when_sql = (
+            f"WHEN ({when}) AND {reservation_exists}"
+            if when is not None
+            else f"WHEN {reservation_exists}"
+        )
+        return f"""
+            CREATE TRIGGER {trigger_name}
+            {timing} ON {table}
+            {when_sql}
+            BEGIN
+                SELECT RAISE(ROLLBACK, '{trigger_error}');
+            END
+        """
+
+    return {
+        "fence_card_sidecar_quarantine_card_insert": fence(
+            "fence_card_sidecar_quarantine_card_insert",
+            "BEFORE INSERT",
+            "cards",
+        ),
+        "fence_card_sidecar_quarantine_card_update": fence(
+            "fence_card_sidecar_quarantine_card_update",
+            "BEFORE UPDATE",
+            "cards",
+        ),
+        "fence_card_sidecar_quarantine_card_delete": fence(
+            "fence_card_sidecar_quarantine_card_delete",
+            "BEFORE DELETE",
+            "cards",
+        ),
+        "fence_card_sidecar_quarantine_outbox_insert": fence(
+            "fence_card_sidecar_quarantine_outbox_insert",
+            "BEFORE INSERT",
+            "card_sidecar_outbox",
+        ),
+        "fence_card_sidecar_quarantine_outbox_update": fence(
+            "fence_card_sidecar_quarantine_outbox_update",
+            "BEFORE UPDATE",
+            "card_sidecar_outbox",
+        ),
+        "fence_card_sidecar_quarantine_outbox_delete": fence(
+            "fence_card_sidecar_quarantine_outbox_delete",
+            "BEFORE DELETE",
+            "card_sidecar_outbox",
+        ),
+        "fence_card_sidecar_quarantine_immutable_artifact_insert": fence(
+            "fence_card_sidecar_quarantine_immutable_artifact_insert",
+            "BEFORE INSERT",
+            "artifacts",
+            when=f"NEW.immutable = 1 OR {immutable_conflict}",
+        ),
+        "fence_card_sidecar_quarantine_immutable_artifact_update": fence(
+            "fence_card_sidecar_quarantine_immutable_artifact_update",
+            "BEFORE UPDATE",
+            "artifacts",
+            when=(
+                "OLD.immutable = 1 "
+                "OR NEW.immutable = 1 "
+                f"OR {immutable_conflict}"
+            ),
+        ),
+        "fence_card_sidecar_quarantine_immutable_artifact_delete": fence(
+            "fence_card_sidecar_quarantine_immutable_artifact_delete",
+            "BEFORE DELETE",
+            "artifacts",
+            when="OLD.immutable = 1",
+        ),
+    }
+
+
+def _card_sidecar_quarantine_reservation_triggers_ready(
+    conn: sqlite3.Connection,
+) -> bool:
+    expected = _card_sidecar_quarantine_reservation_trigger_sql()
+    installed = {
+        str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+        ).fetchall()
+        if str(row["name"]) in expected
+    }
+    return all(
+        installed.get(trigger_name)
+        == _normalize_sqlite_schema_sql(trigger_sql)
+        for trigger_name, trigger_sql in expected.items()
+    )
+
+
+def _ensure_card_sidecar_quarantine_reservation_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Card sidecar quarantine guard installation requires no active "
+            "transaction"
+        )
+    expected = _card_sidecar_quarantine_reservation_trigger_sql()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        installed = {
+            str(row["name"]): _normalize_sqlite_schema_sql(row["sql"])
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["name"]) in expected
+        }
+        active_reservation = (
+            _card_sidecar_quarantine_reservation_value(conn) is not None
+            or _card_sidecar_artifact_write_reservation_value(conn) is not None
+        )
+        if active_reservation and any(
+            installed.get(trigger_name)
+            != _normalize_sqlite_schema_sql(trigger_sql)
+            for trigger_name, trigger_sql in expected.items()
+        ):
+            raise RuntimeError(
+                "active Card sidecar reservation has nonexact quarantine "
+                "triggers"
+            )
+        for trigger_name, trigger_sql in expected.items():
+            if (
+                installed.get(trigger_name)
+                == _normalize_sqlite_schema_sql(trigger_sql)
+            ):
+                continue
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"{_quote_sqlite_identifier(trigger_name)}"
+            )
+            conn.execute(trigger_sql)
+        if not _card_sidecar_quarantine_reservation_triggers_ready(conn):
+            raise RuntimeError(
+                "Card sidecar quarantine reservation triggers did not install "
+                "exactly"
+            )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def _card_sidecar_artifact_write_reservation_triggers_ready(
@@ -8283,11 +9996,20 @@ def _ensure_card_sidecar_artifact_write_reservation_triggers(
         # Install the baseline and its mutation triggers under one writer
         # boundary. No immutable artifact commit can fall between them.
         conn.execute("BEGIN IMMEDIATE")
+        active_reservation = (
+            _card_sidecar_quarantine_reservation_value(conn) is not None
+            or _card_sidecar_artifact_write_reservation_value(conn) is not None
+        )
         epoch_row = conn.execute(
             "SELECT value FROM meta WHERE key = ?",
             (IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY,),
         ).fetchone()
         if epoch_row is None:
+            if active_reservation:
+                raise RuntimeError(
+                    "active Card sidecar reservation has no immutable "
+                    "artifact epoch"
+                )
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES(?, '0')",
                 (IMMUTABLE_ARTIFACT_PATH_INDEX_EPOCH_META_KEY,),
@@ -8306,6 +10028,15 @@ def _ensure_card_sidecar_artifact_write_reservation_triggers(
             ).fetchall()
             if str(row["name"]) in expected
         }
+        if active_reservation and any(
+            installed.get(trigger_name)
+            != _normalize_sqlite_schema_sql(trigger_sql)
+            for trigger_name, trigger_sql in expected.items()
+        ):
+            raise RuntimeError(
+                "active Card sidecar reservation has nonexact immutable "
+                "artifact triggers"
+            )
         for trigger_name, trigger_sql in expected.items():
             if (
                 installed.get(trigger_name)
@@ -8422,11 +10153,19 @@ def _ensure_card_sidecar_db_authority_triggers(
     expected = _card_sidecar_db_authority_trigger_sql()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        active_quarantine = (
+            _card_sidecar_quarantine_reservation_value(conn) is not None
+        )
         epoch_row = conn.execute(
             "SELECT value FROM meta WHERE key = ?",
             (CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,),
         ).fetchone()
         if epoch_row is None:
+            if active_quarantine:
+                raise RuntimeError(
+                    "active Card sidecar quarantine reservation has no "
+                    "Card/outbox authority epoch"
+                )
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES(?, '0')",
                 (CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,),
@@ -8445,6 +10184,15 @@ def _ensure_card_sidecar_db_authority_triggers(
             ).fetchall()
             if str(row["name"]) in expected
         }
+        if active_quarantine and any(
+            installed.get(trigger_name)
+            != _normalize_sqlite_schema_sql(trigger_sql)
+            for trigger_name, trigger_sql in expected.items()
+        ):
+            raise RuntimeError(
+                "active Card sidecar quarantine reservation has nonexact "
+                "Card/outbox authority triggers"
+            )
         for trigger_name, trigger_sql in expected.items():
             if (
                 installed.get(trigger_name)
@@ -8815,6 +10563,38 @@ def apply_schema_migrations(root: Path, conn: sqlite3.Connection) -> list[str]:
     for table, column, ddl in migrations:
         if _add_column_if_missing(conn, table, column, ddl):
             applied.append(f"{table}.{column}")
+    fairness_table_changed = _ensure_queue_job_fairness_table(conn)
+    fairness_triggers_changed = _ensure_queue_job_fairness_triggers(conn)
+    stale_fairness_rows = int(
+        conn.execute(
+            """
+            DELETE FROM queue_job_fairness
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM queue_jobs
+                WHERE queue_jobs.id = queue_job_fairness.job_id
+                  AND queue_jobs.status = 'pending'
+                  AND (
+                      (
+                          queue_job_fairness.lane = 'priority'
+                          AND queue_jobs.retry_pending = 0
+                      )
+                      OR (
+                          queue_job_fairness.lane = 'retry'
+                          AND queue_jobs.retry_pending = 1
+                      )
+                  )
+            )
+            """
+        ).rowcount
+        or 0
+    )
+    if (
+        fairness_table_changed
+        or fairness_triggers_changed
+        or stale_fairness_rows
+    ):
+        applied.append("queue_job_fairness.authority.v1")
     queue_retry_authority_triggers_ready = (
         _queue_retry_authority_triggers_ready(conn)
     )
@@ -9046,6 +10826,10 @@ def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
         )
         if intent_state is None:
             return retirement_state is not None
+        publisher_temp_candidates: list[
+            tuple[Path, tuple[int, int]]
+        ] = []
+        inventory_failures: list[dict[str, Any]] = []
         (
             intent_paths,
             retirement_paths,
@@ -9058,7 +10842,9 @@ def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
                 if retirement_state is not None
                 else None
             ),
-            entry_limit=MAX_CARD_SIDECAR_WRITE_INTENTS,
+            entry_limit=1,
+            publisher_temp_candidates=publisher_temp_candidates,
+            inventory_failures=inventory_failures,
         )
         _assert_card_sidecar_state_dir_unchanged(intent_state)
         if retirement_state is not None:
@@ -9068,6 +10854,8 @@ def _card_sidecar_write_intents_pending_or_unreadable(root: Path) -> bool:
     return bool(
         intent_paths
         or retirement_paths
+        or publisher_temp_candidates
+        or inventory_failures
         or inventory_truncated
     )
 
@@ -9092,9 +10880,18 @@ def _init_db_durable_ready(root: Path) -> bool:
             schema_version = conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
+            fts5_available = _fts5_runtime_available(conn)
+            fts_table_ready = "chunks_fts" in tables
+            fts_meta = conn.execute(
+                "SELECT value FROM meta WHERE key = 'fts5_available'"
+            ).fetchone()
             if (
                 schema_version is None
                 or str(schema_version["value"]) != SCHEMA_VERSION
+                or (fts5_available and not fts_table_ready)
+                or fts_meta is None
+                or str(fts_meta["value"])
+                != ("1" if fts_table_ready else "0")
                 or not _migration_marker_complete(
                     conn,
                     key=SCROLL_EVENT_SCOPE_BACKFILL_META_KEY,
@@ -9126,11 +10923,18 @@ def _init_db_durable_ready(root: Path) -> bool:
                 )
                 or not _queue_retry_authority_triggers_ready(conn)
                 or not _queue_retry_order_counter_ready(conn)
+                or not _queue_job_fairness_table_ready(conn)
+                or not _queue_job_fairness_triggers_ready(conn)
                 or not _graph_edge_source_backfill_triggers_ready(conn)
+                or not _review_artifact_immutability_triggers_ready(conn)
+                or not _conflict_indexes_ready(conn)
                 or not (
                     _card_sidecar_artifact_write_reservation_triggers_ready(
                         conn
                     )
+                )
+                or not (
+                    _card_sidecar_quarantine_reservation_triggers_ready(conn)
                 )
                 or not _immutable_artifact_path_index_epoch_ready(conn)
                 or not _card_sidecar_db_authority_triggers_ready(conn)
@@ -9140,6 +10944,10 @@ def _init_db_durable_ready(root: Path) -> bool:
                 or _graph_edge_source_backfill_queue_pending(conn)
                 or (
                     _card_sidecar_artifact_write_reservation_value(conn)
+                    is not None
+                )
+                or (
+                    _card_sidecar_quarantine_reservation_value(conn)
                     is not None
                 )
                 or conn.execute(
@@ -9170,32 +10978,100 @@ def init_db(
         _INIT_DB_CACHE.discard(cache_key)
     init_layout(root)
     write_default_config(root)
-    conn = connect(root)
     sync_migrated_sidecars = False
     pending_sidecar_outbox = False
-    try:
-        conn.executescript(_schema_table_ddl())
-        _ensure_card_sidecar_db_authority_triggers(conn)
-        applied = apply_schema_migrations(root, conn)
-        sync_migrated_sidecars = "partition_aliases.backfill" in applied
-        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        _ensure_card_sidecar_artifact_write_reservation_triggers(conn)
-        _ensure_card_sidecar_db_authority_triggers(conn)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)", (SCHEMA_VERSION,))
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_user_version', ?)", ("2",))
-        if applied:
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_migration_at', ?)", (utc_now(),))
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('created_at', ?)", (utc_now(),))
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('fts5_available', ?)", ("1" if ensure_fts(conn) else "0",))
-        pending_sidecar_outbox = (
+    from .operations import operation_lock
+
+    # The complete schema phase shares the sidecar operation lock. Checking for
+    # an existing reservation before taking this lock leaves a TOCTOU window in
+    # which reconciliation can reserve and a migration can then invalidate its
+    # durable authority.
+    with operation_lock(
+        root,
+        CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+        timeout_seconds=60.0,
+    ):
+        conn = connect(root)
+        schema_authority_token: (
+            contextvars.Token[frozenset[str]] | None
+        ) = None
+        try:
+            if (
+                _card_sidecar_quarantine_reservation_value(conn) is not None
+                or _card_sidecar_artifact_write_reservation_value(conn)
+                is not None
+            ):
+                # Resolve exact reservation authority before any schema or data
+                # migration can touch its protected surfaces.
+                quarantine_recovery = (
+                    _recover_stale_card_sidecar_quarantine_reservation(
+                        root,
+                        conn,
+                    )
+                )
+                if (
+                    quarantine_recovery is not None
+                    and not quarantine_recovery.get("ok")
+                ):
+                    raise RuntimeError(
+                        "Card sidecar quarantine recovery blocked "
+                        f"initialization: {quarantine_recovery}"
+                    )
+                _recover_stale_card_sidecar_artifact_write_reservation(
+                    root,
+                    conn,
+                )
+            schema_authority_token = (
+                _claim_live_catalog_schema_mutation_authority(root)
+            )
+            conn.executescript(_schema_table_ddl())
+            _ensure_card_sidecar_db_authority_triggers(conn)
+            applied = apply_schema_migrations(root, conn)
+            sync_migrated_sidecars = "partition_aliases.backfill" in applied
+            conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            _ensure_review_artifact_immutability_triggers(conn)
+            _ensure_card_sidecar_artifact_write_reservation_triggers(conn)
+            _ensure_card_sidecar_quarantine_reservation_triggers(conn)
+            _ensure_card_sidecar_db_authority_triggers(conn)
             conn.execute(
-                "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
-            ).fetchone()
-            is not None
-        )
-        conn.commit()
-    finally:
-        conn.close()
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES('schema_version', ?)",
+                (SCHEMA_VERSION,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES('schema_user_version', ?)",
+                ("2",),
+            )
+            if applied:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) "
+                    "VALUES('last_migration_at', ?)",
+                    (utc_now(),),
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) "
+                "VALUES('created_at', ?)",
+                (utc_now(),),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES('fts5_available', ?)",
+                ("1" if ensure_fts(conn) else "0",),
+            )
+            pending_sidecar_outbox = (
+                conn.execute(
+                    "SELECT 1 FROM card_sidecar_outbox LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+            conn.commit()
+        finally:
+            conn.close()
+            if schema_authority_token is not None:
+                _release_live_catalog_schema_mutation_authority(
+                    schema_authority_token
+                )
     if not recover_pending_card_sidecars:
         # Queue-owning operations still need structural upgrades, but must
         # observe or fence the pending sidecar work themselves.
@@ -9243,7 +11119,10 @@ def record_artifact(
 ) -> str:
     if (
         immutable
-        and _card_sidecar_artifact_write_reservation_value(conn) is not None
+        and (
+            _card_sidecar_artifact_write_reservation_value(conn) is not None
+            or _card_sidecar_quarantine_reservation_value(conn) is not None
+        )
     ):
         # The schema trigger remains the race-closing authority. This early
         # check gives helper callers a stable error and explicitly releases any
@@ -9252,7 +11131,12 @@ def record_artifact(
         if conn.in_transaction:
             conn.rollback()
         raise CardSidecarArtifactWriteReservationError(
-            CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR
+            (
+                CARD_SIDECAR_QUARANTINE_RESERVATION_TRIGGER_ERROR
+                if _card_sidecar_quarantine_reservation_value(conn)
+                is not None
+                else CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_TRIGGER_ERROR
+            )
         )
     artifact_id = stable_id("artifact", kind, uri, sha256)
     conn.execute(
@@ -9286,7 +11170,62 @@ def record_artifact(
     return str(row["id"] if row else artifact_id)
 
 
+def _fts_table_ready(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM main.sqlite_schema "
+            "WHERE type = 'table' AND name = 'chunks_fts'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _fts5_runtime_available(conn: sqlite3.Connection) -> bool:
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM pragma_module_list WHERE name = 'fts5'"
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.OperationalError:
+        row = conn.execute(
+            "SELECT sqlite_compileoption_used('ENABLE_FTS5')"
+        ).fetchone()
+        return bool(row is not None and int(row[0]) == 1)
+
+
+def _live_catalog_root_for_connection(
+    conn: sqlite3.Connection,
+) -> Path | None:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if str(row[1]) != "main" or not str(row[2] or ""):
+            continue
+        database_path = Path(str(row[2])).resolve(strict=False)
+        if (
+            database_path.name == "catalog.sqlite3"
+            and database_path.parent.name == "catalog"
+        ):
+            return database_path.parent.parent
+    return None
+
+
 def ensure_fts(conn: sqlite3.Connection) -> bool:
+    """Return FTS readiness, provisioning only under init's schema authority."""
+
+    if _fts_table_ready(conn):
+        return True
+    if not _fts5_runtime_available(conn):
+        return False
+    live_root = _live_catalog_root_for_connection(conn)
+    if (
+        live_root is not None
+        and str(live_root.resolve(strict=False))
+        not in _LIVE_CATALOG_SCHEMA_MUTATION_ROOTS.get()
+    ):
+        # Transaction-time callers must never acquire the sidecar lock after
+        # obtaining a DB writer. init_db owns all live schema provisioning.
+        return False
     try:
         conn.execute(
             """
@@ -9296,7 +11235,7 @@ def ensure_fts(conn: sqlite3.Connection) -> bool:
         )
     except sqlite3.OperationalError:
         return False
-    return True
+    return _fts_table_ready(conn)
 
 
 def delete_book_fts(conn: sqlite3.Connection, book_id: str) -> bool:
@@ -10433,8 +12372,15 @@ def enqueue_job(
             """
             UPDATE queue_jobs
             SET priority = ?, preemptible = ?, related_card_ids_json = ?,
-                payload_json = ?, updated_at = ?, retry_pending = 0,
-                retry_order = 0, error_json = NULL
+                payload_json = ?, updated_at = ?,
+                retry_order = CASE
+                    WHEN retry_pending = 1 THEN retry_order
+                    ELSE 0
+                END,
+                error_json = CASE
+                    WHEN retry_pending = 1 THEN error_json
+                    ELSE NULL
+                END
             WHERE id = ? AND status = 'pending' AND dedupe_key = ?
               AND role = ? AND job_type = ?
             """,
@@ -10740,6 +12686,20 @@ def sync_card_sidecars_after_commit(
                     CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
                     timeout_seconds=60.0,
                 ):
+                    quarantine_recovery = (
+                        _recover_stale_card_sidecar_quarantine_reservation(
+                            root,
+                            conn,
+                        )
+                    )
+                    if (
+                        quarantine_recovery is not None
+                        and not quarantine_recovery.get("ok")
+                    ):
+                        raise RuntimeError(
+                            "Card sidecar quarantine reservation recovery "
+                            f"remains incomplete: {quarantine_recovery}"
+                        )
                     _recover_stale_card_sidecar_artifact_write_reservation(
                         root,
                         conn,
@@ -20023,7 +21983,75 @@ def _project_state_effective_durable_authority_signals(
     }
 
 
+class _ProjectStateRepairPlanChangedError(RuntimeError):
+    """The catalog changed between repair planning and its short commit."""
+
+
 def repair_invalid_project_state_checkpoints(
+    root: Path,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    all_projects: bool = False,
+    include_session_scoped: bool = False,
+    include_private: bool = False,
+    limit: int = 100,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Serialize one bounded checkpoint-repair plan and commit cycle."""
+
+    validate_project_state_repair_scope(
+        project_id=project_id,
+        session_id=session_id,
+        all_projects=all_projects,
+    )
+    validate_project_state_repair_limit(limit)
+    if not isinstance(include_session_scoped, bool):
+        raise ValueError(
+            "checkpoint repair include_session_scoped must be a boolean"
+        )
+    if not isinstance(include_private, bool):
+        raise ValueError(
+            "checkpoint repair include_private must be a boolean"
+        )
+    if not is_initialized(root):
+        return _repair_invalid_project_state_checkpoints_locked(
+            root,
+            project_id=project_id,
+            session_id=session_id,
+            all_projects=all_projects,
+            include_session_scoped=include_session_scoped,
+            include_private=include_private,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+    from .operations import operation_lock
+
+    with operation_lock(
+        root,
+        "repair-invalid-project-state-checkpoints",
+        timeout_seconds=60.0,
+    ):
+        for attempt in range(2):
+            try:
+                return _repair_invalid_project_state_checkpoints_locked(
+                    root,
+                    project_id=project_id,
+                    session_id=session_id,
+                    all_projects=all_projects,
+                    include_session_scoped=include_session_scoped,
+                    include_private=include_private,
+                    limit=limit,
+                    dry_run=dry_run,
+                )
+            except _ProjectStateRepairPlanChangedError:
+                if dry_run or attempt >= 1:
+                    raise
+        raise AssertionError("project-state repair retry loop exhausted")
+
+
+def _repair_invalid_project_state_checkpoints_locked(
     root: Path,
     *,
     project_id: str | None = None,
@@ -20113,9 +22141,13 @@ def repair_invalid_project_state_checkpoints(
     has_more = False
     withheld_uncertain_candidate_count = 0
     semantic_precondition: dict[str, Any] | None = None
+    planning_data_version: int | None = None
     try:
         if not dry_run:
-            conn.execute("BEGIN IMMEDIATE")
+            planning_data_version = int(
+                conn.execute("PRAGMA data_version").fetchone()[0]
+            )
+            conn.execute("BEGIN")
             semantic_precondition = semantic_integrity_report(
                 root,
                 conn=conn,
@@ -20836,6 +22868,181 @@ def repair_invalid_project_state_checkpoints(
                 }
             )
 
+        planned_repairs: list[dict[str, Any]] = []
+
+        def apply_planned_repair(plan: dict[str, Any]) -> None:
+            head = plan["head"]
+            head_id = str(head["id"])
+            record = plan["record"]
+            predecessor = plan["predecessor"]
+            peer_rows = plan["peer_rows"]
+            detached_peer_rows = plan["detached_peer_rows"]
+            direct_successor_ids = plan["direct_successor_ids"]
+            grouped_ids = plan["grouped_ids"]
+            if head_id in reactivated:
+                reactivated.remove(head_id)
+            now = utc_now()
+            updated_head = conn.execute(
+                """
+                UPDATE cards SET card_type = 'project_state',
+                    status = 'historical', supersedes_card_id = NULL,
+                    superseded_by_card_id = NULL, conflict_group = NULL,
+                    updated_at = ? WHERE id = ?
+                """,
+                (now, head_id),
+            )
+            if int(updated_head.rowcount or 0) != 1:
+                raise RuntimeError(
+                    "project-state repair head changed after planning: "
+                    f"{head_id}"
+                )
+            touched.add(head_id)
+            if direct_successor_ids:
+                successor_placeholders = ", ".join(
+                    "?" for _ in direct_successor_ids
+                )
+                updated_successors = conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET supersedes_card_id = NULL, updated_at = ?
+                    WHERE id IN ({successor_placeholders})
+                      AND supersedes_card_id = ?
+                    """,
+                    (now, *direct_successor_ids, head_id),
+                )
+                if int(updated_successors.rowcount or 0) != len(
+                    direct_successor_ids
+                ):
+                    raise RuntimeError(
+                        "project-state repair successor set changed after "
+                        f"planning: {head_id}"
+                    )
+                touched.update(direct_successor_ids)
+            original_conflict_group = str(
+                head["conflict_group"] or ""
+            ).strip()
+            if grouped_ids:
+                group_placeholders = ", ".join(
+                    "?" for _ in grouped_ids
+                )
+                updated_group = conn.execute(
+                    f"""
+                    UPDATE cards SET conflict_group = NULL, updated_at = ?
+                    WHERE id IN ({group_placeholders})
+                      AND conflict_group = ?
+                    """,
+                    (now, *grouped_ids, original_conflict_group),
+                )
+                if int(updated_group.rowcount or 0) != len(grouped_ids):
+                    raise RuntimeError(
+                        "project-state repair conflict group changed after "
+                        f"planning: {head_id}"
+                    )
+                touched.update(grouped_ids)
+            if predecessor is not None:
+                predecessor_id = str(predecessor["id"])
+                updated_predecessor = conn.execute(
+                    """
+                    UPDATE cards SET superseded_by_card_id = NULL, updated_at = ?
+                    WHERE id = ? AND superseded_by_card_id = ?
+                    """,
+                    (now, predecessor_id, head_id),
+                )
+                if int(updated_predecessor.rowcount or 0) != 1:
+                    raise RuntimeError(
+                        "project-state repair predecessor changed after "
+                        f"planning: {predecessor_id}"
+                    )
+                reactivated.append(predecessor_id)
+                touched.add(predecessor_id)
+            remaining_incoming_ids = [
+                str(row["id"]) for row in peer_rows
+            ]
+            if remaining_incoming_ids:
+                placeholders = ", ".join(
+                    "?" for _ in remaining_incoming_ids
+                )
+                updated_incoming = conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET status = 'historical', supersedes_card_id = NULL,
+                        superseded_by_card_id = NULL, conflict_group = NULL,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                      AND superseded_by_card_id = ?
+                    """,
+                    (now, *remaining_incoming_ids, head_id),
+                )
+                if int(updated_incoming.rowcount or 0) != len(
+                    remaining_incoming_ids
+                ):
+                    raise RuntimeError(
+                        "project-state repair peer set changed after "
+                        f"planning: {head_id}"
+                    )
+                touched.update(remaining_incoming_ids)
+                for incoming_row in peer_rows:
+                    if (
+                        str(incoming_row["card_type"] or "")
+                        != "project_state"
+                    ):
+                        continue
+                    _record_project_state_quarantine(
+                        conn,
+                        card_id=str(incoming_row["id"]),
+                        reason=(
+                            "project-state predecessor retired while "
+                            f"quarantining invalid successor {head_id}"
+                        ),
+                        predecessor_card_id=None,
+                    )
+            detached_peer_ids = [
+                str(row["id"]) for row in detached_peer_rows
+            ]
+            if detached_peer_ids:
+                detached_placeholders = ", ".join(
+                    "?" for _ in detached_peer_ids
+                )
+                updated_detached = conn.execute(
+                    f"""
+                    UPDATE cards
+                    SET superseded_by_card_id = NULL, updated_at = ?
+                    WHERE id IN ({detached_placeholders})
+                      AND superseded_by_card_id = ?
+                    """,
+                    (now, *detached_peer_ids, head_id),
+                )
+                if int(updated_detached.rowcount or 0) != len(
+                    detached_peer_ids
+                ):
+                    raise RuntimeError(
+                        "project-state repair detached peer set changed "
+                        f"after planning: {head_id}"
+                    )
+                touched.update(detached_peer_ids)
+            recorded_quarantine = _record_project_state_quarantine(
+                conn,
+                card_id=head_id,
+                reason=str(record["reason"]),
+                predecessor_card_id=(
+                    str(record["predecessor_card_id"])
+                    if record["predecessor_card_id"] is not None
+                    else None
+                ),
+            )
+            record.update(
+                {
+                    key: value
+                    for key, value in recorded_quarantine.items()
+                    if key
+                    not in {
+                        "card_id",
+                        "reason",
+                        "predecessor_card_id",
+                    }
+                }
+            )
+
         pending = list(scanned_rows)
         visited: set[str] = set()
         while (
@@ -20889,20 +23096,7 @@ def repair_invalid_project_state_checkpoints(
                 pending.insert(0, predecessor)
             if dry_run:
                 continue
-            if head_id in reactivated:
-                reactivated.remove(head_id)
-            now = utc_now()
             original_conflict_group = str(head["conflict_group"] or "").strip()
-            conn.execute(
-                """
-                UPDATE cards SET card_type = 'project_state',
-                    status = 'historical', supersedes_card_id = NULL,
-                    superseded_by_card_id = NULL, conflict_group = NULL,
-                    updated_at = ? WHERE id = ?
-                """,
-                (now, head_id),
-            )
-            touched.add(head_id)
             direct_successor_rows = conn.execute(
                 f"""
                 SELECT {select_fields} FROM cards
@@ -20916,20 +23110,7 @@ def repair_invalid_project_state_checkpoints(
                 for row in direct_successor_rows
                 if repair_row_is_authorized(row)
             ]
-            if direct_successor_ids:
-                successor_placeholders = ", ".join(
-                    "?" for _ in direct_successor_ids
-                )
-                conn.execute(
-                    f"""
-                    UPDATE cards
-                    SET supersedes_card_id = NULL, updated_at = ?
-                    WHERE id IN ({successor_placeholders})
-                      AND supersedes_card_id = ?
-                    """,
-                    (now, *direct_successor_ids, head_id),
-                )
-                touched.update(direct_successor_ids)
+            grouped_ids: list[str] = []
             if original_conflict_group:
                 grouped_rows = conn.execute(
                     f"SELECT {select_fields} FROM cards "
@@ -20939,97 +23120,112 @@ def repair_invalid_project_state_checkpoints(
                 grouped_ids = [
                     str(row["id"])
                     for row in grouped_rows
-                    if repair_row_is_authorized(row)
+                    if str(row["id"]) != head_id
+                    and repair_row_is_authorized(row)
                 ]
-                if grouped_ids:
-                    group_placeholders = ", ".join("?" for _ in grouped_ids)
-                    conn.execute(
-                        f"""
-                        UPDATE cards SET conflict_group = NULL, updated_at = ?
-                        WHERE id IN ({group_placeholders})
-                          AND conflict_group = ?
-                        """,
-                        (now, *grouped_ids, original_conflict_group),
-                    )
-                    touched.update(grouped_ids)
-            if predecessor is not None:
-                predecessor_id = str(predecessor["id"])
-                if conn.execute(
-                    """
-                    UPDATE cards SET superseded_by_card_id = NULL, updated_at = ?
-                    WHERE id = ? AND superseded_by_card_id = ?
-                    """,
-                    (now, predecessor_id, head_id),
-                ).rowcount == 1:
-                    reactivated.append(predecessor_id)
-                    touched.add(predecessor_id)
-            remaining_incoming = peer_rows
-            remaining_incoming_ids = [str(row["id"]) for row in peer_rows]
-            if remaining_incoming_ids:
-                placeholders = ", ".join(
-                    "?" for _ in remaining_incoming_ids
-                )
-                conn.execute(
-                    f"""
-                    UPDATE cards
-                    SET status = 'historical', supersedes_card_id = NULL,
-                        superseded_by_card_id = NULL, conflict_group = NULL,
-                        updated_at = ?
-                    WHERE id IN ({placeholders})
-                      AND superseded_by_card_id = ?
-                    """,
-                    (now, *remaining_incoming_ids, head_id),
-                )
-                touched.update(remaining_incoming_ids)
-                for incoming_row in remaining_incoming:
-                    if str(incoming_row["card_type"] or "") != "project_state":
-                        continue
-                    _record_project_state_quarantine(
-                        conn,
-                        card_id=str(incoming_row["id"]),
-                        reason=(
-                            "project-state predecessor retired while "
-                            f"quarantining invalid successor {head_id}"
-                        ),
-                        predecessor_card_id=None,
-                    )
-            detached_peer_ids = [
-                str(row["id"]) for row in detached_peer_rows
-            ]
-            if detached_peer_ids:
-                detached_placeholders = ", ".join(
-                    "?" for _ in detached_peer_ids
-                )
-                conn.execute(
-                    f"""
-                    UPDATE cards
-                    SET superseded_by_card_id = NULL, updated_at = ?
-                    WHERE id IN ({detached_placeholders})
-                      AND superseded_by_card_id = ?
-                    """,
-                    (now, *detached_peer_ids, head_id),
-                )
-                touched.update(detached_peer_ids)
-            recorded_quarantine = _record_project_state_quarantine(
-                conn,
-                card_id=head_id,
-                reason=str(record["reason"]),
-                predecessor_card_id=(
-                    str(record["predecessor_card_id"])
-                    if record["predecessor_card_id"] is not None
-                    else None
-                ),
-            )
-            record.update(
+            planned_repairs.append(
                 {
-                    key: value
-                    for key, value in recorded_quarantine.items()
-                    if key not in {"card_id", "reason", "predecessor_card_id"}
+                    "head": head,
+                    "record": record,
+                    "predecessor": predecessor,
+                    "peer_rows": peer_rows,
+                    "detached_peer_rows": detached_peer_rows,
+                    "direct_successor_ids": direct_successor_ids,
+                    "grouped_ids": grouped_ids,
                 }
             )
+        planned_head_ids = {
+            str(plan["head"]["id"]) for plan in planned_repairs
+        }
+        planned_retired_peer_ids = {
+            str(row["id"])
+            for plan in planned_repairs
+            for row in plan["peer_rows"]
+        }
+        owned_group_ids: set[str] = set()
+        for plan in planned_repairs:
+            predecessor = plan["predecessor"]
+            if (
+                predecessor is not None
+                and str(predecessor["id"]) in planned_head_ids
+            ):
+                plan["predecessor"] = None
+            plan["peer_rows"] = [
+                row
+                for row in plan["peer_rows"]
+                if str(row["id"]) not in planned_head_ids
+            ]
+            plan["detached_peer_rows"] = [
+                row
+                for row in plan["detached_peer_rows"]
+                if str(row["id"]) not in planned_head_ids
+            ]
+            plan["direct_successor_ids"] = [
+                card_id
+                for card_id in plan["direct_successor_ids"]
+                if card_id not in planned_head_ids
+                and card_id not in planned_retired_peer_ids
+            ]
+            assigned_group_ids: list[str] = []
+            for card_id in plan["grouped_ids"]:
+                if (
+                    card_id in planned_head_ids
+                    or card_id in planned_retired_peer_ids
+                    or card_id in owned_group_ids
+                ):
+                    continue
+                owned_group_ids.add(card_id)
+                assigned_group_ids.append(card_id)
+            plan["grouped_ids"] = assigned_group_ids
+        retired_peers[:] = [
+            record
+            for record in retired_peers
+            if str(record["card_id"]) not in planned_head_ids
+        ]
+        detached_peers[:] = [
+            record
+            for record in detached_peers
+            if str(record["card_id"]) not in planned_head_ids
+        ]
         repaired_candidate_ids = {
             str(record["card_id"]) for record in quarantined
         }
+        planned_mutation_card_ids: set[str] = set()
+        for plan in planned_repairs:
+            planned_mutation_card_ids.add(str(plan["head"]["id"]))
+            predecessor = plan["predecessor"]
+            if predecessor is not None:
+                planned_mutation_card_ids.add(str(predecessor["id"]))
+            for key in (
+                "peer_rows",
+                "detached_peer_rows",
+            ):
+                planned_mutation_card_ids.update(
+                    str(row["id"]) for row in plan[key]
+                )
+            planned_mutation_card_ids.update(
+                str(card_id)
+                for card_id in plan["direct_successor_ids"]
+            )
+            planned_mutation_card_ids.update(
+                str(card_id) for card_id in plan["grouped_ids"]
+            )
+        if (
+            not dry_run
+            and len(planned_mutation_card_ids)
+            > PROJECT_STATE_REPAIR_SCAN_LIMIT
+        ):
+            unrepairable_topology.append(
+                {
+                    "type": "repair_mutation_set_overflow",
+                    "planned_mutation_card_count": len(
+                        planned_mutation_card_ids
+                    ),
+                    "repair_mutation_limit": (
+                        PROJECT_STATE_REPAIR_SCAN_LIMIT
+                    ),
+                }
+            )
         remaining_invalid_count = len(
             repair_candidate_ids - repaired_candidate_ids
         )
@@ -21038,74 +23234,147 @@ def repair_invalid_project_state_checkpoints(
             or remaining_invalid_count
         )
         if not dry_run and not unrepairable_topology:
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            if (
+                planning_data_version is None
+                or int(
+                    conn.execute("PRAGMA data_version").fetchone()[0]
+                )
+                != planning_data_version
+            ):
+                conn.rollback()
+                raise _ProjectStateRepairPlanChangedError(
+                    "project-state repair authority changed while it was "
+                    "planned; retry"
+                )
+            for plan in planned_repairs:
+                apply_planned_repair(plan)
             if touched:
                 mark_card_sidecar_outbox(
                     conn,
                     sorted(touched),
                     reason="project_state_checkpoint_quarantined",
                 )
-            semantic_postcondition = semantic_integrity_report(
-                root,
-                conn=conn,
-                check_card_sidecars=False,
-            )
-            precondition_checks = (
-                semantic_precondition.get("checks", {})
-                if isinstance(semantic_precondition, dict)
-                else {}
-            )
-            postcondition_checks = semantic_postcondition.get("checks", {})
-            semantic_regressions: dict[str, Any] = {}
-            for check_name, post_value in postcondition_checks.items():
-                if check_name in {
-                    "alias_count",
-                    "quarantined_project_state_cards",
-                }:
-                    continue
-                pre_value = precondition_checks.get(check_name)
+            for plan in planned_repairs:
+                head_id = str(plan["head"]["id"])
+                head_state = conn.execute(
+                    """
+                    SELECT card_type, status, conflict_group,
+                           supersedes_card_id, superseded_by_card_id
+                    FROM cards
+                    WHERE id = ?
+                    """,
+                    (head_id,),
+                ).fetchone()
                 if (
-                    isinstance(post_value, bool)
-                    and post_value is False
-                    and pre_value is not False
-                ) or (
-                    isinstance(post_value, int)
-                    and not isinstance(post_value, bool)
-                    and post_value > int(pre_value or 0)
-                ):
-                    semantic_regressions[check_name] = {
-                        "before": pre_value,
-                        "after": post_value,
-                    }
-            post_repair_reports = [
-                _project_state_authority_boundary_report(
-                    conn,
-                    boundary,
-                    row_is_authorized=repair_row_is_authorized,
-                )
-                for boundary in sorted(boundaries)
-            ]
-            post_repair_authority_boundaries = [
-                _public_project_state_authority_report(report)
-                for report in post_repair_reports
-            ]
-            boundary_postcondition_failures = [
-                _public_project_state_authority_report(report)
-                for report in post_repair_reports
-                if not report["ok"]
-            ]
-            if semantic_regressions or boundary_postcondition_failures:
-                raise ValueError(
-                    "project-state checkpoint repair failed its authority "
-                    "postcondition: "
-                    + json_dumps(
-                        {
-                            "semantic_regressions": semantic_regressions,
-                            "boundary_failures": boundary_postcondition_failures,
-                        }
+                    head_state is None
+                    or str(head_state["card_type"] or "")
+                    != "project_state"
+                    or str(head_state["status"] or "").casefold()
+                    != "historical"
+                    or str(head_state["conflict_group"] or "").strip()
+                    or str(
+                        head_state["supersedes_card_id"] or ""
+                    ).strip()
+                    or str(
+                        head_state["superseded_by_card_id"] or ""
+                    ).strip()
+                    or not str(
+                        plan["record"].get("card_binding_hash") or ""
                     )
-                )
+                ):
+                    raise RuntimeError(
+                        "project-state repair failed its bounded "
+                        f"postcondition: {head_id}"
+                    )
             conn.commit()
             catalog_repair_committed = True
+
+            try:
+                semantic_postcondition = semantic_integrity_report(
+                    root,
+                    conn=conn,
+                    check_card_sidecars=False,
+                )
+                precondition_checks = (
+                    semantic_precondition.get("checks", {})
+                    if isinstance(semantic_precondition, dict)
+                    else {}
+                )
+                postcondition_checks = semantic_postcondition.get(
+                    "checks",
+                    {},
+                )
+                semantic_regressions: dict[str, Any] = {}
+                for check_name, post_value in postcondition_checks.items():
+                    if check_name in {
+                        "alias_count",
+                        "quarantined_project_state_cards",
+                    }:
+                        continue
+                    pre_value = precondition_checks.get(check_name)
+                    if (
+                        isinstance(post_value, bool)
+                        and post_value is False
+                        and pre_value is not False
+                    ) or (
+                        isinstance(post_value, int)
+                        and not isinstance(post_value, bool)
+                        and post_value > int(pre_value or 0)
+                    ):
+                        semantic_regressions[check_name] = {
+                            "before": pre_value,
+                            "after": post_value,
+                        }
+                post_repair_reports = [
+                    _project_state_authority_boundary_report(
+                        conn,
+                        boundary,
+                        row_is_authorized=repair_row_is_authorized,
+                    )
+                    for boundary in sorted(boundaries)
+                ]
+                post_repair_authority_boundaries = [
+                    _public_project_state_authority_report(report)
+                    for report in post_repair_reports
+                ]
+                boundary_postcondition_failures = [
+                    _public_project_state_authority_report(report)
+                    for report in post_repair_reports
+                    if not report["ok"]
+                ]
+                if (
+                    semantic_regressions
+                    or boundary_postcondition_failures
+                ):
+                    post_repair_semantic_error = True
+                    unrepairable_topology.append(
+                        {
+                            "type": (
+                                "post_commit_authority_postcondition_failed"
+                            ),
+                            "semantic_regressions": (
+                                semantic_regressions
+                            ),
+                            "boundary_failures": (
+                                boundary_postcondition_failures[:20]
+                            ),
+                        }
+                    )
+            except Exception as exc:
+                post_repair_semantic_error = True
+                unrepairable_topology.append(
+                    {
+                        "type": (
+                            "post_commit_authority_postcondition_error"
+                        ),
+                        "error": str(exc)[:512],
+                    }
+                )
+        elif not dry_run and conn.in_transaction:
+            conn.commit()
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -22264,6 +24533,71 @@ def _render_resume_recovery_packet(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _retire_uncommitted_recovery_packet(
+    packet_path: Path,
+    *,
+    recovery_id: str,
+    packet_identity: tuple[int, int, int, int, int, int],
+    packet_hash: str,
+) -> dict[str, Any]:
+    try:
+        current_packet = os.lstat(packet_path)
+    except FileNotFoundError:
+        return {"retired": False, "reason": "packet_missing"}
+    current_identity = (
+        int(current_packet.st_dev),
+        int(current_packet.st_ino),
+        stat.S_IFMT(current_packet.st_mode),
+        int(current_packet.st_size),
+        int(current_packet.st_mtime_ns),
+        int(current_packet.st_ctime_ns),
+    )
+    if (
+        current_identity != packet_identity
+        or not stat.S_ISREG(current_packet.st_mode)
+        or file_sha256(packet_path) != packet_hash
+    ):
+        return {"retired": False, "reason": "packet_authority_changed"}
+    if retire_exact_windows_file(
+        packet_path,
+        expected_identity=packet_identity,
+    ):
+        return {"retired": True, "reason": "windows_exact_handle"}
+    cleanup_slot = packet_path.parent / (
+        ".continuum-recovery-packet-cleanup-slot.md"
+    )
+    if (
+        os.path.lexists(cleanup_slot)
+        and _sidecar_nofollow_path_identity(cleanup_slot) is None
+    ):
+        return {
+            "retired": False,
+            "reason": "portable_cleanup_slot_unsafe",
+            "preserved_path": str(packet_path),
+        }
+    os.replace(packet_path, cleanup_slot)
+    flush_directory_strict(cleanup_slot.parent)
+    slot = os.lstat(cleanup_slot)
+    slot_identity = (
+        int(slot.st_dev),
+        int(slot.st_ino),
+        stat.S_IFMT(slot.st_mode),
+        int(slot.st_size),
+        int(slot.st_mtime_ns),
+    )
+    if (
+        slot_identity != packet_identity[:5]
+        or os.path.lexists(packet_path)
+        or file_sha256(cleanup_slot) != packet_hash
+    ):
+        return {
+            "retired": False,
+            "reason": "packet_replaced_during_retirement",
+            "preserved_path": str(cleanup_slot),
+        }
+    return {"retired": True, "reason": "portable_bounded_slot"}
+
+
 def recover_thread(
     root: Path,
     *,
@@ -22343,37 +24677,161 @@ def recover_thread(
             mandatory_checkpoint=None,
         )
 
+    def assert_expected_discovery_current(
+        discovery_conn: sqlite3.Connection,
+    ) -> dict[str, Any] | None:
+        if expected_discovery is None:
+            return None
+        revalidated = _discover_resume_state(
+            root,
+            discovery_conn,
+            requested_session=str(
+                expected_discovery.get("requested_session_id") or ""
+            ),
+            requested_project=str(
+                expected_discovery.get("requested_project_id") or ""
+            ),
+        )
+        checkpoint = revalidated.get("state")
+        if (
+            checkpoint is None
+            or str(revalidated.get("source") or "")
+            != str(expected_discovery.get("source") or "")
+            or str(checkpoint.get("id") or "")
+            != str(expected_discovery.get("checkpoint_id") or "")
+            or str(checkpoint["session_id"] or "") != lookup_session_id
+            or str(checkpoint["project_id"] or "")
+            != str(lookup_project_id or "")
+            or str(checkpoint["visibility_scope"] or "")
+            != str(
+                expected_discovery.get(
+                    "checkpoint_visibility_scope"
+                )
+                or ""
+            )
+        ):
+            raise ResumeCheckpointChangedError(
+                "resume checkpoint changed after discovery: "
+                f"{expected_discovery.get('checkpoint_id')}"
+            )
+        return revalidated
+
+    def checkpoint_cas_token(
+        token_conn: sqlite3.Connection,
+    ) -> str | None:
+        if expected_discovery is None:
+            return None
+        checkpoint_id = str(
+            expected_discovery.get("checkpoint_id") or ""
+        )
+        source = str(expected_discovery.get("source") or "")
+        if source == "project_state_card":
+            row = token_conn.execute(
+                """
+                SELECT rowid AS checkpoint_rowid, id, card_type, status,
+                       session_id, project_id, visibility_scope,
+                       conflict_group, supersedes_card_id,
+                       superseded_by_card_id, created_at, updated_at
+                FROM cards
+                WHERE id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        elif source == "scroll_event":
+            row = token_conn.execute(
+                """
+                SELECT rowid AS checkpoint_rowid, id, session_id, seq, role,
+                       event_type, content, content_hash, visibility_scope,
+                       project_id, metadata_json, created_at
+                FROM scroll_events
+                WHERE id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        else:
+            row = None
+        return (
+            content_hash(json_dumps(dict(row)))
+            if row is not None
+            else None
+        )
+
+    def scroll_head_cas_token(
+        token_conn: sqlite3.Connection,
+    ) -> str | None:
+        if (
+            expected_discovery is None
+            or str(expected_discovery.get("source") or "")
+            != "scroll_event"
+        ):
+            return None
+        requested_session = str(
+            expected_discovery.get("requested_session_id") or ""
+        )
+        requested_project = str(
+            expected_discovery.get("requested_project_id") or ""
+        )
+        if requested_session and requested_project:
+            visibility_clause = (
+                "((visibility_scope = 'session' AND session_id = ?) "
+                "OR (visibility_scope = 'project' AND project_id = ?))"
+            )
+            params: tuple[Any, ...] = (
+                requested_session,
+                requested_project,
+            )
+        elif requested_session:
+            visibility_clause = (
+                "(visibility_scope = 'session' AND session_id = ?)"
+            )
+            params = (requested_session,)
+        elif requested_project:
+            visibility_clause = (
+                "(visibility_scope = 'project' AND project_id = ?)"
+            )
+            params = (requested_project,)
+        else:
+            visibility_clause = (
+                "(visibility_scope = 'session' "
+                "OR (visibility_scope = 'project' "
+                "AND coalesce(project_id, '') != '') "
+                "OR (visibility_scope = 'global' "
+                "AND coalesce(project_id, '') = ''))"
+            )
+            params = ()
+        row = token_conn.execute(
+            f"""
+            SELECT rowid AS checkpoint_rowid, id, session_id, seq,
+                   event_type, content_hash, visibility_scope, project_id,
+                   created_at
+            FROM scroll_events
+            WHERE coalesce(session_id, '') != ''
+              AND event_type != 'project_state'
+              AND {visibility_clause}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return (
+            content_hash(json_dumps(dict(row)))
+            if row is not None
+            else None
+        )
+
     conn: sqlite3.Connection | None = None
+    packet_path: Path | None = None
+    packet_published = False
+    packet_audited = False
+    packet_identity: tuple[int, int, int, int, int, int] | None = None
+    packet_evidence: StableRegularFileEvidence | None = None
+    packet_fd = -1
+    packet_hash: str | None = None
     try:
         if expected_discovery is not None:
             conn = connect(root)
-            conn.execute("BEGIN IMMEDIATE")
-            revalidated = _discover_resume_state(
-                root,
-                conn,
-                requested_session=str(
-                    expected_discovery.get("requested_session_id") or ""
-                ),
-                requested_project=str(
-                    expected_discovery.get("requested_project_id") or ""
-                ),
-            )
-            checkpoint = revalidated.get("state")
-            if (
-                checkpoint is None
-                or str(revalidated.get("source") or "")
-                != str(expected_discovery.get("source") or "")
-                or str(checkpoint.get("id") or "")
-                != str(expected_discovery.get("checkpoint_id") or "")
-                or str(checkpoint["session_id"] or "") != lookup_session_id
-                or str(checkpoint["project_id"] or "") != str(lookup_project_id or "")
-                or str(checkpoint["visibility_scope"] or "")
-                != str(expected_discovery.get("checkpoint_visibility_scope") or "")
-            ):
-                raise ResumeCheckpointChangedError(
-                    "resume checkpoint changed after discovery: "
-                    f"{expected_discovery.get('checkpoint_id')}"
-                )
+            conn.execute("BEGIN")
+            assert_expected_discovery_current(conn)
 
         context = compile_recovery_context(token_budget)
         if (
@@ -22978,16 +25436,111 @@ def recover_thread(
         context.pop("_mandatory_checkpoint_minimal_context_text", None)
         safe_session = safe_external_name(lookup_session_id, limit=80)
         packet_path = root / "exports" / "thread_recovery" / f"{safe_session}_{recovery_id}.md"
+        if conn.in_transaction:
+            conn.commit()
         secure_mkdir(packet_path.parent)
+        packet_hash = content_hash(packet_text)
         atomic_write_text_file(packet_path, packet_text)
+        packet_published = True
+        packet_evidence, packet_fd, _captured_packet = (
+            _open_stable_regular_file_hash_evidence(packet_path)
+        )
+        packet_file_identity = packet_evidence[0][1]
+        if packet_file_identity is None:
+            raise OSError(
+                "thread recovery packet publication has no stable file identity"
+            )
+        packet_metadata = os.lstat(packet_path)
+        packet_identity = (
+            int(packet_metadata.st_dev),
+            int(packet_metadata.st_ino),
+            stat.S_IFMT(packet_metadata.st_mode),
+            int(packet_metadata.st_size),
+            int(packet_metadata.st_mtime_ns),
+            int(packet_metadata.st_ctime_ns),
+        )
+        if (
+            not stat.S_ISREG(packet_metadata.st_mode)
+            or packet_evidence[2] != packet_hash
+        ):
+            raise OSError(
+                "thread recovery packet publication changed before audit"
+            )
+        conn.execute("BEGIN")
+        assert_expected_discovery_current(conn)
+        expected_sidecar_db_authority = (
+            _card_sidecar_db_authority_token(conn)
+        )
+        expected_checkpoint_cas = checkpoint_cas_token(conn)
+        expected_scroll_head_cas = scroll_head_cas_token(conn)
+        conn.commit()
+        if not _held_regular_file_evidence_is_current(
+            packet_path,
+            packet_evidence,
+            packet_fd,
+        ):
+            raise OSError(
+                "thread recovery packet changed before its audit transaction"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            _card_sidecar_db_authority_token(conn)
+            != expected_sidecar_db_authority
+            or checkpoint_cas_token(conn) != expected_checkpoint_cas
+            or scroll_head_cas_token(conn) != expected_scroll_head_cas
+        ):
+            raise ResumeCheckpointChangedError(
+                "resume checkpoint changed between packet verification "
+                "and audit"
+            )
         audit_event(
             conn,
             action="recover_thread",
             target_type="thread",
             target_id=lookup_session_id,
-            payload={"recovery_id": recovery_id, "packet_uri": continuum_uri(root, packet_path)},
+            payload={
+                "recovery_id": recovery_id,
+                "packet_uri": continuum_uri(root, packet_path),
+                "packet_hash": packet_hash,
+                "packet_file_authority": {
+                    "device": int(packet_file_identity[0]),
+                    "inode": int(packet_file_identity[1]),
+                    "size_bytes": int(packet_evidence[1][0]),
+                    "mtime_ns": int(packet_evidence[1][1]),
+                    "ctime_ns": int(packet_evidence[1][2]),
+                },
+                "checkpoint": (
+                    {
+                        "source": str(
+                            expected_discovery.get("source") or ""
+                        ),
+                        "checkpoint_id": str(
+                            expected_discovery.get("checkpoint_id") or ""
+                        ),
+                        "session_id": lookup_session_id,
+                        "project_id": lookup_project_id,
+                        "visibility_scope": str(
+                            expected_discovery.get(
+                                "checkpoint_visibility_scope"
+                            )
+                            or ""
+                        ),
+                    }
+                    if expected_discovery is not None
+                    else None
+                ),
+            },
         )
         conn.commit()
+        packet_audited = True
+        if not _held_regular_file_evidence_is_current(
+            packet_path,
+            packet_evidence,
+            packet_fd,
+        ):
+            raise OSError(
+                "thread recovery packet changed immediately after audit"
+            )
         return {
             "recovery_id": recovery_id,
             "session_id": lookup_session_id,
@@ -22996,7 +25549,7 @@ def recover_thread(
             "project_id_redacted": lookup_project_id != project_id,
             "visibility_capability": effective_visibility_capability,
             "packet_uri": str(packet_path),
-            "packet_hash": content_hash(packet_text),
+            "packet_hash": packet_hash,
             "packet_estimated_tokens": packet_estimated_tokens,
             "packet_token_budget": packet_token_budget,
             "packet_truncated": packet_truncated,
@@ -23010,8 +25563,29 @@ def recover_thread(
     except Exception:
         if conn is not None and conn.in_transaction:
             conn.rollback()
+        if packet_fd >= 0:
+            os.close(packet_fd)
+            packet_fd = -1
+        if (
+            packet_published
+            and not packet_audited
+            and packet_path is not None
+            and packet_identity is not None
+            and packet_hash is not None
+        ):
+            try:
+                _retire_uncommitted_recovery_packet(
+                    packet_path,
+                    recovery_id=recovery_id,
+                    packet_identity=packet_identity,
+                    packet_hash=packet_hash,
+                )
+            except OSError:
+                pass
         raise
     finally:
+        if packet_fd >= 0:
+            os.close(packet_fd)
         if conn is not None:
             conn.close()
 
@@ -24040,6 +26614,10 @@ def semantic_integrity_report(
                 retirement_state = None
             intent_paths: list[Path] = []
             retirement_paths: list[Path] = []
+            publisher_temp_candidates: list[
+                tuple[Path, tuple[int, int]]
+            ] = []
+            inventory_failures: list[dict[str, Any]] = []
             inventory_truncated = False
             if intent_state is None and retirement_state is not None:
                 unsafe_card_sidecar_write_intent_paths += 1
@@ -24050,6 +26628,7 @@ def semantic_integrity_report(
                         _enumerated,
                     ) = _bounded_card_sidecar_state_paths(
                         retirement_state[0],
+                        include_all=True,
                     )
                 except OSError:
                     unsafe_card_sidecar_write_intent_paths += 1
@@ -24067,12 +26646,22 @@ def semantic_integrity_report(
                             if retirement_state is not None
                             else None
                         ),
-                        entry_limit=MAX_CARD_SIDECAR_WRITE_INTENTS,
+                        entry_limit=MAX_CARD_SIDECAR_WRITE_INTENTS + 1,
+                        publisher_temp_candidates=(
+                            publisher_temp_candidates
+                        ),
+                        inventory_failures=inventory_failures,
                     )
-                except OSError:
+                except (OSError, ValueError):
                     unsafe_card_sidecar_write_intent_paths += 1
             if inventory_truncated:
                 card_sidecar_write_intent_scan_overflow = 1
+            unresolved_card_sidecar_write_intents += len(
+                publisher_temp_candidates
+            )
+            unsafe_card_sidecar_write_intent_paths += len(
+                inventory_failures
+            )
             for intent_path in intent_paths:
                 unresolved_card_sidecar_write_intents += 1
                 try:

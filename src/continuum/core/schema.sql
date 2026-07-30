@@ -137,6 +137,17 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
     finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS queue_job_fairness (
+    job_id TEXT NOT NULL REFERENCES queue_jobs(id) ON DELETE CASCADE,
+    lane TEXT NOT NULL CHECK(lane IN ('priority', 'retry')),
+    bypass_count INTEGER NOT NULL
+        CHECK(
+            typeof(bypass_count) = 'integer'
+            AND bypass_count > 0
+    ),
+    PRIMARY KEY(job_id, lane)
+);
+
 CREATE TABLE IF NOT EXISTS graph_nodes (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -401,6 +412,18 @@ END;
 CREATE INDEX IF NOT EXISTS idx_queue_running_dedupe ON queue_jobs(dedupe_key) WHERE status = 'running' AND dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_queue_job_type_status ON queue_jobs(job_type, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_pending_dedupe_key ON queue_jobs(dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS purge_queue_job_fairness_after_job_update
+AFTER UPDATE OF status, retry_pending ON queue_jobs
+WHEN NEW.status != 'pending' OR OLD.retry_pending != NEW.retry_pending
+BEGIN
+    DELETE FROM queue_job_fairness
+    WHERE job_id = NEW.id
+      AND (
+          NEW.status != 'pending'
+          OR (lane = 'priority' AND NEW.retry_pending != 0)
+          OR (lane = 'retry' AND NEW.retry_pending != 1)
+      );
+END;
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_card_id ON graph_nodes(card_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node_id, status, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node_id, status, weight DESC);
@@ -449,6 +472,79 @@ CREATE INDEX IF NOT EXISTS idx_conflict_resolution_receipts_fingerprint ON confl
 CREATE INDEX IF NOT EXISTS idx_conflict_resolution_members_card ON conflict_resolution_members(card_id, receipt_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_operation ON artifacts(operation_id);
+
+CREATE TRIGGER IF NOT EXISTS protect_review_phase_artifact_updates
+BEFORE UPDATE ON artifacts
+WHEN OLD.kind = 'review_phase_envelope'
+BEGIN
+    SELECT RAISE(ABORT, 'review phase artifacts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS protect_review_phase_artifact_deletes
+BEFORE DELETE ON artifacts
+WHEN OLD.kind = 'review_phase_envelope'
+BEGIN
+    SELECT RAISE(ABORT, 'review phase artifacts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS protect_review_legacy_quarantine_updates
+BEFORE UPDATE ON artifacts
+WHEN OLD.kind = 'review_legacy_quarantine_receipt'
+BEGIN
+    SELECT RAISE(ABORT, 'review legacy quarantine artifacts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS protect_review_legacy_quarantine_deletes
+BEFORE DELETE ON artifacts
+WHEN OLD.kind = 'review_legacy_quarantine_receipt'
+BEGIN
+    SELECT RAISE(ABORT, 'review legacy quarantine artifacts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS protect_review_artifact_replace_conflicts
+BEFORE INSERT ON artifacts
+WHEN EXISTS (
+    SELECT 1
+    FROM artifacts AS existing
+    WHERE existing.kind IN (
+        'review_phase_envelope',
+        'review_legacy_quarantine_receipt'
+    )
+      AND (
+          existing.rowid = NEW.rowid
+          OR existing.id = NEW.id
+          OR (
+              existing.uri = NEW.uri
+              AND existing.sha256 = NEW.sha256
+          )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review artifacts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS protect_review_artifact_update_conflicts
+BEFORE UPDATE ON artifacts
+WHEN EXISTS (
+    SELECT 1
+    FROM artifacts AS existing
+    WHERE existing.kind IN (
+        'review_phase_envelope',
+        'review_legacy_quarantine_receipt'
+    )
+      AND existing.rowid != OLD.rowid
+      AND (
+          existing.rowid = NEW.rowid
+          OR existing.id = NEW.id
+          OR (
+              existing.uri = NEW.uri
+              AND existing.sha256 = NEW.sha256
+          )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review artifacts are immutable');
+END;
 
 CREATE TRIGGER IF NOT EXISTS trg_graph_edges_source_refs_backfill_insert
 AFTER INSERT ON graph_edges

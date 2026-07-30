@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import os
@@ -265,6 +266,242 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertGreaterEqual(elapsed, 0.03)
             self.assertLess(elapsed, 0.25)
 
+    def test_operation_lock_timeout_includes_setup_before_file_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            clock = {"now": 100.0}
+
+            def consume_deadline(_path: Path) -> None:
+                clock["now"] = 100.051
+
+            class ProbeHandle:
+                def __init__(self) -> None:
+                    self.close_calls = 0
+
+                def seek(self, *_args: object) -> None:
+                    pass
+
+                def tell(self) -> int:
+                    return 1
+
+                def close(self) -> None:
+                    self.close_calls += 1
+
+            handle = ProbeHandle()
+            if os.name == "nt":
+                import msvcrt
+
+                lock_attempt = patch.object(msvcrt, "locking")
+            else:
+                import fcntl
+
+                lock_attempt = patch.object(fcntl, "flock")
+            with (
+                patch.object(
+                    operations_module.time,
+                    "monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                patch.object(
+                    operations_module,
+                    "secure_mkdir",
+                    side_effect=consume_deadline,
+                ),
+                patch.object(
+                    operations_module,
+                    "_open_operation_lock_file",
+                    return_value=handle,
+                ) as open_lock_file,
+                patch.object(operations_module, "secure_file"),
+                lock_attempt as acquire_file_lock,
+            ):
+                with self.assertRaisesRegex(
+                    TimeoutError,
+                    "timed out waiting for operation lock",
+                ):
+                    with operations_module.operation_lock(
+                        root,
+                        "slow-setup",
+                        timeout_seconds=0.05,
+                    ):
+                        self.fail("expired setup entered operation lock")
+
+            open_lock_file.assert_called_once()
+            acquire_file_lock.assert_not_called()
+            self.assertEqual(handle.close_calls, 1)
+
+    def test_file_lock_sleep_is_bounded_by_remaining_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "bounded-wait.lock"
+            clock = {"now": 200.0}
+            sleeps: list[float] = []
+
+            def advance_clock(seconds: float) -> None:
+                sleeps.append(seconds)
+                clock["now"] += seconds
+
+            if os.name == "nt":
+                import msvcrt
+
+                lock_attempt = patch.object(
+                    msvcrt,
+                    "locking",
+                    side_effect=OSError(errno.EACCES, "contended"),
+                )
+            else:
+                import fcntl
+
+                lock_attempt = patch.object(
+                    fcntl,
+                    "flock",
+                    side_effect=OSError(errno.EAGAIN, "contended"),
+                )
+
+            with (
+                lock_path.open("w+b", buffering=0) as handle,
+                lock_attempt,
+                patch.object(
+                    operations_module.time,
+                    "monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                patch.object(
+                    operations_module.time,
+                    "sleep",
+                    side_effect=advance_clock,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    TimeoutError,
+                    "timed out waiting for operation lock",
+                ):
+                    operations_module._lock_file_handle(
+                        handle,
+                        deadline=200.01,
+                        nonblocking=False,
+                    )
+
+            self.assertEqual(len(sleeps), 1)
+            self.assertAlmostEqual(sleeps[0], 0.01)
+            self.assertLess(sleeps[0], 0.05)
+
+    def test_operation_lock_zero_timeout_succeeds_when_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            entered = False
+
+            with patch.object(operations_module.time, "sleep") as sleep:
+                with operations_module.operation_lock(
+                    root,
+                    "zero-timeout-free",
+                    timeout_seconds=0,
+                ):
+                    entered = True
+
+            self.assertTrue(entered)
+            sleep.assert_not_called()
+
+    def test_operation_lock_zero_timeout_fails_without_sleep_when_contended(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            holder_ready = threading.Event()
+            release_holder = threading.Event()
+
+            def hold_lock() -> None:
+                with operations_module.operation_lock(
+                    root,
+                    "zero-timeout-contended",
+                    timeout_seconds=1.0,
+                ):
+                    holder_ready.set()
+                    release_holder.wait(timeout=1.0)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                holder = executor.submit(hold_lock)
+                self.assertTrue(holder_ready.wait(timeout=1.0))
+                try:
+                    with (
+                        patch.object(operations_module.time, "sleep") as sleep,
+                        self.assertRaisesRegex(
+                            TimeoutError,
+                            "timed out waiting for operation lock",
+                        ),
+                    ):
+                        with operations_module.operation_lock(
+                            root,
+                            "zero-timeout-contended",
+                            timeout_seconds=0,
+                        ):
+                            self.fail("contended nonblocking lock was entered")
+                    sleep.assert_not_called()
+                finally:
+                    release_holder.set()
+                holder.result(timeout=1.0)
+
+    def test_operation_lock_zero_timeout_remains_reentrant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            entered_nested_lock = False
+
+            with operations_module.operation_lock(
+                root,
+                "zero-timeout-reentrant",
+                timeout_seconds=1.0,
+            ):
+                with operations_module.operation_lock(
+                    root,
+                    "zero-timeout-reentrant",
+                    timeout_seconds=0,
+                ):
+                    entered_nested_lock = True
+
+            self.assertTrue(entered_nested_lock)
+
+    def test_operation_lock_closes_handle_when_unlock_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+
+            class ProbeHandle:
+                def __init__(self) -> None:
+                    self.close_calls = 0
+
+                def close(self) -> None:
+                    self.close_calls += 1
+
+            handle = ProbeHandle()
+            with (
+                patch.object(
+                    operations_module,
+                    "_open_operation_lock_file",
+                    return_value=handle,
+                ),
+                patch.object(operations_module, "secure_file"),
+                patch.object(operations_module, "_lock_file_handle"),
+                patch.object(
+                    operations_module,
+                    "_unlock_file_handle",
+                    side_effect=RuntimeError("synthetic unlock failure"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic unlock failure",
+                ),
+            ):
+                with operations_module.operation_lock(
+                    root,
+                    "unlock-cleanup",
+                    timeout_seconds=1.0,
+                ):
+                    pass
+
+            self.assertEqual(handle.close_calls, 1)
+            with operations_module.operation_lock(
+                root,
+                "unlock-cleanup",
+                timeout_seconds=1.0,
+            ):
+                pass
+
     def test_cross_process_progress_updates_are_lossless_and_hash_chained(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"
@@ -278,6 +515,13 @@ class OperationLedgerTest(unittest.TestCase):
                 "current=int(sys.argv[3]), total=8)"
             )
             environment = dict(os.environ)
+            source_path = str(Path(__file__).resolve().parents[1] / "src")
+            existing_pythonpath = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = (
+                source_path
+                if not existing_pythonpath
+                else source_path + os.pathsep + existing_pythonpath
+            )
             processes = [
                 subprocess.Popen(
                     [sys.executable, "-c", code, str(root), operation_id, str(index)],
@@ -594,7 +838,7 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertTrue(verification["ok"])
             self.assertEqual(verification["operation_id"], started["operation_id"])
 
-    def test_proof_pack_remains_available_during_sidecar_artifact_reservation(
+    def test_proof_pack_recovers_stale_sidecar_artifact_reservation(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -644,25 +888,19 @@ class OperationLedgerTest(unittest.TestCase):
             proof_path = Path(proof["proof_pack_uri"])
             self.assertTrue(proof_path.is_file())
             verification = verify_proof_pack(proof_path, root=root)
-            self.assertFalse(verification["ok"], verification)
-            self.assertEqual(
-                [error["check"] for error in verification["errors"]],
-                ["artifact_ledger_proof_pack_bound"],
-                verification,
-            )
+            self.assertTrue(verification["ok"], verification)
             conn = connect(root)
             try:
-                self.assertEqual(
+                self.assertIsNone(
                     conn.execute(
                         "SELECT value FROM meta WHERE key = ?",
                         (
                             store_module
                             .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
                         ),
-                    ).fetchone()["value"],
-                    reservation,
+                    ).fetchone()
                 )
-                self.assertEqual(
+                self.assertGreater(
                     conn.execute(
                         """
                         SELECT COUNT(*) AS n

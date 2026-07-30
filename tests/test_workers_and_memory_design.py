@@ -6,6 +6,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,7 +22,7 @@ from continuum.core import store as store_module
 from continuum.core import workers as worker_module
 from continuum.core.config import default_config, write_config
 from continuum.core.evals import run_memory_quality_evals
-from continuum.core.operations import restore_drill
+from continuum.core.operations import operation_lock, restore_drill
 from continuum.core.store import (
     append_scroll_event,
     add_graph_edge,
@@ -55,6 +57,95 @@ from continuum.integrations.common import record_turn
 
 
 class EpicContinuumWorkerDesignTest(unittest.TestCase):
+    @staticmethod
+    def _seed_unbound_sidecar_intent(
+        root: Path,
+        *,
+        title: str,
+    ) -> tuple[str, dict, Path, str]:
+        init_db(root)
+        conn = connect(root)
+        try:
+            card_id = create_card(
+                conn,
+                root=root,
+                card_type="note",
+                title=title,
+                summary="Quarantine reservation regression authority.",
+                source_refs=[],
+            )
+            row = conn.execute(
+                "SELECT * FROM cards WHERE id = ?",
+                (card_id,),
+            ).fetchone()
+            payload = store_module._card_sidecar_payload_for_row(row)
+            conn.execute(
+                "UPDATE cards SET location_uri = NULL WHERE id = ?",
+                (card_id,),
+            )
+            conn.execute(
+                "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                (card_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        target_path = root / "catalog" / "cards" / f"{card_id}.live.yaml"
+        target_uri = store_module.continuum_uri(root, target_path)
+        intent_id, _intent_path = (
+            store_module._write_card_sidecar_write_intent(
+                root,
+                card_id=card_id,
+                target_uri=target_uri,
+                expected_state_hash=str(payload["state_hash"]),
+            )
+        )
+        store_module.write_atomic_yaml(target_path, payload)
+        return card_id, payload, target_path, intent_id
+
+    def test_worker_intent_budget_excludes_physical_enumeration(
+        self,
+    ) -> None:
+        budget = {"limit": 50, "used": 0, "remaining": 50}
+
+        charged = worker_module._charge_worker_sidecar_intent_budget(
+            budget,
+            allowance=50,
+            result={
+                "ok": True,
+                "complete": False,
+                "remaining": 51,
+                "enumerated": 52,
+                "inspected": 1,
+                "selected": 1,
+                "processed": 1,
+            },
+        )
+
+        self.assertEqual(charged, 1)
+        self.assertEqual(budget, {"limit": 50, "used": 1, "remaining": 49})
+
+        failed_budget = {"limit": 50, "used": 0, "remaining": 50}
+        failed_charge = worker_module._charge_worker_sidecar_intent_budget(
+            failed_budget,
+            allowance=50,
+            result={
+                "ok": False,
+                "complete": False,
+                "remaining": 51,
+                "enumerated": 52,
+                "inspected": 1,
+                "selected": 1,
+                "processed": 1,
+            },
+        )
+
+        self.assertEqual(failed_charge, 50)
+        self.assertEqual(
+            failed_budget,
+            {"limit": 50, "used": 50, "remaining": 0},
+        )
+
     @staticmethod
     def _create_pending_sidecar_cards(
         root: Path,
@@ -980,9 +1071,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             )
             self.assertEqual(intent_result["selected"], 50)
             self.assertEqual(intent_result["processed"], 50)
-            self.assertEqual(intent_result["enumerated"], 51)
-            self.assertEqual(intent_result["remaining"], 1)
-            self.assertTrue(intent_result["remaining_is_lower_bound"])
+            self.assertGreater(
+                intent_result["enumerated"],
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
+            )
+            self.assertGreaterEqual(intent_result["remaining"], 1)
+            self.assertFalse(intent_result["remaining_is_lower_bound"])
             self.assertFalse(intent_result["complete"])
             self.assertTrue(intent_result["has_more"])
 
@@ -1036,6 +1130,65 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertFalse(reconciled["scope_complete"])
             self.assertEqual(reconciled["remaining"], 1)
             self.assertFalse(reconciled["complete"])
+
+    def test_explicit_empty_card_filter_is_vacuous_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_ids = self._create_pending_sidecar_cards(
+                root,
+                count=2,
+                namespace="empty-card-filter",
+            )
+            with (
+                patch.object(
+                    store_module,
+                    "reconcile_card_sidecar_write_intents",
+                    side_effect=SystemExit(
+                        "simulated process death before intent reconciliation"
+                    ),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                sync_card_sidecars_after_commit(root, card_ids)
+            intent_dir = (
+                root / "run" / "card_sidecar_write_intents"
+            )
+            intent_bytes = {
+                path.name: path.read_bytes()
+                for path in intent_dir.glob("*.json")
+            }
+            self.assertEqual(len(intent_bytes), 2)
+
+            with patch.object(
+                store_module,
+                "_bounded_card_sidecar_intent_inventory",
+            ) as inventory:
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        card_ids=[],
+                    )
+                )
+
+            inventory.assert_not_called()
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertEqual(reconciled["selected"], 0)
+            self.assertEqual(reconciled["processed"], 0)
+            self.assertEqual(reconciled["remaining"], 0)
+            self.assertFalse(reconciled["has_more"])
+            self.assertTrue(reconciled["complete"])
+            self.assertTrue(reconciled["scope_filtered"])
+            self.assertTrue(reconciled["scope_complete"])
+            self.assertEqual(reconciled["physical_limit"], 0)
+            self.assertEqual(reconciled["postflight_physical_limit"], 0)
+            self.assertEqual(reconciled["postflight_enumerated"], 0)
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in intent_dir.glob("*.json")
+                },
+                intent_bytes,
+            )
 
     def test_card_filtered_scope_rejects_concurrent_matching_arrival(
         self,
@@ -1132,10 +1285,24 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(reconciled["selected"], 0)
             self.assertEqual(reconciled["processed"], 0)
             self.assertEqual(reconciled["remaining"], 2)
+            self.assertFalse(reconciled["remaining_is_lower_bound"])
             self.assertFalse(reconciled["complete"])
+            self.assertTrue(reconciled["scope_filtered"])
             self.assertFalse(reconciled["scope_complete"])
+            self.assertEqual(reconciled["postflight_authority"], 2)
+            self.assertEqual(reconciled["postflight_physical_limit"], 2)
+            self.assertEqual(reconciled["postflight_enumerated"], 2)
+            self.assertFalse(reconciled["postflight_scan_truncated"])
+            self.assertLessEqual(
+                reconciled["postflight_physical_limit"],
+                reconciled["physical_limit"],
+            )
+            self.assertLessEqual(
+                reconciled["postflight_enumerated"],
+                reconciled["postflight_physical_limit"] + 1,
+            )
 
-    def test_reconciliation_postflight_waits_for_db_bound_intent_publisher(
+    def test_reconciliation_inventory_allows_writer_and_rejects_db_publisher(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1166,63 +1333,15 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 create=True,
             )
             self.assertIsNotNone(intent_state)
+            assert intent_state is not None
 
-            initial_inventory_seen = threading.Event()
-            publisher_written = threading.Event()
-            allow_publisher_commit = threading.Event()
-            postflight_scan_started = threading.Event()
-            reconciliation_done = threading.Event()
-            errors: list[BaseException] = []
-            results: list[dict[str, object]] = []
-            real_inventory = (
-                store_module._bounded_card_sidecar_intent_inventory
-            )
-            real_retire_captured = (
-                store_module
-                ._retire_captured_card_sidecar_publisher_temps
-            )
-            inventory_calls = 0
-            retirement_calls = 0
-
-            def gate_inventory(
-                intent_dir: Path,
-                retirement_dir: Path | None,
-                *,
-                entry_limit: int,
-                **inventory_kwargs: object,
-            ) -> tuple[list[Path], list[Path], bool, int]:
-                nonlocal inventory_calls
-                inventory = real_inventory(
-                    intent_dir,
-                    retirement_dir,
-                    entry_limit=entry_limit,
-                    **inventory_kwargs,
-                )
-                inventory_calls += 1
-                if inventory_calls == 1:
-                    initial_inventory_seen.set()
-                elif inventory_calls == 2:
-                    postflight_scan_started.set()
-                return inventory
-
-            def gate_after_initial_inventory(
-                *args: object,
-                **kwargs: object,
-            ) -> None:
-                nonlocal retirement_calls
-                real_retire_captured(*args, **kwargs)
-                retirement_calls += 1
-                if retirement_calls == 1 and not publisher_written.wait(
-                    timeout=10.0
+            publisher_conn = connect(root)
+            try:
+                publisher_conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot perform filesystem durability work",
                 ):
-                    raise TimeoutError("publisher did not write its intent")
-
-            def publish() -> None:
-                publisher_conn = connect(root)
-                try:
-                    if not initial_inventory_seen.wait(timeout=10.0):
-                        raise TimeoutError("initial inventory did not run")
-                    publisher_conn.execute("BEGIN IMMEDIATE")
                     store_module._write_card_sidecar_write_intent(
                         root,
                         card_id=card_id,
@@ -1230,69 +1349,113 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                         expected_state_hash=str(payload["state_hash"]),
                         conn=publisher_conn,
                     )
-                    publisher_written.set()
-                    if not allow_publisher_commit.wait(timeout=10.0):
-                        raise TimeoutError("publisher commit was not released")
-                    publisher_conn.commit()
-                except BaseException as exc:
-                    if publisher_conn.in_transaction:
-                        publisher_conn.rollback()
-                    errors.append(exc)
-                finally:
-                    publisher_conn.close()
+                publisher_conn.rollback()
+            finally:
+                publisher_conn.close()
 
-            def reconcile() -> None:
-                try:
-                    results.append(
-                        store_module.reconcile_card_sidecar_write_intents(
-                            root,
-                            limit=1,
-                        )
-                    )
-                except BaseException as exc:
-                    errors.append(exc)
-                finally:
-                    reconciliation_done.set()
-
-            publisher_thread = threading.Thread(target=publish, daemon=True)
-            reconciliation_thread = threading.Thread(
-                target=reconcile,
-                daemon=True,
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
             )
+            publisher_temp_path = intent_state[0] / (
+                ".card_sidecar_write_intent_"
+                "0123456789abcdef01234567.json.deadbeef.tmp"
+            )
+            publisher_temp_path.write_text("temp", encoding="utf-8")
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            real_cleanup_publisher_temps = (
+                store_module
+                ._retire_captured_card_sidecar_publisher_temps
+            )
+            inventory_writer_probes = 0
+            cleanup_writer_probes = 0
+
+            def probe_unrelated_writer() -> None:
+                probe = connect(root)
+                try:
+                    probe.execute("PRAGMA busy_timeout = 0")
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.rollback()
+                finally:
+                    probe.close()
+
+            def probe_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+                **inventory_kwargs: object,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                nonlocal inventory_writer_probes
+                probe_unrelated_writer()
+                inventory_writer_probes += 1
+                return real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                    **inventory_kwargs,
+                )
+
+            def probe_publisher_temp_cleanup(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, bool]:
+                nonlocal cleanup_writer_probes
+                probe_unrelated_writer()
+                cleanup_writer_probes += 1
+                return real_cleanup_publisher_temps(*args, **kwargs)
+
             with (
                 patch.object(
                     store_module,
                     "_bounded_card_sidecar_intent_inventory",
-                    side_effect=gate_inventory,
+                    side_effect=probe_inventory,
                 ),
                 patch.object(
                     store_module,
                     "_retire_captured_card_sidecar_publisher_temps",
-                    side_effect=gate_after_initial_inventory,
+                    side_effect=probe_publisher_temp_cleanup,
                 ),
             ):
-                publisher_thread.start()
-                reconciliation_thread.start()
-                self.assertTrue(publisher_written.wait(timeout=10.0))
-                self.assertFalse(
-                    postflight_scan_started.wait(timeout=0.25),
-                    "postflight scan crossed an active publisher transaction",
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(
+                        root,
+                        limit=1,
+                    )
                 )
-                self.assertFalse(reconciliation_done.is_set())
-                allow_publisher_commit.set()
-                publisher_thread.join(timeout=10.0)
-                reconciliation_thread.join(timeout=10.0)
 
-            self.assertFalse(publisher_thread.is_alive())
-            self.assertFalse(reconciliation_thread.is_alive())
-            self.assertFalse(errors, errors)
-            self.assertEqual(len(results), 1)
-            reconciled = results[0]
             self.assertTrue(reconciled["ok"], reconciled)
-            self.assertEqual(reconciled["processed"], 0)
-            self.assertEqual(reconciled["remaining"], 1)
-            self.assertFalse(reconciled["complete"])
-            self.assertTrue(postflight_scan_started.is_set())
+            self.assertEqual(reconciled["processed"], 1, reconciled)
+            self.assertEqual(
+                reconciled["publisher_temps_retired"],
+                1,
+                reconciled,
+            )
+            self.assertEqual(
+                len(
+                    reconciled[
+                        "publisher_temp_retirement_evidence"
+                    ]
+                ),
+                1,
+                reconciled,
+            )
+            self.assertFalse(
+                reconciled[
+                    "publisher_temp_retirements_authoritative"
+                ]
+            )
+            self.assertTrue(reconciled["complete"], reconciled)
+            self.assertEqual(inventory_writer_probes, 1)
+            self.assertEqual(cleanup_writer_probes, 1)
+            self.assertFalse(intent_path.exists())
+            self.assertFalse(os.path.lexists(publisher_temp_path))
 
     def test_private_intent_publisher_cannot_cross_reconciliation_scan(
         self,
@@ -1377,7 +1540,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     results.append(
                         store_module.reconcile_card_sidecar_write_intents(
                             root,
-                            limit=1,
+                            card_ids=[card_id],
                         )
                     )
                 except BaseException as exc:
@@ -1422,7 +1585,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 1,
             )
 
-    def test_reconciliation_postflight_db_fence_failure_is_nonterminal(
+    def test_reconciliation_postflight_inventory_failure_is_nonterminal(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1434,35 +1597,55 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 create=True,
             )
             self.assertIsNotNone(intent_state)
-            real_connect = store_module.connect
-            connect_calls = 0
+            real_inventory = (
+                store_module._bounded_card_sidecar_intent_inventory
+            )
+            inventory_calls = 0
 
-            def fail_postflight_connect(path: Path) -> sqlite3.Connection:
-                nonlocal connect_calls
-                connect_calls += 1
-                if connect_calls == 2:
-                    raise sqlite3.OperationalError(
-                        "synthetic postflight writer fence failure"
+            def fail_postflight_inventory(
+                intent_dir: Path,
+                retirement_dir: Path | None,
+                *,
+                entry_limit: int,
+                **inventory_kwargs: object,
+            ) -> tuple[list[Path], list[Path], bool, int]:
+                nonlocal inventory_calls
+                inventory_calls += 1
+                if inventory_calls == 2:
+                    raise PermissionError(
+                        "synthetic postflight inventory failure"
                     )
-                return real_connect(path)
+                return real_inventory(
+                    intent_dir,
+                    retirement_dir,
+                    entry_limit=entry_limit,
+                    **inventory_kwargs,
+                )
 
             with patch.object(
                 store_module,
-                "connect",
-                side_effect=fail_postflight_connect,
+                "_bounded_card_sidecar_intent_inventory",
+                side_effect=fail_postflight_inventory,
             ):
                 reconciled = (
                     store_module.reconcile_card_sidecar_write_intents(
                         root,
-                        limit=1,
+                        card_ids=["card_postflight_probe"],
                     )
                 )
 
+            self.assertEqual(inventory_calls, 2)
             self.assertFalse(reconciled["ok"], reconciled)
             self.assertIsNone(reconciled["remaining"])
             self.assertTrue(reconciled["remaining_is_lower_bound"])
             self.assertFalse(reconciled["complete"])
             self.assertTrue(reconciled["has_more"])
+            self.assertTrue(reconciled["scope_filtered"])
+            self.assertFalse(reconciled["scope_complete"])
+            self.assertEqual(
+                reconciled["failures"][-1]["reason"],
+                "selected_scope_postflight_unavailable",
+            )
 
     def test_uninitialized_reconciliation_does_not_cross_into_unlocked_mutation(
         self,
@@ -1605,7 +1788,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(first_intents["pending"], 0)
             self.assertEqual(first_intents["selected"], 50)
             self.assertEqual(first_intents["remaining"], 1)
-            self.assertTrue(first_intents["remaining_is_lower_bound"])
+            self.assertFalse(first_intents["remaining_is_lower_bound"])
             self.assertFalse(first_intents["complete"])
             self.assertTrue(first_intents["has_more"])
             self.assertEqual(first_intents["remaining_lower_bound"], 1)
@@ -2980,25 +3163,49 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             finally:
                 conn.close()
 
-            observation: dict[str, object] = {}
             conn = connect(root)
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 artifact_index = store_module._immutable_artifact_path_index(
                     root,
                     conn,
                 )
-                store_module.sync_card_sidecar(
-                    root,
-                    conn,
-                    card_id,
-                    artifact_index=artifact_index,
-                    write_observation=observation,
-                )
-                self.assertTrue(observation.get("write_completed"))
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot perform filesystem durability work",
+                ):
+                    store_module.sync_card_sidecar(
+                        root,
+                        conn,
+                        card_id,
+                        artifact_index=artifact_index,
+                        write_observation={},
+                    )
                 conn.rollback()
             finally:
                 conn.close()
+
+            real_write = store_module.write_card_sidecar_from_values
+
+            def crash_after_production_write(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                real_write(*args, **kwargs)
+                raise SystemExit("crash after production sidecar write")
+
+            with (
+                patch.object(
+                    store_module,
+                    "write_card_sidecar_from_values",
+                    side_effect=crash_after_production_write,
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "after production sidecar write",
+                ),
+            ):
+                sync_card_sidecars_after_commit(root, [card_id])
 
             intent_dir = root / "run" / "card_sidecar_write_intents"
             self.assertEqual(len(list(intent_dir.glob("*.json"))), 1)
@@ -3096,24 +3303,49 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             finally:
                 conn.close()
 
-            observation: dict[str, object] = {}
             conn = connect(root)
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                store_module.sync_card_sidecar(
+                artifact_index = store_module._immutable_artifact_path_index(
                     root,
                     conn,
-                    card_id,
-                    artifact_index=store_module._immutable_artifact_path_index(
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot perform filesystem durability work",
+                ):
+                    store_module.sync_card_sidecar(
                         root,
                         conn,
-                    ),
-                    write_observation=observation,
-                )
-                self.assertTrue(observation.get("write_completed"))
+                        card_id,
+                        artifact_index=artifact_index,
+                        write_observation={},
+                    )
                 conn.rollback()
             finally:
                 conn.close()
+
+            real_write = store_module.write_card_sidecar_from_values
+
+            def crash_after_production_write(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                real_write(*args, **kwargs)
+                raise SystemExit("crash after production sidecar write")
+
+            with (
+                patch.object(
+                    store_module,
+                    "write_card_sidecar_from_values",
+                    side_effect=crash_after_production_write,
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "after production sidecar write",
+                ),
+            ):
+                sync_card_sidecars_after_commit(root, [card_id])
 
             first = run_worker_pass(
                 root,
@@ -3139,8 +3371,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 ),
                 first_intents["pending"],
             )
-            self.assertEqual(first_intents["remaining"], 1)
-            self.assertTrue(first_intents["remaining_is_lower_bound"])
+            self.assertEqual(first_intents["remaining"], 2)
+            self.assertFalse(first_intents["remaining_is_lower_bound"])
             self.assertFalse(first_intents["complete"])
             self.assertTrue(first_intents["has_more"])
 
@@ -3881,9 +4113,9 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 sum(call["processed"] for call in calls),
                 worker_module.WORKER_SIDECAR_INTENT_LIMIT,
             )
-            self.assertLessEqual(
+            self.assertGreater(
                 sum(call["enumerated"] for call in calls),
-                worker_module.WORKER_SIDECAR_INTENT_LIMIT + 1,
+                worker_module.WORKER_SIDECAR_INTENT_LIMIT,
             )
             budget = worker["sidecar_intent_budget"]
             self.assertEqual(
@@ -4211,8 +4443,118 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             verified = verify_book_integrity(root, book_id=result["book_id"])
 
             self.assertTrue(verified["ok"], verified)
+            self.assertEqual(verified["reason"], "ok")
             self.assertTrue(verified["checked_original"])
             self.assertFalse(verified["checked_reader"])
+
+    def test_book_verification_refuses_concurrent_row_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            source = Path(tmp) / "book-before.txt"
+            source.write_text("book bytes before verification\n", encoding="utf-8")
+            book = ingest_file(root, path=source)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    "SELECT original_uri FROM books WHERE id = ?",
+                    (book["book_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            original_path = resolve_stored_uri(root, row["original_uri"])
+            replacement_path = root / "archive" / "originals" / "book-after.txt"
+            replacement_path.write_text(
+                "replacement book bytes\n",
+                encoding="utf-8",
+            )
+            replacement_hash = hashlib.sha256(
+                replacement_path.read_bytes()
+            ).hexdigest()
+            replacement_metadata = json.dumps(
+                {"concurrent_metadata": "preserved"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            hash_started = threading.Event()
+            allow_hash = threading.Event()
+            verification_result: dict[str, object] = {}
+            real_file_sha256 = worker_module.file_sha256
+
+            def paused_file_sha256(path: Path) -> str:
+                if path == original_path:
+                    hash_started.set()
+                    self.assertTrue(allow_hash.wait(timeout=10))
+                return real_file_sha256(path)
+
+            def run_verification() -> None:
+                verification_result.update(
+                    verify_book_integrity(
+                        root,
+                        book_id=book["book_id"],
+                    )
+                )
+
+            with patch.object(
+                worker_module,
+                "file_sha256",
+                side_effect=paused_file_sha256,
+            ):
+                thread = threading.Thread(target=run_verification)
+                thread.start()
+                self.assertTrue(hash_started.wait(timeout=10))
+                writer = connect(root)
+                try:
+                    writer.execute(
+                        """
+                        UPDATE books
+                        SET original_uri = ?, content_hash = ?,
+                            metadata_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(replacement_path),
+                            replacement_hash,
+                            replacement_metadata,
+                            store_module.utc_now(),
+                            book["book_id"],
+                        ),
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+                    allow_hash.set()
+                thread.join(timeout=20)
+
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(verification_result["ok"], verification_result)
+            self.assertTrue(
+                verification_result["retry_pending"],
+                verification_result,
+            )
+            self.assertEqual(
+                verification_result["reason"],
+                "book_changed_during_verification",
+            )
+            conn = connect_existing(root)
+            try:
+                final_row = conn.execute(
+                    """
+                    SELECT original_uri, content_hash, metadata_json,
+                           verification_status
+                    FROM books
+                    WHERE id = ?
+                    """,
+                    (book["book_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(final_row["original_uri"], str(replacement_path))
+            self.assertEqual(final_row["content_hash"], replacement_hash)
+            self.assertEqual(
+                final_row["metadata_json"],
+                replacement_metadata,
+            )
+            self.assertEqual(final_row["verification_status"], "pending")
 
     def test_segment_integrity_detects_tamper_and_failed_worker_marks_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4253,7 +4595,6 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
     def test_multi_role_worker_pass_selects_exact_strict_and_oldest_winners(
         self,
     ) -> None:
-        roles = {"archivist", "librarian"}
         with tempfile.TemporaryDirectory() as tmp:
             for forced_oldest in (False, True):
                 with self.subTest(forced_oldest=forced_oldest):
@@ -4271,11 +4612,18 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     if forced_oldest:
                         conn = connect(root)
                         try:
-                            worker_module._set_queue_priority_bypass_count(
+                            worker_module._set_queue_job_bypass_count(
                                 conn,
-                                roles,
-                                worker_module
-                                .MAX_CONSECUTIVE_PRIORITY_BYPASSES,
+                                identities["oldest"],
+                                lane="priority",
+                                value=(
+                                    worker_module
+                                    .MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                                ),
+                                maximum=(
+                                    worker_module
+                                    .MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                                ),
                             )
                             conn.commit()
                         finally:
@@ -4331,14 +4679,16 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                                 """
                             ).fetchone()["n"]
                         )
-                        fairness_counter = conn.execute(
-                            "SELECT value FROM meta WHERE key = ?",
-                            (
-                                worker_module._queue_fairness_meta_key(
-                                    roles
-                                ),
-                            ),
-                        ).fetchone()
+                        fairness_rows = [
+                            dict(row)
+                            for row in conn.execute(
+                                """
+                                SELECT job_id, lane, bypass_count
+                                FROM queue_job_fairness
+                                ORDER BY job_id, lane
+                                """
+                            ).fetchall()
+                        ]
                     finally:
                         conn.close()
                     self.assertEqual(
@@ -4363,11 +4713,17 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                             )
                     self.assertEqual(excluded_pending, 5_000)
                     if forced_oldest:
-                        self.assertIsNone(fairness_counter)
+                        self.assertEqual(fairness_rows, [])
                     else:
                         self.assertEqual(
-                            int(fairness_counter["value"]),
-                            1,
+                            fairness_rows,
+                            [
+                                {
+                                    "job_id": identities["oldest"],
+                                    "lane": "priority",
+                                    "bypass_count": 1,
+                                }
+                            ],
                         )
 
     def test_multi_role_claim_uses_role_first_indexes_with_bounded_work(
@@ -4393,11 +4749,18 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     conn = connect(root)
                     try:
                         if forced_oldest:
-                            worker_module._set_queue_priority_bypass_count(
+                            worker_module._set_queue_job_bypass_count(
                                 conn,
-                                roles,
-                                worker_module
-                                .MAX_CONSECUTIVE_PRIORITY_BYPASSES,
+                                identities["oldest"],
+                                lane="priority",
+                                value=(
+                                    worker_module
+                                    .MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                                ),
+                                maximum=(
+                                    worker_module
+                                    .MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                                ),
                             )
                             conn.commit()
                         for oldest, index_name in (
@@ -4779,7 +5142,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             reclaim_instruction_counts: list[int] = []
             real_reclaim = worker_module._reclaim_expired_leases
 
-            def measured_reclaim(conn, roles=None):
+            def measured_reclaim(
+                conn,
+                roles=None,
+                *,
+                public_results=None,
+            ):
                 instruction_count = 0
 
                 def count_instruction() -> int:
@@ -4789,7 +5157,11 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
 
                 conn.set_progress_handler(count_instruction, 1)
                 try:
-                    return real_reclaim(conn, roles)
+                    return real_reclaim(
+                        conn,
+                        roles,
+                        public_results=public_results,
+                    )
                 finally:
                     conn.set_progress_handler(None, 0)
                     reclaim_instruction_counts.append(instruction_count)
@@ -4989,12 +5361,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     ).fetchall()
                 }
                 fairness_counter = conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    (
-                        worker_module._queue_fairness_meta_key(
-                            {"archivist"}
-                        ),
-                    ),
+                    """
+                    SELECT bypass_count
+                    FROM queue_job_fairness
+                    WHERE job_id = ? AND lane = 'priority'
+                    """,
+                    (oldest_job_id,),
                 ).fetchone()
             finally:
                 conn.close()
@@ -5106,12 +5478,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     (fresh_job_ids[-1],),
                 ).fetchone()
                 fairness_counter = conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    (
-                        worker_module._queue_fairness_meta_key(
-                            {"archivist"}
-                        ),
-                    ),
+                    """
+                    SELECT bypass_count
+                    FROM queue_job_fairness
+                    WHERE job_id = ? AND lane = 'retry'
+                    """,
+                    (retry_job_id,),
                 ).fetchone()
             finally:
                 conn.close()
@@ -5120,6 +5492,137 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 {"status": "pending", "attempt_count": 0},
             )
             self.assertIsNone(fairness_counter)
+
+    def test_overlapping_role_filters_share_per_job_fairness_authority(
+        self,
+    ) -> None:
+        for lane in ("priority", "retry"):
+            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                init_db(root)
+                maximum = (
+                    worker_module.MAX_CONSECUTIVE_PRIORITY_BYPASSES
+                    if lane == "priority"
+                    else worker_module.MAX_CONSECUTIVE_RETRY_BYPASSES
+                )
+                conn = connect(root)
+                try:
+                    delayed_job_id = enqueue_job(
+                        conn,
+                        role="librarian",
+                        job_type=f"overlap_delayed_{lane}",
+                        priority=900 if lane == "priority" else 1,
+                        payload={},
+                    )
+                    if lane == "retry":
+                        retry_order = worker_module._next_queue_retry_order(
+                            conn
+                        )
+                        conn.execute(
+                            """
+                            UPDATE queue_jobs
+                            SET retry_pending = 1, retry_order = ?
+                            WHERE id = ?
+                            """,
+                            (retry_order, delayed_job_id),
+                        )
+                    high_job_ids = [
+                        enqueue_job(
+                            conn,
+                            role="librarian",
+                            job_type=f"overlap_strict_{lane}",
+                            priority=1,
+                            payload={"index": index},
+                        )
+                        for index in range(maximum + 1)
+                    ]
+                    conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET created_at = '2026-07-29T00:00:00+00:00'
+                        WHERE id = ?
+                        """,
+                        (delayed_job_id,),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET created_at = '2026-07-29T00:00:01+00:00'
+                        WHERE id != ?
+                        """,
+                        (delayed_job_id,),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                filters = (
+                    ["librarian", "archivist"],
+                    ["librarian", "scribe"],
+                )
+                for index, expected_job_id in enumerate(
+                    high_job_ids[:-1]
+                ):
+                    claimed = run_worker_pass(
+                        root,
+                        roles=filters[index % len(filters)],
+                        limit=1,
+                        maintenance=False,
+                    )
+                    self.assertEqual(
+                        claimed["processed"][0]["job_id"],
+                        expected_job_id,
+                        claimed,
+                    )
+
+                conn = connect_existing(root)
+                try:
+                    fairness = conn.execute(
+                        """
+                        SELECT lane, bypass_count
+                        FROM queue_job_fairness
+                        WHERE job_id = ?
+                        """,
+                        (delayed_job_id,),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                self.assertEqual(
+                    dict(fairness),
+                    {"lane": lane, "bypass_count": maximum},
+                )
+
+                forced = run_worker_pass(
+                    root,
+                    roles=filters[1],
+                    limit=1,
+                    maintenance=False,
+                )
+                self.assertEqual(
+                    forced["processed"][0]["job_id"],
+                    delayed_job_id,
+                    forced,
+                )
+                conn = connect_existing(root)
+                try:
+                    remaining = conn.execute(
+                        "SELECT status FROM queue_jobs WHERE id = ?",
+                        (high_job_ids[-1],),
+                    ).fetchone()
+                    fairness_count = int(
+                        conn.execute(
+                            """
+                            SELECT count(*) AS n
+                            FROM queue_job_fairness
+                            WHERE job_id = ?
+                            """,
+                            (delayed_job_id,),
+                        ).fetchone()["n"]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(remaining["status"], "pending")
+                self.assertEqual(fairness_count, 0)
 
     def test_retry_lane_does_not_reset_fresh_priority_aging(
         self,
@@ -5277,7 +5780,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             init_db(root)
             conn = connect(root)
             try:
-                enqueue_job(
+                low_job_id = enqueue_job(
                     conn,
                     role="archivist",
                     job_type="fairness_rollback_low",
@@ -5333,16 +5836,18 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
                 self.assertEqual(claimed["id"], high_job_id)
                 self.assertEqual(
-                    worker_module._queue_priority_bypass_count(
+                    worker_module._queue_job_bypass_count(
                         conn,
-                        {"archivist"},
+                        low_job_id,
+                        lane="priority",
                     ),
                     1,
                 )
                 self.assertEqual(
-                    worker_module._queue_retry_bypass_count(
+                    worker_module._queue_job_bypass_count(
                         conn,
-                        {"archivist"},
+                        retry_job_id,
+                        lane="retry",
                     ),
                     1,
                 )
@@ -5355,22 +5860,11 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 states = conn.execute(
                     "SELECT status, attempt_count FROM queue_jobs"
                 ).fetchall()
-                counter = conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    (
-                        worker_module._queue_fairness_meta_key(
-                            {"archivist"}
-                        ),
-                    ),
-                ).fetchone()
-                retry_counter = conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    (
-                        worker_module._queue_retry_fairness_meta_key(
-                            {"archivist"}
-                        ),
-                    ),
-                ).fetchone()
+                fairness_count = int(
+                    conn.execute(
+                        "SELECT count(*) AS n FROM queue_job_fairness"
+                    ).fetchone()["n"]
+                )
             finally:
                 conn.close()
             self.assertTrue(
@@ -5381,8 +5875,7 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 ),
                 states,
             )
-            self.assertIsNone(counter)
-            self.assertIsNone(retry_counter)
+            self.assertEqual(fairness_count, 0)
 
     def test_worker_pass_reclaims_expired_running_job_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5665,8 +6158,21 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             with patch("continuum.core.workers._process_job", side_effect=steal_lease):
                 result = run_worker_pass(root, roles=["archivist"], limit=1, maintenance=False)
 
-            self.assertFalse(result["ok"])
-            self.assertIn("worker lease lost", result["processed"][0]["error"])
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["incomplete_attempt_count"], 1)
+            attempt = result["processed"][0]
+            self.assertEqual(attempt["status"], "incomplete")
+            self.assertFalse(attempt["attempt_completed"])
+            self.assertEqual(attempt["reason"], "worker_lease_lost")
+            authority = attempt["authoritative_job"]
+            self.assertEqual(authority["status"], "running")
+            self.assertEqual(authority["lease_owner"], "new-worker")
+            self.assertTrue(authority["lease_valid"])
+            self.assertTrue(authority["recoverable"])
+            self.assertEqual(
+                authority["authority_state"],
+                "running_live_owner",
+            )
             conn = connect_existing(root)
             try:
                 row = conn.execute("SELECT status, lease_owner, finished_at FROM queue_jobs WHERE id = 'job_lease_stolen'").fetchone()
@@ -5675,6 +6181,324 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(row["status"], "running")
             self.assertEqual(row["lease_owner"], "new-worker")
             self.assertIsNone(row["finished_at"])
+
+    def test_worker_pass_reports_pending_or_succeeded_authority_after_lease_loss(
+        self,
+    ) -> None:
+        for durable_status in ("pending", "succeeded"):
+            with self.subTest(durable_status=durable_status):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    init_db(root)
+                    conn = connect(root)
+                    try:
+                        job_id = enqueue_job(
+                            conn,
+                            role="archivist",
+                            job_type="lease_authority_probe",
+                            priority=1,
+                            payload={},
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    def replace_authority(
+                        _root: Path,
+                        job: dict,
+                    ) -> dict:
+                        replacement = connect(root)
+                        try:
+                            replacement.execute(
+                                """
+                                UPDATE queue_jobs
+                                SET status = ?,
+                                    finished_at = CASE
+                                        WHEN ? = 'succeeded' THEN ?
+                                        ELSE NULL
+                                    END,
+                                    lease_owner = NULL,
+                                    lease_expires_at = NULL,
+                                    heartbeat_at = NULL
+                                WHERE id = ?
+                                """,
+                                (
+                                    durable_status,
+                                    durable_status,
+                                    "2026-01-01T00:00:00+00:00",
+                                    job["id"],
+                                ),
+                            )
+                            replacement.commit()
+                        finally:
+                            replacement.close()
+                        return {"ok": True}
+
+                    with patch.object(
+                        worker_module,
+                        "_process_job",
+                        side_effect=replace_authority,
+                    ):
+                        result = run_worker_pass(
+                            root,
+                            roles=["archivist"],
+                            limit=1,
+                            maintenance=False,
+                        )
+
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["incomplete_attempt_count"], 1)
+                    attempt = result["processed"][0]
+                    self.assertEqual(attempt["job_id"], job_id)
+                    self.assertEqual(attempt["status"], "incomplete")
+                    self.assertFalse(attempt["attempt_completed"])
+                    self.assertEqual(attempt["reason"], "worker_lease_lost")
+                    self.assertEqual(
+                        attempt["authoritative_job"]["status"],
+                        durable_status,
+                    )
+                    self.assertTrue(
+                        attempt["authoritative_job"]["authority_ok"]
+                    )
+                    self.assertEqual(
+                        attempt["authoritative_job"]["recoverable"],
+                        durable_status == "pending",
+                    )
+
+    def test_worker_pass_fails_closed_for_failed_or_missing_lost_authority(
+        self,
+    ) -> None:
+        for durable_status in ("failed", "missing"):
+            with self.subTest(durable_status=durable_status):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    init_db(root)
+                    conn = connect(root)
+                    try:
+                        enqueue_job(
+                            conn,
+                            role="archivist",
+                            job_type="lost_authority_failure_probe",
+                            priority=1,
+                            payload={},
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    def replace_authority(
+                        _root: Path,
+                        job: dict,
+                    ) -> dict:
+                        replacement = connect(root)
+                        try:
+                            if durable_status == "failed":
+                                replacement.execute(
+                                    """
+                                    UPDATE queue_jobs
+                                    SET status = 'failed', finished_at = ?,
+                                        lease_owner = NULL,
+                                        lease_expires_at = NULL,
+                                        heartbeat_at = NULL
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        "2026-01-01T00:00:00+00:00",
+                                        job["id"],
+                                    ),
+                                )
+                            else:
+                                replacement.execute(
+                                    "DELETE FROM queue_jobs WHERE id = ?",
+                                    (job["id"],),
+                                )
+                            replacement.commit()
+                        finally:
+                            replacement.close()
+                        return {"ok": True}
+
+                    with patch.object(
+                        worker_module,
+                        "_process_job",
+                        side_effect=replace_authority,
+                    ):
+                        result = run_worker_pass(
+                            root,
+                            roles=["archivist"],
+                            limit=1,
+                            maintenance=False,
+                        )
+
+                    self.assertFalse(result["ok"], result)
+                    self.assertEqual(result["incomplete_attempt_count"], 1)
+                    attempt = result["processed"][0]
+                    self.assertEqual(attempt["status"], "incomplete")
+                    self.assertFalse(attempt["attempt_completed"])
+                    self.assertFalse(attempt["authoritative_job_ok"])
+                    self.assertEqual(
+                        attempt["authoritative_job"]["exists"],
+                        durable_status == "failed",
+                    )
+                    self.assertEqual(
+                        attempt["authoritative_job"]["status"],
+                        "failed" if durable_status == "failed" else None,
+                    )
+
+    def test_worker_pass_fails_closed_for_expired_non_preemptible_lost_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="non_preemptible_lost_lease_probe",
+                    priority=1,
+                    payload={},
+                    preemptible=False,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            def expire_lease(_root: Path, job: dict) -> dict:
+                expiry_conn = connect(root)
+                try:
+                    expiry_conn.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET lease_expires_at =
+                                '2000-01-01T00:00:00+00:00',
+                            heartbeat_at =
+                                '2000-01-01T00:00:00+00:00'
+                        WHERE id = ? AND status = 'running'
+                        """,
+                        (job["id"],),
+                    )
+                    expiry_conn.commit()
+                finally:
+                    expiry_conn.close()
+                return {"ok": True}
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=expire_lease,
+            ):
+                result = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["incomplete_attempt_count"], 1)
+            attempt = result["processed"][0]
+            self.assertEqual(attempt["job_id"], job_id)
+            self.assertEqual(attempt["reason"], "worker_lease_lost")
+            self.assertFalse(attempt["authoritative_job_ok"])
+            authority = attempt["authoritative_job"]
+            self.assertEqual(authority["status"], "running")
+            self.assertFalse(authority["preemptible"])
+            self.assertFalse(authority["lease_valid"])
+            self.assertFalse(authority["reclaimable"])
+            self.assertFalse(authority["recoverable"])
+            self.assertFalse(authority["authority_ok"])
+            self.assertEqual(
+                authority["authority_state"],
+                "running_non_preemptible_unrecoverable",
+            )
+
+    def test_expired_non_preemptible_reclaim_is_public_pass_and_service_failure(
+        self,
+    ) -> None:
+        for public_api in ("pass", "service"):
+            with self.subTest(public_api=public_api):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "continuum"
+                    init_db(root)
+                    conn = connect(root)
+                    try:
+                        job_id = enqueue_job(
+                            conn,
+                            role="archivist",
+                            job_type=(
+                                "expired_non_preemptible_reclaim_probe"
+                            ),
+                            priority=1,
+                            payload={},
+                            preemptible=False,
+                        )
+                        conn.commit()
+                        conn.execute("BEGIN IMMEDIATE")
+                        claimed = worker_module._claim_job(
+                            conn,
+                            {"archivist"},
+                            lease_owner="expired-non-preemptible-owner",
+                            lease_seconds=300,
+                        )
+                        self.assertEqual(claimed["id"], job_id)
+                        conn.execute(
+                            """
+                            UPDATE queue_jobs
+                            SET lease_expires_at =
+                                    '2000-01-01T00:00:00+00:00',
+                                heartbeat_at =
+                                    '2000-01-01T00:00:00+00:00'
+                            WHERE id = ?
+                            """,
+                            (job_id,),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    if public_api == "pass":
+                        result = run_worker_pass(
+                            root,
+                            roles=["archivist"],
+                            limit=1,
+                            maintenance=False,
+                        )
+                        failed_pass = result
+                    else:
+                        result = worker_module.serve_workers(
+                            root,
+                            roles=["archivist"],
+                            limit=1,
+                            interval_seconds=0.1,
+                            maintenance_interval_seconds=3600.0,
+                            maintenance_on_start=False,
+                        )
+                        failed_pass = result["failed_pass"]
+
+                    self.assertFalse(result["ok"], result)
+                    self.assertEqual(result["processed_count"], 1)
+                    self.assertEqual(
+                        result[
+                            "expired_non_preemptible_failure_count"
+                        ],
+                        1,
+                    )
+                    failure = failed_pass["processed"][0]
+                    self.assertEqual(failure["job_id"], job_id)
+                    self.assertEqual(failure["status"], "failed")
+                    self.assertFalse(failure["ok"])
+                    self.assertEqual(
+                        failure["reason"],
+                        "non_preemptible_worker_lease_expired",
+                    )
+                    self.assertFalse(
+                        failure["authoritative_job"]["recoverable"]
+                    )
+                    self.assertEqual(
+                        failure["authoritative_job"]["authority_state"],
+                        "terminal_failure",
+                    )
 
     def test_non_scribe_worker_renews_lease_while_processor_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5780,7 +6604,13 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     maintenance=False,
                 )
 
-            self.assertFalse(expired["ok"], expired)
+            self.assertTrue(expired["ok"], expired)
+            self.assertEqual(expired["incomplete_attempt_count"], 1)
+            self.assertEqual(expired["processed"][0]["status"], "incomplete")
+            self.assertFalse(
+                expired["processed"][0]["attempt_completed"],
+                expired,
+            )
             self.assertIn("worker lease lost", expired["processed"][0]["error"])
             conn = connect_existing(root)
             try:
@@ -6489,7 +7319,15 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
 
             self.assertFalse(old_worker.is_alive())
             self.assertFalse(new_worker.is_alive())
-            self.assertFalse(results["old"]["ok"], results)
+            self.assertTrue(results["old"]["ok"], results)
+            self.assertEqual(
+                results["old"]["processed"][0]["status"],
+                "incomplete",
+            )
+            self.assertFalse(
+                results["old"]["processed"][0]["attempt_completed"],
+                results,
+            )
             self.assertIn("worker lease lost", results["old"]["processed"][0]["error"])
             self.assertTrue(results["new"]["ok"], results)
 
@@ -6848,7 +7686,15 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     self.assertFalse(thread.is_alive(), job_type)
 
                 expired_result = worker_result["result"]
-                self.assertFalse(expired_result["ok"], expired_result)
+                self.assertTrue(expired_result["ok"], expired_result)
+                self.assertEqual(
+                    expired_result["processed"][0]["status"],
+                    "incomplete",
+                )
+                self.assertFalse(
+                    expired_result["processed"][0]["attempt_completed"],
+                    expired_result,
+                )
                 self.assertIn(
                     "worker lease lost",
                     expired_result["processed"][0]["error"],
@@ -7369,6 +8215,435 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 },
             )
             self.assertEqual(failed_jobs, 0)
+
+    def test_mempalace_continuation_cannot_erase_prior_retry_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            import_id = "mempalace-dedupe-retry-split"
+            card_ids: list[str] = []
+            conn = connect(root)
+            try:
+                term_node = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="mempalace-retry-split",
+                )
+                for index in range(2):
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="mempalace_drawer",
+                        title=f"MemPalace retry split {index}",
+                        summary=(
+                            "Prior sidecar authority must survive a bounded "
+                            "continuation."
+                        ),
+                        source_refs=[],
+                        metadata={"import_id": import_id},
+                    )
+                    card_ids.append(card_id)
+                    card_node = upsert_graph_node(
+                        conn,
+                        kind="card",
+                        label=f"MemPalace retry split {index}",
+                        card_id=card_id,
+                    )
+                    add_graph_edge(
+                        conn,
+                        source_node_id=card_node,
+                        relation="mentions",
+                        target_node_id=term_node,
+                        weight=0.5,
+                        confidence=0.8,
+                        source_refs=[{"card_id": card_id}],
+                    )
+                conn.execute("DELETE FROM queue_jobs")
+                source_job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_mempalace_import",
+                    priority=7,
+                    payload={"import_id": import_id, "limit": 1},
+                    related_card_ids=card_ids,
+                    dedupe_key=f"import:{import_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                worker_module,
+                "_sync_worker_card_sidecars",
+                return_value={
+                    "ok": False,
+                    "synced": 0,
+                    "failed": 1,
+                    "pending_outbox": True,
+                    "failures": [
+                        {
+                            "card_id": card_ids[0],
+                            "error": "forced first-generation sidecar failure",
+                        }
+                    ],
+                },
+            ):
+                first = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["retry_pending_count"], 1)
+            first_attempt = first["processed"][0]
+            self.assertEqual(first_attempt["job_id"], source_job_id)
+            self.assertEqual(first_attempt["status"], "skipped")
+            self.assertTrue(first_attempt["result"]["retry_transferred"])
+            successor_job_id = first_attempt["result"][
+                "retry_job_id"
+            ]
+            self.assertNotEqual(successor_job_id, source_job_id)
+
+            conn = connect_existing(root)
+            try:
+                generations = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, priority, retry_pending,
+                               retry_order, dedupe_key
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (source_job_id, successor_job_id),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                (
+                    generations[source_job_id]["status"],
+                    generations[source_job_id]["priority"],
+                    generations[source_job_id]["retry_pending"],
+                    generations[source_job_id]["dedupe_key"],
+                ),
+                (
+                    "skipped",
+                    7,
+                    0,
+                    generations[successor_job_id]["dedupe_key"],
+                ),
+            )
+            self.assertEqual(
+                generations[source_job_id]["retry_order"],
+                0,
+            )
+            self.assertEqual(
+                (
+                    generations[successor_job_id]["status"],
+                    generations[successor_job_id]["priority"],
+                    generations[successor_job_id]["retry_pending"],
+                ),
+                ("pending", 7, 1),
+            )
+            self.assertGreater(
+                generations[successor_job_id]["retry_order"],
+                0,
+            )
+            self.assertIsNotNone(
+                generations[successor_job_id]["dedupe_key"]
+            )
+
+            service = worker_module.serve_workers(
+                root,
+                roles=["librarian"],
+                limit=1,
+                interval_seconds=0.1,
+                maintenance_interval_seconds=3600.0,
+                maintenance_on_start=True,
+            )
+            self.assertTrue(service["ok"], service)
+
+            conn = connect_existing(root)
+            try:
+                final_rows = conn.execute(
+                    """
+                    SELECT status, retry_pending, retry_order
+                    FROM queue_jobs
+                    WHERE id IN (?, ?)
+                    """,
+                    (source_job_id, successor_job_id),
+                ).fetchall()
+                remaining_outbox = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM card_sidecar_outbox
+                        WHERE card_id IN (?, ?)
+                        """,
+                        tuple(card_ids),
+                    ).fetchone()["n"]
+                )
+                remaining_legacy = (
+                    worker_module._count_legacy_card_candidates(
+                        conn,
+                        import_id=import_id,
+                    )
+                )
+            finally:
+                conn.close()
+            self.assertEqual(remaining_outbox, 0)
+            self.assertEqual(remaining_legacy, 0)
+            self.assertEqual(len(final_rows), 2)
+            self.assertEqual(
+                {
+                    str(row["status"])
+                    for row in final_rows
+                },
+                {"skipped", "succeeded"},
+            )
+            for row in final_rows:
+                self.assertEqual(row["retry_pending"], 0)
+                self.assertEqual(row["retry_order"], 0)
+
+    def test_mempalace_refresh_preserves_transferred_retry_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            import_id = "mempalace-transferred-refresh-authority"
+            card_ids: list[str] = []
+            conn = connect(root)
+            try:
+                term_node = upsert_graph_node(
+                    conn,
+                    kind="term",
+                    label="mempalace-transferred-refresh",
+                )
+                for index in range(3):
+                    card_id = create_card(
+                        conn,
+                        root=root,
+                        card_type="mempalace_drawer",
+                        title=f"MemPalace transferred refresh {index}",
+                        summary=(
+                            "Continuation refresh must preserve transferred "
+                            "retry authority."
+                        ),
+                        source_refs=[],
+                        metadata={"import_id": import_id},
+                    )
+                    card_ids.append(card_id)
+                    card_node = upsert_graph_node(
+                        conn,
+                        kind="card",
+                        label=f"MemPalace transferred refresh {index}",
+                        card_id=card_id,
+                    )
+                    add_graph_edge(
+                        conn,
+                        source_node_id=card_node,
+                        relation="mentions",
+                        target_node_id=term_node,
+                        weight=0.5,
+                        confidence=0.8,
+                        source_refs=[{"card_id": card_id}],
+                    )
+                conn.execute("DELETE FROM queue_jobs")
+                source_job_id = enqueue_job(
+                    conn,
+                    role="librarian",
+                    job_type="review_mempalace_import",
+                    priority=9,
+                    payload={"import_id": import_id, "limit": 1},
+                    related_card_ids=card_ids,
+                    dedupe_key=f"import:{import_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(
+                worker_module,
+                "_sync_worker_card_sidecars",
+                return_value={
+                    "ok": False,
+                    "synced": 0,
+                    "failed": 1,
+                    "pending_outbox": True,
+                    "failures": [
+                        {
+                            "card_id": card_ids[0],
+                            "error": "forced transferred-refresh failure",
+                        }
+                    ],
+                },
+            ):
+                first = run_worker_pass(
+                    root,
+                    roles=["librarian"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["processed_count"], 1)
+            self.assertEqual(first["retry_pending_count"], 1)
+            first_attempt = first["processed"][0]
+            self.assertEqual(first_attempt["job_id"], source_job_id)
+            self.assertEqual(first_attempt["status"], "skipped")
+            self.assertTrue(first_attempt["result"]["retry_transferred"])
+            continuation_job_id = first_attempt["result"]["retry_job_id"]
+
+            conn = connect_existing(root)
+            try:
+                before = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, error_json,
+                               dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+            before_receipt = json.loads(before["error_json"])
+            self.assertEqual(before["status"], "pending")
+            self.assertEqual(before["retry_pending"], 1)
+            self.assertGreater(before["retry_order"], 0)
+            self.assertIsNotNone(before["dedupe_key"])
+            self.assertTrue(
+                before_receipt["result"]["retry_transferred"]
+            )
+            self.assertEqual(
+                before_receipt["result"]["retry_source_job_id"],
+                source_job_id,
+            )
+            self.assertEqual(
+                before_receipt["result"]["retry_job_id"],
+                continuation_job_id,
+            )
+
+            real_enqueue_job = worker_module.enqueue_job
+            with patch.object(
+                worker_module,
+                "enqueue_job",
+                wraps=real_enqueue_job,
+            ) as enqueue_spy:
+                refreshed = worker_module.review_mempalace_import(
+                    root,
+                    import_id=import_id,
+                    limit=1,
+                    recover_pending_card_sidecars=False,
+                )
+
+            self.assertTrue(refreshed["ok"], refreshed)
+            self.assertFalse(refreshed["complete"], refreshed)
+            self.assertEqual(
+                refreshed["continuation_job_id"],
+                continuation_job_id,
+            )
+            self.assertTrue(
+                any(
+                    call.kwargs.get("replace_pending") is True
+                    for call in enqueue_spy.call_args_list
+                ),
+                enqueue_spy.call_args_list,
+            )
+            conn = connect_existing(root)
+            try:
+                after = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, error_json,
+                               dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+                pending_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND dedupe_key = ?
+                        ORDER BY id
+                        """,
+                        (before["dedupe_key"],),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(after, before)
+            self.assertEqual(pending_ids, [continuation_job_id])
+
+            claimed = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=2,
+                maintenance=False,
+            )
+            idle = run_worker_pass(
+                root,
+                roles=["librarian"],
+                limit=2,
+                maintenance=False,
+            )
+
+            self.assertTrue(claimed["ok"], claimed)
+            self.assertEqual(claimed["processed_count"], 1, claimed)
+            self.assertEqual(
+                claimed["processed"][0]["job_id"],
+                continuation_job_id,
+            )
+            self.assertEqual(
+                claimed["processed"][0]["status"],
+                "succeeded",
+            )
+            self.assertTrue(idle["ok"], idle)
+            self.assertEqual(idle["processed_count"], 0, idle)
+
+            conn = connect_existing(root)
+            try:
+                final = dict(
+                    conn.execute(
+                        """
+                        SELECT status, attempt_count, retry_pending, retry_order
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (continuation_job_id,),
+                    ).fetchone()
+                )
+                remaining_legacy = (
+                    worker_module._count_legacy_card_candidates(
+                        conn,
+                        import_id=import_id,
+                    )
+                )
+            finally:
+                conn.close()
+            self.assertEqual(
+                final,
+                {
+                    "status": "succeeded",
+                    "attempt_count": 1,
+                    "retry_pending": 0,
+                    "retry_order": 0,
+                },
+            )
+            self.assertEqual(remaining_legacy, 0)
 
     def test_worker_pass_requeues_legacy_mempalace_until_sidecar_authority_clears(
         self,
@@ -9759,6 +11034,89 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(rows[ordinary]["status"], "archived")
             self.assertTrue(semantic_integrity_report(root)["ok"])
 
+    def test_prune_compensation_publishes_before_sqlite_writer_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="prepublished compensation",
+                    summary=(
+                        "The compensation intent is durable before DB "
+                        "restoration."
+                    ),
+                    source_refs=[],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(
+                sync_card_sidecars_after_commit(root, [card_id])["ok"]
+            )
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT card.*,
+                           outbox.generation AS sidecar_generation
+                    FROM cards AS card
+                    LEFT JOIN card_sidecar_outbox AS outbox
+                      ON outbox.card_id = card.id
+                    WHERE card.id = ?
+                    """,
+                    (card_id,),
+                ).fetchone()
+                original_row = dict(row)
+                payload = store_module._card_sidecar_payload_for_row(row)
+                target_uri = str(row["location_uri"])
+            finally:
+                conn.close()
+
+            real_register = (
+                store_module.register_card_sidecar_compensation_intents
+            )
+            publication_checks = 0
+
+            def assert_writer_is_available(*args, **kwargs):
+                nonlocal publication_checks
+                probe = connect(root)
+                try:
+                    probe.execute("PRAGMA busy_timeout = 0")
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.rollback()
+                finally:
+                    probe.close()
+                publication_checks += 1
+                return real_register(*args, **kwargs)
+
+            with patch.object(
+                worker_module,
+                "register_card_sidecar_compensation_intents",
+                side_effect=assert_writer_is_available,
+            ):
+                restored = worker_module._restore_prune_memory_rows(
+                    root,
+                    [original_row],
+                    expected_rows=[original_row],
+                    failure_reason="synthetic post-commit failure",
+                    cleanup_candidates=[
+                        {
+                            "card_id": card_id,
+                            "uri": target_uri,
+                            "state_hash": payload["state_hash"],
+                        }
+                    ],
+                )
+
+            self.assertEqual(publication_checks, 1)
+            self.assertTrue(restored["restored"], restored)
+
     def test_prune_memory_compensates_postflight_and_sidecar_sync_failures(self) -> None:
         for failure_mode in (
             "postflight",
@@ -9797,12 +11155,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
 
                 if failure_mode.startswith("postflight"):
                     real_report = worker_module.semantic_integrity_report
-                    report_calls = 0
+                    postflight_injected = False
 
                     def report_with_failed_postflight(*args, **kwargs):
-                        nonlocal report_calls
-                        report_calls += 1
-                        if report_calls == 3:
+                        nonlocal postflight_injected
+                        if kwargs.get("conn") is None and not postflight_injected:
+                            postflight_injected = True
                             if failure_mode == "postflight_exception":
                                 raise RuntimeError("simulated postflight exception")
                             return {"ok": False, "failing": {"simulated_postflight": 1}}
@@ -10016,26 +11374,53 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.close()
 
             conn = connect(root)
-            observation: dict[str, object] = {}
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                artifact_index = store_module._immutable_artifact_path_index(root, conn)
-                live_uri = store_module.sync_card_sidecar(
+                artifact_index = store_module._immutable_artifact_path_index(
                     root,
                     conn,
-                    card_id,
-                    artifact_index=artifact_index,
-                    write_observation=observation,
                 )
-                self.assertIsNotNone(live_uri)
-                self.assertTrue(observation.get("write_completed"))
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot perform filesystem durability work",
+                ):
+                    store_module.sync_card_sidecar(
+                        root,
+                        conn,
+                        card_id,
+                        artifact_index=artifact_index,
+                        write_observation={},
+                    )
                 conn.rollback()
             finally:
                 conn.close()
 
-            live_path = resolve_stored_uri(root, str(observation["target_uri"]))
+            real_write = store_module.write_card_sidecar_from_values
+
+            def crash_after_production_write(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                real_write(*args, **kwargs)
+                raise SystemExit("crash after production sidecar write")
+
+            with (
+                patch.object(
+                    store_module,
+                    "write_card_sidecar_from_values",
+                    side_effect=crash_after_production_write,
+                ),
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "after production sidecar write",
+                ),
+            ):
+                sync_card_sidecars_after_commit(root, [card_id])
+
             intent_paths = list((root / "run" / "card_sidecar_write_intents").glob("*.json"))
             self.assertEqual(len(intent_paths), 1)
+            intent = json.loads(intent_paths[0].read_text(encoding="utf-8"))
+            live_path = resolve_stored_uri(root, str(intent["target_uri"]))
             self.assertTrue(live_path.is_file())
             pending = store_module.reconcile_card_sidecar_write_intents(root)
             self.assertTrue(pending["ok"], pending)
@@ -11318,6 +12703,1604 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             integrity = semantic_integrity_report(root)
             self.assertTrue(integrity["ok"], integrity)
 
+    def test_quarantine_reservation_recovers_each_durable_fault_boundary(
+        self,
+    ) -> None:
+        boundaries = (
+            "reservation_before_move",
+            "move_before_receipt",
+            "receipt_before_release",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                (
+                    card_id,
+                    _payload,
+                    target_path,
+                    intent_id,
+                ) = self._seed_unbound_sidecar_intent(
+                    root,
+                    title=f"quarantine-fault-{boundary}",
+                )
+
+                if boundary == "reservation_before_move":
+                    fault = patch.object(
+                        store_module,
+                        "_execute_card_sidecar_quarantine_reservation",
+                        side_effect=OSError("fault after reservation"),
+                    )
+                elif boundary == "move_before_receipt":
+                    fault = patch.object(
+                        store_module,
+                        "_finish_card_sidecar_write_intent",
+                        side_effect=OSError("fault after move"),
+                    )
+                else:
+                    fault = patch.object(
+                        store_module,
+                        "_release_card_sidecar_quarantine_reservation",
+                        side_effect=OSError("fault after receipt"),
+                    )
+                with fault:
+                    interrupted = (
+                        store_module.reconcile_card_sidecar_write_intents(root)
+                    )
+                self.assertFalse(interrupted["ok"], interrupted)
+                conn = connect_existing(root)
+                try:
+                    self.assertIsNotNone(
+                        store_module._card_sidecar_quarantine_reservation_value(
+                            conn
+                        )
+                    )
+                finally:
+                    conn.close()
+
+                if boundary == "reservation_before_move":
+                    init_db(root)
+                resumed = store_module.reconcile_card_sidecar_write_intents(root)
+                self.assertTrue(resumed["ok"], resumed)
+                conn = connect_existing(root)
+                try:
+                    self.assertIsNone(
+                        store_module._card_sidecar_quarantine_reservation_value(
+                            conn
+                        )
+                    )
+                finally:
+                    conn.close()
+                receipt_path = (
+                    root
+                    / "exports"
+                    / "card_sidecar_recovery_receipts"
+                    / f"{intent_id}.json"
+                )
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["status"], "quarantined")
+                recovery_path = target_path.with_name(
+                    f".{target_path.name}.{intent_id}.uncommitted"
+                )
+                self.assertFalse(target_path.exists())
+                self.assertTrue(recovery_path.is_file())
+                repaired_sidecar = sync_card_sidecars_after_commit(
+                    root,
+                    [card_id],
+                )
+                self.assertTrue(repaired_sidecar["ok"], repaired_sidecar)
+                integrity = semantic_integrity_report(root)
+                self.assertTrue(integrity["ok"], integrity)
+
+    def test_quarantine_file_phase_allows_unrelated_writers_and_fences_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_id, _payload, _target_path, _intent_id = (
+                self._seed_unbound_sidecar_intent(
+                    root,
+                    title="quarantine-concurrent-writers",
+                )
+            )
+            conn = connect(root)
+            try:
+                immutable_artifact_id = store_module.record_artifact(
+                    conn,
+                    kind="quarantine_fence_probe",
+                    uri="continuum://exports/quarantine-immutable.txt",
+                    sha256="1" * 64,
+                    size_bytes=1,
+                    immutable=True,
+                )
+                mutable_artifact_id = store_module.record_artifact(
+                    conn,
+                    kind="quarantine_fence_probe",
+                    uri="continuum://exports/quarantine-mutable.txt",
+                    sha256="2" * 64,
+                    size_bytes=1,
+                    immutable=False,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            real_replace = store_module.replace_file_noclobber
+            pause_observed = False
+
+            def write_during_quarantine(source: Path, destination: Path) -> None:
+                nonlocal pause_observed
+                if pause_observed:
+                    real_replace(source, destination)
+                    return
+                pause_observed = True
+
+                # These unrelated writers prove the file phase holds no
+                # BEGIN IMMEDIATE transaction.
+                unrelated = connect(root)
+                try:
+                    unrelated.execute("PRAGMA busy_timeout = 0")
+                    unrelated.execute("BEGIN IMMEDIATE")
+                    unrelated.execute(
+                        """
+                        INSERT INTO audit_events(
+                            id, actor, action, target_type, target_id,
+                            payload_json, created_at
+                        )
+                        VALUES(?, 'test', 'quarantine_unrelated_writer',
+                               'test', NULL, '{}', ?)
+                        """,
+                        (
+                            store_module.unique_id("audit"),
+                            store_module.utc_now(),
+                        ),
+                    )
+                    unrelated.execute(
+                        """
+                        INSERT INTO queue_jobs(
+                            id, role, job_type, payload_json, status, priority,
+                            attempt_count, retry_pending, retry_order,
+                            created_at, updated_at
+                        )
+                        VALUES(?, 'librarian',
+                               'quarantine_unrelated_writer', '{}',
+                               'pending', 100, 0, 0, 0, ?, ?)
+                        """,
+                        (
+                            store_module.unique_id("job"),
+                            store_module.utc_now(),
+                            store_module.utc_now(),
+                        ),
+                    )
+                    unrelated.execute(
+                        """
+                        INSERT INTO scroll_events(
+                            id, session_id, seq, event_type, role, content,
+                            content_hash, created_at, metadata_json
+                        )
+                        VALUES(?, 'quarantine-unrelated-session', 1, 'turn',
+                               'user', 'unrelated', ?, ?, '{}')
+                        """,
+                        (
+                            store_module.unique_id("evt"),
+                            hashlib.sha256(b"unrelated").hexdigest(),
+                            store_module.utc_now(),
+                        ),
+                    )
+                    unrelated.execute(
+                        """
+                        UPDATE artifacts SET metadata_json = '{"safe":true}'
+                        WHERE id = ?
+                        """,
+                        (mutable_artifact_id,),
+                    )
+                    unrelated.commit()
+                finally:
+                    unrelated.close()
+
+                protected_statements = (
+                    (
+                        "UPDATE cards SET summary = summary || 'blocked' "
+                        "WHERE id = ?",
+                        (card_id,),
+                    ),
+                    (
+                        """
+                        INSERT INTO card_sidecar_outbox(
+                            card_id, reason, generation, created_at, updated_at
+                        )
+                        VALUES(?, 'blocked', 'blocked', ?, ?)
+                        """,
+                        (
+                            card_id,
+                            store_module.utc_now(),
+                            store_module.utc_now(),
+                        ),
+                    ),
+                    (
+                        """
+                        INSERT INTO artifacts(
+                            id, kind, uri, sha256, size_bytes, created_at,
+                            immutable, metadata_json
+                        )
+                        VALUES(?, 'blocked', 'continuum://blocked', ?, 1, ?,
+                               1, '{}')
+                        """,
+                        (
+                            store_module.unique_id("artifact"),
+                            "3" * 64,
+                            store_module.utc_now(),
+                        ),
+                    ),
+                    (
+                        "UPDATE artifacts SET immutable = 1 WHERE id = ?",
+                        (mutable_artifact_id,),
+                    ),
+                    (
+                        "UPDATE artifacts SET immutable = 0 WHERE id = ?",
+                        (immutable_artifact_id,),
+                    ),
+                    (
+                        "DELETE FROM artifacts WHERE id = ?",
+                        (immutable_artifact_id,),
+                    ),
+                )
+                for statement, parameters in protected_statements:
+                    protected = connect(root)
+                    try:
+                        protected.execute("PRAGMA busy_timeout = 0")
+                        protected.execute("BEGIN IMMEDIATE")
+                        with self.assertRaisesRegex(
+                            sqlite3.DatabaseError,
+                            "active quarantine reservation",
+                        ):
+                            protected.execute(statement, parameters)
+                        self.assertFalse(protected.in_transaction)
+                    finally:
+                        protected.close()
+                real_replace(source, destination)
+
+            with patch.object(
+                store_module,
+                "replace_file_noclobber",
+                side_effect=write_during_quarantine,
+            ):
+                reconciled = store_module.reconcile_card_sidecar_write_intents(
+                    root
+                )
+
+            self.assertTrue(pause_observed)
+            self.assertTrue(reconciled["ok"], reconciled)
+            conn = connect(root)
+            try:
+                # Every protected mutation is retryable after exact release.
+                conn.execute(
+                    "UPDATE cards SET summary = summary || 'released' "
+                    "WHERE id = ?",
+                    (card_id,),
+                )
+                store_module.mark_card_sidecar_outbox(
+                    conn,
+                    [card_id],
+                    reason="quarantine_fence_released",
+                )
+                conn.execute(
+                    "UPDATE artifacts SET immutable = 1 WHERE id = ?",
+                    (mutable_artifact_id,),
+                )
+                conn.execute(
+                    "DELETE FROM artifacts WHERE id = ?",
+                    (immutable_artifact_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def test_worker_job_waiting_on_quarantine_fence_is_not_terminalized(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._seed_unbound_sidecar_intent(
+                root,
+                title="quarantine-public-loop-fence",
+            )
+            conn = connect(root)
+            try:
+                worker_card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="quarantine-public-loop-worker-card",
+                    summary="A protected worker remains retryable while fenced.",
+                    source_refs=[],
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": worker_card_id},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            entered_file_phase = threading.Event()
+            release_file_phase = threading.Event()
+            reconciliation_result: dict[str, object] = {}
+            worker_result: dict[str, object] = {}
+            real_replace = store_module.replace_file_noclobber
+
+            def pause_file_phase(source: Path, destination: Path) -> None:
+                entered_file_phase.set()
+                if not release_file_phase.wait(10.0):
+                    raise TimeoutError(
+                        "test did not release quarantine file phase"
+                    )
+                real_replace(source, destination)
+
+            def run_reconciliation() -> None:
+                reconciliation_result["value"] = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            def run_public_worker() -> None:
+                worker_result["value"] = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    maintenance=False,
+                )
+
+            with patch.object(
+                store_module,
+                "replace_file_noclobber",
+                side_effect=pause_file_phase,
+            ):
+                reconciliation_thread = threading.Thread(
+                    target=run_reconciliation
+                )
+                reconciliation_thread.start()
+                self.assertTrue(entered_file_phase.wait(10.0))
+                worker_thread = threading.Thread(target=run_public_worker)
+                worker_thread.start()
+                time.sleep(0.1)
+                conn = connect_existing(root)
+                try:
+                    status_while_fenced = str(
+                        conn.execute(
+                            "SELECT status FROM queue_jobs WHERE id = ?",
+                            (job_id,),
+                        ).fetchone()["status"]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(status_while_fenced, "pending")
+                release_file_phase.set()
+                reconciliation_thread.join(10.0)
+                worker_thread.join(10.0)
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertFalse(worker_thread.is_alive())
+            self.assertTrue(
+                dict(reconciliation_result["value"])["ok"],
+                reconciliation_result,
+            )
+            public_result = dict(worker_result["value"])
+            self.assertTrue(public_result["ok"], public_result)
+            conn = connect_existing(root)
+            try:
+                final_job = conn.execute(
+                    """
+                    SELECT status, retry_pending
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIn(final_job["status"], {"pending", "succeeded"})
+            self.assertNotEqual(final_job["status"], "failed")
+            if final_job["status"] == "pending":
+                self.assertEqual(final_job["retry_pending"], 1)
+
+    def test_quarantine_reservation_rejects_same_inode_intent_rewrite(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            _card_id, _payload, target_path, intent_id = (
+                self._seed_unbound_sidecar_intent(
+                    root,
+                    title="quarantine-intent-rewrite",
+                )
+            )
+            intent_path = (
+                root
+                / "run"
+                / "card_sidecar_write_intents"
+                / f"{intent_id}.json"
+            )
+            recovery_path = target_path.with_name(
+                f".{target_path.name}.{intent_id}.uncommitted"
+            )
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            before_identity = (
+                store_module._plain_card_sidecar_state_path_identity(
+                    intent_path,
+                    directory=False,
+                )
+            )
+            real_reserve = store_module._reserve_card_sidecar_quarantine
+            mutated = False
+
+            def mutate_same_inode_then_reserve(
+                *args: object,
+                **kwargs: object,
+            ) -> str | None:
+                nonlocal mutated
+                if not mutated:
+                    raw = json.loads(intent_path.read_text(encoding="utf-8"))
+                    current_hash = str(raw["expected_state_hash"])
+                    raw["expected_state_hash"] = (
+                        ("0" if current_hash[0] != "0" else "1")
+                        + current_hash[1:]
+                    )
+                    replacement = (
+                        store_module.json_dumps(raw) + "\n"
+                    ).encode("utf-8")
+                    with intent_path.open("r+b") as handle:
+                        handle.seek(0)
+                        handle.write(replacement)
+                        handle.truncate()
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    self.assertEqual(
+                        store_module._plain_card_sidecar_state_path_identity(
+                            intent_path,
+                            directory=False,
+                        ),
+                        before_identity,
+                    )
+                    mutated = True
+                return real_reserve(*args, **kwargs)
+
+            with patch.object(
+                store_module,
+                "_reserve_card_sidecar_quarantine",
+                side_effect=mutate_same_inode_then_reserve,
+            ):
+                result = store_module.reconcile_card_sidecar_write_intents(
+                    root
+                )
+
+            self.assertTrue(mutated)
+            self.assertFalse(result["ok"], result)
+            self.assertIn(
+                "intent changed before reservation",
+                result["results"][0]["error"],
+            )
+            self.assertTrue(intent_path.is_file())
+            self.assertTrue(target_path.is_file())
+            self.assertFalse(recovery_path.exists())
+            self.assertFalse(receipt_path.exists())
+            conn = connect_existing(root)
+            try:
+                self.assertIsNone(
+                    store_module._card_sidecar_quarantine_reservation_value(
+                        conn
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_init_schema_phase_waits_for_quarantine_operation_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._seed_unbound_sidecar_intent(
+                root,
+                title="quarantine-init-schema-race",
+            )
+            store_module._INIT_DB_CACHE.discard(
+                str(root.resolve(strict=False))
+            )
+            reservation_entered = threading.Event()
+            release_reservation = threading.Event()
+            schema_entered = threading.Event()
+            reconciliation_result: dict[str, object] = {}
+            init_errors: list[BaseException] = []
+            real_execute = (
+                store_module._execute_card_sidecar_quarantine_reservation
+            )
+            real_schema_table_ddl = store_module._schema_table_ddl
+
+            def pause_reserved_file_phase(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                reservation_entered.set()
+                if not release_reservation.wait(10.0):
+                    raise TimeoutError(
+                        "test did not release quarantine reservation"
+                    )
+                return real_execute(*args, **kwargs)
+
+            def observe_schema_phase() -> str:
+                schema_entered.set()
+                return real_schema_table_ddl()
+
+            def run_reconciliation() -> None:
+                reconciliation_result["value"] = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            def run_init() -> None:
+                try:
+                    init_db(root)
+                except BaseException as exc:
+                    init_errors.append(exc)
+
+            with (
+                patch.object(
+                    store_module,
+                    "_execute_card_sidecar_quarantine_reservation",
+                    side_effect=pause_reserved_file_phase,
+                ),
+                patch.object(
+                    store_module,
+                    "_schema_table_ddl",
+                    side_effect=observe_schema_phase,
+                ),
+            ):
+                reconciliation_thread = threading.Thread(
+                    target=run_reconciliation
+                )
+                reconciliation_thread.start()
+                self.assertTrue(reservation_entered.wait(10.0))
+                init_thread = threading.Thread(target=run_init)
+                init_thread.start()
+                self.assertFalse(schema_entered.wait(0.2))
+                release_reservation.set()
+                reconciliation_thread.join(10.0)
+                init_thread.join(10.0)
+
+            self.assertFalse(reconciliation_thread.is_alive())
+            self.assertFalse(init_thread.is_alive())
+            self.assertFalse(init_errors, init_errors)
+            self.assertTrue(schema_entered.is_set())
+            reconciled = dict(reconciliation_result["value"])
+            self.assertTrue(reconciled["ok"], reconciled)
+            conn = connect_existing(root)
+            try:
+                self.assertIsNone(
+                    store_module._card_sidecar_quarantine_reservation_value(
+                        conn
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_fts_provisioning_is_init_owned_during_quarantine(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._seed_unbound_sidecar_intent(
+                root,
+                title="quarantine-fts-provisioning",
+            )
+            raw_conn = sqlite3.connect(
+                str(root / "catalog" / "catalog.sqlite3")
+            )
+            try:
+                raw_conn.execute("DROP TABLE IF EXISTS chunks_fts")
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+            store_module._INIT_DB_CACHE.discard(
+                str(root.resolve(strict=False))
+            )
+            real_execute = (
+                store_module._execute_card_sidecar_quarantine_reservation
+            )
+            readiness_observed = False
+
+            def probe_fts_without_schema_authority(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal readiness_observed
+                probe_conn = connect(root)
+                try:
+                    schema_before = (
+                        store_module._sqlite_schema_authority_version(
+                            probe_conn
+                        )
+                    )
+                    self.assertFalse(store_module.ensure_fts(probe_conn))
+                    self.assertEqual(
+                        store_module._sqlite_schema_authority_version(
+                            probe_conn
+                        ),
+                        schema_before,
+                    )
+                    self.assertFalse(
+                        store_module._fts_table_ready(probe_conn)
+                    )
+                finally:
+                    probe_conn.close()
+                readiness_observed = True
+                return real_execute(*args, **kwargs)
+
+            with patch.object(
+                store_module,
+                "_execute_card_sidecar_quarantine_reservation",
+                side_effect=probe_fts_without_schema_authority,
+            ):
+                reconciled = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+            self.assertTrue(readiness_observed)
+            self.assertTrue(reconciled["ok"], reconciled)
+
+            init_db(root)
+            conn = connect_existing(root)
+            try:
+                if store_module._fts5_runtime_available(conn):
+                    self.assertTrue(store_module._fts_table_ready(conn))
+            finally:
+                conn.close()
+
+    def test_init_owns_review_triggers_and_conflict_index_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                store_module.record_artifact(
+                    conn,
+                    kind="review_phase_envelope",
+                    uri="continuum://exports/review-phase-test.json",
+                    sha256="a" * 64,
+                    size_bytes=1,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            conn = sqlite3.connect(
+                str(root / "catalog" / "catalog.sqlite3")
+            )
+            try:
+                conn.execute(
+                    "DROP TRIGGER protect_review_phase_artifact_updates"
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER protect_review_phase_artifact_updates
+                    BEFORE UPDATE ON artifacts
+                    WHEN OLD.kind = 'review_phase_envelope'
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                conn.execute(
+                    "DROP INDEX idx_cards_conflict_title_boundary"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            schema_after_init: list[int] = []
+            real_init_db = worker_module.init_db
+
+            def observe_init(*args: object, **kwargs: object) -> None:
+                real_init_db(*args, **kwargs)
+                observed_conn = connect_existing(root)
+                try:
+                    schema_after_init.append(
+                        store_module._sqlite_schema_authority_version(
+                            observed_conn
+                        )
+                    )
+                finally:
+                    observed_conn.close()
+
+            with patch.object(
+                worker_module,
+                "init_db",
+                side_effect=observe_init,
+            ):
+                detected = detect_conflicts(root, limit=1)
+
+            self.assertTrue(detected["ok"], detected)
+            self.assertEqual(len(schema_after_init), 1)
+            conn = connect(root)
+            try:
+                self.assertTrue(
+                    store_module._review_artifact_immutability_triggers_ready(
+                        conn
+                    )
+                )
+                self.assertTrue(store_module._conflict_indexes_ready(conn))
+                self.assertEqual(
+                    store_module._sqlite_schema_authority_version(conn),
+                    schema_after_init[0],
+                )
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review phase artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        UPDATE artifacts
+                        SET metadata_json = '{"drifted":true}'
+                        WHERE kind = 'review_phase_envelope'
+                        """
+                    )
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.close()
+
+    def test_review_artifacts_reject_replace_conflicts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                phase_uri = "continuum://exports/review-phase-replace.json"
+                phase_sha = "a" * 64
+                phase_id = store_module.record_artifact(
+                    conn,
+                    kind="review_phase_envelope",
+                    uri=phase_uri,
+                    sha256=phase_sha,
+                    size_bytes=1,
+                )
+                legacy_uri = (
+                    "continuum://exports/review-legacy-quarantine-replace.json"
+                )
+                legacy_sha = "b" * 64
+                legacy_id = store_module.record_artifact(
+                    conn,
+                    kind="review_legacy_quarantine_receipt",
+                    uri=legacy_uri,
+                    sha256=legacy_sha,
+                    size_bytes=1,
+                )
+                ordinary_id = store_module.record_artifact(
+                    conn,
+                    kind="ordinary",
+                    uri="continuum://exports/ordinary-replace-source.json",
+                    sha256="d" * 64,
+                    size_bytes=1,
+                    immutable=False,
+                )
+                conn.commit()
+                phase_rowid = int(
+                    conn.execute(
+                        "SELECT rowid FROM artifacts WHERE id = ?",
+                        (phase_id,),
+                    ).fetchone()[0]
+                )
+                legacy_rowid = int(
+                    conn.execute(
+                        "SELECT rowid FROM artifacts WHERE id = ?",
+                        (legacy_id,),
+                    ).fetchone()[0]
+                )
+                self.assertEqual(
+                    int(conn.execute("PRAGMA recursive_triggers").fetchone()[0]),
+                    0,
+                )
+
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO artifacts(
+                            id, kind, uri, sha256, size_bytes, created_at,
+                            immutable, metadata_json
+                        )
+                        VALUES(?, 'ordinary', ?, ?, 1, ?, 0, '{}')
+                        """,
+                        (
+                            phase_id,
+                            "continuum://exports/replaced-by-id.json",
+                            "c" * 64,
+                            store_module.utc_now(),
+                        ),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO artifacts(
+                            rowid, id, kind, uri, sha256, size_bytes,
+                            created_at, immutable, metadata_json
+                        )
+                        VALUES(?, ?, 'ordinary', ?, ?, 1, ?, 0, '{}')
+                        """,
+                        (
+                            phase_rowid,
+                            "artifact-rowid-replacement",
+                            "continuum://exports/replaced-by-rowid.json",
+                            "e" * 64,
+                            store_module.utc_now(),
+                        ),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO artifacts(
+                            _rowid_, id, kind, uri, sha256, size_bytes,
+                            created_at, immutable, metadata_json
+                        )
+                        VALUES(?, ?, 'ordinary', ?, ?, 1, ?, 0, '{}')
+                        """,
+                        (
+                            legacy_rowid,
+                            "artifact-rowid-alias-replacement",
+                            "continuum://exports/replaced-by-rowid-alias.json",
+                            "f" * 64,
+                            store_module.utc_now(),
+                        ),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO artifacts(
+                            id, kind, uri, sha256, size_bytes, created_at,
+                            immutable, metadata_json
+                        )
+                        VALUES(?, 'ordinary', ?, ?, 1, ?, 0, '{}')
+                        """,
+                        (
+                            "artifact-replacement",
+                            legacy_uri,
+                            legacy_sha,
+                            store_module.utc_now(),
+                        ),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        UPDATE OR REPLACE artifacts
+                        SET id = ?
+                        WHERE id = ?
+                        """,
+                        (phase_id, ordinary_id),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        UPDATE OR REPLACE artifacts
+                        SET uri = ?, sha256 = ?
+                        WHERE id = ?
+                        """,
+                        (legacy_uri, legacy_sha, ordinary_id),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        UPDATE OR REPLACE artifacts
+                        SET rowid = ?
+                        WHERE id = ?
+                        """,
+                        (phase_rowid, ordinary_id),
+                    )
+                conn.rollback()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "review artifacts are immutable",
+                ):
+                    conn.execute(
+                        """
+                        UPDATE OR REPLACE artifacts
+                        SET oid = ?
+                        WHERE id = ?
+                        """,
+                        (legacy_rowid, ordinary_id),
+                    )
+                conn.rollback()
+                rows = conn.execute(
+                    """
+                    SELECT id, kind, immutable
+                    FROM artifacts
+                    WHERE id IN (?, ?, ?)
+                    ORDER BY id
+                    """,
+                    (phase_id, legacy_id, ordinary_id),
+                ).fetchall()
+                self.assertEqual(len(rows), 3)
+                self.assertEqual(
+                    {str(row["kind"]) for row in rows},
+                    {
+                        "ordinary",
+                        "review_phase_envelope",
+                        "review_legacy_quarantine_receipt",
+                    },
+                )
+                self.assertEqual(
+                    {
+                        str(row["kind"]): int(row["immutable"])
+                        for row in rows
+                    },
+                    {
+                        "ordinary": 0,
+                        "review_phase_envelope": 1,
+                        "review_legacy_quarantine_receipt": 1,
+                    },
+                )
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.close()
+
+    def test_live_connection_denies_trigger_drop_without_schema_capability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            with operation_lock(
+                root,
+                store_module.CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
+            ):
+                conn = connect(root)
+                try:
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "not authorized",
+                    ):
+                        conn.execute(
+                            "DROP TRIGGER "
+                            "fence_card_sidecar_quarantine_card_update"
+                        )
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "not authorized",
+                    ):
+                        conn.execute(
+                            "DROP TRIGGER "
+                            "protect_review_phase_artifact_updates"
+                        )
+                    self.assertTrue(
+                        store_module._card_sidecar_quarantine_reservation_triggers_ready(
+                            conn
+                        )
+                    )
+                finally:
+                    conn.close()
+
+    def test_quarantine_receipt_replay_requires_exact_database_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_id, _payload, target_path, intent_id = (
+                self._seed_unbound_sidecar_intent(
+                    root,
+                    title="quarantine-receipt-authority-replay",
+                )
+            )
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            with patch.object(
+                store_module,
+                "_release_card_sidecar_quarantine_reservation",
+                side_effect=OSError("fault after receipt"),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(target_path.exists())
+
+            # Emulate an external SQLite administrator that bypasses the live
+            # connection authorizer, removes one fence, commits protected Card
+            # drift, then restores the exact trigger before replay.
+            trigger_name = "fence_card_sidecar_quarantine_card_update"
+            trigger_sql = (
+                store_module
+                ._card_sidecar_quarantine_reservation_trigger_sql()[
+                    trigger_name
+                ]
+            )
+            raw_conn = sqlite3.connect(
+                str(root / "catalog" / "catalog.sqlite3")
+            )
+            try:
+                raw_conn.execute(f"DROP TRIGGER {trigger_name}")
+                raw_conn.execute(
+                    "UPDATE cards SET summary = summary || ' drift' "
+                    "WHERE id = ?",
+                    (card_id,),
+                )
+                raw_conn.execute(trigger_sql)
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+
+            replay = store_module.reconcile_card_sidecar_write_intents(root)
+            self.assertFalse(replay["ok"], replay)
+            self.assertEqual(
+                replay["results"][0]["status"],
+                "quarantine_database_authority_drift",
+            )
+            self.assertTrue(
+                replay["results"][0]["reservation_retained"],
+                replay,
+            )
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(
+                    store_module._card_sidecar_quarantine_reservation_value(
+                        conn
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_quarantine_receipt_replay_rechecks_authority_after_finish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_id, _payload, target_path, intent_id = (
+                self._seed_unbound_sidecar_intent(
+                    root,
+                    title="quarantine-receipt-post-finish-authority",
+                )
+            )
+            with patch.object(
+                store_module,
+                "_release_card_sidecar_quarantine_reservation",
+                side_effect=OSError("fault after receipt"),
+            ):
+                interrupted = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+            self.assertFalse(interrupted["ok"], interrupted)
+            self.assertFalse(target_path.exists())
+
+            trigger_name = "fence_card_sidecar_quarantine_card_update"
+            trigger_sql = (
+                store_module
+                ._card_sidecar_quarantine_reservation_trigger_sql()[
+                    trigger_name
+                ]
+            )
+            real_finish = (
+                store_module._finish_intent_from_committed_receipt
+            )
+            authority_drifted = False
+
+            def finish_then_drift_authority(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object] | None:
+                nonlocal authority_drifted
+                finished = real_finish(*args, **kwargs)
+                if finished is not None and not authority_drifted:
+                    raw_conn = sqlite3.connect(
+                        str(root / "catalog" / "catalog.sqlite3")
+                    )
+                    try:
+                        raw_conn.execute(f"DROP TRIGGER {trigger_name}")
+                        raw_conn.execute(
+                            "UPDATE cards SET location_uri = ? WHERE id = ?",
+                            (
+                                store_module.continuum_uri(
+                                    root,
+                                    target_path,
+                                ),
+                                card_id,
+                            ),
+                        )
+                        raw_conn.execute(trigger_sql)
+                        raw_conn.commit()
+                    finally:
+                        raw_conn.close()
+                    authority_drifted = True
+                return finished
+
+            with patch.object(
+                store_module,
+                "_finish_intent_from_committed_receipt",
+                side_effect=finish_then_drift_authority,
+            ):
+                replay = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(authority_drifted)
+            self.assertFalse(replay["ok"], replay)
+            self.assertEqual(
+                replay["results"][0]["status"],
+                "quarantine_database_authority_drift_after_receipt",
+            )
+            self.assertTrue(
+                replay["results"][0]["reservation_retained"],
+                replay,
+            )
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(
+                    store_module._card_sidecar_quarantine_reservation_value(
+                        conn
+                    )
+                )
+                row = conn.execute(
+                    "SELECT location_uri FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                self.assertEqual(
+                    row["location_uri"],
+                    store_module.continuum_uri(root, target_path),
+                )
+            finally:
+                conn.close()
+
+    def test_quarantine_release_revalidates_authority_atomically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            card_id, _payload, target_path, intent_id = (
+                self._seed_unbound_sidecar_intent(
+                    root,
+                    title="quarantine-atomic-release-authority",
+                )
+            )
+            recovery_path = target_path.with_name(
+                f".{target_path.name}.{intent_id}.uncommitted"
+            )
+            receipt_path = (
+                root
+                / "exports"
+                / "card_sidecar_recovery_receipts"
+                / f"{intent_id}.json"
+            )
+            trigger_name = "fence_card_sidecar_quarantine_card_update"
+            trigger_sql = (
+                store_module
+                ._card_sidecar_quarantine_reservation_trigger_sql()[
+                    trigger_name
+                ]
+            )
+            real_release = (
+                store_module._release_card_sidecar_quarantine_reservation
+            )
+            authority_drifted = False
+
+            def drift_then_release(
+                conn: sqlite3.Connection,
+                reservation_value: str,
+                expected_authority: (
+                    store_module.CardSidecarDbAuthorityToken
+                ),
+            ) -> bool:
+                nonlocal authority_drifted
+                raw_conn = sqlite3.connect(
+                    str(root / "catalog" / "catalog.sqlite3")
+                )
+                try:
+                    raw_conn.execute(f"DROP TRIGGER {trigger_name}")
+                    raw_conn.execute(
+                        "UPDATE cards SET location_uri = ? WHERE id = ?",
+                        (
+                            store_module.continuum_uri(root, target_path),
+                            card_id,
+                        ),
+                    )
+                    raw_conn.execute(trigger_sql)
+                    raw_conn.commit()
+                finally:
+                    raw_conn.close()
+                authority_drifted = True
+                return real_release(
+                    conn,
+                    reservation_value,
+                    expected_authority,
+                )
+
+            with patch.object(
+                store_module,
+                "_release_card_sidecar_quarantine_reservation",
+                side_effect=drift_then_release,
+            ):
+                result = (
+                    store_module.reconcile_card_sidecar_write_intents(root)
+                )
+
+            self.assertTrue(authority_drifted)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(
+                result["results"][0]["status"],
+                "quarantine_database_authority_drift_after_receipt",
+            )
+            self.assertTrue(
+                result["results"][0]["reservation_retained"],
+                result,
+            )
+            self.assertFalse(target_path.exists())
+            self.assertTrue(recovery_path.is_file())
+            self.assertTrue(receipt_path.is_file())
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(
+                    store_module._card_sidecar_quarantine_reservation_value(
+                        conn
+                    )
+                )
+            finally:
+                conn.close()
+
+    def test_artifact_replace_conflicts_are_fenced_and_advance_epoch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                artifact_id = store_module.record_artifact(
+                    conn,
+                    kind="replace_conflict_probe",
+                    uri="continuum://exports/replace-conflict.txt",
+                    sha256="a" * 64,
+                    size_bytes=1,
+                    immutable=True,
+                )
+                ordinary_id = store_module.record_artifact(
+                    conn,
+                    kind="replace_conflict_mutable_probe",
+                    uri="continuum://exports/replace-conflict-mutable.txt",
+                    sha256="b" * 64,
+                    size_bytes=1,
+                    immutable=False,
+                )
+                conn.commit()
+                artifact_rowid = int(
+                    conn.execute(
+                        "SELECT rowid FROM artifacts WHERE id = ?",
+                        (artifact_id,),
+                    ).fetchone()[0]
+                )
+                replace_sql = """
+                    INSERT OR REPLACE INTO artifacts(
+                        id, kind, uri, sha256, size_bytes, created_at,
+                        immutable, metadata_json
+                    )
+                    VALUES(?, 'replace_conflict_probe', ?, ?, 1, ?, 0, '{}')
+                """
+                replace_args = (
+                    artifact_id,
+                    "continuum://exports/replace-conflict.txt",
+                    "a" * 64,
+                    store_module.utc_now(),
+                )
+                for reservation_key in (
+                    store_module
+                    .CARD_SIDECAR_ARTIFACT_WRITE_RESERVATION_META_KEY,
+                    store_module
+                    .CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY,
+                ):
+                    with self.subTest(reservation_key=reservation_key):
+                        conn.execute(
+                            "INSERT INTO meta(key, value) VALUES(?, ?)",
+                            (reservation_key, '{"test":true}'),
+                        )
+                        conn.commit()
+                        epoch_before = (
+                            store_module._immutable_artifact_path_index_epoch(
+                                conn
+                            )
+                        )
+                        conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            conn.execute(replace_sql, replace_args)
+                        self.assertFalse(conn.in_transaction)
+                        conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO artifacts(
+                                    _rowid_, id, kind, uri, sha256,
+                                    size_bytes, created_at, immutable,
+                                    metadata_json
+                                )
+                                VALUES(
+                                    ?, ?, 'rowid_replace_conflict_probe',
+                                    ?, ?, 1, ?, 0, '{}'
+                                )
+                                """,
+                                (
+                                    artifact_rowid,
+                                    "artifact-rowid-reservation-replacement",
+                                    (
+                                        "continuum://exports/"
+                                        "rowid-reservation-replacement.txt"
+                                    ),
+                                    "c" * 64,
+                                    store_module.utc_now(),
+                                ),
+                            )
+                        self.assertFalse(conn.in_transaction)
+                        conn.execute("BEGIN IMMEDIATE")
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            conn.execute(
+                                """
+                                UPDATE OR REPLACE artifacts
+                                SET oid = ?
+                                WHERE id = ?
+                                """,
+                                (artifact_rowid, ordinary_id),
+                            )
+                        self.assertFalse(conn.in_transaction)
+                        row = conn.execute(
+                            "SELECT immutable FROM artifacts WHERE id = ?",
+                            (artifact_id,),
+                        ).fetchone()
+                        self.assertEqual(row["immutable"], 1)
+                        self.assertIsNotNone(
+                            conn.execute(
+                                "SELECT 1 FROM artifacts WHERE id = ?",
+                                (ordinary_id,),
+                            ).fetchone()
+                        )
+                        self.assertEqual(
+                            store_module
+                            ._immutable_artifact_path_index_epoch(conn),
+                            epoch_before,
+                        )
+                        conn.execute(
+                            "DELETE FROM meta WHERE key = ?",
+                            (reservation_key,),
+                        )
+                        conn.commit()
+
+                epoch_before_rowid_replace = (
+                    store_module._immutable_artifact_path_index_epoch(conn)
+                )
+                conn.execute(
+                    """
+                    UPDATE OR REPLACE artifacts
+                    SET oid = ?
+                    WHERE id = ?
+                    """,
+                    (artifact_rowid, ordinary_id),
+                )
+                conn.commit()
+                self.assertGreater(
+                    store_module._immutable_artifact_path_index_epoch(conn),
+                    epoch_before_rowid_replace,
+                )
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM artifacts WHERE id = ?",
+                        (artifact_id,),
+                    ).fetchone()
+                )
+
+                restored_artifact_id = store_module.record_artifact(
+                    conn,
+                    kind="replace_conflict_probe",
+                    uri="continuum://exports/replace-conflict.txt",
+                    sha256="a" * 64,
+                    size_bytes=1,
+                    immutable=True,
+                )
+                conn.commit()
+                self.assertEqual(restored_artifact_id, artifact_id)
+                epoch_before_replace = (
+                    store_module._immutable_artifact_path_index_epoch(conn)
+                )
+                conn.execute(replace_sql, replace_args)
+                conn.commit()
+                self.assertGreater(
+                    store_module._immutable_artifact_path_index_epoch(conn),
+                    epoch_before_replace,
+                )
+                row = conn.execute(
+                    "SELECT immutable FROM artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                self.assertEqual(row["immutable"], 0)
+            finally:
+                conn.close()
+
+    def test_quarantine_reservation_retains_ambiguous_or_drifted_state(
+        self,
+    ) -> None:
+        for condition in (
+            "malformed",
+            "authority_drift",
+            "trigger_drift",
+            "target_drift",
+            "recovery_drift",
+            "both",
+            "neither",
+        ):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "continuum"
+                if condition == "malformed":
+                    init_db(root)
+                    conn = connect(root)
+                    try:
+                        conn.execute(
+                            "INSERT INTO meta(key, value) VALUES(?, ?)",
+                            (
+                                store_module
+                                .CARD_SIDECAR_QUARANTINE_RESERVATION_META_KEY,
+                                "{malformed",
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    blocked = (
+                        store_module.reconcile_card_sidecar_write_intents(root)
+                    )
+                    self.assertFalse(blocked["ok"], blocked)
+                    self.assertEqual(
+                        blocked["results"][0]["status"],
+                        "malformed_quarantine_reservation",
+                    )
+                    continue
+
+                (
+                    _card_id,
+                    _payload,
+                    target_path,
+                    intent_id,
+                ) = self._seed_unbound_sidecar_intent(
+                    root,
+                    title=f"quarantine-ambiguous-{condition}",
+                )
+                if condition in {
+                    "authority_drift",
+                    "trigger_drift",
+                    "target_drift",
+                    "neither",
+                }:
+                    with patch.object(
+                        store_module,
+                        "_execute_card_sidecar_quarantine_reservation",
+                        side_effect=OSError("pause after reservation"),
+                    ):
+                        interrupted = (
+                            store_module.reconcile_card_sidecar_write_intents(
+                                root
+                            )
+                        )
+                else:
+                    with patch.object(
+                        store_module,
+                        "_finish_card_sidecar_write_intent",
+                        side_effect=OSError("pause after move"),
+                    ):
+                        interrupted = (
+                            store_module.reconcile_card_sidecar_write_intents(
+                                root
+                            )
+                        )
+                self.assertFalse(interrupted["ok"], interrupted)
+                recovery_path = target_path.with_name(
+                    f".{target_path.name}.{intent_id}.uncommitted"
+                )
+                if condition == "authority_drift":
+                    conn = connect(root)
+                    try:
+                        conn.execute(
+                            """
+                            UPDATE meta
+                            SET value = CAST(value AS INTEGER) + 1
+                            WHERE key = ?
+                            """,
+                            (
+                                store_module
+                                .CARD_SIDECAR_DB_AUTHORITY_EPOCH_META_KEY,
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                elif condition == "trigger_drift":
+                    # Bypass the application connection's schema authorizer to
+                    # emulate an out-of-process SQLite administrator damaging
+                    # a live fence. Supported Continuum DDL cannot do this.
+                    conn = sqlite3.connect(
+                        str(root / "catalog" / "catalog.sqlite3")
+                    )
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        conn.execute(
+                            "DROP TRIGGER "
+                            "fence_card_sidecar_quarantine_card_update"
+                        )
+                        conn.commit()
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "active Card sidecar reservation has nonexact",
+                        ):
+                            store_module._ensure_card_sidecar_quarantine_reservation_triggers(
+                                conn
+                            )
+                    finally:
+                        conn.close()
+                elif condition == "target_drift":
+                    target_path.write_bytes(b"replacement")
+                elif condition == "recovery_drift":
+                    recovery_path.write_bytes(b"replacement")
+                elif condition == "both":
+                    target_path.write_bytes(recovery_path.read_bytes())
+                else:
+                    moved_path = target_path.with_suffix(".outside")
+                    target_path.replace(moved_path)
+
+                blocked = store_module.reconcile_card_sidecar_write_intents(
+                    root
+                )
+                self.assertFalse(blocked["ok"], blocked)
+                self.assertTrue(
+                    blocked["results"][0]["reservation_retained"],
+                    blocked,
+                )
+                conn = connect_existing(root)
+                try:
+                    self.assertIsNotNone(
+                        store_module._card_sidecar_quarantine_reservation_value(
+                            conn
+                        )
+                    )
+                finally:
+                    conn.close()
+
     def test_hardlink_alias_artifact_preserves_and_audits_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -12346,6 +15329,90 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertIsNone(pending_outbox)
             self.assertEqual(memory_health(root)["failed_jobs"], 0)
 
+    def test_worker_service_defers_pending_authority_after_lost_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="service_lost_lease_probe",
+                    priority=1,
+                    payload={},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            processor_calls = 0
+
+            def return_to_pending(
+                _root: Path,
+                job: dict,
+            ) -> dict:
+                nonlocal processor_calls
+                processor_calls += 1
+                replacement = connect(root)
+                try:
+                    replacement.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET status = 'pending', lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            heartbeat_at = NULL
+                        WHERE id = ?
+                        """,
+                        (job["id"],),
+                    )
+                    replacement.commit()
+                finally:
+                    replacement.close()
+                return {"ok": True}
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=return_to_pending,
+            ):
+                service = worker_module.serve_workers(
+                    root,
+                    roles=["archivist"],
+                    limit=1,
+                    interval_seconds=0.1,
+                    maintenance_interval_seconds=3600.0,
+                    maintenance_on_start=False,
+                )
+
+            self.assertTrue(service["ok"], service)
+            self.assertEqual(service["passes"], 1)
+            self.assertEqual(service["processed_count"], 1)
+            self.assertEqual(service["incomplete_attempt_count"], 1)
+            self.assertEqual(processor_calls, 1)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT status, attempt_count, lease_owner
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(
+                dict(row),
+                {
+                    "status": "pending",
+                    "attempt_count": 1,
+                    "lease_owner": None,
+                },
+            )
+
     def test_worker_service_continues_past_durable_retry_without_reclaiming_it(
         self,
     ) -> None:
@@ -13093,6 +16160,568 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertEqual(final_row["attempt_count"], 1)
             self.assertEqual(final_effect_count, 1)
 
+    def test_retry_owned_job_transfers_to_pending_dedupe_successor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            dedupe_key = "retry-transfer-direct"
+            owner = "retry-transfer-owner"
+            conn = connect(root)
+            try:
+                source_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": "card_retry_transfer_direct"},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                claimed = worker_module._claim_job(
+                    conn,
+                    {"archivist"},
+                    lease_owner=owner,
+                    lease_seconds=300,
+                )
+                conn.commit()
+                self.assertEqual(claimed["id"], source_job_id)
+            finally:
+                conn.close()
+
+            conn = connect(root)
+            try:
+                successor_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=2,
+                    payload={"card_id": "card_retry_transfer_direct"},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            retry_result = {
+                "ok": False,
+                "reason": "direct_retry_authority_pending",
+                "retry_pending": True,
+            }
+            conn = connect(root)
+            try:
+                outcome = worker_module._retry_owned_job(
+                    conn,
+                    source_job_id,
+                    lease_owner=owner,
+                    lease_seconds=300,
+                    result=retry_result,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertEqual(outcome["job_status"], "skipped")
+            self.assertFalse(outcome["job_ok"])
+            self.assertTrue(outcome["retry_transferred"])
+            self.assertEqual(outcome["retry_job_id"], successor_job_id)
+            self.assertEqual(outcome["retry_source_job_id"], source_job_id)
+            self.assertEqual(
+                outcome["dedupe_successor_job_id"],
+                successor_job_id,
+            )
+            conn = connect_existing(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, retry_pending, retry_order,
+                               lease_owner, error_json, dedupe_key
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (source_job_id, successor_job_id),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                (
+                    rows[source_job_id]["status"],
+                    rows[source_job_id]["retry_pending"],
+                    rows[source_job_id]["lease_owner"],
+                    rows[source_job_id]["dedupe_key"],
+                ),
+                (
+                    "skipped",
+                    0,
+                    None,
+                    rows[successor_job_id]["dedupe_key"],
+                ),
+            )
+            self.assertEqual(rows[source_job_id]["retry_order"], 0)
+            self.assertEqual(
+                (
+                    rows[successor_job_id]["status"],
+                    rows[successor_job_id]["retry_pending"],
+                ),
+                ("pending", 1),
+            )
+            self.assertGreater(rows[successor_job_id]["retry_order"], 0)
+            successor_error = json.loads(
+                rows[successor_job_id]["error_json"]
+            )
+            self.assertEqual(
+                successor_error["result"][
+                    "retry_dedupe_successor_job_id"
+                ],
+                successor_job_id,
+            )
+            pending_authority = [
+                row
+                for row in rows.values()
+                if row["status"] == "pending"
+            ]
+            self.assertEqual(
+                [row["id"] for row in pending_authority],
+                [successor_job_id],
+            )
+
+    def test_public_retry_transfer_stops_amplification_for_competing_workers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            dedupe_key = "public-retry-transfer-single-authority"
+            job_type = "public_retry_transfer_probe"
+            conn = connect(root)
+            try:
+                source_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type=job_type,
+                    priority=1,
+                    payload={"generation": 0},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            generated_job_ids: list[str] = []
+            original_process_job = worker_module._process_job
+
+            def request_retry_with_continuation(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if job["job_type"] != job_type:
+                    return original_process_job(
+                        worker_root,
+                        job,
+                        **kwargs,
+                    )
+                continuation_conn = connect(worker_root)
+                try:
+                    continuation_job_id = enqueue_job(
+                        continuation_conn,
+                        role="archivist",
+                        job_type=job_type,
+                        priority=1,
+                        payload={
+                            "generation": len(generated_job_ids) + 1,
+                        },
+                        dedupe_key=dedupe_key,
+                    )
+                    continuation_conn.commit()
+                finally:
+                    continuation_conn.close()
+                generated_job_ids.append(continuation_job_id)
+                return {
+                    "ok": False,
+                    "reason": "public_retry_transfer_pending",
+                    "retry_pending": True,
+                }
+
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=request_retry_with_continuation,
+            ):
+                first = run_worker_pass(
+                    root,
+                    roles=["archivist"],
+                    limit=8,
+                    maintenance=False,
+                )
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["processed_count"], 1, first)
+            self.assertEqual(first["retry_pending_count"], 1, first)
+            self.assertEqual(len(generated_job_ids), 1, generated_job_ids)
+            successor_job_id = generated_job_ids[0]
+            first_attempt = first["processed"][0]
+            self.assertEqual(first_attempt["job_id"], source_job_id)
+            self.assertEqual(first_attempt["status"], "skipped")
+            self.assertFalse(first_attempt["ok"])
+            self.assertTrue(first_attempt["result"]["retry_transferred"])
+            self.assertEqual(
+                first_attempt["result"]["retry_job_id"],
+                successor_job_id,
+            )
+
+            conn = connect_existing(root)
+            try:
+                source = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (source_job_id,),
+                    ).fetchone()
+                )
+                successor = dict(
+                    conn.execute(
+                        """
+                        SELECT status, retry_pending, retry_order, dedupe_key
+                        FROM queue_jobs
+                        WHERE id = ?
+                        """,
+                        (successor_job_id,),
+                    ).fetchone()
+                )
+                runnable_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND dedupe_key = ?
+                        ORDER BY id
+                        """,
+                        (successor["dedupe_key"],),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            self.assertEqual(
+                (
+                    source["status"],
+                    source["retry_pending"],
+                    source["retry_order"],
+                    source["dedupe_key"],
+                ),
+                (
+                    "skipped",
+                    0,
+                    0,
+                    successor["dedupe_key"],
+                ),
+            )
+            self.assertEqual(successor["status"], "pending")
+            self.assertEqual(successor["retry_pending"], 1)
+            self.assertGreater(successor["retry_order"], 0)
+            self.assertEqual(runnable_ids, [successor_job_id])
+
+            conn = connect(root)
+            try:
+                reused_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type=job_type,
+                    priority=1,
+                    payload={"generation": "dedupe-reuse-probe"},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(reused_job_id, successor_job_id)
+
+            processing_started = threading.Event()
+            release_processing = threading.Event()
+            claimed_job_ids: list[str] = []
+            result_lock = threading.Lock()
+            worker_results: list[dict[str, object]] = []
+            worker_errors: list[BaseException] = []
+
+            def hold_single_successor(
+                worker_root: Path,
+                job: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if job["id"] != successor_job_id:
+                    return original_process_job(
+                        worker_root,
+                        job,
+                        **kwargs,
+                    )
+                with result_lock:
+                    claimed_job_ids.append(str(job["id"]))
+                processing_started.set()
+                if not release_processing.wait(timeout=10):
+                    raise TimeoutError(
+                        "competing worker proof did not release processor"
+                    )
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "public_retry_transfer_completed",
+                }
+
+            def run_competing_worker() -> None:
+                try:
+                    worker_result = run_worker_pass(
+                        root,
+                        roles=["archivist"],
+                        limit=4,
+                        maintenance=False,
+                    )
+                    with result_lock:
+                        worker_results.append(worker_result)
+                except BaseException as exc:
+                    with result_lock:
+                        worker_errors.append(exc)
+
+            first_worker = threading.Thread(
+                target=run_competing_worker,
+                daemon=True,
+            )
+            second_worker: threading.Thread | None = None
+            started = False
+            second_finished_while_first_held = False
+            with patch.object(
+                worker_module,
+                "_process_job",
+                side_effect=hold_single_successor,
+            ):
+                first_worker.start()
+                try:
+                    started = processing_started.wait(timeout=10)
+                    if started:
+                        second_worker = threading.Thread(
+                            target=run_competing_worker,
+                            daemon=True,
+                        )
+                        second_worker.start()
+                        second_worker.join(timeout=10)
+                        second_finished_while_first_held = (
+                            not second_worker.is_alive()
+                        )
+                finally:
+                    release_processing.set()
+                    first_worker.join(timeout=10)
+                    if second_worker is not None:
+                        second_worker.join(timeout=10)
+
+            self.assertTrue(started)
+            self.assertTrue(second_finished_while_first_held)
+            self.assertFalse(first_worker.is_alive())
+            if second_worker is not None:
+                self.assertFalse(second_worker.is_alive())
+            self.assertEqual(worker_errors, [])
+            self.assertEqual(claimed_job_ids, [successor_job_id])
+            self.assertEqual(len(worker_results), 2)
+            self.assertEqual(
+                sorted(
+                    int(result["processed_count"])
+                    for result in worker_results
+                ),
+                [0, 1],
+            )
+            self.assertTrue(
+                all(bool(result["ok"]) for result in worker_results),
+                worker_results,
+            )
+
+            conn = connect_existing(root)
+            try:
+                final_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, attempt_count, retry_pending,
+                               retry_order
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        ORDER BY id
+                        """,
+                        (source_job_id, successor_job_id),
+                    ).fetchall()
+                ]
+                remaining_runnable = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS n
+                        FROM queue_jobs
+                        WHERE status = 'pending' AND dedupe_key = ?
+                        """,
+                        (successor["dedupe_key"],),
+                    ).fetchone()["n"]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(len(final_rows), 2)
+            self.assertEqual(
+                sorted(int(row["attempt_count"]) for row in final_rows),
+                [1, 1],
+            )
+            self.assertTrue(
+                all(
+                    row["status"] == "skipped"
+                    and int(row["retry_pending"]) == 0
+                    and int(row["retry_order"]) == 0
+                    for row in final_rows
+                ),
+                final_rows,
+            )
+            self.assertEqual(remaining_runnable, 0)
+
+    def test_expired_retry_lease_transfers_to_pending_dedupe_successor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            dedupe_key = "retry-transfer-expired"
+            owner = "retry-transfer-expired-owner"
+            conn = connect(root)
+            try:
+                source_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": "card_retry_transfer_expired"},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                claimed = worker_module._claim_job(
+                    conn,
+                    {"archivist"},
+                    lease_owner=owner,
+                    lease_seconds=300,
+                )
+                self.assertEqual(claimed["id"], source_job_id)
+                retry_order = worker_module._next_queue_retry_order(conn)
+                conn.execute(
+                    """
+                    UPDATE queue_jobs
+                    SET retry_pending = 1, retry_order = ?,
+                        error_json = ?,
+                        lease_expires_at = '2000-01-01T00:00:00+00:00',
+                        heartbeat_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ?
+                    """,
+                    (
+                        retry_order,
+                        store_module.json_dumps(
+                            {
+                                "error": None,
+                                "result": {
+                                    "ok": False,
+                                    "reason": "expired_retry_pending",
+                                    "retry_pending": True,
+                                },
+                                "retry_pending": True,
+                            }
+                        ),
+                        source_job_id,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            conn = connect(root)
+            try:
+                successor_job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=2,
+                    payload={"card_id": "card_retry_transfer_expired"},
+                    dedupe_key=dedupe_key,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            conn = connect(root)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                reclaimed = worker_module._reclaim_expired_leases(
+                    conn,
+                    {"archivist"},
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(reclaimed, 1)
+
+            conn = connect_existing(root)
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, status, retry_pending, retry_order,
+                               error_json, dedupe_key
+                        FROM queue_jobs
+                        WHERE id IN (?, ?)
+                        """,
+                        (source_job_id, successor_job_id),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(
+                (
+                    rows[source_job_id]["status"],
+                    rows[source_job_id]["retry_pending"],
+                    rows[source_job_id]["dedupe_key"],
+                ),
+                (
+                    "skipped",
+                    0,
+                    rows[successor_job_id]["dedupe_key"],
+                ),
+            )
+            self.assertEqual(rows[source_job_id]["retry_order"], 0)
+            self.assertEqual(
+                (
+                    rows[successor_job_id]["status"],
+                    rows[successor_job_id]["retry_pending"],
+                ),
+                ("pending", 1),
+            )
+            self.assertGreater(rows[successor_job_id]["retry_order"], 0)
+            successor_error = json.loads(
+                rows[successor_job_id]["error_json"]
+            )
+            self.assertEqual(
+                successor_error["result"][
+                    "retry_dedupe_successor_job_id"
+                ],
+                successor_job_id,
+            )
+            self.assertEqual(
+                [
+                    row["id"]
+                    for row in rows.values()
+                    if row["status"] == "pending"
+                ],
+                [successor_job_id],
+            )
+
     def test_sidecar_worker_expiry_fences_disabled_retry_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
@@ -13689,18 +17318,22 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertTrue(overflow)
             self.assertEqual(len(bounded_paths), 2)
             self.assertEqual(enumerated, 3)
-            self.assertTrue(reconciled["overflow"], reconciled)
+            self.assertFalse(reconciled["overflow"], reconciled)
+            self.assertFalse(
+                reconciled["remaining_is_lower_bound"],
+                reconciled,
+            )
             self.assertEqual(reconciled["processed"], 0)
             self.assertEqual(
                 integrity["checks"]["card_sidecar_write_intent_scan_overflow"],
-                1,
+                0,
             )
             self.assertEqual(
                 integrity["checks"]["unresolved_card_sidecar_write_intents"],
-                2,
+                3,
             )
 
-    def test_active_and_retirement_debris_share_one_enumeration_cap(
+    def test_noncanonical_entries_share_one_enumeration_cap(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13737,6 +17370,10 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 "MAX_CARD_SIDECAR_WRITE_INTENTS",
                 2,
             ):
+                publisher_temp_candidates: list[
+                    tuple[Path, tuple[int, int]]
+                ] = []
+                inventory_failures: list[dict[str, object]] = []
                 (
                     intent_paths,
                     retirement_paths,
@@ -13746,6 +17383,10 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     intent_state[0],
                     retirement_state[0],
                     entry_limit=2,
+                    publisher_temp_candidates=(
+                        publisher_temp_candidates
+                    ),
+                    inventory_failures=inventory_failures,
                 )
                 reconciled = (
                     store_module.reconcile_card_sidecar_write_intents(
@@ -13755,15 +17396,31 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
 
             self.assertEqual(intent_paths, [])
-            self.assertEqual(retirement_paths, [])
+            self.assertEqual(len(retirement_paths), 1)
+            self.assertEqual(publisher_temp_candidates, [])
+            self.assertEqual(len(inventory_failures), 1)
+            self.assertEqual(
+                inventory_failures[0]["reason"],
+                "noncanonical_card_sidecar_intent_entry",
+            )
             self.assertTrue(truncated)
             self.assertEqual(enumerated, 3)
-            self.assertEqual(reconciled["enumerated"], 3, reconciled)
+            self.assertEqual(
+                reconciled["enumerated"],
+                reconciled["physical_limit"] + 1,
+                reconciled,
+            )
             self.assertTrue(reconciled["batch_truncated"], reconciled)
             self.assertTrue(reconciled["overflow"], reconciled)
             self.assertFalse(reconciled["complete"], reconciled)
+            self.assertEqual(reconciled["selected"], 0, reconciled)
+            self.assertEqual(
+                reconciled["publisher_temps_retired"],
+                0,
+                reconciled,
+            )
 
-    def test_retirement_debris_cannot_starve_active_sidecar_intent(
+    def test_noncanonical_retirement_fails_closed_without_starving_intent(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13776,7 +17433,10 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     root=root,
                     card_type="note",
                     title="Active intent fairness",
-                    summary="Retirement debris cannot hide active authority.",
+                    summary=(
+                        "Noncanonical retirement entries cannot hide active "
+                        "authority."
+                    ),
                     source_refs=[],
                 )
                 row = conn.execute(
@@ -13808,12 +17468,16 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             )
             self.assertIsNotNone(retirement_state)
             assert retirement_state is not None
-            debris_paths = [
-                retirement_state[0] / f"stable-retirement-debris-{index}"
+            noncanonical_paths = [
+                retirement_state[0]
+                / f"stable-noncanonical-retirement-{index}"
                 for index in range(2)
             ]
-            for debris_path in debris_paths:
-                debris_path.write_text("debris", encoding="utf-8")
+            for noncanonical_path in noncanonical_paths:
+                noncanonical_path.write_text(
+                    "operator-review-required",
+                    encoding="utf-8",
+                )
 
             reconciled = (
                 store_module.reconcile_card_sidecar_write_intents(
@@ -13822,16 +17486,34 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
             )
 
-            self.assertTrue(reconciled["ok"], reconciled)
-            self.assertEqual(reconciled["enumerated"], 3, reconciled)
-            self.assertEqual(reconciled["inspected"], 1, reconciled)
+            self.assertFalse(reconciled["ok"], reconciled)
+            self.assertFalse(reconciled["complete"], reconciled)
+            self.assertTrue(reconciled["has_more"], reconciled)
+            self.assertFalse(reconciled["progress_blocked"], reconciled)
+            self.assertGreaterEqual(reconciled["enumerated"], 3, reconciled)
+            self.assertEqual(reconciled["inspected"], 2, reconciled)
             self.assertEqual(reconciled["selected"], 1, reconciled)
             self.assertEqual(reconciled["processed"], 1, reconciled)
             self.assertTrue(reconciled["batch_truncated"], reconciled)
+            self.assertEqual(reconciled["remaining"], 2, reconciled)
+            self.assertEqual(len(reconciled["failures"]), 1, reconciled)
+            self.assertEqual(
+                reconciled["failures"][0]["intent_uri"],
+                (
+                    "run/card_sidecar_retirement_intents/"
+                    "stable-noncanonical-retirement-0"
+                ),
+            )
+            self.assertIn(
+                "retirement queue filename is invalid",
+                reconciled["failures"][0]["error"],
+            )
             self.assertFalse(intent_path.exists())
-            self.assertTrue(all(path.is_file() for path in debris_paths))
+            self.assertTrue(
+                all(path.is_file() for path in noncanonical_paths)
+            )
 
-    def test_active_debris_reports_bounded_progress_blocked(
+    def test_publisher_temps_clean_and_noncanonical_state_keeps_worker_retry(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13844,20 +17526,33 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             )
             self.assertIsNotNone(intent_state)
             assert intent_state is not None
-            debris_paths = [
-                intent_state[0] / f"000-stable-active-debris-{index}"
-                for index in range(2)
+            publisher_temp_paths = [
+                intent_state[0]
+                / (
+                    f".card_sidecar_write_intent_{token * 24}.json."
+                    f"{suffix}.tmp"
+                )
+                for token, suffix in (
+                    ("1", "aaaaaaaa"),
+                    ("2", "bbbbbbbb"),
+                )
             ]
-            for debris_path in debris_paths:
-                debris_path.write_text("debris", encoding="utf-8")
+            for publisher_temp_path in publisher_temp_paths:
+                publisher_temp_path.write_text(
+                    "crash-left-publisher-temp",
+                    encoding="utf-8",
+                )
             conn = connect(root)
             try:
                 card_id = create_card(
                     conn,
                     root=root,
                     card_type="note",
-                    title="Active debris progress",
-                    summary="A blocked scan must never report false success.",
+                    title="Publisher temp progress",
+                    summary=(
+                        "Exact publisher temporaries clean independently of "
+                        "valid intent work."
+                    ),
                     source_refs=[],
                 )
                 row = conn.execute(
@@ -13881,34 +17576,159 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
             )
 
-            attempts = [
+            reconciled = (
                 store_module.reconcile_card_sidecar_write_intents(
                     root,
                     limit=2,
                 )
-                for _index in range(3)
-            ]
+            )
 
-            for reconciled in attempts:
-                self.assertFalse(reconciled["ok"], reconciled)
-                self.assertTrue(
-                    reconciled["progress_blocked"],
-                    reconciled,
+            self.assertTrue(reconciled["ok"], reconciled)
+            self.assertTrue(reconciled["complete"], reconciled)
+            self.assertFalse(reconciled["progress_blocked"], reconciled)
+            self.assertEqual(reconciled["selected"], 1, reconciled)
+            self.assertEqual(reconciled["processed"], 1, reconciled)
+            self.assertEqual(
+                reconciled["publisher_temps_attempted"],
+                2,
+                reconciled,
+            )
+            self.assertEqual(
+                reconciled["publisher_temps_retired"],
+                2,
+                reconciled,
+            )
+            self.assertEqual(
+                len(
+                    reconciled[
+                        "publisher_temp_retirement_evidence"
+                    ]
+                ),
+                2,
+                reconciled,
+            )
+            self.assertFalse(
+                reconciled[
+                    "publisher_temp_retirements_authoritative"
+                ]
+            )
+            self.assertFalse(intent_path.exists())
+            self.assertTrue(
+                all(
+                    not os.path.lexists(path)
+                    for path in publisher_temp_paths
                 )
-                self.assertEqual(reconciled["enumerated"], 3, reconciled)
-                self.assertEqual(reconciled["inspected"], 0, reconciled)
-                self.assertEqual(reconciled["selected"], 0, reconciled)
-                self.assertEqual(reconciled["processed"], 0, reconciled)
-                self.assertTrue(
-                    any(
-                        failure.get("reason")
-                        == "bounded_inventory_progress_blocked"
-                        for failure in reconciled["failures"]
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            init_db(root)
+            conn = connect(root)
+            try:
+                card_id = create_card(
+                    conn,
+                    root=root,
+                    card_type="note",
+                    title="Noncanonical active state retry",
+                    summary=(
+                        "Arbitrary namespace entries remain visible and retain "
+                        "worker retry authority."
                     ),
-                    reconciled,
+                    source_refs=[],
                 )
-            self.assertTrue(intent_path.is_file())
-            self.assertTrue(all(path.is_file() for path in debris_paths))
+                row = conn.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+                payload = store_module._card_sidecar_payload_for_row(row)
+                conn.execute(
+                    "DELETE FROM card_sidecar_outbox WHERE card_id = ?",
+                    (card_id,),
+                )
+                conn.execute("DELETE FROM queue_jobs")
+                job_id = enqueue_job(
+                    conn,
+                    role="archivist",
+                    job_type="sync_card_sidecar",
+                    priority=1,
+                    payload={"card_id": card_id},
+                    related_card_ids=[card_id],
+                    dedupe_key=f"card:{card_id}",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            _intent_id, intent_path = (
+                store_module._write_card_sidecar_write_intent(
+                    root,
+                    card_id=card_id,
+                    target_uri=str(row["location_uri"]),
+                    expected_state_hash=str(payload["state_hash"]),
+                )
+            )
+            intent_state = store_module._validated_card_sidecar_state_dir(
+                root,
+                purpose="intent",
+                create=True,
+            )
+            self.assertIsNotNone(intent_state)
+            assert intent_state is not None
+            noncanonical_path = (
+                intent_state[0] / "000-noncanonical-active-entry"
+            )
+            noncanonical_path.mkdir()
+
+            worker_result = run_worker_pass(
+                root,
+                roles=["archivist"],
+                limit=1,
+                maintenance=False,
+            )
+
+            self.assertTrue(worker_result["ok"], worker_result)
+            self.assertEqual(worker_result["retry_pending_count"], 1)
+            attempt = worker_result["processed"][0]
+            self.assertEqual(attempt["job_id"], job_id)
+            self.assertEqual(attempt["status"], "pending")
+            self.assertFalse(attempt["ok"])
+            self.assertTrue(attempt["result"]["retry_pending"])
+            self.assertEqual(
+                attempt["result"]["reason"],
+                "intent_reconciliation_incomplete",
+            )
+            reconciliation = attempt["result"]["intent_reconciliation"]
+            self.assertFalse(reconciliation["ok"], reconciliation)
+            self.assertGreaterEqual(
+                reconciliation["processed"],
+                1,
+                reconciliation,
+            )
+            self.assertTrue(
+                any(
+                    failure.get("reason")
+                    == "noncanonical_card_sidecar_intent_entry"
+                    for failure in reconciliation["failures"]
+                ),
+                reconciliation,
+            )
+            self.assertFalse(intent_path.exists())
+            self.assertTrue(noncanonical_path.is_dir())
+            conn = connect_existing(root)
+            try:
+                durable = conn.execute(
+                    """
+                    SELECT status, retry_pending, retry_order, lease_owner
+                    FROM queue_jobs
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(durable["status"], "pending")
+            self.assertEqual(durable["retry_pending"], 1)
+            self.assertGreater(durable["retry_order"], 0)
+            self.assertIsNone(durable["lease_owner"])
 
     def test_disabled_unmaterialized_card_review_does_not_block_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -14495,12 +18315,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 conn.close()
 
             real_report = worker_module.semantic_integrity_report
-            report_calls = 0
+            postflight_injected = False
 
             def fail_normal_postflight(*args, **kwargs):
-                nonlocal report_calls
-                report_calls += 1
-                if report_calls == 3:
+                nonlocal postflight_injected
+                if kwargs.get("conn") is None and not postflight_injected:
+                    postflight_injected = True
                     return {"ok": False, "failing": {"simulated_postflight": 1}}
                 return real_report(*args, **kwargs)
 
@@ -14701,12 +18521,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 return sync_result
 
             real_report = worker_module.semantic_integrity_report
-            report_calls = 0
+            postflight_injected = False
 
             def fail_normal_postflight(*args, **kwargs):
-                nonlocal report_calls
-                report_calls += 1
-                if report_calls == 3:
+                nonlocal postflight_injected
+                if kwargs.get("conn") is None and not postflight_injected:
+                    postflight_injected = True
                     return {"ok": False, "failing": {"simulated_postflight": 1}}
                 return real_report(*args, **kwargs)
 
@@ -14890,12 +18710,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 return result
 
             real_report = worker_module.semantic_integrity_report
-            report_calls = 0
+            postflight_injected = False
 
             def fail_postflight(*args, **kwargs):
-                nonlocal report_calls
-                report_calls += 1
-                if report_calls == 3:
+                nonlocal postflight_injected
+                if kwargs.get("conn") is None and not postflight_injected:
+                    postflight_injected = True
                     return {"ok": False, "failing": {"simulated_postflight": 1}}
                 return real_report(*args, **kwargs)
 
@@ -15183,12 +19003,12 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             sync_card_sidecars_after_commit(root, [card_id])
 
             real_report = worker_module.semantic_integrity_report
-            report_calls = 0
+            postflight_injected = False
 
             def report_with_intervening_write(*args, **kwargs):
-                nonlocal report_calls
-                report_calls += 1
-                if report_calls == 3:
+                nonlocal postflight_injected
+                if kwargs.get("conn") is None and not postflight_injected:
+                    postflight_injected = True
                     writer = connect(root)
                     try:
                         row = writer.execute(
@@ -15539,6 +19359,595 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             self.assertTrue((root / row["original_uri"]).exists())
             self.assertTrue((root / row["reader_uri"]).exists())
 
+    def test_storage_tiering_recovers_crash_left_owned_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-crash-source.txt"
+            source.write_text("x" * (2 * 1024 * 1024), encoding="utf-8")
+            book = ingest_file(root, path=source, storage_tier="hot")
+            old_original = Path(book["original_uri"])
+            old_reader = Path(book["reader_uri"])
+            child_code = """
+import os
+import sys
+from pathlib import Path
+from continuum.core import proof_archive
+from continuum.core.workers import apply_storage_tiering
+
+real_write = os.write
+exit_now = os._exit
+
+def crash_after_partial_copy(fd, data):
+    real_write(fd, data[:17])
+    exit_now(73)
+
+proof_archive.os.write = crash_after_partial_copy
+apply_storage_tiering(Path(sys.argv[1]))
+"""
+            env = os.environ.copy()
+            repo_src = str(Path(__file__).resolve().parents[1] / "src")
+            env["PYTHONPATH"] = repo_src + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+            )
+            interrupted = subprocess.run(
+                [sys.executable, "-c", child_code, str(root)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(interrupted.returncode, 73, interrupted.stderr)
+            warm_original = (
+                root / "archive" / "originals" / "warm" / old_original.name
+            )
+            crash_temps = list(
+                warm_original.parent.glob(
+                    ".continuum-storage-tier.*.tmp"
+                )
+            )
+            self.assertEqual(len(crash_temps), 1)
+            self.assertEqual(crash_temps[0].stat().st_size, 17)
+            self.assertFalse(warm_original.exists())
+            self.assertTrue(old_original.exists())
+            self.assertTrue(old_reader.exists())
+            conn = connect_existing(root)
+            try:
+                tier = conn.execute(
+                    "SELECT storage_tier FROM books WHERE id = ?",
+                    (book["book_id"],),
+                ).fetchone()["storage_tier"]
+            finally:
+                conn.close()
+            self.assertEqual(tier, "hot")
+
+            retried = apply_storage_tiering(root)
+
+            self.assertTrue(retried["ok"], retried)
+            self.assertFalse(crash_temps[0].exists())
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT storage_tier, original_uri, reader_uri
+                    FROM books WHERE id = ?
+                    """,
+                    (book["book_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row["storage_tier"], "warm")
+            self.assertTrue((root / row["original_uri"]).is_file())
+            self.assertTrue((root / row["reader_uri"]).is_file())
+            self.assertFalse(old_original.exists())
+            self.assertFalse(old_reader.exists())
+
+    def test_storage_tier_temp_lookup_never_scans_archive_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "warm" / "book.bin"
+            stage_id = "a" * 24
+            destination.parent.mkdir(parents=True)
+            with patch.object(
+                Path,
+                "iterdir",
+                side_effect=AssertionError(
+                    "storage-tier temp lookup must be exact"
+                ),
+            ):
+                self.assertEqual(
+                    worker_module._storage_tier_owned_temp_paths(
+                        destination,
+                        stage_id=stage_id,
+                    ),
+                    [],
+                )
+            temporary = destination.parent / (
+                f".continuum-storage-tier.{stage_id}.tmp"
+            )
+            temporary.write_bytes(b"partial")
+            with patch.object(
+                Path,
+                "iterdir",
+                side_effect=AssertionError(
+                    "storage-tier temp lookup must be exact"
+                ),
+            ):
+                self.assertEqual(
+                    worker_module._storage_tier_owned_temp_paths(
+                        destination,
+                        stage_id=stage_id,
+                    ),
+                    [temporary],
+                )
+
+    def test_storage_tier_temp_retirement_preserves_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "warm" / "book.bin"
+            stage_id = "b" * 24
+            destination.parent.mkdir(parents=True)
+            temporary = destination.parent / (
+                f".continuum-storage-tier.{stage_id}.tmp"
+            )
+            temporary.write_bytes(b"owned partial bytes")
+            preserved_original = destination.parent / "preserved-original.tmp"
+            cleanup_slot = destination.parent / (
+                ".continuum-storage-tier-temp-cleanup-slot.tmp"
+            )
+            real_replace = os.replace
+            replacement_moved = False
+
+            def replace_before_retirement(
+                source_path: Path,
+                destination_path: Path,
+            ) -> None:
+                nonlocal replacement_moved
+                if (
+                    source_path == temporary
+                    and destination_path == cleanup_slot
+                ):
+                    replacement_moved = True
+                    real_replace(source_path, preserved_original)
+                    source_path.write_bytes(b"replacement bytes")
+                real_replace(source_path, destination_path)
+
+            with (
+                patch.object(
+                    worker_module,
+                    "retire_exact_windows_file",
+                    return_value=False,
+                ),
+                patch.object(
+                    worker_module.os,
+                    "replace",
+                    side_effect=replace_before_retirement,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "replacement preserved",
+                ):
+                    worker_module._retire_storage_tier_owned_temps(
+                        destination,
+                        stage_id=stage_id,
+                    )
+
+            self.assertTrue(replacement_moved)
+            self.assertEqual(
+                preserved_original.read_bytes(),
+                b"owned partial bytes",
+            )
+            self.assertFalse(
+                list(
+                destination.parent.glob(
+                    ".continuum-storage-tier-temp-retire.*"
+                )
+                )
+            )
+            self.assertEqual(
+                cleanup_slot.read_bytes(),
+                b"replacement bytes",
+            )
+
+    def test_storage_tier_temp_crash_boundary_uses_one_cleanup_slot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "warm" / "book.bin"
+            stage_id = "d" * 24
+            destination.parent.mkdir(parents=True)
+            temporary = destination.parent / (
+                f".continuum-storage-tier.{stage_id}.tmp"
+            )
+            cleanup_slot = destination.parent / (
+                ".continuum-storage-tier-temp-cleanup-slot.tmp"
+            )
+
+            for index in range(6):
+                temporary_bytes = f"partial bytes {index}".encode()
+                temporary.write_bytes(temporary_bytes)
+                with (
+                    patch.object(
+                        worker_module,
+                        "retire_exact_windows_file",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        worker_module,
+                        "fsync_parent",
+                        side_effect=RuntimeError(
+                            "simulated crash after temporary retirement"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "simulated crash",
+                    ),
+                ):
+                    worker_module._retire_storage_tier_owned_temps(
+                        destination,
+                        stage_id=stage_id,
+                    )
+                self.assertFalse(temporary.exists())
+                self.assertEqual(cleanup_slot.read_bytes(), temporary_bytes)
+
+            self.assertFalse(
+                list(
+                    destination.parent.glob(
+                        ".continuum-storage-tier-temp-retire.*"
+                    )
+                )
+            )
+            self.assertEqual(
+                [path for path in destination.parent.iterdir() if path.is_file()],
+                [cleanup_slot],
+            )
+
+    def test_storage_tier_temp_terminal_delete_refuses_replacement(
+        self,
+    ) -> None:
+        if os.name != "nt":
+            self.skipTest("exact-handle terminal deletion is Windows-specific")
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "warm" / "book.bin"
+            stage_id = "c" * 24
+            destination.parent.mkdir(parents=True)
+            temporary = destination.parent / (
+                f".continuum-storage-tier.{stage_id}.tmp"
+            )
+            temporary.write_bytes(b"owned terminal bytes")
+            preserved_original = destination.parent / "held-original.tmp"
+            replacement_path: Path | None = None
+            real_retire = worker_module.retire_exact_windows_file
+
+            def replace_before_handle_delete(
+                path: Path,
+                *,
+                expected_identity,
+            ) -> bool:
+                nonlocal replacement_path
+                replacement_path = path
+                os.replace(path, preserved_original)
+                path.write_bytes(b"terminal replacement")
+                return real_retire(
+                    path,
+                    expected_identity=expected_identity,
+                )
+
+            with patch.object(
+                worker_module,
+                "retire_exact_windows_file",
+                side_effect=replace_before_handle_delete,
+            ):
+                with self.assertRaises(OSError):
+                    worker_module._retire_storage_tier_owned_temps(
+                        destination,
+                        stage_id=stage_id,
+                    )
+
+            self.assertEqual(
+                preserved_original.read_bytes(),
+                b"owned terminal bytes",
+            )
+            self.assertIsNotNone(replacement_path)
+            self.assertEqual(
+                replacement_path.read_bytes(),
+                b"terminal replacement",
+            )
+
+    def test_completed_storage_tier_cleanup_is_not_rehashed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-cleanup-once.txt"
+            source.write_text(
+                "tier cleanup should be durable\n",
+                encoding="utf-8",
+            )
+            book = ingest_file(root, path=source, storage_tier="hot")
+
+            first = apply_storage_tiering(root)
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(first["action_count"], 1)
+            self.assertEqual(first["actions"][0]["cleanup_marked_count"], 2)
+            conn = connect_existing(root)
+            try:
+                metadata = json.loads(
+                    conn.execute(
+                        "SELECT metadata_json FROM books WHERE id = ?",
+                        (book["book_id"],),
+                    ).fetchone()["metadata_json"]
+                )
+            finally:
+                conn.close()
+            tier_files = metadata["tier_history"][-1]["files"]
+            self.assertEqual(len(tier_files), 2)
+            self.assertTrue(
+                all(
+                    detail.get("cleanup") == "complete"
+                    for detail in tier_files
+                )
+            )
+
+            with (
+                patch.object(
+                    worker_module,
+                    "_storage_tier_file_matches",
+                    side_effect=AssertionError(
+                        "completed cleanup must not rehash files"
+                    ),
+                ),
+                patch.object(
+                    worker_module,
+                    "_retire_storage_tier_source",
+                    wraps=worker_module._retire_storage_tier_source,
+                ) as retire,
+            ):
+                second = apply_storage_tiering(root)
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(second["action_count"], 0)
+            self.assertEqual(second["reconciled_cleanup_count"], 0)
+            retire.assert_not_called()
+
+    def test_storage_tiering_does_not_hold_writer_lock_while_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-contention-source.txt"
+            source.write_text("contention proof\n", encoding="utf-8")
+            ingest_file(root, path=source, storage_tier="hot")
+            copy_entered = threading.Event()
+            allow_copy = threading.Event()
+            tier_result: dict[str, object] = {}
+            real_copy = worker_module._copy_verified_storage_tier_file
+
+            def paused_copy(*args, **kwargs):
+                copy_entered.set()
+                self.assertTrue(allow_copy.wait(timeout=10))
+                return real_copy(*args, **kwargs)
+
+            def run_tiering() -> None:
+                try:
+                    tier_result.update(apply_storage_tiering(root))
+                except Exception as exc:  # pragma: no cover - assertion payload
+                    tier_result["error"] = repr(exc)
+
+            with patch.object(
+                worker_module,
+                "_copy_verified_storage_tier_file",
+                side_effect=paused_copy,
+            ):
+                thread = threading.Thread(target=run_tiering)
+                thread.start()
+                self.assertTrue(copy_entered.wait(timeout=10))
+                writer = sqlite3.connect(
+                    root / "catalog" / "catalog.sqlite3",
+                    timeout=0.15,
+                )
+                try:
+                    writer.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                        ("storage_tier_contention_probe", "committed"),
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+                allow_copy.set()
+                thread.join(timeout=20)
+            self.assertFalse(thread.is_alive())
+            self.assertNotIn("error", tier_result)
+            self.assertTrue(tier_result.get("ok"), tier_result)
+
+    def test_storage_tiering_rejects_link_like_canonical_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-link-source.txt"
+            source.write_text("link refusal proof\n", encoding="utf-8")
+            book = ingest_file(root, path=source, storage_tier="hot")
+            old_original = Path(book["original_uri"])
+            warm_original = (
+                root / "archive" / "originals" / "warm" / old_original.name
+            )
+            warm_original.parent.mkdir(parents=True, exist_ok=True)
+            link_target = Path(tmp) / "unrelated.txt"
+            link_target.write_text("must remain unchanged\n", encoding="utf-8")
+            try:
+                warm_original.symlink_to(link_target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            with self.assertRaises(RuntimeError):
+                apply_storage_tiering(root)
+
+            self.assertTrue(warm_original.is_symlink())
+            self.assertEqual(
+                link_target.read_text(encoding="utf-8"),
+                "must remain unchanged\n",
+            )
+            self.assertTrue(old_original.exists())
+            conn = connect_existing(root)
+            try:
+                tier = conn.execute(
+                    "SELECT storage_tier FROM books WHERE id = ?",
+                    (book["book_id"],),
+                ).fetchone()["storage_tier"]
+            finally:
+                conn.close()
+            self.assertEqual(tier, "hot")
+
+    def test_storage_tiering_preserves_canonical_on_source_retirement_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-retirement-race.txt"
+            source.write_text("original retirement evidence\n", encoding="utf-8")
+            book = ingest_file(root, path=source, storage_tier="hot")
+            old_original = Path(book["original_uri"])
+            expected_original = old_original.read_bytes()
+            real_replace = worker_module.replace_file_noclobber
+            retirement_hook_fired = False
+
+            def mutate_before_retirement(source_path, destination_path):
+                nonlocal retirement_hook_fired
+                if (
+                    not retirement_hook_fired
+                    and destination_path.name.startswith(
+                        ".continuum-storage-tier-retire."
+                    )
+                ):
+                    retirement_hook_fired = True
+                    source_path.write_text(
+                        "unexpected replacement bytes\n",
+                        encoding="utf-8",
+                    )
+                return real_replace(source_path, destination_path)
+
+            with patch.object(
+                worker_module,
+                "replace_file_noclobber",
+                side_effect=mutate_before_retirement,
+            ):
+                with self.assertRaises(RuntimeError):
+                    apply_storage_tiering(root)
+
+            self.assertTrue(retirement_hook_fired)
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT storage_tier, original_uri
+                    FROM books WHERE id = ?
+                    """,
+                    (book["book_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            canonical = root / row["original_uri"]
+            self.assertEqual(row["storage_tier"], "warm")
+            self.assertEqual(canonical.read_bytes(), expected_original)
+            self.assertFalse(old_original.exists())
+            retirements = list(
+                old_original.parent.glob(
+                    ".continuum-storage-tier-retire.*"
+                )
+            )
+            self.assertEqual(len(retirements), 1)
+            self.assertEqual(
+                retirements[0].read_text(encoding="utf-8"),
+                "unexpected replacement bytes\n",
+            )
+
+    def test_storage_tiering_terminal_delete_refuses_source_replacement(
+        self,
+    ) -> None:
+        if os.name != "nt":
+            self.skipTest("exact-handle terminal deletion is Windows-specific")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            config = default_config()
+            config["retention"]["raw_scroll_hot_days"] = 0
+            write_config(root, config)
+            source = Path(tmp) / "tier-terminal-race.txt"
+            source.write_text(
+                "terminal source evidence\n",
+                encoding="utf-8",
+            )
+            book = ingest_file(root, path=source, storage_tier="hot")
+            old_original = Path(book["original_uri"])
+            expected_original = old_original.read_bytes()
+            preserved_original = Path(tmp) / "held-retirement.bin"
+            replacement_path: Path | None = None
+            real_retire = worker_module.retire_exact_windows_file
+
+            def replace_before_handle_delete(
+                path: Path,
+                *,
+                expected_identity,
+            ) -> bool:
+                nonlocal replacement_path
+                if path.name.startswith(
+                    ".continuum-storage-tier-retire."
+                ):
+                    replacement_path = path
+                    os.replace(path, preserved_original)
+                    path.write_bytes(b"terminal source replacement")
+                return real_retire(
+                    path,
+                    expected_identity=expected_identity,
+                )
+
+            with patch.object(
+                worker_module,
+                "retire_exact_windows_file",
+                side_effect=replace_before_handle_delete,
+            ):
+                with self.assertRaises(OSError):
+                    apply_storage_tiering(root)
+
+            conn = connect_existing(root)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT storage_tier, original_uri
+                    FROM books
+                    WHERE id = ?
+                    """,
+                    (book["book_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            canonical = root / row["original_uri"]
+            self.assertEqual(row["storage_tier"], "warm")
+            self.assertEqual(canonical.read_bytes(), expected_original)
+            self.assertEqual(
+                preserved_original.read_bytes(),
+                expected_original,
+            )
+            self.assertIsNotNone(replacement_path)
+            self.assertEqual(
+                replacement_path.read_bytes(),
+                b"terminal source replacement",
+            )
+
     def test_memory_health_reports_legacy_retry_schema_without_mutating(
         self,
     ) -> None:
@@ -15553,6 +19962,11 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     store_module.QUEUE_RETRY_AUTHORITY_TRIGGER_NAMES
                 ):
                     conn.execute(f"DROP TRIGGER {trigger_name}")
+                for trigger_name in (
+                    store_module._queue_job_fairness_trigger_sql()
+                ):
+                    conn.execute(f"DROP TRIGGER {trigger_name}")
+                conn.execute("DROP TABLE queue_job_fairness")
                 conn.execute(
                     "ALTER TABLE queue_jobs DROP COLUMN retry_pending"
                 )
@@ -15618,6 +20032,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                     store_module
                     .QUEUE_RETRY_PENDING_BACKFILL_META_KEY,
                     store_module.QUEUE_RETRY_ORDER_META_KEY,
+                    "queue_job_fairness",
+                    "queue_job_fairness.cleanup_trigger",
                 },
             )
             conn = connect_existing(root)

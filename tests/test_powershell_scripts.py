@@ -76,6 +76,12 @@ class PowerShellNativeExitTests(unittest.TestCase):
                     "STUB_STAGE_OUTPUT": str(temp_root / "stage"),
                 }
             )
+            allowed_roots = os.pathsep.join(
+                (
+                    str(temp_root / "workspace"),
+                    str(temp_root / "evidence"),
+                )
+            )
             script = self.repo_root / "scripts" / "install_codex_plugin.ps1"
             arguments = [
                 "-RepoRoot",
@@ -86,6 +92,10 @@ class PowerShellNativeExitTests(unittest.TestCase):
                 str(python_stub),
                 "-StageRoot",
                 str(temp_root / "stage-base"),
+                "-AllowedRoots",
+                allowed_roots,
+                "-Codex",
+                str(codex_stub),
             ]
 
             for marketplace_exit, plugin_exit, expected_exit, expected_codex_calls in (
@@ -104,7 +114,13 @@ class PowerShellNativeExitTests(unittest.TestCase):
                     )
                     calls = log_path.read_text(encoding="utf-8").splitlines()
                     codex_calls = [line for line in calls if line.startswith("codex ")]
+                    python_calls = [
+                        line for line in calls if line.startswith("python ")
+                    ]
                     self.assertEqual(completed.returncode, expected_exit, completed)
+                    self.assertEqual(len(python_calls), 1, calls)
+                    self.assertIn("--allowed-roots", python_calls[0])
+                    self.assertIn(allowed_roots, python_calls[0])
                     self.assertEqual(len(codex_calls), expected_codex_calls, calls)
                     self.assertNotIn("Epic Continuum Codex plugin installed", completed.stdout)
 
@@ -257,6 +273,12 @@ class PowerShellNativeExitTests(unittest.TestCase):
                     "STUB_STAGE_OUTPUT": str(temp_root / "stage"),
                 }
             )
+            allowed_roots = os.pathsep.join(
+                (
+                    str(temp_root / "workspace"),
+                    str(temp_root / "evidence"),
+                )
+            )
             completed = self._run_script(
                 self.repo_root / "scripts" / "install_codex_plugin.ps1",
                 [
@@ -268,13 +290,21 @@ class PowerShellNativeExitTests(unittest.TestCase):
                     str(python_stub),
                     "-StageRoot",
                     str(temp_root / "stage-base"),
+                    "-AllowedRoots",
+                    allowed_roots,
                     "-StageOnly",
                 ],
                 environment=environment,
             )
 
             calls = log_path.read_text(encoding="utf-8").splitlines()
+            python_calls = [
+                line for line in calls if line.startswith("python ")
+            ]
             self.assertEqual(completed.returncode, 0, completed)
+            self.assertEqual(len(python_calls), 1, calls)
+            self.assertIn("--allowed-roots", python_calls[0])
+            self.assertIn(allowed_roots, python_calls[0])
             self.assertFalse(any(line.startswith("codex ") for line in calls), calls)
             self.assertIn("staged without registration", completed.stdout)
             self.assertNotIn("plugin installed", completed.stdout)

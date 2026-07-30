@@ -16,7 +16,10 @@ from .permissions import PRIVATE_FILE_MODE, fsync_parent, secure_mkdir, secure_w
 
 
 WRITER_CLAIM_SCHEMA = "epic_continuum.writer_claim.v1"
+WRITER_CLAIM_AUTHORITY_SCHEMA = "epic_continuum.writer_claim.v2"
 WRITER_CLAIM_NAME = "writer-claim.json"
+WRITER_AUTHORITY_ENV = "CONTINUUM_WRITER_AUTHORITY_ID"
+WRITER_AUTHORITY_RE = re.compile(r"^[0-9a-f]{64}$")
 SUPPORTED_WRITER_RUNTIMES = {"windows", "wsl", "linux", "macos"}
 WSL_WINDOWS_MOUNT_RE = re.compile(r"^/mnt/[a-z](?:/|$)", re.IGNORECASE)
 
@@ -132,7 +135,7 @@ def _validate_claim(payload: Any) -> dict[str, str]:
     runtime = payload.get("runtime")
     host = payload.get("host")
     claimed_at = payload.get("claimed_at")
-    if schema != WRITER_CLAIM_SCHEMA:
+    if schema not in {WRITER_CLAIM_SCHEMA, WRITER_CLAIM_AUTHORITY_SCHEMA}:
         raise WriterClaimError(f"unsupported writer-claim schema: {schema!r}")
     if runtime not in SUPPORTED_WRITER_RUNTIMES:
         raise WriterClaimError(f"invalid writer-claim runtime: {runtime!r}")
@@ -146,12 +149,23 @@ def _validate_claim(payload: Any) -> dict[str, str]:
         raise WriterClaimError("writer-claim claimed_at must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise WriterClaimError("writer-claim claimed_at must include a UTC offset")
-    return {
-        "schema": WRITER_CLAIM_SCHEMA,
+    validated = {
+        "schema": schema,
         "runtime": runtime,
         "host": host,
         "claimed_at": claimed_at,
     }
+    if schema == WRITER_CLAIM_AUTHORITY_SCHEMA:
+        expected_keys = {"schema", "runtime", "host", "claimed_at", "authority_id"}
+        if set(payload) != expected_keys:
+            raise WriterClaimError(
+                "authority writer-claim marker must contain exactly schema, runtime, host, claimed_at, and authority_id"
+            )
+        authority_id = payload.get("authority_id")
+        if not isinstance(authority_id, str) or WRITER_AUTHORITY_RE.fullmatch(authority_id) is None:
+            raise WriterClaimError("writer-claim authority_id must be exactly 64 lowercase hexadecimal characters")
+        validated["authority_id"] = authority_id
+    return validated
 
 
 def _load_claim(marker: Path) -> dict[str, str]:
@@ -252,16 +266,33 @@ def _is_wsl_windows_mount(root: Path) -> bool:
     return any(WSL_WINDOWS_MOUNT_RE.match(candidate) is not None for candidate in (lexical, resolved))
 
 
-def _identity_matches(claim: Mapping[str, str], identity: Mapping[str, str]) -> bool:
-    return claim.get("runtime") == identity.get("runtime") and claim.get("host") == identity.get("host")
+def _configured_writer_authority(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    value = env.get(WRITER_AUTHORITY_ENV)
+    return value if isinstance(value, str) and value else None
+
+
+def _identity_matches(
+    claim: Mapping[str, str],
+    identity: Mapping[str, str],
+    *,
+    authority_id: str | None = None,
+) -> bool:
+    if claim.get("runtime") != identity.get("runtime") or claim.get("host") != identity.get("host"):
+        return False
+    if claim.get("schema") == WRITER_CLAIM_AUTHORITY_SCHEMA:
+        return authority_id is not None and authority_id == claim.get("authority_id")
+    return True
 
 
 def writer_claim_status(
     root: Path,
     *,
     identity: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    current = dict(identity or detect_runtime_identity())
+    current = dict(identity or detect_runtime_identity(environ=environ))
+    authority_id = _configured_writer_authority(environ)
     result: dict[str, Any] = {
         "ok": True,
         "marker_uri": str(writer_claim_path(root)),
@@ -270,6 +301,9 @@ def writer_claim_status(
         "compatible": None,
         "claim": None,
         "root_has_existing_state": _root_has_existing_state(root),
+        "authority_required": False,
+        "authority_present": authority_id is not None,
+        "authority_compatible": None,
     }
     try:
         marker = _safe_claim_path(root, create=False)
@@ -284,12 +318,16 @@ def writer_claim_status(
     except WriterClaimError as exc:
         result.update({"ok": False, "compatible": False, "error": str(exc), "auto_claim_allowed": False})
         return result
+    authority_required = claim.get("schema") == WRITER_CLAIM_AUTHORITY_SCHEMA
+    authority_compatible = not authority_required or authority_id == claim.get("authority_id")
     result.update(
         {
             "claimed": True,
-            "compatible": _identity_matches(claim, current),
+            "compatible": _identity_matches(claim, current, authority_id=authority_id),
             "claim": claim,
             "auto_claim_allowed": False,
+            "authority_required": authority_required,
+            "authority_compatible": authority_compatible,
         }
     )
     return result
@@ -306,8 +344,10 @@ def claim_writer(
     force: bool = False,
     acknowledge_writers_stopped: bool = False,
     identity: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    current = dict(identity or detect_runtime_identity())
+    current = dict(identity or detect_runtime_identity(environ=environ))
+    authority_id = _configured_writer_authority(environ)
     if current.get("runtime") not in SUPPORTED_WRITER_RUNTIMES:
         raise WriterClaimError(f"unsupported writer runtime: {current.get('runtime')!r}")
     current["host"] = _normalized_host(current.get("host"))
@@ -323,8 +363,8 @@ def claim_writer(
             previous = _load_claim(marker)
         except WriterClaimError:
             previous = None
-        if previous is not None and _identity_matches(previous, current):
-            return {**writer_claim_status(root, identity=current), "changed": False}
+        if previous is not None and _identity_matches(previous, current, authority_id=authority_id):
+            return {**writer_claim_status(root, identity=current, environ=environ), "changed": False}
         if not force or not acknowledge_writers_stopped:
             raise WriterClaimError(
                 "writer claim belongs to another runtime/host or is malformed; stop every Continuum writer first, "
@@ -332,29 +372,39 @@ def claim_writer(
             )
         _safe_claim_path(root, create=False)
         secure_write_text(marker, _claim_text(claim))
-        return {**writer_claim_status(root, identity=current), "changed": True, "previous_claim": previous}
+        return {
+            **writer_claim_status(root, identity=current, environ=environ),
+            "changed": True,
+            "previous_claim": previous,
+        }
     created = _create_claim_exclusive(marker, claim)
     if not created:
         existing = _load_claim(_safe_claim_path(root, create=False))
-        if not _identity_matches(existing, current):
+        if not _identity_matches(existing, current, authority_id=authority_id):
             raise WriterClaimError(
                 "another runtime/host claimed this Continuum root concurrently; "
                 f"inspect with `continuum writer-status --root \"{root}\"`"
             )
-    return {**writer_claim_status(root, identity=current), "changed": created}
+    return {**writer_claim_status(root, identity=current, environ=environ), "changed": created}
 
 
 def ensure_writer_claim(
     root: Path,
     *,
     identity: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    current = dict(identity or detect_runtime_identity())
-    status = writer_claim_status(root, identity=current)
+    current = dict(identity or detect_runtime_identity(environ=environ))
+    status = writer_claim_status(root, identity=current, environ=environ)
     if status.get("claimed"):
         if status.get("ok") and status.get("compatible"):
             return status
         claim = status.get("claim") or {}
+        if claim.get("schema") == WRITER_CLAIM_AUTHORITY_SCHEMA and status.get("authority_compatible") is False:
+            raise WriterClaimError(
+                "Continuum root is fenced by a recovery writer authority; this process does not hold the exact "
+                f"{WRITER_AUTHORITY_ENV} capability. Use read-only commands until the guarded recovery releases it."
+            )
         raise WriterClaimError(
             "Continuum root is write-claimed by "
             f"{claim.get('runtime', 'unknown')}@{claim.get('host', 'unknown')}; current writer is "
@@ -378,4 +428,4 @@ def ensure_writer_claim(
             "WSL will not auto-claim a new Continuum root on /mnt/<drive>; choose one writer runtime, then explicitly "
             f"claim it with `{_claim_command(root)}`"
         )
-    return claim_writer(root, identity=current)
+    return claim_writer(root, identity=current, environ=environ)

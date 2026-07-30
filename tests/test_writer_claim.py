@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -12,7 +13,10 @@ from continuum.cli import main as cli_main
 from continuum.core.bundle import _is_transient
 from continuum.core.operations import start_operation, verify_root
 from continuum.core.store import append_scroll_event, connect, connect_existing, init_db, status
+from continuum.core.workers import run_worker_pass
 from continuum.core.writer_claim import (
+    WRITER_AUTHORITY_ENV,
+    WRITER_CLAIM_AUTHORITY_SCHEMA,
     WRITER_CLAIM_SCHEMA,
     WriterClaimError,
     _is_wsl_windows_mount,
@@ -27,9 +31,31 @@ from continuum.core.writer_claim import (
 WINDOWS = {"runtime": "windows", "host": "continuum-host"}
 WSL = {"runtime": "wsl", "host": "continuum-host"}
 LINUX = {"runtime": "linux", "host": "linux-host"}
+PROMOTION_AUTHORITY = "a" * 64
+NORMAL_AUTHORITY = "b" * 64
 
 
 class WriterClaimTests(unittest.TestCase):
+    @staticmethod
+    def _write_authority_claim(root: Path, authority_id: str = PROMOTION_AUTHORITY) -> None:
+        marker = writer_claim_path(root)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema": WRITER_CLAIM_AUTHORITY_SCHEMA,
+                    "runtime": WINDOWS["runtime"],
+                    "host": WINDOWS["host"],
+                    "claimed_at": "2026-07-30T00:00:00+00:00",
+                    "authority_id": authority_id,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def test_runtime_detection_distinguishes_windows_wsl_linux_and_macos(self) -> None:
         self.assertEqual(
             detect_runtime_identity(system="Windows", environ={}, osrelease="", hostname="HOST-A"),
@@ -176,6 +202,142 @@ class WriterClaimTests(unittest.TestCase):
                     start_operation(root, operation_type="blocked", title="blocked")
                 after = list((root / "run" / "operations").glob("*.json")) if (root / "run" / "operations").exists() else []
                 self.assertEqual(after, before)
+
+    def test_authority_claim_blocks_same_runtime_without_exact_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                self._write_authority_claim(root)
+
+                missing = writer_claim_status(root, environ={})
+                self.assertTrue(missing["claimed"])
+                self.assertTrue(missing["authority_required"])
+                self.assertFalse(missing["authority_present"])
+                self.assertFalse(missing["authority_compatible"])
+                self.assertFalse(missing["compatible"])
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: ""}):
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        connect(root)
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        append_scroll_event(
+                            root,
+                            session_id="fenced",
+                            event_type="message",
+                            role="user",
+                            content="must remain fenced",
+                        )
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        start_operation(root, operation_type="fenced", title="fenced")
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        run_worker_pass(root, limit=1, maintenance=False)
+
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: NORMAL_AUTHORITY}):
+                    wrong = writer_claim_status(root)
+                    self.assertTrue(wrong["authority_present"])
+                    self.assertFalse(wrong["authority_compatible"])
+                    self.assertFalse(wrong["compatible"])
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        init_db(root)
+
+    def test_authority_claim_allows_only_exact_case_sensitive_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            with patch("continuum.core.writer_claim.detect_runtime_identity", return_value=WINDOWS):
+                init_db(root)
+                self._write_authority_claim(root)
+
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: PROMOTION_AUTHORITY}):
+                    allowed = ensure_writer_claim(root)
+                    connection = connect(root)
+                    connection.close()
+                    unchanged = claim_writer(root)
+
+                self.assertTrue(allowed["compatible"])
+                self.assertTrue(allowed["authority_required"])
+                self.assertTrue(allowed["authority_compatible"])
+                self.assertFalse(unchanged["changed"])
+                self.assertEqual(unchanged["claim"]["schema"], WRITER_CLAIM_AUTHORITY_SCHEMA)
+
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: PROMOTION_AUTHORITY.upper()}):
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        ensure_writer_claim(root)
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        connect(root)
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        start_operation(root, operation_type="wrong-authority", title="wrong-authority")
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        run_worker_pass(root, limit=1, maintenance=False)
+
+                with patch.dict(os.environ, {WRITER_AUTHORITY_ENV: "malformed"}):
+                    with self.assertRaisesRegex(WriterClaimError, "recovery writer authority"):
+                        connect(root)
+
+    def test_authority_claim_requires_valid_exact_marker_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._write_authority_claim(root, "ABC")
+
+            state = writer_claim_status(root, identity=WINDOWS, environ={WRITER_AUTHORITY_ENV: "ABC"})
+
+            self.assertFalse(state["ok"])
+            self.assertFalse(state["compatible"])
+            self.assertIn("64 lowercase hexadecimal", state["error"])
+
+    def test_authority_claim_rejects_unbound_extra_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._write_authority_claim(root)
+            marker = writer_claim_path(root)
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["unexpected"] = "not-authority"
+            marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            state = writer_claim_status(
+                root,
+                identity=WINDOWS,
+                environ={WRITER_AUTHORITY_ENV: PROMOTION_AUTHORITY},
+            )
+
+            self.assertFalse(state["ok"])
+            self.assertFalse(state["compatible"])
+            self.assertIn("must contain exactly", state["error"])
+
+    def test_v1_claim_remains_compatible_with_unrelated_authority_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            claim_writer(root, identity=WINDOWS, environ={WRITER_AUTHORITY_ENV: NORMAL_AUTHORITY})
+
+            status_result = writer_claim_status(
+                root,
+                identity=WINDOWS,
+                environ={WRITER_AUTHORITY_ENV: NORMAL_AUTHORITY},
+            )
+
+            self.assertEqual(status_result["claim"]["schema"], WRITER_CLAIM_SCHEMA)
+            self.assertTrue(status_result["compatible"])
+            self.assertFalse(status_result["authority_required"])
+            self.assertTrue(status_result["authority_present"])
+            self.assertTrue(status_result["authority_compatible"])
+
+    def test_authority_claim_force_transfer_still_requires_stopped_writer_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self._write_authority_claim(root)
+
+            with self.assertRaisesRegex(WriterClaimError, "stop every Continuum writer"):
+                claim_writer(root, identity=WINDOWS, force=True, environ={})
+            transferred = claim_writer(
+                root,
+                identity=WINDOWS,
+                force=True,
+                acknowledge_writers_stopped=True,
+                environ={},
+            )
+
+            self.assertTrue(transferred["changed"])
+            self.assertEqual(transferred["claim"]["schema"], WRITER_CLAIM_SCHEMA)
+            self.assertEqual(transferred["previous_claim"]["schema"], WRITER_CLAIM_AUTHORITY_SCHEMA)
 
     def test_strict_verify_degrades_to_read_only_on_runtime_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

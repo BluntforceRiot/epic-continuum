@@ -2320,6 +2320,7 @@ def doctor(
         )
     except Exception as exc:
         add("private_permissions", False, error=str(exc))
+    root_status: dict[str, Any] | None
     if read_only_writer_claim:
         reason = "writer_claim_incompatible_read_only_diagnostic"
         if not writer_claim.get("ok"):

@@ -1,6 +1,6 @@
 {
   "name": "continuum",
-  "version": "0.3.0+codex.20260710025836",
+  "version": "0.3.0+codex.20260812041423",
   "description": "Epic Continuum local persistent memory, context continuity, and crash recovery for Codex-compatible agents.",
   "author": {
     "name": "Bluntforce / Epic Continuum"

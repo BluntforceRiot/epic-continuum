@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - 2026-07-13
+## 0.3.0 - 2026-08-12
 
 - Added automatic latest-state resume discovery for the CLI and MCP surface,
   with strict personal resume modes, canonical partition lookup, immutable
@@ -292,6 +292,11 @@
   canonical source-ZIP extractions, and closes the uploaded directory with a v2
   hash receipt. Download verification is build-tool independent, and the wheel
   and sdist suites run on both Linux and Windows CI.
+- Hardened long-lived-root recovery and release operation with bounded resume
+  authority and migration scans, bounded warm initialization, fair retry-pending
+  scheduling after worker exit, fenced nested recovery, crash-convergent stale
+  publication, writer-claim-safe guarded recovery and diagnostics, and isolated
+  bundle verification that keeps semantic-worker bytecode out of source trees.
 - Kept the catalog capability schema at `0.2.0`; these features are additive and do not
   require a destructive migration or downgrade of existing catalogs.
 

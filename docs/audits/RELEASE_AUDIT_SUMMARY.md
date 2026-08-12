@@ -17,14 +17,18 @@ The release gate focused on:
 
 ## Current Gate
 
-On 2026-07-15, the narrow replacement candidate based on immutable reviewed
-commit `c5f6fb8d98fbb8bab93fe3c48af9824bf5fef64a` completed fresh Windows and
-WSL source verification after repairing strict MCP request handling and the
-slow-host test fixture. Earlier 0.2 release-candidate work also exercised the
-durability foundation on disposable Debian 12 and Debian 13 systems. The public
-source package intentionally keeps this as a summary rather than bundling full
-local run logs; the repository CI matrix remains the cross-platform publication
-gate for the final v0.3 commit.
+On 2026-08-12, the public release candidate was advanced through generic repair
+commit `9577887d4aad17e5585ac9d8a2420182aea966d8`, the last public Continuum
+commit before separate local-only development begins. The candidate remains the
+generic `epic-continuum-memory` 0.3.0 distribution and contains no downstream
+local-agent editions or experimental features. Its final build-cycle receipt
+and GitHub checks are authoritative for the exact release commit, test counts,
+and artifact hashes.
+
+The historical evidence below records earlier v0.3 gates that the final
+candidate supersedes. The public source package intentionally keeps this as a
+summary rather than bundling full local run logs; the repository CI matrix
+remains the cross-platform publication gate for the final v0.3 commit.
 
 Static pytest discovery collected 1,134 test methods across 32 files: 304 in
 `tests/test_review_bridge.py` and 830 in the other 31 files. Fresh Windows runs
@@ -74,10 +78,10 @@ preparation deadlines widened to 30 seconds; the product's 120-second
 preparation default is unchanged.
 
 Repository-wide Ruff, mypy across 31 source files, compileall, the four-test
-fixture-allowlist gate, and Git diff integrity passed. The fixture allowlist has
-166 parsed fingerprints and 169 physical lines, including its three header
-lines. These results supersede this file's historical 210/778/988 test counts
-and 165-fingerprint claim.
+fixture-allowlist gate, and Git diff integrity passed. The refreshed fixture
+allowlist has 196 parsed fingerprints and 199 physical lines, including its
+three header lines. The final release receipt supersedes the historical test
+counts recorded below.
 
 The externally reviewed `c5f6fb8` five-file artifact set, checksums, archive
 audits, finalizer proof, and clean-install behavior all passed and remain

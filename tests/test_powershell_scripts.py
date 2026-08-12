@@ -10,6 +10,76 @@ import unittest
 from pathlib import Path
 
 
+class PosixShellScriptTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repo_root = Path(__file__).resolve().parents[1]
+        cls.bash = shutil.which("bash")
+        if cls.bash is None:
+            raise unittest.SkipTest("Bash is unavailable")
+
+    def test_codex_stage_only_does_not_claim_installation_or_call_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            log_path = temp_root / "calls.log"
+            python_stub = temp_root / "python-stub"
+            codex_stub = temp_root / "codex-stub"
+            python_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'python %s\\n' \"$*\" >> \"$STUB_LOG\"\n"
+                "printf '%s\\n' \"$STUB_STAGE_OUTPUT\"\n",
+                encoding="utf-8",
+            )
+            codex_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'codex %s\\n' \"$*\" >> \"$STUB_LOG\"\n",
+                encoding="utf-8",
+            )
+            python_stub.chmod(0o755)
+            codex_stub.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "STUB_LOG": log_path.as_posix(),
+                    "STUB_STAGE_OUTPUT": (temp_root / "stage").as_posix(),
+                }
+            )
+            completed = subprocess.run(
+                [
+                    str(self.bash),
+                    (self.repo_root / "scripts" / "install_codex_plugin.sh").as_posix(),
+                    "--repo-root",
+                    self.repo_root.as_posix(),
+                    "--root",
+                    (temp_root / "root").as_posix(),
+                    "--python",
+                    python_stub.as_posix(),
+                    "--stage-root",
+                    (temp_root / "stage-base").as_posix(),
+                    "--codex",
+                    codex_stub.as_posix(),
+                    "--stage-only",
+                ],
+                cwd=self.repo_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(completed.returncode, 0, completed)
+            self.assertEqual(
+                len([line for line in calls if line.startswith("python ")]),
+                1,
+                calls,
+            )
+            self.assertFalse(any(line.startswith("codex ") for line in calls), calls)
+            self.assertIn("staged without registration", completed.stdout)
+            self.assertNotIn("plugin installed", completed.stdout)
+
+
 @unittest.skipUnless(os.name == "nt", "PowerShell native-exit tests require Windows")
 class PowerShellNativeExitTests(unittest.TestCase):
     @classmethod

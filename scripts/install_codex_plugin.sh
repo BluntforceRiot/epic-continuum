@@ -70,7 +70,9 @@ stage_root="$("$python_cmd" "${stage_args[@]}")"
 if [[ "$stage_only" == "0" ]]; then
   "$codex_cmd" plugin marketplace add "$stage_root"
   "$codex_cmd" plugin add continuum@epic-continuum
+  printf 'Epic Continuum Codex plugin installed from staged marketplace: %s\n' "$stage_root/.agents/plugins/marketplace.json"
+else
+  printf 'Epic Continuum Codex plugin staged without registration: %s\n' "$stage_root/.agents/plugins/marketplace.json"
 fi
 
-printf 'Epic Continuum Codex plugin installed from staged marketplace: %s\n' "$stage_root/.agents/plugins/marketplace.json"
 printf 'Epic Continuum root: %s\n' "$root"

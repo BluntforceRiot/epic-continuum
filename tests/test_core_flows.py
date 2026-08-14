@@ -2387,9 +2387,8 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                 thread.start()
                 try:
                     self.assertTrue(receipt_flush_entered.wait(timeout=5))
-                    started = time.monotonic()
                     with closing(connect_catalog(root)) as writer_conn:
-                        writer_conn.execute("PRAGMA busy_timeout = 250")
+                        writer_conn.execute("PRAGMA busy_timeout = 0")
                         writer_conn.execute("BEGIN IMMEDIATE")
                         store_module.audit_event(
                             writer_conn,
@@ -2398,7 +2397,6 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                             target_id="writer_committed",
                         )
                         writer_conn.commit()
-                    elapsed = time.monotonic() - started
                 finally:
                     allow_receipt_flush.set()
                     thread.join(timeout=10)
@@ -2408,7 +2406,6 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0]["ok"], results)
             self.assertEqual(results[0]["results"][0]["status"], "adopted")
-            self.assertLess(elapsed, 0.25)
 
     def test_large_catalog_terminal_cas_and_epoch_trigger_cost_are_bounded(
         self,
@@ -3192,9 +3189,8 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                 thread.start()
                 try:
                     self.assertTrue(replay_flush_entered.wait(timeout=5))
-                    started = time.monotonic()
                     with closing(connect_catalog(root)) as writer_conn:
-                        writer_conn.execute("PRAGMA busy_timeout = 250")
+                        writer_conn.execute("PRAGMA busy_timeout = 0")
                         writer_conn.execute("BEGIN IMMEDIATE")
                         store_module.audit_event(
                             writer_conn,
@@ -3203,7 +3199,6 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                             target_id="writer_committed",
                         )
                         writer_conn.commit()
-                    elapsed = time.monotonic() - started
                 finally:
                     allow_replay_flush.set()
                     thread.join(timeout=10)
@@ -3213,7 +3208,6 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0]["ok"], results)
             self.assertEqual(results[0]["results"][0]["status"], "adopted")
-            self.assertLess(elapsed, 0.25)
             self.assertFalse(intent_path.exists())
 
     def test_sidecar_strict_namespace_failures_remain_recoverable(self) -> None:

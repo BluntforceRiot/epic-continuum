@@ -936,9 +936,10 @@ def replace_file_noclobber(source: Path, destination: Path) -> None:
     """Atomically move ``source`` to an absent ``destination``.
 
     Windows rename already has no-replace semantics.  Linux exposes the same
-    operation as ``renameat2(RENAME_NOREPLACE)``.  Refuse the operation on a
-    platform that cannot provide that primitive; copying followed by unlinking
-    would introduce both a clobber window and an identity-unbound deletion.
+    operation as ``renameat2(RENAME_NOREPLACE)``, while macOS exposes
+    ``renamex_np(RENAME_EXCL)``.  Refuse the operation on a platform that
+    cannot provide that primitive; copying followed by unlinking would
+    introduce both a clobber window and an identity-unbound deletion.
     """
 
     secure_mkdir(destination.parent)
@@ -970,6 +971,36 @@ def replace_file_noclobber(source: Path, destination: Path) -> None:
                 at_fdcwd,
                 os.fsencode(destination),
                 rename_noreplace,
+            )
+            != 0
+        ):
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                str(destination),
+            )
+    elif sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-clobber rename is unavailable",
+                str(destination),
+            )
+        renamex_np.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renamex_np.restype = ctypes.c_int
+        rename_excl = 0x00000004
+        if (
+            renamex_np(
+                os.fsencode(source),
+                os.fsencode(destination),
+                rename_excl,
             )
             != 0
         ):

@@ -554,7 +554,7 @@ class TemporalConflictIntegrityTest(unittest.TestCase):
                 comparison_limit=15,
                 component_member_limit=4,
                 mutation_limit=3,
-                transaction_seconds=1.0,
+                transaction_seconds=5.0,
             )
 
             limits = result["work_budget"]["limits"]

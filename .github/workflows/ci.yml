@@ -24,7 +24,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip "setuptools>=77" build
           python -m pip install --no-deps --no-build-isolation -e .
-      - name: Run exact failing test
-        run: >-
-          python -m unittest -v
-          tests.test_authority_capacity.ProjectStateAuthorityCapacityTests.test_1001_projects_remain_verifiable_resumable_and_snapshottable
+      - name: Print compact sidecar failure
+        run: |
+          python - <<'PY'
+          import json
+          import tempfile
+          from pathlib import Path
+
+          from continuum.core import store
+          from tests.test_authority_capacity import _seed_independent_project_states
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp) / "continuum"
+              card_ids = _seed_independent_project_states(root, count=1001)
+              result = store.sync_pending_card_sidecars(root)
+              compact = {
+                  "card_count": len(card_ids),
+                  "ok": result.get("ok"),
+                  "synced": result.get("synced"),
+                  "deferred": result.get("deferred"),
+                  "failed": result.get("failed"),
+                  "pending": result.get("pending"),
+                  "failure_count": len(result.get("failures") or []),
+                  "failure_sample": (result.get("failures") or [])[:3],
+                  "compensation_cas_complete": result.get("compensation_cas_complete"),
+              }
+              print(json.dumps(compact, indent=2, sort_keys=True))
+              if not result.get("ok"):
+                  raise SystemExit(1)
+          PY

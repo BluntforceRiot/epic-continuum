@@ -1020,6 +1020,21 @@ def _role_filtered_candidate_sql(
             "pending_job.priority ASC, pending_job.created_at ASC, "
             "pending_job.rowid ASC"
         )
+    if retry_pending is not None:
+        prefix_clause = """
+          (pending_job.role, pending_job.status, pending_job.retry_pending)
+              >= (?1, ?2, ?3)
+          AND (pending_job.role, pending_job.status, pending_job.retry_pending)
+              <= (?1, ?2, ?3)"""
+        order_by = (
+            "pending_job.role ASC, pending_job.status ASC, "
+            "pending_job.retry_pending ASC, "
+            + order_by
+        )
+    else:
+        prefix_clause = (
+            "pending_job.role = ? AND pending_job.status = ?"
+        )
     deferred_clause = (
         """
           AND pending_job.id NOT IN (
@@ -1028,16 +1043,10 @@ def _role_filtered_candidate_sql(
         if exclude_deferred
         else ""
     )
-    retry_clause = (
-        "AND pending_job.retry_pending = ?"
-        if retry_pending is not None
-        else ""
-    )
     return f"""
         SELECT pending_job.*, pending_job.rowid AS queue_rowid
         FROM queue_jobs AS pending_job INDEXED BY {index_name}
-        WHERE pending_job.role = ? AND pending_job.status = ?
-          {retry_clause}
+        WHERE {prefix_clause}
           {deferred_clause}
           AND (
               pending_job.dedupe_key IS NULL
@@ -1134,17 +1143,22 @@ def _eligible_job_candidate(
             "pending_job.priority ASC, pending_job.created_at ASC, "
             "pending_job.rowid ASC"
         )
+    if retry_pending is not None:
+        prefix_clause = """
+          (pending_job.status, pending_job.retry_pending) >= (?1, ?2)
+          AND (pending_job.status, pending_job.retry_pending) <= (?1, ?2)"""
+        order_by = (
+            "pending_job.status ASC, pending_job.retry_pending ASC, "
+            + order_by
+        )
+    else:
+        prefix_clause = "pending_job.status = ?"
     deferred_clause = (
         """
           AND pending_job.id NOT IN (
               SELECT value FROM json_each(?)
           )"""
         if deferred_json is not None
-        else ""
-    )
-    retry_clause = (
-        "AND pending_job.retry_pending = ?"
-        if retry_pending is not None
         else ""
     )
     params = [PENDING_JOB_STATUS]
@@ -1156,8 +1170,7 @@ def _eligible_job_candidate(
         f"""
         SELECT pending_job.*, pending_job.rowid AS queue_rowid
         FROM queue_jobs AS pending_job INDEXED BY {index_name}
-        WHERE pending_job.status = ?
-          {retry_clause}
+        WHERE {prefix_clause}
           {deferred_clause}
           AND (
               pending_job.dedupe_key IS NULL

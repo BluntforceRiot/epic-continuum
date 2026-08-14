@@ -4949,6 +4949,20 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 )
                 conn.commit()
                 conn.execute("ANALYZE")
+                fresh_plan = " ".join(
+                    str(row["detail"])
+                    for row in conn.execute(
+                        "EXPLAIN QUERY PLAN "
+                        + worker_module._role_filtered_candidate_sql(
+                            oldest=False,
+                            retry_pending=False,
+                        ),
+                        ("archivist", "pending", 0),
+                    ).fetchall()
+                )
+                self.assertIn("SEARCH", fresh_plan)
+                self.assertIn("idx_queue_role_priority", fresh_plan)
+                self.assertNotIn("TEMP B-TREE", fresh_plan)
                 plan = " ".join(
                     str(row["detail"])
                     for row in conn.execute(

@@ -1303,6 +1303,31 @@ print(json.dumps(
             self.assertFalse(destination.exists())
             self.assertEqual(list(destination.parent.glob(".receipt.json.*.tmp")), [])
 
+    def test_atomic_noclobber_rename_moves_once_and_preserves_existing_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(b"first publication")
+
+            permissions_module.replace_file_noclobber(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), b"first publication")
+
+            competitor = root / "competitor.bin"
+            competitor.write_bytes(b"second publication")
+            with self.assertRaises(FileExistsError):
+                permissions_module.replace_file_noclobber(
+                    competitor,
+                    destination,
+                )
+
+            self.assertEqual(competitor.read_bytes(), b"second publication")
+            self.assertEqual(destination.read_bytes(), b"first publication")
+
     def test_secure_copy_file_flushes_data_before_parent_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

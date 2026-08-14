@@ -4231,6 +4231,11 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertNotIn("tree_inventory", receipt)
             self.assertNotIn("accepted_integrity_findings", receipt)
             self.assertEqual(retained_file.read_bytes(), b"historical operator evidence\n")
+            receipt_relative = (
+                f"{review_bridge_module.REVIEW_RECEIPTS_DIR}/"
+                f"{review_bridge_module.REVIEW_LEGACY_QUARANTINE_NAME}"
+            )
+            self.assertTrue(receipt_path.samefile(job_dir / receipt_relative))
             self.assertEqual(
                 original_files,
                 {
@@ -4238,7 +4243,7 @@ class ReviewBridgeTest(unittest.TestCase):
                     for path in job_dir.rglob("*")
                     if path.is_file()
                     and not path.is_symlink()
-                    and path != receipt_path
+                    and path.relative_to(job_dir).as_posix() != receipt_relative
                 },
             )
             self.assertTrue(review_bridge_module.review_bridge_integrity_report(root)["ok"])

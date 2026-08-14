@@ -14942,6 +14942,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
             sidecar = store_module.card_sidecar_path(root, card_id)
             assert sidecar is not None
             uppercase = sidecar.with_name(sidecar.name.upper())
+            if uppercase.exists():
+                self.skipTest("case-distinct paths require a case-sensitive filesystem")
             uppercase.write_bytes(sidecar.read_bytes())
             integrity = semantic_integrity_report(root)
             self.assertEqual(

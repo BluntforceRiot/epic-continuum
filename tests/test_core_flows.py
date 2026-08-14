@@ -5642,6 +5642,8 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             )
             default_path = Path(segment["card_uri"])
             distinct_path = root / "Catalog" / "Cards" / default_path.name
+            if distinct_path.exists():
+                self.skipTest("case-distinct paths require a case-sensitive filesystem")
             distinct_path.parent.mkdir(parents=True, exist_ok=True)
             distinct_bytes = b"case-distinct immutable proof\n"
             distinct_path.write_bytes(distinct_bytes)
@@ -5996,10 +5998,12 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
                     ).fetchone()["location_uri"]
                 )
             managed_path = resolve_stored_uri(root, managed_uri)
+            uppercase_alias = managed_path.with_name(managed_path.name.upper())
+            if uppercase_alias.exists():
+                self.skipTest("case-distinct paths require a case-sensitive filesystem")
             outside_path = Path(tmp) / "outside-casefold-card.yaml"
             managed_path.replace(outside_path)
             outside_bytes = outside_path.read_bytes()
-            uppercase_alias = managed_path.with_name(managed_path.name.upper())
             uppercase_alias.symlink_to(outside_path)
 
             rejected = sync_card_sidecars_after_commit(root, [card_id])

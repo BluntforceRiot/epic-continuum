@@ -5646,7 +5646,7 @@ def _retire_card_sidecar_publisher_temp(
         import msvcrt
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL(
+        kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
             "kernel32",
             use_last_error=True,
         )
@@ -5680,10 +5680,12 @@ def _retire_card_sidecar_publisher_temp(
         )
         handle_value = int(getattr(raw_handle, "value", raw_handle) or 0)
         if handle_value in {0, invalid_handle}:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(  # type: ignore[attr-defined]
+                ctypes.get_last_error()  # type: ignore[attr-defined]
+            )
         fd = -1
         try:
-            fd = msvcrt.open_osfhandle(
+            fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
                 handle_value,
                 os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
             )
@@ -5719,7 +5721,7 @@ def _retire_card_sidecar_publisher_temp(
                     "Card sidecar publisher temporary namespace binding changed"
                 )
             set_windows_delete_disposition(
-                int(msvcrt.get_osfhandle(fd))
+                int(msvcrt.get_osfhandle(fd))  # type: ignore[attr-defined]
             )
         finally:
             if fd >= 0:

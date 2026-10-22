@@ -182,6 +182,7 @@ class ReleaseHardeningTest(unittest.TestCase):
 
         for relative_path in (
             "docs/review-relay.md",
+            "docs/RELEASE_NOTES_0.3.1.md",
             "docs/worker-operations.md",
             "docs/writer-claims.md",
         ):

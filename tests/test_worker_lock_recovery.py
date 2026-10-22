@@ -13,6 +13,77 @@ from continuum.core.store import connect, create_card, enqueue_job, init_db, mar
 
 
 class WorkerLockRecoveryTest(unittest.TestCase):
+    def test_conflict_escalation_lock_preserves_committed_base_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memory"
+            init_db(root)
+            with closing(connect(root)) as conn:
+                for summary in ("Decision: use the blue route.", "Decision: do not use the blue route."):
+                    create_card(conn, root=root, card_type="decision", title="Route choice",
+                                summary=summary, source_refs=[], topics=["routes"])
+                conn.execute("DELETE FROM queue_jobs")
+                conn.commit()
+            original_detect = workers.detect_conflicts
+            original_finish = workers._ConflictWorkBudget.finish_transaction
+            detected = []
+            calls = []
+            finishes = []
+
+            def commit_crosses_deadline(budget):
+                original_finish(budget)
+                finishes.append(1)
+                if len(finishes) == 1:
+                    budget.finished = budget.deadline + 0.001
+                    budget.time_exhausted = True
+
+            def escalation_once_busy(*args, **kwargs):
+                calls.append(kwargs.get("card_id"))
+                if len(calls) == 2:
+                    raise sqlite3.OperationalError("database is locked")
+                result = original_detect(*args, **kwargs)
+                detected.append(result)
+                return result
+
+            with (
+                patch.object(workers._ConflictWorkBudget, "finish_transaction", commit_crosses_deadline),
+                patch.object(workers, "detect_conflicts", side_effect=escalation_once_busy),
+                patch.object(workers, "_sync_worker_card_sidecars", return_value={
+                    "ok": False, "synced": 0, "failed": 2,
+                    "failures": [{"error": "OperationalError: disk I/O error"}],
+                }),
+                patch.object(workers.time, "sleep") as sleep,
+            ):
+                result = workers.serve_workers(root, limit=1)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "worker_pass_failed")
+            self.assertEqual(len(calls), 3)
+            self.assertIsNone(calls[0])
+            self.assertTrue(calls[1])
+            self.assertEqual(calls[1], calls[2])
+            self.assertFalse(detected[0]["ok"])
+            self.assertEqual(result["failed_pass"]["maintenance"]["conflicts"], detected[0])
+            sleep.assert_called_once_with(5)
+            with closing(connect(root)) as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM card_sidecar_outbox").fetchone()[0], 2)
+
+    def test_conflict_signal_lock_preserves_both_scan_results(self):
+        base = {"ok": False, "scan": {"anchor_card_id": "card-fixture"},
+                "continuation": {"required": True, "requires_larger_budget": True}}
+        escalated = {**base, "reason": "permanent-sidecar-failure"}
+        with (
+            patch.object(workers, "detect_conflicts", side_effect=[base, escalated]) as detect,
+            patch.object(workers, "_record_conflict_review_signal", side_effect=[
+                sqlite3.OperationalError("database is locked"), {"ok": True},
+            ]) as signal,
+            patch.object(workers.time, "sleep") as sleep,
+        ):
+            result = workers._run_conflict_maintenance(Path("unused-root"))
+        self.assertEqual(result["conflicts"], base)
+        self.assertEqual(result["conflict_escalation"], escalated)
+        self.assertEqual(detect.call_count, 2)
+        self.assertEqual(signal.call_count, 2)
+        sleep.assert_called_once_with(5)
+
     def test_busy_retry_transfers_to_existing_public_dedupe_successor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "memory"
@@ -169,7 +240,7 @@ class WorkerLockRecoveryTest(unittest.TestCase):
             "_recover_failed_post_phase_sidecar_jobs",
             "decay_graph_routes",
             "apply_storage_tiering",
-            "_run_conflict_maintenance",
+            "detect_conflicts",
         )
         for unit in maintenance_units:
             for job_ok in (False, True):

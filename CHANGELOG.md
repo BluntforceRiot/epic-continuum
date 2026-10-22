@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 - Unreleased
+## 0.3.1 - 2026-10-22
 
 - Persistent workers retry SQLite BUSY/LOCKED failures with capped backoff,
   preserving job retry ownership, deduplication and committed effects. Other

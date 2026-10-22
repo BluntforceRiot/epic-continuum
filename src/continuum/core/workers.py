@@ -5874,10 +5874,12 @@ def _run_conflict_maintenance(
 ) -> dict[str, Any]:
     """Run one base pass, at most one hard-cap escalation, then quarantine."""
 
-    base = detect_conflicts(
-        root,
-        limit=25,
-        recover_pending_card_sidecars=recover_pending_card_sidecars,
+    base = _retry_worker_sqlite_busy(
+        lambda: detect_conflicts(
+            root,
+            limit=25,
+            recover_pending_card_sidecars=recover_pending_card_sidecars,
+        )
     )
     result: dict[str, Any] = {"conflicts": base}
     if not _conflict_result_requires_larger_budget(base):
@@ -5887,23 +5889,24 @@ def _run_conflict_maintenance(
     anchor_card_id = str(scan.get("anchor_card_id") or "")
     final_result = base
     if anchor_card_id:
-        escalated = detect_conflicts(
-            root,
-            card_id=anchor_card_id,
-            limit=25,
-            candidate_card_limit=MAX_CONFLICT_CANDIDATE_CARDS,
-            comparison_limit=MAX_CONFLICT_COMPARISONS,
-            component_member_limit=MAX_CONFLICT_COMPONENT_MEMBERS,
-            mutation_limit=MAX_CONFLICT_CARD_MUTATIONS,
-            transaction_seconds=MAX_CONFLICT_TRANSACTION_SECONDS,
-            recover_pending_card_sidecars=recover_pending_card_sidecars,
+        escalated = _retry_worker_sqlite_busy(
+            lambda: detect_conflicts(
+                root,
+                card_id=anchor_card_id,
+                limit=25,
+                candidate_card_limit=MAX_CONFLICT_CANDIDATE_CARDS,
+                comparison_limit=MAX_CONFLICT_COMPARISONS,
+                component_member_limit=MAX_CONFLICT_COMPONENT_MEMBERS,
+                mutation_limit=MAX_CONFLICT_CARD_MUTATIONS,
+                transaction_seconds=MAX_CONFLICT_TRANSACTION_SECONDS,
+                recover_pending_card_sidecars=recover_pending_card_sidecars,
+            )
         )
         result["conflict_escalation"] = escalated
         final_result = escalated
     if _conflict_result_requires_larger_budget(final_result):
-        result["conflict_review_required"] = _record_conflict_review_signal(
-            root,
-            result=final_result,
+        result["conflict_review_required"] = _retry_worker_sqlite_busy(
+            lambda: _record_conflict_review_signal(root, result=final_result)
         )
     return result
 
@@ -11490,9 +11493,7 @@ def _run_worker_pass_with_sidecar_intent_budget(
             )
         )
         maintenance_result.update(
-            _retry_worker_sqlite_busy(
-                lambda: _run_conflict_maintenance(root, recover_pending_card_sidecars=False)
-            )
+            _run_conflict_maintenance(root, recover_pending_card_sidecars=False)
         )
     retry_pending_count = sum(
         1

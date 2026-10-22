@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1 - Unreleased
+
+- Persistent workers retry SQLite BUSY/LOCKED failures with capped backoff,
+  preserving job retry ownership, deduplication and committed effects. Other
+  errors remain visible; credential policy and memory schemas are unchanged.
+- Memory health distinguishes below-threshold session tails from work actually
+  due for segmentation, while continuing to report uncovered historical gaps.
+- Storage tiering preserves immutable artifact-bound historical Book files
+  instead of retiring those proof locations after moving the current Book.
+- Credential scanning inspects native metadata strings and keys before JSON
+  escaping can hide token boundaries. Safe helper-usage notes remain accepted,
+  and structured audit findings retain their correct physical JSON/JSONL lines.
+- The shared local-model deadline regression uses a deterministic clock and
+  transport; it still requires one total deadline across preflight/completion.
+  Existing real HTTP timeout tests and production model behavior are unchanged.
+
 ## 0.3.0 - 2026-08-12
 
 - Added automatic latest-state resume discovery for the CLI and MCP surface,

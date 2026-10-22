@@ -1317,42 +1317,78 @@ class LocalModelTests(unittest.TestCase):
             self.assertLess(elapsed, 0.5)
 
     def test_assist_uses_one_deadline_across_preflight_and_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, _Server() as (_server, base_url):
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"
+            base_url = "http://127.0.0.1:9/v1"
             configure_yarn(
                 root,
                 enabled=True,
                 base_url=base_url,
                 timeout_seconds=1,
             )
-            _ModelHandler.response_delays = {
-                "health": 0.25,
-                "models": 0.25,
-                "completion": 0.75,
-            }
-            with mock.patch(
-                "continuum.core.local_model._resource_guard",
-                return_value=SAFE_RESOURCES,
+            # Transport wall-clock enforcement is covered separately. Advance only
+            # this module's clock so socket timeout rounding cannot race this
+            # assertion about one budget spanning all three requests.
+            now = 100.0
+            responses = iter(
+                (
+                    (0.25, {"status": "ok"}),
+                    (0.25, {"data": [{"id": DEFAULT_YARN_MODEL}]}),
+                    (0.75, {}),
+                )
+            )
+
+            def http_json(**_request: Any) -> dict[str, Any]:
+                nonlocal now
+                duration, response = next(responses)
+                now += duration
+                return response
+
+            with (
+                mock.patch.object(local_model, "time") as clock,
+                mock.patch.object(
+                    local_model, "_http_json", side_effect=http_json
+                ) as transport,
+                mock.patch.object(
+                    local_model, "_resource_guard", return_value=SAFE_RESOURCES
+                ),
             ):
-                started = time.monotonic()
+                clock.monotonic.side_effect = lambda: now
                 result = assist_resume(
                     root,
                     context_text="deadline evidence",
                     session_id="s",
                     project_id="p",
                 )
-                elapsed = time.monotonic() - started
 
+            self.assertEqual(
+                transport.call_args_list,
+                [
+                    mock.call(
+                        method="GET",
+                        url=f"{base_url}/health",
+                        timeout_seconds=1.0,
+                        deadline=101.0,
+                    ),
+                    mock.call(
+                        method="GET",
+                        url=f"{base_url}/models",
+                        timeout_seconds=0.75,
+                        deadline=101.0,
+                    ),
+                    mock.call(
+                        method="POST",
+                        url=f"{base_url}/chat/completions",
+                        timeout_seconds=0.5,
+                        payload=mock.ANY,
+                        deadline=101.0,
+                    ),
+                ],
+            )
             self.assertFalse(result["used"], result)
             self.assertEqual(result["reason"], "model_request_failed")
             self.assertEqual(result["fallback"], "deterministic")
-            self.assertIn("total deadline", result["detail"])
-            self.assertIsNotNone(_ModelHandler.last_request)
-            self.assertLess(
-                elapsed,
-                1.5,
-                f"full Yarn operation exceeded its deadline: {elapsed:.3f}s",
-            )
+            self.assertEqual(result["detail"], local_model.TOTAL_DEADLINE_ERROR)
 
     def test_assist_deadline_includes_slow_context_preprocessing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

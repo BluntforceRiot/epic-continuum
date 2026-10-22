@@ -334,7 +334,7 @@ jobs:
           "import pathlib,continuum;
           location=pathlib.Path(continuum.__file__).resolve();
           assert 'site-packages' in str(location), location;
-          assert continuum.__version__ == '0.3.0', continuum.__version__;
+          assert continuum.__version__ == '0.3.1', continuum.__version__;
           print(location)"
       - name: Run the complete installed-artifact suite
         run: python -m unittest discover -s tests -v

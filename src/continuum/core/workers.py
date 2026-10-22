@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import contextvars
 import hashlib
+import logging
 import math
 import os
 import sqlite3
@@ -45,6 +46,7 @@ from .store import (
     _queue_job_fairness_triggers_ready,
     _queue_retry_authority_triggers_ready,
     _queue_retry_order_counter_ready,
+    _sidecar_nofollow_path_identity,
     CARD_SIDECAR_INTENT_OPERATION_LOCK_ID,
     add_graph_edge,
     audit_event,
@@ -137,6 +139,71 @@ _FAILED_SIDECAR_RECOVERY_JOB_ROLES = {
     "sync_card_sidecar": "archivist",
 }
 _FAILED_SIDECAR_EFFECTLESS_KEY = "effectless"
+
+
+def _is_worker_sqlite_busy(exc: BaseException) -> bool:
+    """Only SQLite writer contention is safe to wait out automatically."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    # Synthetic/older SQLite exceptions may not carry a numeric result code.
+    message = str(exc).casefold()
+    return message in {"database is locked", "database table is locked"} or message.startswith(
+        "database table is locked:"
+    )
+
+
+def _retry_worker_sqlite_busy(action: Callable[[], Any]) -> Any:
+    """Retry contention after connections unwind; never suppress other errors."""
+    delay = 5.0
+    while True:
+        try:
+            return action()
+        except sqlite3.OperationalError as exc:
+            if not _is_worker_sqlite_busy(exc):
+                raise
+            # No memory text, SQL or exception payload is written to this log.
+            logging.getLogger(__name__).warning(
+                "Worker database busy; retrying in %.0f seconds", delay
+            )
+            time.sleep(delay)
+            delay = min(60.0, delay * 2)
+
+
+class _WorkerRetryLeaseLost(RuntimeError):
+    """Retry authority expired or moved; only ordinary lease recovery may act."""
+
+
+def _worker_sidecar_failures_are_busy(result: Any, depth: int = 0) -> bool:
+    """Recognize only the store's closed sidecar error wrappers, never substrings."""
+    if depth > 2 or not isinstance(result, dict):
+        return False
+    failures = result.get("failures")
+    if not isinstance(failures, list) or not failures:
+        return False
+    for failure in failures:
+        if not isinstance(failure, dict):
+            return False
+        error = failure.get("error")
+        if error == "Card sidecar intent reconciliation did not complete cleanly":
+            if not _worker_sidecar_failures_are_busy(failure.get("intent_reconciliation"), depth + 1):
+                return False
+            continue
+        if not isinstance(error, str):
+            return False
+        for prefix in (
+            "OperationalError: ",
+            "Card sidecar intent postflight scan failed: OperationalError: ",
+            "Card sidecar reconciliation retry authority could not be recorded: OperationalError: ",
+        ):
+            if error.startswith(prefix):
+                error = error[len(prefix):]
+                break
+        if not _is_worker_sqlite_busy(sqlite3.OperationalError(error)):
+            return False
+    return True
 
 
 class _JobLease:
@@ -313,6 +380,8 @@ def _reconcile_worker_sidecar_intents_with_budget(
             limit=allowance,
         )
     except Exception as exc:
+        if _is_worker_sqlite_busy(exc):
+            raise
         if not shared:
             _charge_worker_sidecar_intent_budget(
                 budget,
@@ -361,6 +430,8 @@ def _reconcile_worker_sidecar_intents_with_budget(
     result["worker_intent_budget"] = (
         _worker_sidecar_intent_budget_snapshot(budget)
     )
+    if _worker_sidecar_failures_are_busy(result):
+        raise sqlite3.OperationalError("database is locked")
     return result
 
 
@@ -1760,6 +1831,10 @@ def _sync_worker_card_sidecars(
     result["worker_intent_budget"] = (
         _worker_sidecar_intent_budget_snapshot(budget)
     )
+    # The store reports per-card sync exceptions as data. Do not commit a
+    # terminal failed job effect for a batch whose only failures are locks.
+    if _worker_sidecar_failures_are_busy(result):
+        raise sqlite3.OperationalError("database is locked")
     return result
 
 
@@ -2417,7 +2492,7 @@ def _retry_owned_job(
     """Keep one pending retry authority, merging into a dedupe successor."""
 
     if not _heartbeat_job(conn, job_id, lease_owner=lease_owner, lease_seconds=lease_seconds):
-        raise RuntimeError("worker lease lost before job retry")
+        raise _WorkerRetryLeaseLost("worker lease lost before job retry")
     now = utc_now()
     source_job = conn.execute(
         """
@@ -2434,7 +2509,7 @@ def _retry_owned_job(
         ),
     ).fetchone()
     if source_job is None:
-        raise RuntimeError("worker lease lost before job retry")
+        raise _WorkerRetryLeaseLost("worker lease lost before job retry")
     successor = _pending_dedupe_successor(
         conn,
         source_job_id=job_id,
@@ -2538,7 +2613,7 @@ def _retry_owned_job(
         ),
     )
     if int(cursor.rowcount or 0) != 1:
-        raise RuntimeError("worker lease lost before job retry")
+        raise _WorkerRetryLeaseLost("worker lease lost before job retry")
     return {
         "job_status": PENDING_JOB_STATUS,
         "job_ok": bool(result.get("ok", True)),
@@ -6122,6 +6197,89 @@ def resolve_conflict(
     }
 
 
+def _storage_tier_artifact_bindings(
+    root: Path,
+    conn: sqlite3.Connection,
+    paths: list[Path],
+) -> dict[Path, list[sqlite3.Row]]:
+    """Bind selected paths to immutable artifacts, including hardlink aliases."""
+
+    bindings: dict[Path, list[sqlite3.Row]] = {path: [] for path in paths}
+    by_path: dict[Path, set[Path]] = {}
+    by_identity: dict[tuple[int, int], set[Path]] = {}
+    for path in bindings:
+        by_path.setdefault(path.resolve(strict=False), set()).add(path)
+        identity = _sidecar_nofollow_path_identity(path, allow_missing=True)
+        if identity is not None and identity[1] is not None:
+            by_identity.setdefault(identity[1], set()).add(path)
+    for artifact in conn.execute(
+        "SELECT id, uri, sha256, size_bytes FROM artifacts WHERE immutable = 1"
+    ):
+        artifact_path = resolve_stored_uri(root, str(artifact["uri"]))
+        matched = set(by_path.get(artifact_path.resolve(strict=False), ()))
+        identity = _sidecar_nofollow_path_identity(
+            artifact_path, allow_missing=True,
+        )
+        if identity is not None and identity[1] is not None:
+            matched.update(by_identity.get(identity[1], ()))
+        for path in matched:
+            bindings[path].append(artifact)
+    return bindings
+
+
+def _validate_storage_tier_artifact_bindings(
+    path: Path,
+    bindings: list[sqlite3.Row],
+) -> tuple[int, str]:
+    identity = _storage_tier_file_identity(path)
+    if any(
+        int(artifact["size_bytes"]) != identity[0]
+        or str(artifact["sha256"]) != identity[1]
+        for artifact in bindings
+    ):
+        raise ValueError(
+            f"immutable artifact mismatch during storage tiering: {path}"
+        )
+    return identity
+
+
+def _preflight_storage_tier_artifacts(
+    root: Path,
+    files: list[tuple[Path, Path]],
+) -> set[Path]:
+    """Validate all selected proof paths before staging the first Book."""
+
+    if not files:
+        return set()
+    conn = connect_existing(root)
+    try:
+        bindings = _storage_tier_artifact_bindings(
+            root, conn, [path for pair in files for path in pair],
+        )
+    finally:
+        conn.close()
+    preserved: set[Path] = set()
+    for source, destination in files:
+        source_identity = None
+        if bindings[source]:
+            source_identity = _validate_storage_tier_artifact_bindings(
+                source, bindings[source],
+            )
+            preserved.add(source)
+        if bindings[destination]:
+            destination_identity = _validate_storage_tier_artifact_bindings(
+                destination, bindings[destination],
+            )
+            source_identity = source_identity or _storage_tier_file_identity(source)
+            if source_identity != destination_identity:
+                raise ValueError(
+                    "immutable destination conflict during storage tiering: "
+                    f"{destination}"
+                )
+            preserved.add(source)
+    return preserved
+
+
 def _storage_tier_file_identity(path: Path) -> tuple[int, str]:
     try:
         sha256, size_bytes, _metadata = _hash_storage_tier_file(path)
@@ -6430,6 +6588,7 @@ def _stage_storage_tier_file(
     uri: str,
     target_tier: str,
     dry_run: bool,
+    source_preserved: bool = False,
 ) -> tuple[dict[str, Any], str]:
     source_path = resolve_stored_uri(root, uri)
     destination = base / target_tier / source_path.name
@@ -6441,6 +6600,8 @@ def _stage_storage_tier_file(
         "moved": False,
         "staged": False,
     }
+    if source_preserved:
+        detail.update(copied=True, source_preserved=True)
     try:
         same_path = (
             source_path.resolve(strict=False)
@@ -6624,6 +6785,61 @@ def _retire_storage_tier_source(
             raise RuntimeError(
                 "storage-tier cleanup could not restore its exact destination"
             ) from exc
+    # Staging deliberately runs without a SQLite writer lock. Recheck the
+    # immutable ledger under a short writer fence immediately before retiring
+    # anything, so a proof registered during the copy keeps its original URI.
+    writer = connect(root)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        bindings = _storage_tier_artifact_bindings(
+            root, writer, [source, destination],
+        )
+        for path, artifacts in bindings.items():
+            if artifacts:
+                _validate_storage_tier_artifact_bindings(path, artifacts)
+        if (
+            detail.get("source_preserved")
+            or bindings[source]
+            or bindings[destination]
+        ):
+            if not _storage_tier_file_matches(
+                source, size_bytes=size_bytes, sha256=sha256,
+            ) or not _storage_tier_file_matches(
+                destination, size_bytes=size_bytes, sha256=sha256,
+            ):
+                raise RuntimeError(
+                    "storage-tier immutable source or destination changed "
+                    "after catalog commit"
+                )
+            result.update(
+                cleanup="complete",
+                copied=True,
+                source_preserved=True,
+                retirement_disposition="immutable_artifact_preserved",
+            )
+            return result
+        return _finish_storage_tier_source_retirement(
+            root, detail, stage_id=stage_id,
+        )
+    finally:
+        if writer.in_transaction:
+            writer.rollback()
+        writer.close()
+
+
+def _finish_storage_tier_source_retirement(
+    root: Path,
+    detail: dict[str, Any],
+    *,
+    stage_id: str,
+) -> dict[str, Any]:
+    """Retire unbound sources while the caller fences artifact registration."""
+
+    result = dict(detail)
+    source = resolve_stored_uri(root, str(detail["from_uri"]))
+    destination = resolve_stored_uri(root, str(detail["to_uri"]))
+    size_bytes = int(detail["size_bytes"])
+    sha256 = str(detail["sha256"])
     retirement = source.parent / (
         f".continuum-storage-tier-retire.{stage_id}.{source.name}"
     )
@@ -6901,11 +7117,9 @@ def apply_storage_tiering(
             conn.close()
         now = utc_now()
         now_dt = dt.datetime.now(dt.UTC).replace(microsecond=0)
+        transitions: dict[str, tuple[int, str]] = {}
+        proof_files: list[tuple[Path, Path]] = []
         for row in rows:
-            if not dry_run:
-                reconciled_cleanup.extend(
-                    _reconcile_storage_tier_history(root, row)
-                )
             age_days = 9999
             try:
                 updated = _parse_utc_timestamp(row["updated_at"])
@@ -6921,6 +7135,24 @@ def apply_storage_tiering(
                 target = "warm"
             elif tier == "warm" and age_days >= warm_days:
                 target = "cold"
+            transitions[str(row["id"])] = (age_days, target)
+            if target != tier:
+                for field, directory, target_tier in (
+                    ("original_uri", "originals", target),
+                    ("reader_uri", "reader_editions", "cold" if target == "vault" else target),
+                ):
+                    if row[field]:
+                        source = resolve_stored_uri(root, str(row[field]))
+                        destination = root / "archive" / directory / target_tier / source.name
+                        proof_files.append((source, destination))
+        preserved_sources = _preflight_storage_tier_artifacts(root, proof_files)
+        for row in rows:
+            if not dry_run:
+                reconciled_cleanup.extend(
+                    _reconcile_storage_tier_history(root, row)
+                )
+            tier = str(row["storage_tier"])
+            age_days, target = transitions[str(row["id"])]
             if target == tier:
                 continue
 
@@ -6956,6 +7188,9 @@ def apply_storage_tiering(
                     uri=str(uri),
                     target_tier=target_tier,
                     dry_run=dry_run,
+                    source_preserved=(
+                        resolve_stored_uri(root, str(uri)) in preserved_sources
+                    ),
                 )
                 staged_files.append(detail)
                 if field == "original_uri":
@@ -8001,6 +8236,8 @@ def drain_card_sidecar_outbox(
         card_ids,
         reconcile_intents=reconcile_intents,
     )
+    if _worker_sidecar_failures_are_busy(result):
+        raise sqlite3.OperationalError("database is locked")
     return {
         "ok": bool(result.get("ok")),
         "pending": len(card_ids),
@@ -8025,6 +8262,8 @@ def _reconcile_card_sidecar_intent_maintenance(
             exhausted_ok=True,
         )
     except Exception as exc:
+        if _is_worker_sqlite_busy(exc):
+            raise
         return {
             "ok": False,
             "processed": 0,
@@ -11082,6 +11321,40 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 )
         except Exception as exc:
             renewer.stop()
+            if _is_worker_sqlite_busy(exc):
+                busy_result = {"ok": True, "retry_pending": True, "reason": "sqlite_busy"}
+
+                def release_for_retry() -> dict[str, Any]:
+                    retry_conn = connect(root)
+                    try:
+                        outcome = _retry_owned_job(
+                            retry_conn,
+                            job["id"],
+                            lease_owner=worker_id,
+                            lease_seconds=lease_seconds,
+                            result=busy_result,
+                        )
+                        retry_conn.commit()
+                        return outcome
+                    finally:
+                        retry_conn.close()
+
+                try:
+                    busy_outcome = _retry_worker_sqlite_busy(release_for_retry)
+                    processed.append({
+                        "job_id": job["id"], "role": job["role"], "job_type": job["job_type"],
+                        "status": busy_outcome["job_status"], "ok": busy_outcome["job_ok"],
+                        "result": busy_outcome["result"],
+                    })
+                except _WorkerRetryLeaseLost:
+                    # Ordinary reclaim owns expired/transferred leases; do not
+                    # revive them or overwrite a different worker's authority.
+                    processed.append({
+                        "job_id": job["id"], "role": job["role"], "job_type": job["job_type"],
+                        "status": "lease_recovery_pending", "ok": True,
+                        "result": {**busy_result, "reason": "sqlite_busy_lease_recovery"},
+                    })
+                break
             conn = connect(root)
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -11305,7 +11578,9 @@ def serve_workers(
         while True:
             now = time.monotonic()
             maintenance_due = now >= next_maintenance_at
-            result = run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
+            result = _retry_worker_sqlite_busy(
+                lambda: run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
+            )
             passes += 1
             processed += int(result.get("processed_count", 0))
             retry_pending += int(result.get("retry_pending_count", 0))
@@ -11514,18 +11789,41 @@ def memory_health(root: Path) -> dict[str, Any]:
             """,
             (health_checked_at,),
         ).fetchone()["n"]
-        unsegmented_events = conn.execute(
+        segmentation_threshold = int(config.get("capture", {}).get("roll_segments_every_events", 200))
+        # Scribe waits for each session's frontier to reach its roll threshold.
+        # Many short, healthy tails must not add up to an apparent worker lag.
+        # Count actual rows, but use the same sequence frontier as Scribe to
+        # determine which tails are due; preserve uncovered pre-frontier gaps.
+        segmentation_backlog = conn.execute(
             """
-            SELECT count(*) AS n
-            FROM scroll_events e
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM scroll_segments s
-                WHERE s.session_id = e.session_id
-                  AND e.seq BETWEEN s.start_seq AND s.end_seq
+            WITH frontiers AS (
+                SELECT session_id, max(end_seq) AS end_seq
+                FROM scroll_segments GROUP BY session_id
+            ), tails AS (
+                SELECT e.session_id,
+                       max(0, max(e.seq) - coalesce(f.end_seq, 0)) AS pending_events,
+                       count(CASE WHEN e.seq > coalesce(f.end_seq, 0) THEN 1 END) AS tail_events
+                FROM scroll_events e
+                LEFT JOIN frontiers f ON f.session_id = e.session_id
+                GROUP BY e.session_id
             )
-            """
-        ).fetchone()["n"]
+            SELECT count(CASE WHEN pending_events >= ? THEN 1 END) AS due_sessions,
+                   coalesce(sum(CASE WHEN pending_events >= ? THEN tail_events ELSE 0 END), 0) AS due_events,
+                   coalesce(sum(CASE WHEN pending_events < ? THEN tail_events ELSE 0 END), 0) AS below_threshold_events,
+                   coalesce(sum(tail_events), 0) AS tail_events,
+                   (SELECT count(*) FROM scroll_events e
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM scroll_segments s
+                        WHERE s.session_id = e.session_id
+                          AND e.seq BETWEEN s.start_seq AND s.end_seq
+                    )) AS unsegmented_events
+            FROM tails
+            """,
+            (segmentation_threshold, segmentation_threshold, segmentation_threshold),
+        ).fetchone()
+        unsegmented_events = segmentation_backlog["unsegmented_events"]
+        unsegmented_before_frontier = unsegmented_events - segmentation_backlog["tail_events"]
+        segmentation_lag = segmentation_backlog["due_events"] + unsegmented_before_frontier
         sidecar_backlog = conn.execute("SELECT count(*) AS n FROM card_sidecar_outbox").fetchone()["n"]
         latest_snapshot = conn.execute("SELECT max(created_at) AS ts FROM snapshots").fetchone()["ts"]
         root_size = _root_size_bytes(root)
@@ -11568,7 +11866,17 @@ def memory_health(root: Path) -> dict[str, Any]:
                 "stale_running_jobs": stale_running_jobs,
             },
             {"name": "librarian_backlog_reasonable", "ok": pending_cards < 1000, "pending_librarian_cards": pending_cards},
-            {"name": "scroll_segmentation_lag_reasonable", "ok": unsegmented_events < 1000, "unsegmented_events": unsegmented_events},
+            {
+                "name": "scroll_segmentation_lag_reasonable",
+                "ok": segmentation_lag < 1000,
+                "unsegmented_events": unsegmented_events,
+                "segmentation_lag_events": segmentation_lag,
+                "segmentation_due_sessions": segmentation_backlog["due_sessions"],
+                "segmentation_due_events": segmentation_backlog["due_events"],
+                "below_threshold_tail_events": segmentation_backlog["below_threshold_events"],
+                "unsegmented_before_frontier_events": unsegmented_before_frontier,
+                "segmentation_roll_threshold": segmentation_threshold,
+            },
             {"name": "root_size_within_budget", "ok": root_size <= max_root_size, "root_size_bytes": root_size, "max_root_size": max_root_size},
         ]
         return {
@@ -11589,6 +11897,12 @@ def memory_health(root: Path) -> dict[str, Any]:
             "running_jobs": running_jobs,
             "stale_running_jobs": stale_running_jobs,
             "unsegmented_scroll_events": unsegmented_events,
+            "segmentation_lag_events": segmentation_lag,
+            "segmentation_due_sessions": segmentation_backlog["due_sessions"],
+            "segmentation_due_events": segmentation_backlog["due_events"],
+            "below_threshold_tail_events": segmentation_backlog["below_threshold_events"],
+            "unsegmented_before_frontier_events": unsegmented_before_frontier,
+            "segmentation_roll_threshold": segmentation_threshold,
             "sidecar_outbox_backlog": sidecar_backlog,
             "latest_snapshot_at": latest_snapshot,
             "catalog_wal_size_bytes": wal_size,

@@ -1,4 +1,8 @@
-# Release Audit Summary
+# Historical 0.3.0 Release Audit Summary
+
+This is historical evidence, not a test certificate for 0.3.1. The 0.3.1
+candidate's build-cycle receipt and exact distribution manifest bind its fresh
+checks. Hosted CI remains a separate publication gate.
 
 This file curates the release-gate evidence for Epic Continuum `0.3.0` without
 shipping the full internal build-review history.

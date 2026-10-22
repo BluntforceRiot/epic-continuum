@@ -147,7 +147,9 @@ redacted before storage and findings are stored in event metadata.
   unless the prune policy remains `ask` or `manual`.
 
 `tier-storage` applies the current Archivist tiering policy. It relocates
-internal archive files and leaves any legacy external URI untouched. `prune-memory`
+internal archive files and leaves any legacy external URI untouched. Historical
+paths bound by immutable artifact records are preserved and verified, even when
+the current Book is routed to a copied file in a colder tier. `prune-memory`
 archives, marks summary-only, or prunes Cards by topic. These commands write
 audit events; they do not delete raw evidence unless a future destructive policy
 explicitly allows it.
@@ -190,6 +192,16 @@ When a worker process dies, the next worker pass can return an expired
 preemptible job to `pending` and finish it instead of leaving it stranded.
 Run one persistent service per root; see [Worker operations](worker-operations.md)
 for service, backlog-reconciliation, and Windows Task Scheduler guidance.
+
+The persistent service retries SQLite BUSY/LOCKED failures with delays of 5,
+10, 20, 40, then at most 60 seconds. Connections unwind before waiting. Jobs
+retain normal lease, retry and deduplication rules; expired or transferred
+leases are not revived. Permanent/non-lock errors still stop or fail work
+normally. This does not install or change an operating-system supervisor.
+
+Health telemetry reports below-threshold session tails separately from due
+segmentation and uncovered pre-frontier gaps; many short sessions are not by
+themselves an overdue segmentation backlog.
 
 ## Ingest Limits
 

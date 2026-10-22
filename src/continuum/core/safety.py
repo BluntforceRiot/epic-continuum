@@ -804,6 +804,7 @@ def _scan_sensitive_key_findings(
     path: str = "$",
     max_findings: int = 20,
 ) -> list[dict[str, Any]]:
+    """Scan native strings as well as sensitive keys before JSON escaping."""
     findings: list[dict[str, Any]] = []
     if max_findings <= 0:
         return findings
@@ -822,6 +823,17 @@ def _scan_sensitive_key_findings(
                         "scope": scope,
                         "metadata_path": nested_path,
                     }
+                )
+                if len(findings) >= max_findings:
+                    return findings
+            if isinstance(key, str):
+                findings.extend(
+                    _scan_sensitive_key_findings(
+                        key,
+                        scope=scope,
+                        path=nested_path,
+                        max_findings=max_findings - len(findings),
+                    )
                 )
                 if len(findings) >= max_findings:
                     return findings
@@ -847,6 +859,15 @@ def _scan_sensitive_key_findings(
             )
             if len(findings) >= max_findings:
                 return findings
+    elif isinstance(value, str):
+        # Serializing first can turn a newline before a token into a literal
+        # "n" prefix, hiding the word boundary from the text scanner.
+        # Structured findings use the serialized line origin; decoded value
+        # newlines must not become physical JSON/JSONL audit line offsets.
+        findings.extend(
+            dict(finding, line=1, scope=scope, metadata_path=path)
+            for finding in scan_text_for_secrets(value, max_findings=max_findings)
+        )
     return findings
 
 

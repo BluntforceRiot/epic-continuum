@@ -7143,6 +7143,16 @@ def apply_storage_tiering(
                 ):
                     if row[field]:
                         source = resolve_stored_uri(root, str(row[field]))
+                        try:
+                            inside_root = source.resolve(strict=False).is_relative_to(
+                                root.resolve(strict=False)
+                            )
+                        except OSError:
+                            inside_root = False
+                        if not inside_root:
+                            # Match staging: an external legacy URI is not
+                            # routed to this hypothetical internal destination.
+                            continue
                         destination = root / "archive" / directory / target_tier / source.name
                         proof_files.append((source, destination))
         preserved_sources = _preflight_storage_tier_artifacts(root, proof_files)
@@ -11228,7 +11238,9 @@ def _run_worker_pass_with_sidecar_intent_budget(
     limit: int = 50,
     maintenance: bool = True,
 ) -> dict[str, Any]:
-    init_db(root, recover_pending_card_sidecars=False)
+    _retry_worker_sqlite_busy(
+        lambda: init_db(root, recover_pending_card_sidecars=False)
+    )
     config = load_config(root)
     lease_seconds = max(30, int(config.get("queues", {}).get("worker_lease_seconds", 3600)))
     worker_id = unique_id("worker")
@@ -11236,13 +11248,18 @@ def _run_worker_pass_with_sidecar_intent_budget(
     processed: list[dict[str, Any]] = []
     deferred_job_ids: set[str] = set()
     reclaimed_expired_jobs = 0
-    reclaimed_public_results: list[dict[str, Any]] = []
-    for pass_index in range(max(1, int(limit))):
+
+    def claim_next_job(
+        *, reclaim_expired: bool
+    ) -> tuple[dict[str, Any] | None, int, list[dict[str, Any]]]:
+        # Publish reclaim accounting only after the claim transaction commits.
+        reclaimed_public_results: list[dict[str, Any]] = []
+        reclaimed_count = 0
         conn = connect(root)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if pass_index == 0:
-                reclaimed_expired_jobs += _reclaim_expired_leases(
+            if reclaim_expired:
+                reclaimed_count = _reclaim_expired_leases(
                     conn,
                     role_set,
                     public_results=reclaimed_public_results,
@@ -11255,10 +11272,16 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 deferred_job_ids=deferred_job_ids,
             )
             conn.commit()
+            return job, reclaimed_count, reclaimed_public_results
         finally:
             conn.close()
-        if pass_index == 0 and reclaimed_public_results:
-            processed.extend(reclaimed_public_results)
+
+    for pass_index in range(max(1, int(limit))):
+        job, reclaimed_count, reclaimed_public_results = _retry_worker_sqlite_busy(
+            lambda: claim_next_job(reclaim_expired=pass_index == 0)
+        )
+        reclaimed_expired_jobs += reclaimed_count
+        processed.extend(reclaimed_public_results)
         if job is None:
             break
         lease = _JobLease(root, str(job["id"]), worker_id, lease_seconds)
@@ -11349,135 +11372,126 @@ def _run_worker_pass_with_sidecar_intent_budget(
                 except _WorkerRetryLeaseLost:
                     # Ordinary reclaim owns expired/transferred leases; do not
                     # revive them or overwrite a different worker's authority.
-                    processed.append({
-                        "job_id": job["id"], "role": job["role"], "job_type": job["job_type"],
-                        "status": "lease_recovery_pending", "ok": True,
-                        "result": {**busy_result, "reason": "sqlite_busy_lease_recovery"},
-                    })
+                    def read_retry_authority() -> dict[str, Any]:
+                        authority_conn = connect(root)
+                        try:
+                            return _queue_job_authority_snapshot(
+                                authority_conn, str(job["id"])
+                            )
+                        finally:
+                            authority_conn.close()
+
+                    processed.append(_lost_lease_processed_result(
+                        job=job,
+                        error=exc,
+                        authority=_retry_worker_sqlite_busy(read_retry_authority),
+                    ))
                 break
-            conn = connect(root)
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                retry_outcome = None
-                lost_lease_result: dict[str, Any] | None = None
-                post_commit_authority = (
-                    _running_job_post_commit_authority(conn, job)
-                )
-                retry_authority_is_owned = bool(
-                    post_commit_authority is not None
-                    and _job_lease_is_owned(
-                        conn,
-                        str(job["id"]),
-                        lease_owner=worker_id,
+
+            def record_job_failure(error: Exception = exc) -> tuple[dict[str, Any], str | None]:
+                failure_conn = connect(root)
+                try:
+                    failure_conn.execute("BEGIN IMMEDIATE")
+                    post_commit_authority = (
+                        _running_job_post_commit_authority(failure_conn, job)
                     )
-                )
-                if retry_authority_is_owned:
-                    retry_result = {
-                        "ok": False,
-                        "reason": POST_COMMIT_EXCEPTION_RETRY_REASON,
-                        "retry_pending": True,
-                        "post_commit_authority": post_commit_authority,
-                        "exception_sha256": content_hash(
-                            f"{type(exc).__name__}:{exc}"
-                        ),
-                    }
-                    retry_outcome = _retry_owned_job(
-                        conn,
-                        job["id"],
-                        lease_owner=worker_id,
-                        lease_seconds=lease_seconds,
-                        result=retry_result,
+                    retry_authority_is_owned = bool(
+                        post_commit_authority is not None
+                        and _job_lease_is_owned(
+                            failure_conn,
+                            str(job["id"]),
+                            lease_owner=worker_id,
+                        )
                     )
-                else:
-                    post_commit_authority = None
-                    failure_recorded = _finish_job(
-                        conn,
+                    deferred_job_id = None
+                    if retry_authority_is_owned:
+                        retry_result = {
+                            "ok": False,
+                            "reason": POST_COMMIT_EXCEPTION_RETRY_REASON,
+                            "retry_pending": True,
+                            "post_commit_authority": post_commit_authority,
+                            "exception_sha256": content_hash(
+                                f"{type(error).__name__}:{error}"
+                            ),
+                        }
+                        retry_outcome = _retry_owned_job(
+                            failure_conn,
+                            job["id"],
+                            lease_owner=worker_id,
+                            lease_seconds=lease_seconds,
+                            result=retry_result,
+                        )
+                        failure_result = {
+                            "job_id": job["id"],
+                            "role": job["role"],
+                            "job_type": job["job_type"],
+                            "status": str(retry_outcome["job_status"]),
+                            "ok": bool(retry_outcome["job_ok"]),
+                            "result": dict(retry_outcome["result"]),
+                        }
+                        deferred_job_id = str(retry_outcome["retry_job_id"])
+                    elif _finish_job(
+                        failure_conn,
                         job["id"],
                         status="failed",
-                        error=str(exc),
+                        error=str(error),
                         lease_owner=worker_id,
-                    )
-                    if not failure_recorded:
-                        lost_lease_result = _lost_lease_processed_result(
+                    ):
+                        failure_result = {
+                            "job_id": job["id"],
+                            "role": job["role"],
+                            "job_type": job["job_type"],
+                            "status": "failed",
+                            "ok": False,
+                            "error": str(error),
+                        }
+                    else:
+                        failure_result = _lost_lease_processed_result(
                             job=job,
-                            error=exc,
+                            error=error,
                             authority=_queue_job_authority_snapshot(
-                                conn,
-                                str(job["id"]),
+                                failure_conn, str(job["id"])
                             ),
                         )
-                conn.commit()
-            finally:
-                conn.close()
-            if post_commit_authority is not None:
-                if retry_outcome is None:
-                    raise RuntimeError(
-                        "post-commit retry outcome is unavailable"
-                    )
-                processed.append(
-                    {
-                        "job_id": job["id"],
-                        "role": job["role"],
-                        "job_type": job["job_type"],
-                        "status": str(
-                            retry_outcome["job_status"]
-                        ),
-                        "ok": bool(retry_outcome["job_ok"]),
-                        "result": dict(retry_outcome["result"]),
-                    }
-                )
-                deferred_job_ids.add(
-                    str(retry_outcome["retry_job_id"])
-                )
-            elif lost_lease_result is not None:
-                processed.append(lost_lease_result)
-                if (
-                    lost_lease_result["authoritative_job"].get("status")
-                    == PENDING_JOB_STATUS
-                ):
-                    deferred_job_ids.add(str(job["id"]))
-            else:
-                processed.append(
-                    {
-                        "job_id": job["id"],
-                        "role": job["role"],
-                        "job_type": job["job_type"],
-                        "status": "failed",
-                        "ok": False,
-                        "error": str(exc),
-                    }
-                )
+                        if (
+                            failure_result["authoritative_job"].get("status")
+                            == PENDING_JOB_STATUS
+                        ):
+                            deferred_job_id = str(job["id"])
+                    failure_conn.commit()
+                    return failure_result, deferred_job_id
+                finally:
+                    failure_conn.close()
+
+            failure_result, deferred_job_id = _retry_worker_sqlite_busy(record_job_failure)
+            processed.append(failure_result)
+            if deferred_job_id is not None:
+                deferred_job_ids.add(deferred_job_id)
         finally:
             renewer.stop()
             _CURRENT_JOB_LEASE.reset(lease_token)
     maintenance_result: dict[str, Any] = {}
     if maintenance:
-        maintenance_result["sidecars"] = drain_card_sidecar_outbox(
-            root,
-            limit=50,
-            reconcile_intents=False,
+        maintenance_result["sidecars"] = _retry_worker_sqlite_busy(
+            lambda: drain_card_sidecar_outbox(root, limit=50, reconcile_intents=False)
         )
-        maintenance_result["sidecar_intents"] = (
-            _reconcile_card_sidecar_intent_maintenance(root)
+        maintenance_result["sidecar_intents"] = _retry_worker_sqlite_busy(
+            lambda: _reconcile_card_sidecar_intent_maintenance(root)
         )
-        maintenance_result["failed_sidecar_jobs"] = (
-            _recover_failed_post_phase_sidecar_jobs(root)
+        maintenance_result["failed_sidecar_jobs"] = _retry_worker_sqlite_busy(
+            lambda: _recover_failed_post_phase_sidecar_jobs(root)
         )
-        maintenance_result["decay"] = decay_graph_routes(
-            root,
-            limit=50,
-            recover_pending_card_sidecars=False,
+        maintenance_result["decay"] = _retry_worker_sqlite_busy(
+            lambda: decay_graph_routes(root, limit=50, recover_pending_card_sidecars=False)
         )
-        maintenance_result["tiering"] = apply_storage_tiering(
-            root,
-            dry_run=False,
-            limit=50,
-            recover_pending_card_sidecars=False,
+        maintenance_result["tiering"] = _retry_worker_sqlite_busy(
+            lambda: apply_storage_tiering(
+                root, dry_run=False, limit=50, recover_pending_card_sidecars=False
+            )
         )
         maintenance_result.update(
-            _run_conflict_maintenance(
-                root,
-                recover_pending_card_sidecars=False,
+            _retry_worker_sqlite_busy(
+                lambda: _run_conflict_maintenance(root, recover_pending_card_sidecars=False)
             )
         )
     retry_pending_count = sum(
@@ -11578,9 +11592,7 @@ def serve_workers(
         while True:
             now = time.monotonic()
             maintenance_due = now >= next_maintenance_at
-            result = _retry_worker_sqlite_busy(
-                lambda: run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
-            )
+            result = run_worker_pass(root, roles=roles, limit=50, maintenance=maintenance_due)
             passes += 1
             processed += int(result.get("processed_count", 0))
             retry_pending += int(result.get("retry_pending_count", 0))

@@ -199,6 +199,50 @@ class StorageTierProofPreservationTest(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertEqual(self._current(root, book)["storage_tier"], "hot")
 
+    def test_external_legacy_uri_ignores_an_unselected_internal_proof(self) -> None:
+        for field in ("original_uri", "reader_uri"):
+            for dry_run in (False, True):
+                with self.subTest(field=field, dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                    root, book, _paths = self._book(tmp)
+                    external = Path(tmp) / "legacy.txt"
+                    external_bytes = b"External legacy bytes remain untouched.\n"
+                    external.write_bytes(external_bytes)
+                    directory = "originals" if field == "original_uri" else "reader_editions"
+                    unrelated = root / "archive" / directory / "warm" / external.name
+                    unrelated.parent.mkdir(parents=True, exist_ok=True)
+                    unrelated_bytes = b"Separate immutable proof not selected for tiering.\n"
+                    unrelated.write_bytes(unrelated_bytes)
+                    self._bind(root, unrelated)
+                    artifacts = self._artifacts(root)
+                    conn = store.connect(root)
+                    try:
+                        conn.execute(
+                            "UPDATE books SET original_uri = ?, reader_uri = ?, location_uri = ? WHERE id = ?",
+                            (
+                                str(external) if field == "original_uri" else None,
+                                str(external) if field == "reader_uri" else None,
+                                str(external), book["book_id"],
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    result = workers.apply_storage_tiering(root, dry_run=dry_run)
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["action_count"], 1)
+                    detail = result["actions"][0]["files"][0]
+                    self.assertEqual(detail["reason"], "external_uri_not_moved")
+                    self.assertFalse(detail["moved"])
+                    current = self._current(root, book)
+                    self.assertEqual(current["storage_tier"], "hot" if dry_run else "warm")
+                    self.assertEqual(current[field], str(external))
+                    self.assertEqual(current["location_uri"], str(external))
+                    self.assertEqual(external.read_bytes(), external_bytes)
+                    self.assertEqual(unrelated.read_bytes(), unrelated_bytes)
+                    self.assertEqual(self._artifacts(root), artifacts)
+
     def test_new_binding_during_staging_is_preserved_at_retirement(self) -> None:
         for bind_destination in (False, True):
             with self.subTest(destination=bind_destination), tempfile.TemporaryDirectory() as tmp:

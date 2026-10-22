@@ -104,19 +104,172 @@ class WorkerLockRecoveryTest(unittest.TestCase):
     def test_service_retries_lock_without_skipping_maintenance_or_counting_failure_as_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = []
+            original_init = workers.init_db
+            original_pass = workers.run_worker_pass
+            init_calls = []
+
+            def init_once_busy(*args, **kwargs):
+                init_calls.append(1)
+                if len(init_calls) == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return original_init(*args, **kwargs)
 
             def run_pass(root, *, roles, limit, maintenance):
                 calls.append(maintenance)
-                if len(calls) == 1:
-                    raise sqlite3.OperationalError("database is locked")
-                return {"ok": True, "processed_count": 0}
+                return original_pass(root, roles=roles, limit=limit, maintenance=maintenance)
 
-            with patch.object(workers, "run_worker_pass", side_effect=run_pass), patch.object(workers.time, "sleep"):
+            with (
+                patch.object(workers, "init_db", side_effect=init_once_busy),
+                patch.object(workers, "run_worker_pass", side_effect=run_pass),
+                patch.object(workers.time, "sleep"),
+            ):
                 result = workers.serve_workers(Path(tmp), limit=2, maintenance_interval_seconds=3600)
-            self.assertEqual(calls, [True, True, False])
+            self.assertEqual(calls, [True, False])
             self.assertTrue(result["ok"])
             self.assertEqual(result["passes"], 2)
             self.assertEqual(result["maintenance_passes"], 1)
+
+    def test_later_claim_lock_preserves_completed_job_results(self):
+        for job_ok in (False, True):
+            with self.subTest(job_ok=job_ok), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "memory"
+                job_id = self.make_job(root)
+                original_claim = workers._claim_job
+                claims = []
+
+                def claim_once_busy(*args, **kwargs):
+                    claims.append(1)
+                    if len(claims) == 2:
+                        raise sqlite3.OperationalError("database is locked")
+                    return original_claim(*args, **kwargs)
+
+                with (
+                    patch.object(workers, "_process_job", return_value={"ok": True},
+                                 side_effect=None if job_ok else sqlite3.OperationalError("disk I/O error")) as process,
+                    patch.object(workers, "_claim_job", side_effect=claim_once_busy),
+                    patch.object(workers.time, "sleep") as sleep,
+                ):
+                    result = workers.serve_workers(root, limit=1, maintenance_on_start=False)
+                self.assertEqual(result["ok"], job_ok, result)
+                self.assertEqual(result["passes"], 1)
+                self.assertEqual(result["processed_count"], 1)
+                self.assertEqual(process.call_count, 1)
+                sleep.assert_called_once_with(5)
+                job = self.read_job(root, job_id)
+                self.assertEqual(job["status"], "succeeded" if job_ok else "failed")
+                self.assertEqual(job["attempt_count"], 1)
+                if not job_ok:
+                    self.assertEqual(result["reason"], "worker_pass_failed")
+                    self.assertEqual(result["failed_pass"]["processed"][0]["error"], "disk I/O error")
+
+    def test_each_maintenance_lock_preserves_completed_job_results(self):
+        maintenance_units = (
+            "drain_card_sidecar_outbox",
+            "_reconcile_card_sidecar_intent_maintenance",
+            "_recover_failed_post_phase_sidecar_jobs",
+            "decay_graph_routes",
+            "apply_storage_tiering",
+            "_run_conflict_maintenance",
+        )
+        for unit in maintenance_units:
+            for job_ok in (False, True):
+                with self.subTest(unit=unit, job_ok=job_ok), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "memory"
+                    job_id = self.make_job(root)
+                    with (
+                        patch.object(workers, "_process_job", return_value={"ok": True},
+                                     side_effect=None if job_ok else sqlite3.OperationalError("disk I/O error")) as process,
+                        patch.object(workers, unit, side_effect=[
+                            sqlite3.OperationalError("database is locked"), {"ok": True}
+                        ]) as maintenance,
+                        patch.object(workers.time, "sleep") as sleep,
+                    ):
+                        result = workers.serve_workers(root, limit=1)
+                    self.assertEqual(result["ok"], job_ok, result)
+                    self.assertEqual(result["processed_count"], 1)
+                    self.assertEqual(result["passes"], 1)
+                    self.assertEqual(result["maintenance_passes"], 1)
+                    self.assertEqual(process.call_count, 1)
+                    self.assertEqual(maintenance.call_count, 2)
+                    sleep.assert_called_once_with(5)
+                    job = self.read_job(root, job_id)
+                    self.assertEqual(job["status"], "succeeded" if job_ok else "failed")
+                    self.assertEqual(job["attempt_count"], 1)
+                    if not job_ok:
+                        self.assertEqual(result["reason"], "worker_pass_failed")
+                        self.assertEqual(result["failed_pass"]["processed"][0]["error"], "disk I/O error")
+
+    def test_later_maintenance_lock_preserves_prior_maintenance_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memory"
+            with (
+                patch.object(workers, "drain_card_sidecar_outbox", return_value={"ok": False, "failed": 1}) as drain,
+                patch.object(workers, "_reconcile_card_sidecar_intent_maintenance", side_effect=[
+                    sqlite3.OperationalError("database is locked"), {"ok": True}
+                ]),
+                patch.object(workers.time, "sleep") as sleep,
+            ):
+                result = workers.serve_workers(root, limit=1)
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["failed_pass"]["maintenance"]["sidecars"]["ok"])
+            self.assertEqual(drain.call_count, 1)
+            sleep.assert_called_once_with(5)
+
+    def test_failure_persistence_lock_keeps_prior_failed_results_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memory"
+            self.make_job(root)
+            self.make_job(root)
+            original_finish = workers._finish_job
+            finishes = []
+
+            def finish_once_busy(*args, **kwargs):
+                finishes.append(1)
+                result = original_finish(*args, **kwargs)
+                if len(finishes) == 2:
+                    raise sqlite3.OperationalError("database is locked")
+                return result
+
+            with (
+                patch.object(workers, "_process_job", side_effect=sqlite3.OperationalError("disk I/O error")) as process,
+                patch.object(workers, "_finish_job", side_effect=finish_once_busy),
+                patch.object(workers.time, "sleep") as sleep,
+            ):
+                result = workers.serve_workers(root, limit=1, maintenance_on_start=False)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["processed_count"], 2)
+            self.assertEqual(process.call_count, 2)
+            self.assertEqual(len(finishes), 3)
+            sleep.assert_called_once_with(5)
+            for attempt in result["failed_pass"]["processed"]:
+                self.assertEqual(attempt["status"], "failed")
+                self.assertEqual(attempt["error"], "disk I/O error")
+                job = self.read_job(root, attempt["job_id"])
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual(job["attempt_count"], 1)
+
+    def test_claim_retry_does_not_double_count_rolled_back_reclaims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memory"
+            job_id = self.make_job(root)
+            with closing(connect(root)) as conn:
+                conn.execute(
+                    "UPDATE queue_jobs SET status='running', preemptible=0, "
+                    "lease_owner='expired-worker', lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                    (job_id,),
+                )
+                conn.commit()
+            with (
+                patch.object(workers, "_claim_job", side_effect=[sqlite3.OperationalError("database is locked"), None]),
+                patch.object(workers.time, "sleep") as sleep,
+            ):
+                result = workers.run_worker_pass(root, maintenance=False)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(result["reclaimed_expired_jobs"], 1)
+            self.assertEqual(result["expired_non_preemptible_failure_count"], 1)
+            self.assertEqual(self.read_job(root, job_id)["status"], "failed")
+            sleep.assert_called_once_with(5)
 
     def test_real_sqlite_writer_lock_releases_and_same_service_drains_job(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -445,3 +598,60 @@ class WorkerLockRecoveryTest(unittest.TestCase):
             job = self.read_job(root, job_id)
             self.assertEqual(job["status"], "running")
             self.assertEqual(job["lease_owner"], "another-worker")
+
+    def test_busy_lost_lease_uses_durable_authority(self):
+        cases = (
+            ("failed_reclaim", "terminal_failure", False),
+            ("non_preemptible_expired", "running_non_preemptible_unrecoverable", False),
+            ("missing", "missing", False),
+            ("live_transferred", "running_live_owner", True),
+            ("preemptible_expired", "running_preemptible_reclaimable", True),
+            ("pending_reclaim", "pending_recoverable", True),
+            ("completed", "terminal_success", True),
+        )
+        for transition, authority_state, authority_ok in cases:
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "memory"
+                job_id = self.make_job(root)
+                reclaimed = []
+
+                def change_authority_then_busy(*args, **kwargs):
+                    with closing(connect(root)) as conn:
+                        if transition == "missing":
+                            conn.execute("DELETE FROM queue_jobs WHERE id=?", (job_id,))
+                        elif transition == "live_transferred":
+                            conn.execute("UPDATE queue_jobs SET lease_owner='another-worker' WHERE id=?", (job_id,))
+                        elif transition == "completed":
+                            self.assertTrue(workers._finish_job(conn, job_id, status="succeeded", result={"ok": True}))
+                        else:
+                            conn.execute(
+                                "UPDATE queue_jobs SET preemptible=?, lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                                (0 if transition in {"failed_reclaim", "non_preemptible_expired"} else 1, job_id),
+                            )
+                            if transition in {"failed_reclaim", "pending_reclaim"}:
+                                workers._reclaim_expired_leases(conn, public_results=reclaimed)
+                        conn.commit()
+                    raise sqlite3.OperationalError("database is locked")
+
+                with patch.object(workers, "_process_job", side_effect=change_authority_then_busy) as process:
+                    result = workers.run_worker_pass(root, limit=8, maintenance=False)
+                self.assertEqual(result["ok"], authority_ok, result)
+                self.assertEqual(result["processed_count"], 1)
+                self.assertEqual(result["incomplete_attempt_count"], 1)
+                self.assertEqual(result["retry_pending_count"], 0)
+                self.assertEqual(process.call_count, 1)
+                attempt = result["processed"][0]
+                self.assertEqual(attempt["status"], "incomplete")
+                self.assertFalse(attempt["attempt_completed"])
+                self.assertEqual(attempt["reason"], "worker_lease_lost")
+                authority = attempt["authoritative_job"]
+                self.assertEqual(authority["authority_state"], authority_state)
+                self.assertEqual(authority["authority_ok"], authority_ok)
+                if transition == "failed_reclaim":
+                    self.assertEqual(len(reclaimed), 1)
+                    self.assertEqual(reclaimed[0]["reason"], "non_preemptible_worker_lease_expired")
+                    self.assertEqual(self.read_job(root, job_id)["status"], "failed")
+                elif transition == "live_transferred":
+                    self.assertEqual(self.read_job(root, job_id)["lease_owner"], "another-worker")
+                elif transition == "missing":
+                    self.assertFalse(authority["exists"])

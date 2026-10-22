@@ -560,11 +560,6 @@ class WorkerLockRecoveryTest(unittest.TestCase):
                 conn.close()
 
     def test_real_sidecar_write_lock_recovers_without_terminal_failed_effect(self):
-        for hold_seconds in (7, 12):
-            with self.subTest(hold_seconds=hold_seconds):
-                self._check_real_sidecar_lock(hold_seconds)
-
-    def _check_real_sidecar_lock(self, hold_seconds):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "memory"
             init_db(root)
@@ -579,34 +574,50 @@ class WorkerLockRecoveryTest(unittest.TestCase):
                 conn.close()
             original_sync = workers._sync_worker_card_sidecars
             ready = threading.Event()
+            release = threading.Event()
+            busy_seen = threading.Event()
             failures = []
 
             def hold_writer():
-                blocker = connect(root)
                 try:
-                    blocker.execute("BEGIN IMMEDIATE")
-                    ready.set()
-                    threading.Event().wait(hold_seconds)
+                    with closing(connect(root)) as blocker:
+                        try:
+                            blocker.execute("BEGIN IMMEDIATE")
+                            ready.set()
+                            if not release.wait(30):
+                                raise TimeoutError("sidecar operation did not release the test writer")
+                        finally:
+                            blocker.rollback()
                 except BaseException as exc:
                     failures.append(exc)
-                finally:
-                    blocker.rollback()
-                    blocker.close()
+
+            blocker_thread = threading.Thread(target=hold_writer, daemon=True)
 
             def locked_sync(*args, **kwargs):
-                blocker_thread = threading.Thread(target=hold_writer, daemon=True)
                 blocker_thread.start()
                 try:
-                    self.assertTrue(ready.wait(10))
+                    self.assertTrue(ready.wait(10), "test writer did not acquire the SQLite lock")
                     return original_sync(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    if workers._is_worker_sqlite_busy(exc):
+                        busy_seen.set()
+                    raise
                 finally:
+                    # Hold the real lock until the sidecar operation exits,
+                    # rather than guessing how long it takes to hit its write.
+                    release.set()
                     blocker_thread.join(15)
 
             with patch.object(workers, "_sync_worker_card_sidecars", side_effect=locked_sync):
                 first = workers.serve_workers(root, limit=1, maintenance_on_start=False)
+            self.assertFalse(blocker_thread.is_alive(), "test writer did not stop")
             self.assertEqual(failures, [])
+            self.assertTrue(busy_seen.is_set(), "sidecar operation did not observe real SQLite contention")
             self.assertTrue(first["ok"])
-            self.assertEqual(self.read_job(root, job_id)["status"], "pending")
+            self.assertEqual(first["retry_pending_count"], 1)
+            pending = self.read_job(root, job_id)
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["retry_pending"], 1)
             second = workers.serve_workers(root, limit=1, maintenance_on_start=False)
             self.assertTrue(second["ok"])
             self.assertEqual(self.read_job(root, job_id)["status"], "succeeded")

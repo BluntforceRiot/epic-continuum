@@ -31,7 +31,7 @@ class ProjectKnowledgeTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory(prefix="continuum-project-knowledge-")
         self.addCleanup(directory.cleanup)
-        self.directory = Path(directory.name)
+        self.directory = Path(directory.name).resolve(strict=True)
         self.root = self.directory / "memory"
         self.source = self.directory / "source"
         self.source.mkdir()

@@ -30,7 +30,7 @@ class ExperienceTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="continuum-experience-")
         self.addCleanup(temporary.cleanup)
-        self.directory = Path(temporary.name)
+        self.directory = Path(temporary.name).resolve(strict=True)
         self.root = self.directory / "memory"
         config = default_config()
         config["capture"]["mode"] = "manual"

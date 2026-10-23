@@ -22,7 +22,7 @@ class MemoryIntelligenceInterfacesTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="continuum-intelligence-")
         self.addCleanup(temp.cleanup)
-        self.directory = Path(temp.name)
+        self.directory = Path(temp.name).resolve(strict=True)
         self.root = self.directory / "memory"
         self.source = self.directory / "source"
         self.source.mkdir()

@@ -62,7 +62,7 @@ class CapabilityIntegrationTests(unittest.TestCase):
             prefix="continuum-capability-integration-"
         )
         self.addCleanup(temporary.cleanup)
-        self.directory = Path(temporary.name)
+        self.directory = Path(temporary.name).resolve(strict=True)
         self.root = self.directory / "source-memory"
         self.source = self.directory / "source-files"
         self.source.mkdir()

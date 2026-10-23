@@ -26,7 +26,7 @@ class CapabilityTransportTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="continuum-capability-transport-")
         self.addCleanup(temporary.cleanup)
-        self.directory = Path(temporary.name)
+        self.directory = Path(temporary.name).resolve(strict=True)
         self.root = self.directory / "memory"
         self.source = self.directory / "inputs"
         self.source.mkdir()

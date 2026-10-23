@@ -145,7 +145,7 @@ class WorkingKnowledgeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="continuum-working-context-")
         self.addCleanup(temporary.cleanup)
-        self.directory = Path(temporary.name)
+        self.directory = Path(temporary.name).resolve(strict=True)
         self.root = self.directory / "memory"
         self.source = self.directory / "source"
         self.source.mkdir()

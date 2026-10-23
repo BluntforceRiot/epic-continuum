@@ -172,6 +172,18 @@ their separate opt-in flags are true. Apply with the identical arguments plus
 - `continuum_cue_recall`
 - `continuum_record_project_state`
 - `continuum_search`
+- `continuum_read_chunk`
+- `continuum_recall`
+- `continuum_index_embeddings`
+- `continuum_recall_indexed`
+- `continuum_record_fact`
+- `continuum_query_facts`
+- `continuum_index_project_files`
+- `continuum_record_project_knowledge`
+- `continuum_project_context`
+- `continuum_knowledge_read`
+- `continuum_knowledge_write`
+- `continuum_read_source`
 - `continuum_audit_search_index`
 - `continuum_rebuild_search_index`
 - `continuum_reindex_memory`
@@ -207,6 +219,11 @@ their separate opt-in flags are true. Apply with the identical arguments plus
 - `continuum_review_status`
 - `continuum_review_check_current`
 - `continuum_review_browser_attempt_start`
+
+The two knowledge tools require an explicit absolute root, a fixed action and
+a bounded JSON request. See [capability transports](../capability-api.md) for
+the action registry and source/destination ownership. The existing 256-KiB
+stdio frame ceiling still applies; use the Python API for larger capsules.
 
 `continuum_review_prepare` accepts the same narrow secret-scan exceptions as
 the CLI: `secret_allowlist_files` for UTF JSONL files containing exact

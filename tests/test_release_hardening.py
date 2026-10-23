@@ -183,6 +183,8 @@ class ReleaseHardeningTest(unittest.TestCase):
         for relative_path in (
             "docs/review-relay.md",
             "docs/RELEASE_NOTES_0.3.1.md",
+            "docs/RELEASE_NOTES_0.4.0.md",
+            "docs/upgrade-0.4.md",
             "docs/worker-operations.md",
             "docs/writer-claims.md",
         ):
@@ -606,6 +608,13 @@ class ReleaseHardeningTest(unittest.TestCase):
             )
         )
         self.assertTrue(codex_manifest["version"].startswith(f"{version}+codex."))
+
+        notes = repo_root / "docs" / f"RELEASE_NOTES_{version}.md"
+        self.assertTrue(notes.is_file())
+        self.assertIn(f"{version}", notes.read_text(encoding="utf-8"))
+        workflow = (repo_root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("assert continuum.__version__ == expected", workflow)
+        self.assertIn("tomllib.loads(pathlib.Path('pyproject.toml')", workflow)
 
     def test_powershell_installers_accept_continuum_root_alias_and_strict_binding(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

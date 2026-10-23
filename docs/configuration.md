@@ -107,12 +107,15 @@ The per-event booleans under `capture` can still disable a category. Adapter
 environment variables, such as `CONTINUUM_RECORD_USER_TURNS=false`, override the
 local adapter config when present.
 
-`capture.max_tool_result_bytes` is a hard cap on stored tool-result payloads.
+`capture.max_tool_result_bytes` is a hard cap on Scroll tool-result payloads.
 When a result is too large, `capture.large_result_policy` decides whether the
 adapter uses `truncate_with_notice`, plain `truncate`, or `skip`. The default
 `truncate_with_notice` reserves room for the notice inside the configured byte
-cap. Exact large evidence should be archived through file ingest so the Scroll
-can link to it without bloating every context compile.
+cap. The opt-in `index_and_link` policy preserves approved oversized text in the
+Library (up to `storage.max_ingest_bytes`) and puts only a bounded reference in
+Scroll. Full-content credential scanning still runs before archival. See
+[retrieval and large outputs](retrieval-and-large-outputs.md) for the selected
+chunk reader and continuation contract. Existing defaults do not change.
 
 `capture.roll_segments_every_events` is a policy hint for scribe workers and
 adapters that compact older Scroll ranges into Cards. The core never deletes the

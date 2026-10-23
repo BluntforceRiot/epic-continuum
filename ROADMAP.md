@@ -15,13 +15,31 @@ The 0.3 line turns the 0.2 durability foundation into a daily recovery system.
 
 ## Next Release Focus (0.4)
 
-- Evaluate additional local-model tasks only where deterministic benchmarks prove
-  improvement: candidate reranking, proposed summaries, and review assistance.
-- Add scoped Library collections and a formal schema-migration ledger.
-- Add cross-root/export synchronization without multi-writer SQLite access.
-- Build a compact personal health/recovery dashboard and richer project profiles.
-- Expand adapter certification across Codex, Claude Code, Hermes, OpenClaw, and
-  OpenAI-compatible runtimes.
+The [approved 0.4 scope](docs/v04-scope.md) expands Continuum into a headless,
+local-first memory and working-context platform. One shared core serves Hermes,
+Codex, and other supported hosts through adapters and profiles. A separate
+private Vanta product branch is no longer a target; private memory scopes remain.
+
+- Semantic, exact, relational, and temporal recall with evidence and bounded cost.
+- Living project knowledge, including source and binary-analysis findings,
+  change-impact tracking, and evidence-linked investigation notebooks.
+- Real host context management for large outputs and multimodal conversations.
+- Time-aware facts, corrections, verified experience, and reusable procedures.
+- Cross-agent continuity, claimable handoffs, and task-ready context packs.
+- Browsable collections, disposable memory experiments and replay, cross-project
+  transfer of verified lessons, and selective cross-machine sharing.
+- Headless memory debugging and operator diagnostics through CLI, MCP, and APIs.
+
+Memory Studio and all new graphical/dashboard interfaces are excluded. A
+productized practical evaluation lab is deferred pending a separate decision;
+ordinary tests, representative quality checks, and release validation remain
+required. Neither exclusion removes existing test utilities.
+
+The reviewed retrieval/output/inspection work is foundation evidence only, not
+completion of this expanded scope. Follow the [readiness gates](docs/v04-readiness.md)
+for each assembled candidate. Live deployment and publication remain separate
+decisions; optional model-assisted features must not become a mandatory cloud
+dependency or cause Continuum to control the user's model lifecycle.
 
 ## Foundation Slice
 

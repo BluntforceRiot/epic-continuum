@@ -29,6 +29,13 @@ from .core.bundle import (
     verify_root_bundle,
 )
 from .core.evals import run_memory_quality_evals
+from .core.recall import recall_memory, read_memory_source
+from .core.embedding_index import refresh_embedding_index, recall_indexed
+from .core.temporal_facts import record_temporal_fact, query_temporal_facts
+from .core.project_knowledge import index_project_files, record_project_knowledge, query_project_knowledge
+from .core.capability_api import (
+    CAPABILITIES, dispatch_capability, explicit_path, parse_request_json, prepare_capability,
+)
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace, progress_bar
 from .core.local_model import (
@@ -115,6 +122,7 @@ from .core.store import (
     resolve_stored_uri,
     roll_scroll_segment,
     search_memory,
+    read_memory_chunk,
     source_file_reference,
     snapshot,
     status,
@@ -308,6 +316,17 @@ def guarded_result(
         return operation.wrap_result(result)
 
 
+def _knowledge_json(raw: str | None) -> Any:
+    if raw is None:
+        return None
+    if len(raw.encode("utf-8")) > 65536:
+        raise ValueError("knowledge JSON argument exceeds 65536 bytes")
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ValueError("knowledge argument must be a bounded JSON array") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Epic Continuum persistent-memory substrate")
     parser.add_argument("--version", action="version", version=f"epic-continuum-memory {__version__}")
@@ -318,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show root status")
     p_status.add_argument("--root", required=True)
+
+    p_inspect = sub.add_parser("inspect", help="Read-only runtime, queue and optional connection inspection")
+    p_inspect.add_argument("--root", required=True)
+    p_inspect.add_argument("--hermes-config", type=Path, help="Explicit Hermes adapter JSON to inspect; never executed or edited")
+    p_inspect.add_argument("--codex-config", type=Path, help="Explicit Codex MCP JSON/TOML to inspect; never executed or edited")
 
     p_writer_status = sub.add_parser("writer-status", help="Show the root writer claim without changing it")
     p_writer_status.add_argument("--root", required=True)
@@ -378,6 +402,88 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=10)
     p_search.add_argument("--session-id")
     p_search.add_argument("--project-id")
+
+    p_read_chunk = sub.add_parser("read-chunk", help="Read selected Library evidence with bounded continuation")
+    p_read_chunk.add_argument("--root", required=True)
+    p_read_chunk.add_argument("--chunk-id", required=True)
+    p_read_chunk.add_argument("--offset", type=int, default=0)
+    p_read_chunk.add_argument("--limit", type=int, default=4000)
+    p_read_chunk.add_argument("--session-id")
+    p_read_chunk.add_argument("--project-id")
+
+    p_recall = sub.add_parser("recall", help="Fuse scoped lexical, associative, and optional precomputed semantic recall")
+    p_recall.add_argument("--root", required=True)
+    p_recall.add_argument("--query", required=True)
+    p_recall.add_argument("--limit", type=int, default=8)
+    p_recall.add_argument("--token-budget", type=int, default=2400)
+    p_recall.add_argument("--created-after", help="Inclusive recorded-time ISO-8601 timestamp with UTC offset")
+    p_recall.add_argument("--created-before", help="Exclusive recorded-time ISO-8601 timestamp with UTC offset")
+    p_recall.add_argument("--semantic-input", help="Explicit precomputed vector JSON file; never starts a model")
+    p_recall.add_argument("--session-id")
+    p_recall.add_argument("--project-id")
+
+    p_read_source = sub.add_parser("read-source", help="Read exact current Card, Scroll, or Library evidence")
+    p_read_source.add_argument("--root", required=True)
+    p_read_source.add_argument("--kind", required=True, choices=["card", "scroll_event", "chunk"])
+    p_read_source.add_argument("--source-id", required=True)
+    p_read_source.add_argument("--content-hash", help="Require unchanged evidence across pagination")
+    p_read_source.add_argument("--offset", type=int, default=0)
+    p_read_source.add_argument("--limit", type=int, default=4000)
+    p_read_source.add_argument("--session-id")
+    p_read_source.add_argument("--project-id")
+
+    p_knowledge = sub.add_parser("knowledge", help="Explicit bounded JSON dispatch for scoped 0.4 knowledge capabilities")
+    p_knowledge.add_argument("--root", required=True, help="Explicit absolute memory root; no default root")
+    p_knowledge.add_argument("--action", required=True, choices=sorted(CAPABILITIES))
+    p_knowledge.add_argument("--request-json", required=True, help="Strict JSON object of action arguments, at most 512 KiB")
+
+    for name in ("index-embeddings", "recall-indexed"):
+        item = sub.add_parser(name, help="Explicit local embedding index pass" if name == "index-embeddings" else "Read-only recall using an existing local embedding index")
+        item.add_argument("--root", required=True)
+        item.add_argument("--endpoint", required=True, help="Explicit loopback OpenAI-compatible /v1 base URL")
+        item.add_argument("--model", required=True)
+        item.add_argument("--session-id")
+        item.add_argument("--project-id")
+        if name == "index-embeddings":
+            item.add_argument("--max-sources", type=int, default=5000)
+            item.add_argument("--batch-size", type=int, default=16)
+        else:
+            item.add_argument("--query", required=True)
+            item.add_argument("--limit", type=int, default=8)
+            item.add_argument("--token-budget", type=int, default=2400)
+            item.add_argument("--created-after")
+            item.add_argument("--created-before")
+
+    for name in ("record-fact", "query-facts", "index-project-files", "record-project-knowledge", "project-context"):
+        item = sub.add_parser(name, help="Project-scoped typed evidence; no implicit model calls")
+        item.add_argument("--root", required=True)
+        item.add_argument("--project-id", required=True)
+        if name in {"record-fact", "index-project-files", "record-project-knowledge"}:
+            item.add_argument("--session-id", required=True)
+        else:
+            item.add_argument("--include-history", action="store_true")
+            item.add_argument("--token-budget", type=int, default=2400)
+        if name == "record-fact":
+            for field in ("subject", "predicate", "value", "valid-from"):
+                item.add_argument("--" + field, required=True)
+            item.add_argument("--valid-to")
+            item.add_argument("--corrects", help="Replace this entire earlier assertion, preserving its history")
+            item.add_argument("--evidence-json", help="JSON array of exact kind/id/content_hash citations")
+        elif name == "query-facts":
+            for field in ("subject", "predicate", "valid-at", "known-at"):
+                item.add_argument("--" + field)
+        elif name == "index-project-files":
+            item.add_argument("--source-root", type=Path, required=True)
+            item.add_argument("--path", action="append", required=True, dest="paths", help="Explicit relative text file; repeat up to 32 times")
+        elif name == "record-project-knowledge":
+            item.add_argument("--kind", required=True, choices=["decision", "test", "error", "fix", "note"])
+            item.add_argument("--title", required=True)
+            item.add_argument("--summary", required=True)
+            item.add_argument("--links-json", help="JSON array of relation/target_id links")
+            item.add_argument("--evidence-json", help="JSON array of exact kind/id/content_hash citations")
+        else:
+            item.add_argument("--query")
+            item.add_argument("--source-root", type=Path, help="Explicit file root for current hash/staleness checks")
 
     p_cue = sub.add_parser("cue-recall", help="Recover buried ideas from loose associative cues")
     p_cue.add_argument("--root", required=True)
@@ -919,6 +1025,34 @@ def _main(argv: list[str] | None = None) -> int:
 
     root_arg_value = getattr(args, "root", None)
     root = Path(root_arg_value) if root_arg_value else None
+    if args.command == "knowledge":
+        root = explicit_path(args.root, "root")
+        prepared = prepare_capability(args.action, parse_request_json(args.request_json))
+        operation_root = prepared.operation_root(root)
+        if operation_root is None:
+            # Reads and destination-only derivations must not initialize, add
+            # receipts to, or otherwise mutate the source memory root.
+            emit(dispatch_capability(root, prepared))
+        else:
+            intent: dict[str, Any] = {"action": prepared.action}
+            for key in ("project_id", "session_id"):
+                if key in prepared.request:
+                    intent[key] = prevalidate_cli_partition(operation_root, key, prepared.request[key])
+            emit(guarded_result(
+                operation_root, operation_type="cli_knowledge_" + prepared.action,
+                title="Record scoped knowledge", intent=intent,
+                snapshot_policy="none", snapshot_reason="append-only scoped knowledge",
+                proof=False, touched_paths=[operation_root / "catalog" / "catalog.sqlite3"],
+                action=lambda operation: dispatch_capability(root, prepared),
+            ))
+        return 0
+    if args.command == "inspect":
+        from .core.inspection import inspect_runtime
+
+        assert root is not None
+        emit(inspect_runtime(root, hermes_adapter_config=args.hermes_config, codex_mcp_config=args.codex_config))
+        return 0
+
     if args.command == "writer-status":
         assert root is not None
         return emit_result(writer_claim_status(root))
@@ -1301,6 +1435,89 @@ def _main(argv: list[str] | None = None) -> int:
                 create=False,
             )
         )
+        return 0
+
+    if args.command == "read-chunk":
+        assert root is not None
+        if args.session_id:
+            prevalidate_cli_partition(root, "session_id", args.session_id)
+        if args.project_id:
+            prevalidate_cli_partition(root, "project_id", args.project_id)
+        emit(read_memory_chunk(root, chunk_id=args.chunk_id, offset=args.offset, limit=args.limit,
+                               session_id=args.session_id, project_id=args.project_id))
+        return 0
+
+    if args.command in {"recall", "read-source"}:
+        assert root is not None
+        if args.session_id:
+            prevalidate_cli_partition(root, "session_id", args.session_id)
+        if args.project_id:
+            prevalidate_cli_partition(root, "project_id", args.project_id)
+        if args.command == "read-source":
+            emit(read_memory_source(root, kind=args.kind, source_id=args.source_id,
+                                    offset=args.offset, limit=args.limit, content_hash=args.content_hash,
+                                    session_id=args.session_id, project_id=args.project_id))
+        else:
+            semantic = None
+            if args.semantic_input:
+                with Path(args.semantic_input).open("rb") as handle:
+                    raw = handle.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError("semantic input file exceeds 2 MiB")
+                try:
+                    semantic = json.loads(raw)
+                except (ValueError, UnicodeError) as exc:
+                    raise ValueError("semantic input file must be UTF-8 JSON") from exc
+            emit(recall_memory(root, query=args.query, limit=args.limit, token_budget=args.token_budget,
+                               created_after=args.created_after, created_before=args.created_before,
+                               semantic=semantic, session_id=args.session_id, project_id=args.project_id))
+        return 0
+
+    if args.command in {"index-embeddings", "recall-indexed"}:
+        assert root is not None
+        for key in ("session_id", "project_id"):
+            if getattr(args, key):
+                prevalidate_cli_partition(root, key, getattr(args, key))
+        options = {"endpoint": args.endpoint, "model": args.model,
+                   "session_id": args.session_id, "project_id": args.project_id}
+        if args.command == "index-embeddings":
+            # Derived cache only: do not create a durable memory operation/event.
+            emit(refresh_embedding_index(root, **options, max_sources=args.max_sources, batch_size=args.batch_size))
+        else:
+            emit(recall_indexed(root, **options, query=args.query, limit=args.limit, token_budget=args.token_budget,
+                                created_after=args.created_after, created_before=args.created_before))
+        return 0
+
+    if args.command in {"record-fact", "query-facts", "index-project-files", "record-project-knowledge", "project-context"}:
+        assert root is not None
+        safe_project = prevalidate_cli_partition(root, "project_id", args.project_id)
+        if args.command == "query-facts":
+            emit(query_temporal_facts(root, project_id=args.project_id, subject=args.subject, predicate=args.predicate,
+                                      valid_at=args.valid_at, known_at=args.known_at, include_history=args.include_history,
+                                      token_budget=args.token_budget))
+        elif args.command == "project-context":
+            emit(query_project_knowledge(root, project_id=args.project_id, query=args.query, source_root=args.source_root,
+                                         include_history=args.include_history, token_budget=args.token_budget))
+        else:
+            safe_session = prevalidate_cli_partition(root, "session_id", args.session_id)
+
+            def typed_action(operation: OperationGuard) -> dict[str, Any]:
+                if args.command == "record-fact":
+                    return record_temporal_fact(root, project_id=args.project_id, session_id=args.session_id,
+                                                subject=args.subject, predicate=args.predicate, value=args.value,
+                                                valid_from=args.valid_from, valid_to=args.valid_to, corrects=args.corrects,
+                                                evidence=_knowledge_json(args.evidence_json))
+                if args.command == "index-project-files":
+                    return index_project_files(root, project_id=args.project_id, session_id=args.session_id,
+                                               source_root=args.source_root, paths=args.paths)
+                return record_project_knowledge(root, project_id=args.project_id, session_id=args.session_id,
+                                                kind=args.kind, title=args.title, summary=args.summary,
+                                                links=_knowledge_json(args.links_json), evidence=_knowledge_json(args.evidence_json))
+
+            emit(guarded_result(root, operation_type="cli_" + args.command.replace("-", "_"),
+                                title="Record project knowledge", intent={"project_id": safe_project, "session_id": safe_session},
+                                snapshot_policy="none", snapshot_reason="append-only project evidence", proof=False,
+                                touched_paths=[root / "catalog" / "catalog.sqlite3"], action=typed_action))
         return 0
 
     if args.command == "cue-recall":

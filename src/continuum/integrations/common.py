@@ -182,9 +182,13 @@ def record_tool_event(
     kind = "tool_result" if result else "tool_call"
     if not should_capture(resolved_root, kind, explicit=explicit):
         return None
-    text = as_text(payload).strip()
-    if not text:
+    text = as_text(payload)
+    if not text.strip():
         return None
+    capture_config = load_config(resolved_root).get("capture", {})
+    indexed_policy = result and capture_config.get("large_result_policy") == "index_and_link"
+    if not indexed_policy:
+        text = text.strip()
     event_metadata = adapter_metadata(source, metadata or {})
     event_metadata["source"] = source
     event_metadata["source_type"] = "adapter_tool_event"
@@ -198,6 +202,21 @@ def record_tool_event(
         return None
     text, event_metadata = capture_ready
     if result:
+        if indexed_policy:
+            from continuum.core.tool_outputs import record_indexed_tool_result
+            from continuum.core.units import parse_size
+
+            max_bytes = parse_size(capture_config.get("max_tool_result_bytes", "256KB"))
+            if len(text.encode("utf-8")) > max_bytes:
+                storage_max = parse_size(load_config(resolved_root).get("storage", {}).get("max_ingest_bytes", "50MB"))
+                if len(text.encode("utf-8")) <= storage_max:
+                    event = record_indexed_tool_result(
+                        resolved_root, session_id=session_id, event_type=f"{source}_{kind}",
+                        text=text, metadata=event_metadata, max_reference_bytes=max_bytes,
+                    )
+                    maybe_maintain_after_capture(resolved_root, session_id=event["session_id"])
+                    return event
+                event_metadata["index_skipped_reason"] = "storage.max_ingest_bytes exceeded"
         text, capture_meta = trim_tool_result_for_capture(resolved_root, text)
         event_metadata["capture"] = capture_meta
         if capture_meta.get("skipped"):

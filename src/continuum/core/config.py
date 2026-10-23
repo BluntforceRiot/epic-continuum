@@ -29,6 +29,7 @@ LARGE_RESULT_POLICIES = {
     "summarize_and_link",
     "truncate",
     "skip",
+    "index_and_link",
 }
 PRUNE_POLICIES = {"ask", "manual", "auto_tier_only", "auto_prune"}
 SNAPSHOT_RETENTION_POLICIES = {"last_20", "keep_all"}
@@ -573,7 +574,7 @@ def validate_config(config: dict[str, Any]) -> None:
         not in LARGE_RESULT_POLICIES
     ):
         raise ValueError(
-            "capture.large_result_policy must be truncate_with_notice, truncate, or skip"
+            "capture.large_result_policy must be truncate_with_notice, truncate, skip, or index_and_link"
         )
     retention = config.get("retention", {})
     for key in ("raw_scroll_hot_days", "raw_scroll_warm_days"):

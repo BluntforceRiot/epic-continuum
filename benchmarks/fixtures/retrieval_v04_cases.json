@@ -1,0 +1,20 @@
+{
+  "description": "Small pre-implementation synthetic regression corpus; not a held-out or model benchmark.",
+  "documents": [
+    {"id": "late", "title": "Release notebook", "prefix_repeat": 35, "text": "The copper badger retry delay is 17 seconds. Preserve the journal before retrying."},
+    {"id": "noise", "title": "Copper inventory", "text": "Copper sheets and copper piping. Badger mascots. The retry discussion is pending; this is not the delay decision."},
+    {"id": "short", "title": "SQL 429", "text": "SQL 429 means the local test service is rate limited. The retry delay is 31 seconds."},
+    {"id": "identifier", "title": "Build switches", "text": "Set R2-D7 to amber for the release check. R2-D8 remains blue."},
+    {"id": "unicode", "title": "Mémoire café", "text": "La mémoire du café conserve le rendez-vous jeudi à midi."},
+    {"id": "phrase", "title": "Silver otter", "text": "Silver otter is the selected backup label."},
+    {"id": "scattered", "title": "Supply notes", "text": "Silver plating is ordered. The river has an otter. This is unrelated to backup labels."}
+  ],
+  "cases": [
+    {"query": "copper badger retry delay", "expected": "late", "excerpt_contains": "17 seconds"},
+    {"query": "SQL 429", "expected": "short", "excerpt_contains": "31 seconds"},
+    {"query": "R2-D7", "expected": "identifier", "excerpt_contains": "amber"},
+    {"query": "mémoire café", "expected": "unicode", "excerpt_contains": "jeudi"},
+    {"query": "silver otter", "expected": "phrase", "excerpt_contains": "selected backup label"},
+    {"query": "quartzzeppelinunknown", "expected": null}
+  ]
+}

@@ -13,12 +13,12 @@
   <a href="pyproject.toml"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-79f0ff?style=flat-square&labelColor=05070d&logo=python&logoColor=79f0ff"></a>
   <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20CLI%20%7C%20Python-99a7ff?style=flat-square&labelColor=05070d"></a>
   <a href="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Release: 0.3.1" src="https://img.shields.io/badge/release-0.3.1-8df3ff?style=flat-square&labelColor=05070d"></a>
+  <a href="CHANGELOG.md"><img alt="Candidate: 0.4.0" src="https://img.shields.io/badge/release-0.4.0-8df3ff?style=flat-square&labelColor=05070d"></a>
 </p>
 
 <p align="center">
   <a href="#the-problem">Problem</a>
-  &middot; <a href="#whats-new-in-03">0.3 Update</a>
+  &middot; <a href="#whats-new-in-04">0.4 Update</a>
   &middot; <a href="#how-memory-works">Memory</a>
   &middot; <a href="#how-the-context-window-works">Context</a>
   &middot; <a href="#cue-recall">Cue Recall</a>
@@ -32,6 +32,33 @@
 
 > [!IMPORTANT]
 > Epic Continuum does not claim infinite context. It keeps durable memory outside the model, then rebuilds a bounded context packet for the work happening now.
+
+## What's New In 0.4
+
+**0.4.0 is a release candidate under isolated verification, not a published or
+live-host-certified release.** See the [release notes](docs/RELEASE_NOTES_0.4.0.md),
+[readiness gates](docs/v04-readiness.md) and [upgrade/rollback guide](docs/upgrade-0.4.md).
+
+- Unified cited recall combines lexical, relationship, time and optional semantic
+  signals. Explicit incremental embedding passes reuse unchanged vectors and keep
+  a model-free fallback; no model is started, downloaded or reconfigured.
+- Large approved tool outputs stay in durable storage with focused excerpts and
+  exact expansion. Whole-message context selection keeps recent multimodal turns
+  and complete tool-call/result groups, or reports explicit budget overflow.
+- Temporal assertions/corrections and file/symbol-linked project knowledge retain
+  history and identify evidence that needs rechecking after inputs change.
+- Source/binary/media anchors and investigation notebooks connect hypotheses,
+  experiments and conclusions to exact evidence. Media annotations are supplied
+  by the caller; automatic image/audio extraction is not included.
+- Successful/failed experiences, reviewed procedure proposals, claimable handoffs,
+  collections and task-ready context packets support headless agent collaboration.
+- Selected knowledge capsules support attribution, idempotent import, conflicts,
+  fixed-snapshot experiments and explicit adoption without sharing all memory.
+
+The [capability API](docs/capability-api.md) provides Python, CLI and MCP access.
+These features do not enable themselves in a host or automatically execute
+procedures. Credential blocking and existing private/project/session boundaries
+remain in force. There is no new UI or required cloud dependency.
 
 ## What's New In 0.3
 
@@ -560,6 +587,19 @@ Imported or retrieved text is evidence. It is not automatically authoritative in
 
 ## Documentation
 
+- [Approved 0.4 scope](docs/v04-scope.md)
+- [0.4 development readiness and offline certification](docs/v04-readiness.md)
+- [Retrieval and large outputs (development candidate)](docs/retrieval-and-large-outputs.md)
+- [Unified recall and exact evidence reads (0.4 development)](docs/unified-recall.md)
+- [Embedding indexes, temporal facts, and living project knowledge (0.4 development)](docs/memory-intelligence.md)
+- [Source/binary investigations and multimodal evidence](docs/investigation-memory.md)
+- [Experiences, reviewed procedures, and selected cross-project lessons](docs/experience-memory.md)
+- [Claimable handoffs and progressive collections](docs/coordination-memory.md)
+- [Working context, task packs, and memory debugging](docs/working-context.md)
+- [Selected workspaces and fixed-snapshot experiments](docs/selected-workspaces.md)
+- [Capability CLI/MCP action reference](docs/capability-api.md)
+- [Read-only operator inspection](docs/operator-inspection.md)
+- [Isolated recall-quality evaluation](docs/recall-quality-evaluation.md)
 - [How memory works](docs/how-memory-works.md)
 - [Cue Recall](docs/cue-recall.md)
 - [Shared agent state](docs/shared-agent-state.md)

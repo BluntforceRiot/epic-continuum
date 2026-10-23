@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 - 2026-10-23 (candidate preparation)
+
+This section describes the isolated candidate, not a publication announcement.
+Hosted CI, practical host/model certification and release approval are separate.
+
+- Added unified, cited lexical/relationship/temporal recall and optional local
+  embedding indexes with incremental reuse, current-source admission and a
+  model-free fallback. Index refresh is explicit; no background model is started.
+- Added focused large-output excerpts, exact source expansion, bounded headless
+  inspection and whole-group working-context selection with explicit overflow.
+- Added ordinary temporal fact assertions/corrections and living file/symbol/
+  decision/test/error/fix knowledge with retained history and stale-evidence flags.
+- Added exact source/binary/build and supplied media anchors, investigation
+  notebooks, successful/failed experiences and explicitly reviewed procedures.
+- Added claimable handoffs, progressive collections, task packets, change-impact
+  and memory diagnostics, selected cross-project lessons and scoped knowledge
+  capsules with conflicts, fixed-snapshot replay and selective inert adoption.
+- Exposed the new capabilities through Python, CLI and separated read/write MCP
+  surfaces, with explicit roots, provenance, credential guards and scope checks.
+- Aligned release/plugin metadata and version checks; documented candidate limits
+  and backed-up upgrade/rollback. No core schema replacement, live migration,
+  private Vanta fork activation, UI, or automatic procedure execution is included.
+
 ## 0.3.1 - 2026-10-22
 
 - Persistent workers retry SQLite BUSY/LOCKED failures with capped backoff,

@@ -331,10 +331,11 @@ jobs:
       - name: Prove imports use the installed artifact
         run: >-
           python -c
-          "import pathlib,continuum;
+          "import pathlib,continuum,tomllib;
           location=pathlib.Path(continuum.__file__).resolve();
           assert 'site-packages' in str(location), location;
-          assert continuum.__version__ == '0.3.1', continuum.__version__;
+          expected=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'];
+          assert continuum.__version__ == expected, (continuum.__version__,expected);
           print(location)"
       - name: Run the complete installed-artifact suite
         run: python -m unittest discover -s tests -v

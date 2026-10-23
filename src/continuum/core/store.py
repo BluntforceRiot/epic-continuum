@@ -62,6 +62,7 @@ from .temporal_authority import (
     temporal_authority_integrity_report,
 )
 from .units import format_size, parse_size
+from .retrieval import query_excerpt, query_terms, rank_library_candidates
 from .writer_claim import WriterClaimError, ensure_writer_claim, writer_claim_status
 
 
@@ -13918,6 +13919,17 @@ def _append_scroll_event_once(
             existing = None
             for candidate in candidates:
                 candidate_metadata = json_loads(candidate["metadata_json"], {})
+                current_capture = metadata.get("capture")
+                candidate_capture = candidate_metadata.get("capture")
+                if any(isinstance(capture, dict) and capture.get("large_result_policy") == "index_and_link"
+                       for capture in (current_capture, candidate_capture)):
+                    # A tightly capped reference may be identical for different
+                    # outputs. Deduplicate only the same preserved evidence.
+                    if not isinstance(current_capture, dict) or not isinstance(candidate_capture, dict):
+                        continue
+                    if any(current_capture.get(key) != candidate_capture.get(key)
+                           for key in ("large_result_policy", "book_id", "original_sha256", "original_bytes")):
+                        continue
                 candidate_scope = str(candidate_metadata.get("visibility_scope") or "session")
                 candidate_project_id = str(candidate_metadata.get("project_id")) if candidate_metadata.get("project_id") else None
                 if (candidate_scope, candidate_project_id) == (current_scope, current_project_id):
@@ -16270,8 +16282,9 @@ def search_memory(
         }
     conn = connect(root) if create else connect_existing(root)
     try:
-        terms = extract_terms(query, limit=8)
+        terms = query_terms(query)
         bounded_limit = max(1, min(int(limit), 100))
+        candidate_limit = max(50, bounded_limit * 10)
 
         def book_visible(metadata_json: str | None) -> bool:
             metadata = json_loads(metadata_json, {})
@@ -16287,17 +16300,28 @@ def search_memory(
         def result_from_row(row: sqlite3.Row, *, backend_reason: str) -> dict[str, Any] | None:
             if not book_visible(row["metadata_json"]):
                 return None
-            snippet = row["snippet"] if "snippet" in row.keys() else summarize_text(row["text"], limit=240)
             score = row["score"] if "score" in row.keys() else None
             return {
                 "kind": "chunk",
                 "chunk_id": row["chunk_id"],
                 "book_id": row["book_id"],
                 "title": row["title"],
-                "snippet": snippet,
+                "text": row["text"],
                 "score": score,
                 "reason": [backend_reason],
             }
+
+        def ranked_results(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            selected = rank_library_candidates(candidates, query)[:bounded_limit]
+            for item in selected:
+                excerpt = query_excerpt(item.pop("text"), query)
+                item["snippet"] = excerpt["text"]
+                item["excerpt_start"] = excerpt["start"]
+                item["excerpt_end"] = excerpt["end"]
+                item["reason"].append("literal_rank_fusion")
+                item.pop("_literal_score")
+                item.pop("_index_rank")
+            return selected
 
         has_fts = bool(
             conn.execute(
@@ -16310,20 +16334,20 @@ def search_memory(
                 results: list[dict[str, Any]] = []
                 page_size = max(50, bounded_limit * 10)
                 offset = 0
-                while len(results) < bounded_limit:
+                while len(results) < candidate_limit:
                     rows = conn.execute(
                         """
                         SELECT
                             f.chunk_id,
                             f.book_id,
                             f.title,
-                            snippet(chunks_fts, 3, '[', ']', '...', 18) AS snippet,
+                            f.text,
                             bm25(chunks_fts) AS score,
                             b.metadata_json
                         FROM chunks_fts f
                         JOIN books b ON b.id = f.book_id
                         WHERE chunks_fts MATCH ?
-                        ORDER BY score ASC
+                        ORDER BY score ASC, f.chunk_id ASC
                         LIMIT ? OFFSET ?
                         """,
                         (fts_query, page_size, offset),
@@ -16334,9 +16358,10 @@ def search_memory(
                         result = result_from_row(row, backend_reason="fts5_match")
                         if result is not None:
                             results.append(result)
-                            if len(results) >= bounded_limit:
+                            if len(results) >= candidate_limit:
                                 break
                     offset += len(rows)
+                results = ranked_results(results)
                 return {
                     "query": query,
                     "initialized": True,
@@ -16347,7 +16372,9 @@ def search_memory(
             except sqlite3.OperationalError:
                 pass
 
-        like_terms = terms or [query]
+        if not terms and not query.strip():
+            return {"query": query, "initialized": True, "backend": "like", "result_count": 0, "results": []}
+        like_terms = terms or [query.strip()]
         clauses = " OR ".join(["c.text LIKE ? OR b.title LIKE ?" for _term in like_terms])
         params: list[Any] = []
         for term in like_terms:
@@ -16356,14 +16383,14 @@ def search_memory(
         results = []
         page_size = max(50, bounded_limit * 10)
         offset = 0
-        while len(results) < bounded_limit:
+        while len(results) < candidate_limit:
             rows = conn.execute(
                 f"""
                 SELECT c.id AS chunk_id, c.book_id, b.title, c.text, b.metadata_json
                 FROM chunks c
                 JOIN books b ON b.id = c.book_id
                 WHERE {clauses}
-                ORDER BY c.created_at DESC
+                ORDER BY c.created_at DESC, c.id ASC
                 LIMIT ? OFFSET ?
                 """,
                 (*params, page_size, offset),
@@ -16374,15 +16401,62 @@ def search_memory(
                 result = result_from_row(row, backend_reason="like_match")
                 if result is not None:
                     results.append(result)
-                    if len(results) >= bounded_limit:
+                    if len(results) >= candidate_limit:
                         break
             offset += len(rows)
+        results = ranked_results(results)
         return {
             "query": query,
             "initialized": True,
             "backend": "like",
             "result_count": len(results),
             "results": results,
+        }
+    finally:
+        conn.close()
+
+
+def read_memory_chunk(
+    root: Path, *, chunk_id: str, offset: int = 0, limit: int = 4000,
+    session_id: str | None = None, project_id: str | None = None,
+) -> dict[str, Any]:
+    """Read exact selected evidence, not an instruction or an authorization grant."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8000:
+        raise ValueError("limit must be an integer from 1 to 8000 characters")
+    session_id = canonical_partition_identifier(root, "session_id", session_id, lookup=True)
+    project_id = canonical_partition_identifier(root, "project_id", project_id, lookup=True)
+    missing = {"found": False, "content": "", "next_offset": None}
+    if not is_initialized(root):
+        return missing
+    conn = connect_existing(root)
+    try:
+        row = conn.execute(
+            """SELECT c.*, b.title, b.metadata_json FROM chunks c
+               JOIN books b ON b.id=c.book_id WHERE c.id=?""", (chunk_id,),
+        ).fetchone()
+        if row is None:
+            return missing
+        metadata = json_loads(row["metadata_json"], {})
+        if "visibility_scope" not in metadata and not metadata.get("project_id"):
+            metadata = {**metadata, "visibility_scope": "global"}
+        if not _metadata_scope_visible(metadata, candidate_session_id=metadata.get("session_id"),
+                                       session_id=session_id, project_id=project_id):
+            return missing
+        content = row["text"]
+        if offset > len(content):
+            raise ValueError("offset exceeds chunk length")
+        end = min(len(content), offset + limit)
+        next_chunk = conn.execute("SELECT id FROM chunks WHERE book_id=? AND ordinal>? ORDER BY ordinal LIMIT 1",
+                                  (row["book_id"], row["ordinal"])).fetchone()
+        return {
+            "found": True, "chunk_id": row["id"], "book_id": row["book_id"],
+            "title": row["title"][:500], "content": content[offset:end],
+            "offset": offset, "next_offset": end if end < len(content) else None,
+            "total_chars": len(content), "content_hash": row["content_hash"],
+            "next_chunk_id": next_chunk["id"] if next_chunk and end == len(content) else None,
+            "instruction_authority": "user_level_evidence",
         }
     finally:
         conn.close()
@@ -17555,7 +17629,7 @@ def cue_recall(
                         "seq": row["seq"],
                         "role": row["role"],
                         "event_type": row["event_type"],
-                        "summary": summarize_text(row["content"], limit=300),
+                        "summary": query_excerpt(row["content"], cue, limit=300)["text"],
                         "created_at": row["created_at"],
                     }
                 )
@@ -17568,16 +17642,16 @@ def cue_recall(
             session_id=session_id,
             project_id=project_id,
         )
-        for result in library.get("results", []):
+        for library_rank, result in enumerate(library.get("results", []), 1):
             book_row = conn.execute("SELECT metadata_json FROM books WHERE id = ?", (result.get("book_id"),)).fetchone()
             book_metadata = json_loads(book_row["metadata_json"], {}) if book_row else {}
-            if not _metadata_scope_visible(book_metadata, session_id=session_id, project_id=project_id):
+            if not _metadata_scope_visible(book_metadata, candidate_session_id=book_metadata.get("session_id"), session_id=session_id, project_id=project_id):
                 continue
             key = f"library:{result.get('chunk_id') or result.get('book_id')}"
             candidate_scores[key] = {
                 "kind": "library",
                 "id": result.get("chunk_id") or result.get("book_id"),
-                "score": 0.35 + _term_text_score(terms, f"{result.get('title', '')} {result.get('snippet', '')}"),
+                "score": 0.35 + _term_text_score(terms, f"{result.get('title', '')} {result.get('snippet', '')}") + 1 / (60 + library_rank),
                 "title": result.get("title"),
                 "summary": result.get("snippet"),
                 "reasons": ["library_search"],
@@ -17658,10 +17732,12 @@ def cue_recall(
                         "seq": row["seq"],
                         "role": row["role"],
                         "event_type": row["event_type"],
-                        "summary": summarize_text(row["content"], limit=300),
+                        "summary": query_excerpt(row["content"], cue, limit=300)["text"],
                         "created_at": row["created_at"],
                     }
                 )
+            if item.get("kind") == "card":
+                item["summary"] = query_excerpt(str(item.get("summary") or ""), cue, limit=360)["text"]
             item["related_terms"] = sorted(str(term) for term in item.get("related_terms", set()))[:association_limit]
             item["reasons"] = sorted(set(str(reason) for reason in item.get("reasons", [])))
             results.append(item)

@@ -3371,7 +3371,8 @@ class EpicContinuumWorkerDesignTest(unittest.TestCase):
                 ),
                 first_intents["pending"],
             )
-            self.assertEqual(first_intents["remaining"], 2)
+            # One unselected intent remains, plus any selected pending retry.
+            self.assertEqual(first_intents["remaining"], 1 + first_intents["pending"])
             self.assertFalse(first_intents["remaining_is_lower_bound"])
             self.assertFalse(first_intents["complete"])
             self.assertTrue(first_intents["has_more"])

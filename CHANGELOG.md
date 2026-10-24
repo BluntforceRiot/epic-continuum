@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0
+## 0.4.0 - shared-core engineering release
 
 Shared-core engineering release changes. The GitHub release record identifies
 the publication date and exact qualified build. Publication does not certify

@@ -1,9 +1,12 @@
 # Changelog
 
-## 0.4.0 - 2026-10-23 (candidate preparation)
+## 0.4.0
 
-This section describes the isolated candidate, not a publication announcement.
-Hosted CI, practical host/model certification and release approval are separate.
+Shared-core engineering release changes. The GitHub release record identifies
+the publication date and exact qualified build. Publication does not certify
+live Hermes/Codex operation, actual host context costs or compaction,
+model/embedding quality, or representative private-memory upgrade compatibility;
+those gates remain unrun, not passed. Live deployment is separately authorized.
 
 - Added unified, cited lexical/relationship/temporal recall and optional local
   embedding indexes with incremental reuse, current-source admission and a
@@ -19,7 +22,7 @@ Hosted CI, practical host/model certification and release approval are separate.
   capsules with conflicts, fixed-snapshot replay and selective inert adoption.
 - Exposed the new capabilities through Python, CLI and separated read/write MCP
   surfaces, with explicit roots, provenance, credential guards and scope checks.
-- Aligned release/plugin metadata and version checks; documented candidate limits
+- Aligned release/plugin metadata and version checks; documented qualification limits
   and backed-up upgrade/rollback. No core schema replacement, live migration,
   private Vanta fork activation, UI, or automatic procedure execution is included.
 

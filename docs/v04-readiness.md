@@ -1,11 +1,13 @@
-# 0.4 readiness and foundation certification boundary
+# 0.4 shared-core qualification and operator-certification boundary
 
-This source is the assembled 0.4.0 candidate, not a released distribution. Keep the live
-0.3.1 runtime and memories unchanged until a separately approved deployment.
+This describes the shared headless core and packaged interfaces in 0.4.0.
+Publication is recorded by the exact tagged GitHub release, CI and artifact
+receipts; it does not certify a particular operator environment. Keep existing
+live runtimes and memories unchanged until a separately approved deployment.
 
-The [approved scope](v04-scope.md) is broader than the current foundations and
-uses one shared core with host adapters, without a separate private Vanta product
-branch. The foundation slice includes retrieval relevance and query-centered excerpts, exact
+The [approved scope](v04-scope.md) sets the direction for one shared core with
+host adapters, without a separate private Vanta product branch. The foundation
+slice includes retrieval relevance and query-centered excerpts, exact
 on-demand Library reads, opt-in preservation of large captured results, compact
 operator inspection, connection/upgrade preflight, and a reproducible recall
 test utility. The foundation slice alone is not the expanded release.
@@ -50,7 +52,7 @@ Run offline adapter contracts with:
 python -m unittest discover -s tests -p test_adapter_contracts_v04.py -v
 ```
 
-## Still required for actual 0.4 shipping
+## Required for shared-core publication
 
 - Verify the assembled capabilities against [the scope](v04-scope.md), with each
   implementation limit visible. Passing isolated API gates alone is not the
@@ -59,15 +61,34 @@ python -m unittest discover -s tests -p test_adapter_contracts_v04.py -v
 - Run the entire existing suite, static/credential-fixture checks and independent
   review against the assembled candidate. Repeat reproducible wheel/sdist builds.
 - Run the hosted OS/Python CI matrix on that exact candidate after push approval.
-- Evaluate a separately held-out representative corpus; retain unanswerable cases.
-  Synthetic regression success alone is not a practical quality claim.
-- With separate authorization, test installed Hermes and Codex connections. For
+- Preserve the frozen, independently authored held-out engineering cases,
+  including unanswerable queries and measured retrieval/context costs. Synthetic
+  regression success is not representative real-use or model-answer quality.
+- Verify isolated installation, protocol and synthetic upgrade/backup/restore
+  evidence without substituting it for private-memory compatibility proof.
+- Review version/release notes, verify the exact downloadable artifacts and
+  obtain public publication authorization. Live deployment is a separate action.
+
+All required shared-core gates must pass on the exact shipping authority;
+missing, skipped or pending jobs do not count as successful jobs. Current results
+belong to the hash-bound release record, not an assumed status in this checklist.
+
+## Operator-environment certification — unrun, not passed
+
+The following are not certified by this shared-core release. They require their
+own authorization and evidence before claiming live-host readiness, prompt
+savings, model quality or representative private-memory compatibility:
+
+- Test installed Hermes and Codex connections. For
   Hermes include normal conversation, passive update, explicit factual recall,
   image follow-up and structured call/result preservation across real compaction.
   Record provider/tool counts, context costs and exact source/runtime versions.
+- Evaluate a separately held-out representative real-use corpus with unanswerable
+  cases and the chosen model/provider. Do not infer unseen-answer or embedding
+  quality from deterministic engineering fixtures.
 - Perform a stopped-state, backed-up upgrade/rollback rehearsal on a disposable
   copy of representative memory. Preserve all memories and credential blocking.
-- Review version/release notes and approve deployment/publication separately.
+- Separately approve live deployment only after the relevant operator checks.
 
 Historical private Vanta HCE work is not activated or bulk-imported by these
 foundations. Shared-core/adaptor reuse requires individual review; retiring the

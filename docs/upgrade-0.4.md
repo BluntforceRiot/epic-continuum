@@ -1,9 +1,11 @@
 # Preparing an upgrade to 0.4
 
-This guide describes an operator-approved upgrade, not permission to modify a
-running installation. Candidate preparation does not touch any live memory,
-Hermes/Codex configuration, workers, or model. Keep the current runtime until
-the exact candidate has completed the required [release gates](v04-readiness.md).
+Publishing or installing the shared-core package is not permission to modify a
+running installation. Release qualification does not touch live memory,
+Hermes/Codex configuration, workers, or a model. Keep the current runtime until
+the exact package has passed its [public release gates](v04-readiness.md) and
+the separately authorized host/memory acceptance checks for your installation.
+Those operator-environment checks are not certified by the public release.
 
 ## Rehearse before promotion
 
@@ -36,8 +38,9 @@ it into public source archives or test fixtures.
 
 ## Promote only with explicit authority
 
-After exact-candidate checks pass, separately approve the live writer boundary,
-backup verification, runtime pointer change and host reconnect. Preserve the
+After exact-package and operator-environment checks pass, separately approve
+the live writer boundary, backup verification, runtime pointer change and host
+reconnect. Preserve the
 old runtime and config preimages until real conversation/recall, image follow-up,
 structured call/result preservation and worker recovery checks pass. A failure
 requires the recorded rollback, not ad-hoc schema edits or deleting memories.

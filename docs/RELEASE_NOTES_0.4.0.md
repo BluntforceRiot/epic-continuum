@@ -1,9 +1,13 @@
-# Epic Continuum 0.4.0 candidate
+# Epic Continuum 0.4.0 — shared-core engineering release
 
-This is a candidate release description, not an assertion that publication or
-live-host certification has occurred. Exact gate results belong to the final
-hash-bound build receipt; [readiness](v04-readiness.md) distinguishes local
-engineering proof from hosted CI and practical host/model proof.
+This release qualifies the shared headless core and packaged interfaces. Exact
+source, CI and artifact results belong to the final hash-bound release record.
+Live Hermes/Codex operation, actual host prompt reduction and compaction,
+model/embedding quality, representative real-use answer quality and private-memory
+upgrade compatibility were not certified. Those gates remain unrun, not passed;
+live deployment requires separate operator authorization. The
+[qualification checklist](v04-readiness.md) separates shared-core publication
+proof from those operator-environment checks.
 
 ## What changes
 
@@ -38,7 +42,7 @@ The reviewed slices assemble one shared, headless memory core:
 
 Python 3.11+ remains required; runtime dependencies remain empty. Existing Scroll,
 Card, Library, graph, proof, recovery and bundle mechanisms are reused. No new
-core schema migration is part of this candidate. Derived indexes are rebuildable;
+core schema migration is part of this release. Derived indexes are rebuildable;
 original evidence remains authoritative. Git is not required for memory use.
 
 New model/embedding work is opt-in against an explicit already-running local
@@ -53,7 +57,7 @@ are not relaxed by safe notes, export/import or new typed knowledge.
 
 ## Deliberate limits
 
-Media annotations are caller-supplied; this candidate does not install OCR,
+Media annotations are caller-supplied; this release does not install OCR,
 transcription or binary analysis tools. It does not execute learned procedures,
 automatically rewrite prompts, synchronize whole conversations, add a GUI or
 provide a productized evaluation service. Local actor labels are attribution,
@@ -68,5 +72,7 @@ memory projects. Those claims require their own measured evidence.
 
 Follow [upgrade and rollback](upgrade-0.4.md). Development archives whose
 provenance says allow_dirty=true are review artifacts, not final publication
-artifacts. Ship only the exact reviewed clean commit after the required hosted
-matrix and remaining practical gates pass. No PyPI publication is implied.
+artifacts. Publish only the exact reviewed clean commit after the shared-core
+release gates, including its complete hosted matrix and verified artifacts,
+pass. Excluded operator-environment checks remain explicitly unrun; package
+publication is not live deployment approval. No PyPI publication is implied.

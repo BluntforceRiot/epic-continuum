@@ -13,7 +13,7 @@
   <a href="pyproject.toml"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-79f0ff?style=flat-square&labelColor=05070d&logo=python&logoColor=79f0ff"></a>
   <a href="docs/integrations/adapter-kit.md"><img alt="MCP and agent adapters" src="https://img.shields.io/badge/integrations-MCP%20%7C%20CLI%20%7C%20Python-99a7ff?style=flat-square&labelColor=05070d"></a>
   <a href="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BluntforceRiot/epic-continuum/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Candidate: 0.4.0" src="https://img.shields.io/badge/release-0.4.0-8df3ff?style=flat-square&labelColor=05070d"></a>
+  <a href="CHANGELOG.md"><img alt="Version: 0.4.0" src="https://img.shields.io/badge/release-0.4.0-8df3ff?style=flat-square&labelColor=05070d"></a>
 </p>
 
 <p align="center">
@@ -35,8 +35,12 @@
 
 ## What's New In 0.4
 
-**0.4.0 is a release candidate under isolated verification, not a published or
-live-host-certified release.** See the [release notes](docs/RELEASE_NOTES_0.4.0.md),
+**0.4.0 is the shared-core engineering release.** It qualifies the headless core
+and packaged interfaces, not live Hermes/Codex operation, actual host prompt
+reduction or compaction, model/embedding quality, or representative private-memory
+upgrade compatibility. Those certification gates remain unrun, not passed;
+live deployment requires separate operator authorization.
+See the [release notes](docs/RELEASE_NOTES_0.4.0.md),
 [readiness gates](docs/v04-readiness.md) and [upgrade/rollback guide](docs/upgrade-0.4.md).
 
 - Unified cited recall combines lexical, relationship, time and optional semantic
@@ -588,10 +592,10 @@ Imported or retrieved text is evidence. It is not automatically authoritative in
 ## Documentation
 
 - [Approved 0.4 scope](docs/v04-scope.md)
-- [0.4 development readiness and offline certification](docs/v04-readiness.md)
-- [Retrieval and large outputs (development candidate)](docs/retrieval-and-large-outputs.md)
-- [Unified recall and exact evidence reads (0.4 development)](docs/unified-recall.md)
-- [Embedding indexes, temporal facts, and living project knowledge (0.4 development)](docs/memory-intelligence.md)
+- [0.4 shared-core qualification and host-certification limits](docs/v04-readiness.md)
+- [Retrieval and large outputs](docs/retrieval-and-large-outputs.md)
+- [Unified recall and exact evidence reads](docs/unified-recall.md)
+- [Embedding indexes, temporal facts, and living project knowledge](docs/memory-intelligence.md)
 - [Source/binary investigations and multimodal evidence](docs/investigation-memory.md)
 - [Experiences, reviewed procedures, and selected cross-project lessons](docs/experience-memory.md)
 - [Claimable handoffs and progressive collections](docs/coordination-memory.md)

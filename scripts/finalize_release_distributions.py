@@ -25,10 +25,10 @@ from typing import IO, Any
 
 
 CANONICAL_TOOLCHAIN = {
-    "python": "3.13.5",
-    "pip": "25.1.1",
-    "setuptools": "80.9.0",
-    "wheel": "0.45.1",
+    "python": "3.13.18",
+    "pip": "26.2.2",
+    "setuptools": "84.1.0",
+    "wheel": "0.46.2",
     "build": "1.2.2.post1",
     "twine": "6.1.0",
 }

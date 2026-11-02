@@ -769,7 +769,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
         )
         self.assertEqual(
             pyproject["build-system"]["requires"],
-            ["setuptools==80.9.0", "wheel==0.45.1"],
+            ["setuptools==84.1.0", "wheel==0.46.2"],
         )
 
         builder_path = REPO_ROOT / "scripts" / "build_release_package.py"
@@ -816,7 +816,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             _write_wheel(
                 wheel,
                 provenance,
-                generator="setuptools (80.9.0)",
+                generator="setuptools (84.1.0)",
                 extra_dist_info_files={"licenses/LICENSE": b"tracked\r\nlicense\r\n"},
             )
             _write_sdist(
@@ -837,7 +837,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
 
             self.assertEqual(wheel_provenance, provenance)
             self.assertEqual(sdist_provenance, provenance)
-            self.assertEqual(generator, "setuptools (80.9.0)")
+            self.assertEqual(generator, "setuptools (84.1.0)")
             self.assertEqual(
                 package_files["continuum/__init__.py"],
                 b"tracked\r\nsource\r\n",
@@ -860,7 +860,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             _write_wheel(
                 wheel,
                 provenance,
-                generator="setuptools (80.9.0)",
+                generator="setuptools (84.1.0)",
             )
             _write_sdist(sdist, provenance)
 
@@ -899,7 +899,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
                 _write_wheel(
                     wheel,
                     provenance,
-                    generator="setuptools (80.9.0)",
+                    generator="setuptools (84.1.0)",
                 )
                 _rewrite_wheel(
                     wheel,
@@ -914,7 +914,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             wheel = Path(tmp) / "epic_continuum_memory-0.3.0-py3-none-any.whl"
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _rewrite_zip_member_flags(wheel, member_name=target, value=0x0800)
             with self.assertRaisesRegex(RuntimeError, "canonical wheel builder"):
                 finalizer._read_wheel_provenance(wheel, version="0.3.0")
@@ -926,7 +926,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             wheel = root / "epic_continuum_memory-0.3.0-py3-none-any.whl"
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             with zipfile.ZipFile(wheel) as archive:
                 member_names = archive.namelist()
             member_names[0], member_names[1] = member_names[1], member_names[0]
@@ -934,7 +934,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "lexicographic order"):
                 finalizer._read_wheel_provenance(wheel, version="0.3.0")
 
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             with zipfile.ZipFile(wheel) as archive:
                 record_lines = archive.read(record_name).splitlines(keepends=True)
             record_lines[0], record_lines[1] = record_lines[1], record_lines[0]
@@ -967,7 +967,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
                 _write_wheel(
                     wheel,
                     provenance,
-                    generator="setuptools (80.9.0)",
+                    generator="setuptools (84.1.0)",
                     extra_dist_info_files={generated_name: payload},
                 )
                 with self.assertRaisesRegex(RuntimeError, "must use LF"):
@@ -1014,7 +1014,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             comparison = base / "comparison"
             comparison.mkdir()
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1033,7 +1033,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             )
 
             self.assertEqual(receipt["distribution_build_toolchain"], canonical)
-            self.assertEqual(receipt["wheel_generator"], "setuptools (80.9.0)")
+            self.assertEqual(receipt["wheel_generator"], "setuptools (84.1.0)")
             self.assertEqual(
                 receipt["source_provenance_sha256"],
                 hashlib.sha256(provenance).hexdigest(),
@@ -1182,7 +1182,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
                 _write_wheel(
                     wheel,
                     provenance,
-                    generator="setuptools (80.9.0)",
+                    generator="setuptools (84.1.0)",
                     package_files=wheel_files,
                 )
                 _write_sdist(sdist, provenance, package_files=sdist_files)
@@ -1217,7 +1217,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             with zipfile.ZipFile(wheel) as archive:
                 members = {name: archive.read(name) for name in archive.namelist()}
@@ -1259,7 +1259,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1306,7 +1306,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             canonical_wheel = wheel.read_bytes()
             canonical_sdist = sdist.read_bytes()
@@ -1349,7 +1349,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             _write_wheel(
                 wheel,
                 provenance,
-                generator="setuptools (80.9.0)",
+                generator="setuptools (84.1.0)",
                 extra_dist_info_files={
                     "entry_points.txt": b"[console_scripts]\nother = continuum.cli:main\n"
                 },
@@ -1390,7 +1390,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             try:
                 os.link(wheel, comparison / wheel.name)
@@ -1460,7 +1460,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             _write_wheel(
                 wheel,
                 provenance,
-                generator="setuptools (80.9.0)",
+                generator="setuptools (84.1.0)",
                 version="9.9.9",
             )
             shutil.copy2(wheel, comparison / wheel.name)
@@ -1476,7 +1476,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
                     actual_toolchain=canonical,
                 )
 
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance, version="9.9.9")
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1506,7 +1506,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1552,7 +1552,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             comparison = base / "comparison"
             comparison.mkdir()
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1600,7 +1600,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             receipt_out = release / "RELEASE_DISTRIBUTIONS.json"
             checksums_out = release / "SHA256SUMS"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1677,7 +1677,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             receipt_out = release / "RELEASE_DISTRIBUTIONS.json"
             checksums_out = release / "SHA256SUMS"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1723,7 +1723,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
             wheel = release / "epic_continuum_memory-0.3.0-py3-none-any.whl"
             sdist = release / "epic_continuum_memory-0.3.0.tar.gz"
             _write_source_zip(source_zip, provenance)
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)
@@ -1781,7 +1781,7 @@ class ReleaseDistributionFinalizerTest(unittest.TestCase):
                 tampered.create_system = 3
                 tampered.external_attr = 0o100644 << 16
                 archive.writestr(tampered, b"print('not in provenance')\n")
-            _write_wheel(wheel, provenance, generator="setuptools (80.9.0)")
+            _write_wheel(wheel, provenance, generator="setuptools (84.1.0)")
             _write_sdist(sdist, provenance)
             shutil.copy2(wheel, comparison / wheel.name)
             shutil.copy2(sdist, comparison / sdist.name)

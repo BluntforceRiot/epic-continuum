@@ -1402,11 +1402,11 @@ version = "9.9.9"
                     provenance_payload["distribution_build_toolchain"],
                     {
                         "build": "1.2.2.post1",
-                        "pip": "25.1.1",
-                        "python": "3.13.5",
-                        "setuptools": "80.9.0",
+                        "pip": "26.2.2",
+                        "python": "3.13.18",
+                        "setuptools": "84.1.0",
                         "twine": "6.1.0",
-                        "wheel": "0.45.1",
+                        "wheel": "0.46.2",
                     },
                 )
                 package_provenance = zf.read(
@@ -1489,10 +1489,10 @@ version = "9.9.9"
                 encoding="utf-8"
             )
             for pin in (
-                'python-version: "3.13.5"',
-                '"pip==25.1.1"',
-                '"setuptools==80.9.0"',
-                '"wheel==0.45.1"',
+                'python-version: "3.13.18"',
+                '"pip==26.2.2"',
+                '"setuptools==84.1.0"',
+                '"wheel==0.46.2"',
                 '"build==1.2.2.post1"',
                 '"twine==6.1.0"',
                 "env -u SOURCE_DATE_EPOCH python -m build",

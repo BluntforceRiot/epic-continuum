@@ -73,6 +73,123 @@ class BundleResourceLimitsTest(unittest.TestCase):
         result = verify_root_bundle(self.bundle)
         self.assertTrue(result["ok"], result)
 
+    def test_non_zip_inputs_keep_missing_end_record_classification(self) -> None:
+        cases = [b"", b"ordinary text without a ZIP end record", b"PK\x05\x06" + b"\0" * 12]
+        for index, data in enumerate(cases):
+            with self.subTest(index=index):
+                archive_path = self.base / f"non-zip-{index}.bin"
+                archive_path.write_bytes(data)
+                with patch.object(
+                    bundle_module.zipfile,
+                    "ZipFile",
+                    side_effect=AssertionError("ZipFile must not see non-ZIP input"),
+                ):
+                    result = verify_root_bundle(archive_path, verify_embedded_root=False)
+                self.assertEqual(_error_codes(result), {"not_a_zip_archive"})
+
+    def test_structurally_empty_zip_still_requires_bundle_manifest(self) -> None:
+        archive_path = self.base / "empty-zip.zip"
+        with zipfile.ZipFile(archive_path, "w"):
+            pass
+        result = verify_root_bundle(archive_path, verify_embedded_root=False)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("manifest_member_count", _error_codes(result))
+        self.assertNotIn("not_a_zip_archive", _error_codes(result))
+
+    def test_preflight_zip64_diagnostics_precede_version_dependent_probe(self) -> None:
+        for field_offset in (12, 16):
+            with self.subTest(field_offset=field_offset):
+                archive_path = self.base / f"required-zip64-{field_offset}.zip"
+                data = bytearray(self.bundle.read_bytes())
+                eocd = data.rfind(b"PK\x05\x06")
+                self.assertGreaterEqual(eocd, 0)
+                struct.pack_into("<I", data, eocd + field_offset, zipfile.ZIP64_LIMIT + 1)
+                archive_path.write_bytes(data)
+                with patch.object(
+                    bundle_module.zipfile,
+                    "is_zipfile",
+                    side_effect=AssertionError("stdlib probe must not hide preflight rejection"),
+                ), patch.object(
+                    bundle_module.zipfile,
+                    "ZipFile",
+                    side_effect=AssertionError("ZipFile must not see missing required ZIP64"),
+                ):
+                    result = verify_root_bundle(archive_path, verify_embedded_root=False)
+                self.assertEqual(_error_codes(result), {"zip64_required"})
+
+    def test_negative_stdlib_probe_still_rejects_after_preflight(self) -> None:
+        with patch.object(bundle_module.zipfile, "is_zipfile", return_value=False), patch.object(
+            bundle_module.zipfile,
+            "ZipFile",
+            side_effect=AssertionError("ZipFile must not see a rejected probe"),
+        ):
+            result = verify_root_bundle(self.bundle, verify_embedded_root=False)
+        self.assertEqual(_error_codes(result), {"not_a_zip_archive"})
+
+    def test_stdlib_probe_error_still_closes_owned_raw_handle(self) -> None:
+        tracked = self.bundle.open("rb")
+        with patch.object(
+            bundle_module,
+            "_open_bundle_read_handle",
+            return_value=tracked,
+        ), patch.object(bundle_module.zipfile, "is_zipfile", side_effect=ValueError("probe failed")):
+            result = verify_root_bundle(self.bundle, verify_embedded_root=False)
+        self.assertEqual(_error_codes(result), {"bundle_probe_failed"})
+        self.assertTrue(tracked.closed)
+
+    def test_terminal_eocd_numeric_signature_keeps_stdlib_fast_path(self) -> None:
+        for field in (5, 6):
+            with self.subTest(field=field):
+                values = [0x06054B50, 0, 0, 1, 1, 46, 0, 0]
+                values[field] = 0x06054B50
+                prefix = b"ordinary prefix"
+                tail = prefix + struct.pack("<IHHHHIIH", *values)
+                located = bundle_module._find_eocd(tail)
+                self.assertEqual(located, (len(prefix), tuple(values)))
+
+    def test_noncanonical_end_forms_reject_before_stdlib_allocation(self) -> None:
+        data = self.bundle.read_bytes()
+        tail_size = min(len(data), 22 + 0xFFFF + 4096)
+        relative = data.rfind(b"PK\x05\x06") - (len(data) - tail_size)
+        values = list(struct.unpack_from("<IHHHHIIH", data, len(data) - 22))
+        # Mock only the selected metadata over an unchanged legitimate bundle.
+        # The earlier record either leaves trailing bytes or claims them as a comment.
+        for comment_length, error in ((0, "zip_trailing_bytes"), (22, "archive_comment_not_allowed")):
+            for embedded in (False, True):
+                with self.subTest(comment_length=comment_length, embedded=embedded):
+                    selected = values.copy()
+                    selected[-1] = comment_length
+                    with patch.object(
+                        bundle_module, "_find_eocd", return_value=(relative - 22, tuple(selected))
+                    ), patch.object(
+                        bundle_module.zipfile,
+                        "is_zipfile",
+                        side_effect=AssertionError("probe must not see noncanonical end metadata"),
+                    ), patch.object(
+                        bundle_module.zipfile,
+                        "ZipFile",
+                        side_effect=AssertionError("ZipFile allocation must stay unreachable"),
+                    ):
+                        result = verify_root_bundle(self.bundle, verify_embedded_root=embedded)
+                    self.assertEqual(_error_codes(result), {error})
+
+    def test_trusted_packer_limits_reject_noncanonical_end_before_zipfile(self) -> None:
+        data = self.bundle.read_bytes()
+        tail_size = min(len(data), 22 + 0xFFFF + 4096)
+        relative = data.rfind(b"PK\x05\x06") - (len(data) - tail_size)
+        values = list(struct.unpack_from("<IHHHHIIH", data, len(data) - 22))
+        values[-1] = 22
+        with patch.object(
+            bundle_module, "_find_eocd", return_value=(relative - 22, tuple(values))
+        ), patch.object(
+            bundle_module.zipfile,
+            "ZipFile",
+            side_effect=AssertionError("trusted-limit parser must not see alternate end metadata"),
+        ):
+            with self.assertRaises(_BundleLimitError) as caught:
+                bundle_module._trusted_bundle_verification_limits(self.bundle)
+        self.assertEqual(caught.exception.code, "archive_comment_not_allowed")
+
     def test_expanded_and_member_limits_reject_before_inflation(self) -> None:
         with zipfile.ZipFile(self.bundle) as archive:
             infos = archive.infolist()

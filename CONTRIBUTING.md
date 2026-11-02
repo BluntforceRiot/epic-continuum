@@ -7,7 +7,7 @@ Thanks for taking a look at Epic Continuum.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip "setuptools>=77"
+python -m pip install --upgrade "pip>=26.2.2" "setuptools>=84.1.0" "wheel>=0.46.2"
 python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
@@ -17,7 +17,7 @@ On Windows PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip "setuptools>=77"
+python -m pip install --upgrade "pip>=26.2.2" "setuptools>=84.1.0" "wheel>=0.46.2"
 python -m pip install -e .
 python -m unittest discover -s tests -v
 ```

@@ -415,8 +415,9 @@ continuum recover-thread --root ./.continuum-demo --session-id demo --query "res
 ```
 
 For offline or `--no-index` installs, use a built wheel or preinstall the build
-backend requirements from `pyproject.toml` such as `setuptools>=77`; otherwise
-pip build isolation may fail before Epic Continuum itself is installed.
+backend requirements from `pyproject.toml`: `setuptools==84.1.0` and
+`wheel==0.46.2`; otherwise pip build isolation may fail before Epic Continuum
+itself is installed.
 
 Trimmed output from the tested flow:
 

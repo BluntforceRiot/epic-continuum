@@ -82,6 +82,10 @@ _BUNDLE_MAX_RETAINED_ERRORS = 100
 _BUNDLE_DIAGNOSTIC_SAMPLE_LIMIT = 20
 
 
+class _BundleNotZipError(ValueError):
+    """The bounded envelope scan found no complete ZIP end record."""
+
+
 class _BundleLimitError(RuntimeError):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
@@ -2568,6 +2572,11 @@ def _decode_zip_filename(raw: bytes, flags: int) -> str:
 def _find_eocd(data: bytes) -> tuple[int, tuple[int, ...]] | None:
     minimum = max(0, len(data) - (22 + _ZIP_UINT16_MAX + 4096))
     signature = struct.pack("<I", _ZIP_EOCD_SIGNATURE)
+    # Match ZipFile's terminal zero-comment fast path before searching for
+    # signatures that may also occur inside the end record's numeric fields.
+    terminal = len(data) - 22
+    if terminal >= 0 and data[terminal : terminal + 4] == signature and data[-2:] == b"\0\0":
+        return terminal, struct.unpack_from("<IHHHHIIH", data, terminal)
     cursor = len(data)
     while True:
         offset = data.rfind(signature, minimum, cursor)
@@ -2630,7 +2639,7 @@ def _read_bundle_zip_preflight(
         else path.stat().st_size
     )
     if file_size < 22:
-        raise ValueError("ZIP end-of-central-directory record is missing")
+        raise _BundleNotZipError("ZIP end-of-central-directory record is missing")
     handle_context = nullcontext(raw_handle) if raw_handle is not None else path.open("rb")
     with handle_context as handle:
         if budget is not None:
@@ -2639,7 +2648,7 @@ def _read_bundle_zip_preflight(
         tail = _read_exact_at(handle, file_size - tail_size, tail_size)
         located = _find_eocd(tail)
         if located is None:
-            raise ValueError("ZIP end-of-central-directory record is missing")
+            raise _BundleNotZipError("ZIP end-of-central-directory record is missing")
         relative_eocd, eocd = located
         eocd_offset = file_size - tail_size + relative_eocd
         (
@@ -2652,6 +2661,20 @@ def _read_bundle_zip_preflight(
             central_offset,
             _comment_length,
         ) = eocd
+        # Only the terminal, comment-free EOCD can reach the stdlib. Both
+        # parsers then select this exact record (and its adjacent ZIP64 data),
+        # so a different end record cannot control an unchecked directory read.
+        expected_end = eocd_offset + 22 + _comment_length
+        if expected_end != file_size:
+            raise _BundleLimitError(
+                "zip_trailing_bytes",
+                "ZIP bytes follow the selected end record",
+            )
+        if _comment_length:
+            raise _BundleLimitError(
+                "archive_comment_not_allowed",
+                "ZIP archive comments are not allowed",
+            )
         legacy_central_size = int(central_size)
         legacy_central_offset = int(central_offset)
         if _disk_number != 0 or _central_disk != 0 or _entries_on_disk != declared_entries:
@@ -3939,6 +3962,27 @@ def _verify_root_bundle_impl(
         ),
     )
     try:
+        preflight = _read_bundle_zip_preflight(
+            path,
+            budget=budget,
+            raw_handle=raw_archive,
+            max_entries=max_entries,
+            max_central_directory_bytes=max_central_directory_bytes,
+        )
+    except _BundleNotZipError:
+        errors.append({"error": "not_a_zip_archive"})
+        return result()
+    except _BundleLimitError as exc:
+        errors.append({"error": exc.code, "detail": exc.detail})
+        return result()
+    except (OSError, EOFError, ValueError, OverflowError, struct.error) as exc:
+        errors.append(
+            {"error": "zip_preflight_failed", "detail": redact_text_secrets(str(exc))}
+        )
+        return result()
+
+    # Own bounded diagnostics must precede the stdlib's version-dependent probe.
+    try:
         budget.check_deadline("probing the ZIP archive")
         is_zip = zipfile.is_zipfile(raw_archive)
     except _BundleLimitError as exc:
@@ -3949,23 +3993,6 @@ def _verify_root_bundle_impl(
         return result()
     if not is_zip:
         errors.append({"error": "not_a_zip_archive"})
-        return result()
-
-    try:
-        preflight = _read_bundle_zip_preflight(
-            path,
-            budget=budget,
-            raw_handle=raw_archive,
-            max_entries=max_entries,
-            max_central_directory_bytes=max_central_directory_bytes,
-        )
-    except _BundleLimitError as exc:
-        errors.append({"error": exc.code, "detail": exc.detail})
-        return result()
-    except (OSError, EOFError, ValueError, OverflowError, struct.error) as exc:
-        errors.append(
-            {"error": "zip_preflight_failed", "detail": redact_text_secrets(str(exc))}
-        )
         return result()
 
     if preflight.entry_count > max_entries:

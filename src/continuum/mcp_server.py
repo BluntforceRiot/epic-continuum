@@ -1066,15 +1066,21 @@ def _tool_knowledge(args: JSON, *, write: bool) -> Any:
             return dispatch_capability(root, prepared)
         destination = prepared.request["destination"]
         destination_roots = None if env_truthy("CONTINUUM_MCP_ALLOW_ANY_PATH") else allowed_roots()
-        if destination_roots is not None and not os.path.lexists(destination):
+        leaf_only = False
+        if (
+            destination_roots is not None
+            and not os.path.lexists(destination)
+            and not any(path_is_within(destination.parent, allowed) for allowed in destination_roots)
+        ):
             # An explicit, not-yet-created allowed leaf also authorizes
             # reserving that exact basename under its pinned parent.
             if any(allowed.absolute() == destination.absolute() for allowed in destination_roots):
                 destination_roots = [*destination_roots, destination.parent]
+                leaf_only = True
         with open_directory_beneath(destination.parent, roots=destination_roots) as pinned_parent:
             from .core.workspaces import _use_pinned_experiment_destination
 
-            with _use_pinned_experiment_destination(pinned_parent):
+            with _use_pinned_experiment_destination(pinned_parent, leaf_only=leaf_only):
                 return dispatch_capability(root, prepared)
 
     operation_root = prepared.operation_root(root)

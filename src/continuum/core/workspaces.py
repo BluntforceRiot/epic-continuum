@@ -34,15 +34,15 @@ _MAX_SNAPSHOT = 64 * 1024 * 1024
 _MAX_PROJECT_RECORDS = 10000
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_PINNED_EXPERIMENT_DESTINATION: ContextVar[PinnedDirectory | None] = ContextVar(
+_PINNED_EXPERIMENT_DESTINATION: ContextVar[tuple[PinnedDirectory, bool] | None] = ContextVar(
     "continuum_pinned_experiment_destination",
     default=None,
 )
 
 
 @contextmanager
-def _use_pinned_experiment_destination(directory: PinnedDirectory):
-    token = _PINNED_EXPERIMENT_DESTINATION.set(directory)
+def _use_pinned_experiment_destination(directory: PinnedDirectory, *, leaf_only: bool = False):
+    token = _PINNED_EXPERIMENT_DESTINATION.set((directory, leaf_only))
     try:
         yield
     finally:
@@ -455,17 +455,20 @@ def create_memory_experiment(
         raise ValueError("destination must be an explicit absolute new directory")
     requested = Path(destination)
     requested_parent = requested.parent.absolute()
-    _pinned_destination = _PINNED_EXPERIMENT_DESTINATION.get()
+    parent = _directory(requested_parent)
+    destination_binding = _PINNED_EXPERIMENT_DESTINATION.get()
     parent_context: AbstractContextManager[PinnedDirectory]
-    if _pinned_destination is not None:
+    leaf_only = False
+    if destination_binding is not None:
+        _pinned_destination, leaf_only = destination_binding
         if (
             not isinstance(_pinned_destination, PinnedDirectory)
             or _pinned_destination.requested_path != requested_parent
+            or _pinned_destination.path != parent
         ):
             raise ValueError("pinned destination does not match the requested parent")
         parent_context = nullcontext(_pinned_destination)
     else:
-        parent = _directory(requested.parent)
         parent_context = open_directory_beneath(parent, roots=[parent])
 
     with parent_context as pinned_parent:
@@ -525,7 +528,7 @@ def create_memory_experiment(
             for name, content in (("capsule.json", _json(capsule)), ("config.json", config_raw), ("manifest.json", _json(manifest))):
                 with (evidence / name).open("xb") as stream:
                     stream.write(content)
-            published = publish_private_tree(staged, pinned_parent, requested.name)
+            published = publish_private_tree(staged, pinned_parent, requested.name, leaf_only=leaf_only)
 
         return {"schema_version": 1, "experiment_root": str(published), "manifest_sha256": _digest(manifest),
                 "project_id": imported["project_id"], "source_project": capsule["source_project"],

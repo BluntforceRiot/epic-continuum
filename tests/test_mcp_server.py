@@ -3120,20 +3120,29 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 root, project_id="fixture-project", session_id="fixture-session", kind="note",
                 title="Project fixture", summary="One synthetic project observation.",
             )
+            args = {
+                "root": str(root),
+                "action": "create_memory_experiment",
+                "request": {"project_id": "fixture-project", "record_ids": [row["id"]],
+                            "workspace_id": "fixture-workspace", "destination": str(destination)},
+            }
 
             with patch.dict(os.environ, {
                 "CONTINUUM_ROOT": str(root),
                 "CONTINUUM_ALLOWED_ROOTS": str(destination),
                 "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
             }):
-                result = call_tool("continuum_knowledge_write", {
-                    "root": str(root),
-                    "action": "create_memory_experiment",
-                    "request": {"project_id": "fixture-project", "record_ids": [row["id"]],
-                                "workspace_id": "fixture-workspace", "destination": str(destination)},
-                })
+                with patch(
+                    "continuum.core.permissions._publish_owned_experiment_stage",
+                    side_effect=OSError("fixture publication refused"),
+                ):
+                    refused = call_tool_raw("continuum_knowledge_write", args)
+                self.assertTrue(refused["isError"])
+                self.assertEqual({path.name for path in base.iterdir()}, {"memory"})
+                result = call_tool("continuum_knowledge_write", args)
 
             self.assertEqual(Path(result["experiment_root"]), destination)
+            self.assertEqual({path.name for path in base.iterdir()}, {"memory", "approved-experiment"})
             self.assertTrue((destination / ".experiment" / "manifest.json").is_file())
 
     def test_mcp_verify_proof_pack_rejects_entries_outside_allowed_roots(self) -> None:

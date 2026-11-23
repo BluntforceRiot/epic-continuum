@@ -432,6 +432,34 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(self.snapshot(), before)
 
+    def test_experiment_requires_plain_requested_parent_even_with_pin(self) -> None:
+        from continuum.core import workspaces
+        from continuum.core.permissions import open_directory_beneath
+
+        row = self.record()
+        target = self.directory / "no-alias-experiment"
+        before = self.snapshot()
+        original = workspaces._directory
+
+        def verify_directory(path):
+            if path == target.parent:
+                raise ValueError("fixture plain-parent check refused")
+            return original(path)
+
+        with (
+            open_directory_beneath(target.parent, roots=[self.directory]) as pinned,
+            workspaces._use_pinned_experiment_destination(pinned),
+            patch.object(workspaces, "_directory", side_effect=verify_directory),
+            self.assertRaisesRegex(ValueError, "plain-parent check refused"),
+        ):
+            create_memory_experiment(
+                self.root, project_id="project-a", record_ids=[row["id"]],
+                workspace_id="fixture-experiment", destination=target,
+            )
+
+        self.assertFalse(target.exists())
+        self.assertEqual(self.snapshot(), before)
+
     def test_replay_rejects_changed_manifest_and_frozen_snapshot(self) -> None:
         experiment = self.experiment()
         with self.assertRaisesRegex(ValueError, "manifest hash"):

@@ -546,7 +546,7 @@ def secure_mkdir(path: Path, *, secure_existing: bool = False) -> None:
         _chmod(path, PRIVATE_DIR_MODE)
 
 
-class PinnedDirectory:
+class PinnedInternalDirectory:
     """A validated directory whose namespace identity remains open."""
 
     def __init__(self, path: Path, *, descriptor: int | None = None) -> None:
@@ -560,7 +560,7 @@ def _pin_secure_directory_beneath_posix(
     parts: tuple[str, ...],
     *,
     secure_existing: bool,
-) -> Iterator[PinnedDirectory]:
+) -> Iterator[PinnedInternalDirectory]:
     """Create a relative directory while pinning every traversed component."""
 
     flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
@@ -606,7 +606,7 @@ def _pin_secure_directory_beneath_posix(
                     os.fchmod(child_descriptor, PRIVATE_DIR_MODE)
                 except (AttributeError, OSError):
                     pass
-        yield PinnedDirectory(current, descriptor=descriptors[-1])
+        yield PinnedInternalDirectory(current, descriptor=descriptors[-1])
     finally:
         for descriptor in reversed(descriptors):
             try:
@@ -619,7 +619,7 @@ def _pin_secure_directory_beneath_posix(
 def _pin_secure_directory_beneath_windows(
     root: Path,
     parts: tuple[str, ...],
-) -> Iterator[PinnedDirectory]:
+) -> Iterator[PinnedInternalDirectory]:
     """Create a relative directory behind non-replaceable Windows handles."""
 
     from ctypes import wintypes
@@ -701,7 +701,7 @@ def _pin_secure_directory_beneath_windows(
             except FileExistsError:
                 pass
             pin_directory(current)
-        yield PinnedDirectory(current)
+        yield PinnedInternalDirectory(current)
     finally:
         for handle_value in reversed(handles):
             try:
@@ -716,7 +716,7 @@ def pin_secure_directory_beneath(
     relative: str | Path,
     *,
     secure_existing: bool = False,
-) -> Iterator[PinnedDirectory]:
+) -> Iterator[PinnedInternalDirectory]:
     """Create and pin a fixed internal directory without following links."""
 
     relative_path = Path(relative)
@@ -758,7 +758,7 @@ def pin_secure_directory_beneath(
 
 @contextmanager
 def pin_secure_file_beneath(
-    directory: PinnedDirectory,
+    directory: PinnedInternalDirectory,
     filename: str,
 ) -> Iterator[Path]:
     """Create and pin one regular file beneath a pinned directory."""
@@ -881,7 +881,7 @@ def pin_secure_file_beneath(
 
 
 def secure_sqlite_files_beneath(
-    directory: PinnedDirectory,
+    directory: PinnedInternalDirectory,
     filename: str,
 ) -> None:
     """Secure SQLite files through the already-pinned catalog parent."""

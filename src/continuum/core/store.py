@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -28,11 +28,15 @@ from .permissions import (
     flush_file_strict,
     flush_tree_strict,
     guard_windows_file_disposition,
+    pin_secure_directory_beneath,
+    pin_secure_file_beneath,
     replace_durable,
     secure_copy_file,
     secure_copytree,
     secure_mkdir,
+    secure_mkdir_beneath,
     secure_sqlite_files,
+    secure_sqlite_files_beneath,
     secure_write_text,
     secure_write_text_exclusive,
     set_windows_delete_disposition,
@@ -3102,22 +3106,62 @@ def _install_live_catalog_schema_authorizer(
     conn.set_authorizer(authorize)
 
 
+class _PinnedCatalogConnection(sqlite3.Connection):
+    """A live connection that retains its exact catalog namespace guards."""
+
+    _catalog_guard: ExitStack | None = None
+
+    def retain_catalog_guard(self, guard: ExitStack) -> None:
+        if self._catalog_guard is not None:
+            raise RuntimeError("catalog namespace guard is already installed")
+        self._catalog_guard = guard
+
+    def close(self) -> None:
+        guard = self._catalog_guard
+        self._catalog_guard = None
+        try:
+            super().close()
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
 def connect(root: Path) -> sqlite3.Connection:
     # This is the single live-catalog write connection factory. Keep the claim
     # check here so direct library callers cannot bypass the runtime boundary.
     ensure_writer_claim(root)
-    db_path = root / "catalog" / "catalog.sqlite3"
     secure_mkdir(root, secure_existing=True)
-    secure_mkdir(db_path.parent, secure_existing=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    _install_live_catalog_schema_authorizer(root, conn)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    secure_sqlite_files(db_path)
-    return conn
+    with ExitStack() as catalog_guard:
+        catalog_dir = catalog_guard.enter_context(
+            pin_secure_directory_beneath(
+                root,
+                "catalog",
+                secure_existing=True,
+            )
+        )
+        db_path = catalog_guard.enter_context(
+            pin_secure_file_beneath(catalog_dir, "catalog.sqlite3")
+        )
+        conn = sqlite3.connect(str(db_path), factory=_PinnedCatalogConnection)
+        conn.retain_catalog_guard(catalog_guard.pop_all())
+        try:
+            conn.row_factory = sqlite3.Row
+            _install_live_catalog_schema_authorizer(root, conn)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
 
 def _assert_live_wal_read_compatible(root: Path, db_path: Path, *, immutable: bool) -> None:
@@ -9231,7 +9275,7 @@ def init_layout(root: Path) -> None:
         "run",
     ]
     for rel in dirs:
-        secure_mkdir(root / rel, secure_existing=True)
+        secure_mkdir_beneath(root, rel, secure_existing=True)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

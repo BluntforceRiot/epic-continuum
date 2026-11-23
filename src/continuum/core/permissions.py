@@ -546,6 +546,415 @@ def secure_mkdir(path: Path, *, secure_existing: bool = False) -> None:
         _chmod(path, PRIVATE_DIR_MODE)
 
 
+class PinnedDirectory:
+    """A validated directory whose namespace identity remains open."""
+
+    def __init__(self, path: Path, *, descriptor: int | None = None) -> None:
+        self.path = path
+        self.descriptor = descriptor
+
+
+@contextmanager
+def _pin_secure_directory_beneath_posix(
+    root: Path,
+    parts: tuple[str, ...],
+    *,
+    secure_existing: bool,
+) -> Iterator[PinnedDirectory]:
+    """Create a relative directory while pinning every traversed component."""
+
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+    if not nofollow:
+        raise OSError(errno.ENOTSUP, "O_NOFOLLOW is unavailable", str(root))
+    flags |= nofollow
+    descriptors = [os.open(root, flags)]
+    current = root
+    try:
+        for index, part in enumerate(parts):
+            descriptor = descriptors[-1]
+            created = False
+            try:
+                os.mkdir(
+                    part,
+                    PRIVATE_DIR_MODE,
+                    dir_fd=descriptor,
+                )
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                child_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "refusing unsafe internal layout directory: "
+                    f"{current / part}"
+                ) from exc
+            descriptors.append(child_descriptor)
+            current /= part
+            opened = os.fstat(child_descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise ValueError(
+                    f"refusing unsafe internal layout directory: {current}"
+                )
+            if created or (secure_existing and index == len(parts) - 1):
+                try:
+                    os.fchmod(child_descriptor, PRIVATE_DIR_MODE)
+                except (AttributeError, OSError):
+                    pass
+        yield PinnedDirectory(current, descriptor=descriptors[-1])
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _pin_secure_directory_beneath_windows(
+    root: Path,
+    parts: tuple[str, ...],
+) -> Iterator[PinnedDirectory]:
+    """Create a relative directory behind non-replaceable Windows handles."""
+
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    file_read_attributes = 0x00000080
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    handles: list[int] = []
+
+    def pin_directory(path: Path) -> None:
+        handle = kernel32.CreateFileW(
+            str(path),
+            file_read_attributes,
+            share_read_write,
+            None,
+            open_existing,
+            backup_semantics | open_reparse_point,
+            None,
+        )
+        handle_value = int(getattr(handle, "value", handle) or 0)
+        if handle_value in {0, invalid_handle}:
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        handles.append(handle_value)
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            wintypes.HANDLE(handle_value),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        attributes = int(information.file_attributes)
+        if not attributes & 0x10 or attributes & 0x400:
+            raise ValueError(
+                f"refusing unsafe internal layout directory: {path}"
+            )
+
+    current = root
+    try:
+        pin_directory(current)
+        for part in parts:
+            current /= part
+            try:
+                current.mkdir(mode=PRIVATE_DIR_MODE)
+            except FileExistsError:
+                pass
+            pin_directory(current)
+        yield PinnedDirectory(current)
+    finally:
+        for handle_value in reversed(handles):
+            try:
+                kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+            except Exception:
+                pass
+
+
+@contextmanager
+def pin_secure_directory_beneath(
+    root: Path,
+    relative: str | Path,
+    *,
+    secure_existing: bool = False,
+) -> Iterator[PinnedDirectory]:
+    """Create and pin a fixed internal directory without following links."""
+
+    relative_path = Path(relative)
+    parts = relative_path.parts
+    if (
+        relative_path.is_absolute()
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError(
+            f"internal layout path must be a non-empty relative path: {relative}"
+        )
+    canonical_root = Path(root).resolve(strict=True)
+    if (
+        os.name == "posix"
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+    ):
+        with _pin_secure_directory_beneath_posix(
+            canonical_root,
+            parts,
+            secure_existing=secure_existing,
+        ) as pinned:
+            yield pinned
+        return
+    if os.name == "nt":
+        with _pin_secure_directory_beneath_windows(
+            canonical_root,
+            parts,
+        ) as pinned:
+            yield pinned
+        return
+    raise OSError(
+        errno.ENOTSUP,
+        "race-safe internal directory traversal is unavailable",
+        str(canonical_root / relative_path),
+    )
+
+
+@contextmanager
+def pin_secure_file_beneath(
+    directory: PinnedDirectory,
+    filename: str,
+) -> Iterator[Path]:
+    """Create and pin one regular file beneath a pinned directory."""
+
+    if Path(filename).name != filename or filename in {"", ".", ".."}:
+        raise ValueError(f"internal filename must be one path component: {filename}")
+    lexical_path = directory.path / filename
+    if os.name == "posix":
+        if directory.descriptor is None:
+            raise OSError(errno.EBADF, "pinned directory descriptor is unavailable")
+        flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_NOFOLLOW", 0))
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        descriptor = os.open(
+            filename,
+            flags,
+            PRIVATE_FILE_MODE,
+            dir_fd=directory.descriptor,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"refusing unsafe internal layout file: {lexical_path}"
+                )
+            try:
+                os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            except (AttributeError, OSError):
+                pass
+            descriptor_root = (
+                Path("/proc/self/fd")
+                if sys.platform.startswith("linux")
+                else Path("/dev/fd")
+            )
+            if not descriptor_root.is_dir():
+                raise OSError(
+                    errno.ENOTSUP,
+                    "descriptor-backed SQLite paths are unavailable",
+                    str(descriptor_root),
+                )
+            yield descriptor_root / str(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+
+    if os.name != "nt":
+        raise OSError(
+            errno.ENOTSUP,
+            "race-safe internal file opening is unavailable",
+            str(lexical_path),
+        )
+
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    generic_read_write = 0x80000000 | 0x40000000
+    share_read_write = 0x00000001 | 0x00000002
+    open_always = 4
+    file_attribute_normal = 0x00000080
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = kernel32.CreateFileW(
+        str(lexical_path),
+        generic_read_write,
+        share_read_write,
+        None,
+        open_always,
+        file_attribute_normal | open_reparse_point,
+        None,
+    )
+    handle_value = int(getattr(handle, "value", handle) or 0)
+    if handle_value in {0, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            wintypes.HANDLE(handle_value),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        attributes = int(information.file_attributes)
+        if attributes & 0x10 or attributes & 0x400:
+            raise ValueError(
+                f"refusing unsafe internal layout file: {lexical_path}"
+            )
+        yield lexical_path
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+
+
+def secure_sqlite_files_beneath(
+    directory: PinnedDirectory,
+    filename: str,
+) -> None:
+    """Secure SQLite files through the already-pinned catalog parent."""
+
+    for candidate in (filename, f"{filename}-wal", f"{filename}-shm"):
+        if os.name == "posix":
+            if directory.descriptor is None:
+                raise OSError(
+                    errno.EBADF,
+                    "pinned directory descriptor is unavailable",
+                )
+            flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0))
+            flags |= int(getattr(os, "O_NONBLOCK", 0))
+            try:
+                descriptor = os.open(
+                    candidate,
+                    flags,
+                    dir_fd=directory.descriptor,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ValueError(
+                        "refusing unsafe internal SQLite file: "
+                        f"{directory.path / candidate}"
+                    )
+                try:
+                    os.fchmod(descriptor, PRIVATE_FILE_MODE)
+                except (AttributeError, OSError):
+                    pass
+            finally:
+                os.close(descriptor)
+            continue
+
+        path = directory.path / candidate
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        reparse = bool(
+            int(getattr(metadata, "st_file_attributes", 0))
+            & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or reparse
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise ValueError(f"refusing unsafe internal SQLite file: {path}")
+
+
+def secure_mkdir_beneath(
+    root: Path,
+    relative: str | Path,
+    *,
+    secure_existing: bool = False,
+) -> Path:
+    """Create a fixed internal directory without following link-like components.
+
+    ``root`` is the caller-selected trust anchor. Every component below it is
+    either created directly beneath a validated parent or rejected when it is a
+    symlink, junction, reparse point, or non-directory.
+    """
+
+    with pin_secure_directory_beneath(
+        root,
+        relative,
+        secure_existing=secure_existing,
+    ) as pinned:
+        return pinned.path
+
+
 def fsync_parent(path: Path) -> None:
     """Best-effort fsync for the containing directory after atomic renames."""
     if os.name != "posix":

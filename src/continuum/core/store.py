@@ -3226,7 +3226,6 @@ def connect(root: Path) -> sqlite3.Connection:
             assert pinned_file.descriptor is not None
             pinned_stat = os.fstat(pinned_file.descriptor)
             identity = pinned_stat.st_dev, pinned_stat.st_ino
-            open_fds_before = _darwin_open_catalog_fd_count(identity)
             conn = sqlite3.connect(
                 darwin_uri,
                 uri=True,
@@ -3234,7 +3233,11 @@ def connect(root: Path) -> sqlite3.Connection:
             )
             try:
                 darwin_uri.verify()
-                if _darwin_open_catalog_fd_count(identity) <= open_fds_before:
+                # SQLite's Unix VFS may reuse a catalog descriptor retained
+                # for POSIX locks, so a valid connect need not add a new fd.
+                # Our pin accounts for one fd; require another live fd for
+                # the same inode before any pragma can write a sidecar.
+                if _darwin_open_catalog_fd_count(identity) <= 1:
                     raise ValueError("SQLite opened a different catalog file")
             except BaseException:
                 conn.close()

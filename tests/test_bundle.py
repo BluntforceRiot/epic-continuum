@@ -660,6 +660,13 @@ class RootBundleTest(unittest.TestCase):
             self.assertTrue((stage / "catalog" / "catalog.sqlite3").is_file())
             self.assertTrue(any(entry["reason"] == "symlink_skipped" for entry in result["skipped"]))
 
+            with (
+                patch.object(bundle, "_symlink_inventory", return_value=[]),
+                patch.object(bundle, "_is_link_like", side_effect=lambda path: path == selected or original_predicate(path)),
+                self.assertRaisesRegex(ValueError, "symlink policy is 'fail'"),
+            ):
+                _copy_root_to_stage(root, base / "fail-stage", symlink_policy="fail")
+
     def test_portable_skip_never_follows_symlinked_catalog_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

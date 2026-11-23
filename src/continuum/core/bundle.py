@@ -1951,10 +1951,16 @@ def _copy_root_to_stage(
         if _is_transient(rel):
             skipped.append({**_safe_rel_text(rel), "reason": "transient_excluded"})
             continue
-        if _is_link_like(path):
+        inspected = path.lstat()
+        if (
+            _is_link_like(path)
+            or stat.S_ISLNK(inspected.st_mode)
+            or getattr(inspected, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            if symlink_policy == "fail":
+                raise ValueError("bundle symlink policy is 'fail': found a link-like entry during staging")
             skipped.append({**_safe_rel_text(rel), "reason": "symlink_skipped"})
             continue
-        inspected = path.lstat()
         if stat.S_ISDIR(inspected.st_mode):
             continue
         if not stat.S_ISREG(inspected.st_mode):

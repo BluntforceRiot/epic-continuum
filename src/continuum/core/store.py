@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -26566,7 +26566,12 @@ def count_orphan_card_sidecars(root: Path, conn: sqlite3.Connection) -> int:
     return audit_card_sidecars(root, conn)["orphan_card_sidecars"]
 
 
-def _retire_missing_snapshot_catalog_rows(root: Path) -> int:
+def _retire_missing_snapshot_catalog_rows(
+    root: Path,
+    *,
+    preserve_uris: set[str] | None = None,
+    snapshot_storage: _SnapshotRetentionDirectory | None = None,
+) -> int:
     if not is_initialized(root):
         return 0
     conn = connect(root)
@@ -26577,7 +26582,20 @@ def _retire_missing_snapshot_catalog_rows(root: Path) -> int:
         rows = conn.execute("SELECT id, snapshot_uri FROM snapshots").fetchall()
         for row in rows:
             snapshot_path = resolve_stored_uri(root, str(row["snapshot_uri"] or ""))
-            if snapshot_path.exists():
+            if preserve_uris and lexical_continuum_uri(root, snapshot_path) in preserve_uris:
+                continue
+            try:
+                if (
+                    snapshot_storage is not None
+                    and snapshot_path.absolute().parent == (root / "snapshots").absolute()
+                ):
+                    present = snapshot_storage.stat(snapshot_path.name) is not None
+                else:
+                    present = snapshot_path.exists()
+            except OSError:
+                # An unreadable namespace cannot prove that recorded data is gone.
+                continue
+            if present:
                 continue
             before = conn.total_changes
             conn.execute("DELETE FROM snapshots WHERE id = ?", (row["id"],))
@@ -27344,6 +27362,170 @@ def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
     return result
 
 
+def _same_snapshot_retention_entry(
+    left: os.stat_result, right: os.stat_result
+) -> bool:
+    return (
+        bool(left.st_ino)
+        and os.path.samestat(left, right)
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and getattr(left, "st_reparse_tag", 0) == getattr(right, "st_reparse_tag", 0)
+    )
+
+
+class _SnapshotRetentionDirectory:
+    """Retain a no-follow parent for selection and every cleanup operation."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        fd: int | None = None,
+        native: Any = None,
+        handle: int = 0,
+    ) -> None:
+        self.path = path
+        self.fd = fd
+        self.native = native
+        self.handle = handle
+
+    def names(self) -> list[str]:
+        return os.listdir(self.path if self.fd is None else self.fd)
+
+    def stat(self, name: str) -> os.stat_result | None:
+        self._require_entry_name(name)
+        try:
+            if self.fd is not None:
+                return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            return os.lstat(self.path / name)
+        except FileNotFoundError:
+            return None
+
+    def remove(self, name: str, expected: os.stat_result, *, tree: bool = False) -> None:
+        self._require_entry_name(name)
+        if self.fd is not None:
+            self._remove_relative(self.fd, name, expected, tree=tree)
+        else:
+            self._remove_native(self.handle, self.path / name, expected, tree=tree)
+
+    @staticmethod
+    def _require_entry_name(name: str) -> None:
+        if name in {"", ".", ".."} or Path(name).name != name or "\x00" in name:
+            raise OSError("snapshot retention requires a single entry name")
+
+    @classmethod
+    def _remove_relative(
+        cls, parent_fd: int, name: str, expected: os.stat_result, *, tree: bool
+    ) -> None:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_snapshot_retention_entry(expected, current):
+            raise OSError("snapshot retention entry identity changed")
+        if stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
+            # unlinkat acts on the entry itself; it never follows a link.
+            os.unlink(name, dir_fd=parent_fd)
+            return
+        if not tree or not stat.S_ISDIR(current.st_mode):
+            raise OSError("snapshot retention entry is not an eligible file or directory")
+        if current.st_dev != os.fstat(parent_fd).st_dev:
+            raise OSError("snapshot retention will not cross filesystems")
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            if not _same_snapshot_retention_entry(expected, os.fstat(fd)):
+                raise OSError("snapshot retention directory identity changed at open")
+            for child in os.listdir(fd):
+                child_stat = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                cls._remove_relative(fd, child, child_stat, tree=True)
+            if not _same_snapshot_retention_entry(
+                expected, os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            ):
+                raise OSError("snapshot retention directory identity changed during cleanup")
+            os.rmdir(name, dir_fd=parent_fd)
+        finally:
+            os.close(fd)
+
+    def _remove_native(
+        self, parent_handle: int, path: Path, expected: os.stat_result, *, tree: bool
+    ) -> None:
+        current = os.lstat(path)
+        if not _same_snapshot_retention_entry(expected, current):
+            raise OSError("snapshot retention entry identity changed")
+        attributes = getattr(current, "st_file_attributes", 0)
+        if stat.S_ISLNK(current.st_mode):
+            path.unlink()
+            return
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            # A known junction can be detached as an entry, never enumerated.
+            if tree and getattr(current, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT:
+                path.rmdir()
+                return
+            raise OSError("snapshot retention will not traverse a reparse point")
+        native = self.native
+        directory = stat.S_ISDIR(current.st_mode)
+        if (directory and not tree) or (not directory and not stat.S_ISREG(current.st_mode)):
+            raise OSError("snapshot retention entry is not an eligible file or directory")
+        access = native._DELETE | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE
+        if directory:
+            access |= native._FILE_LIST_DIRECTORY | native._FILE_TRAVERSE
+        handle = native.open_relative(
+            parent_handle,
+            path.name,
+            directory=directory,
+            desired_access=access,
+            share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+        )
+        try:
+            if not _same_snapshot_retention_entry(expected, native.fstat(handle)):
+                raise OSError("snapshot retention entry identity changed at open")
+            if directory:
+                # All ancestors and this directory are pinned without a
+                # delete share while the pathname is used for enumeration.
+                for child_name in os.listdir(path):
+                    child = path / child_name
+                    self._remove_native(handle, child, os.lstat(child), tree=True)
+            native.mark_delete(handle)
+        finally:
+            native.close(handle)
+
+
+@contextmanager
+def _open_snapshot_retention_directory(path: Path) -> Iterator[_SnapshotRetentionDirectory]:
+    from .review_bridge import _open_plain_directory_fd, _windows_native_confinement
+
+    if os.name == "nt":
+        from .operations import _restore_io_path
+
+        native = _windows_native_confinement()
+        absolute = Path(os.path.abspath(path))
+        with ExitStack() as stack:
+            handle = native.open_anchor(absolute.anchor)
+            stack.callback(native.close, handle)
+            for part in absolute.parts[1:]:
+                handle = native.open_relative(
+                    handle,
+                    part,
+                    directory=True,
+                    share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+                )
+                stack.callback(native.close, handle)
+            yield _SnapshotRetentionDirectory(
+                _restore_io_path(absolute), native=native, handle=handle
+            )
+        return
+    if (
+        not getattr(os, "O_DIRECTORY", 0)
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or os.listdir not in os.supports_fd
+        or os.stat not in os.supports_follow_symlinks
+        or not {os.open, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd
+    ):
+        raise OSError("snapshot retention requires directory-relative no-follow cleanup")
+    with _open_plain_directory_fd(path) as fd:
+        if fd is None:
+            raise OSError("snapshot retention directory could not be pinned")
+        yield _SnapshotRetentionDirectory(path, fd=fd)
+
+
 def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     reconciliation = _reconcile_interrupted_snapshot_publications(root)
     policy = str(load_config(root).get("retention", {}).get("snapshot_retention", "last_20"))
@@ -27397,85 +27579,95 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                         )
         finally:
             conn.close()
-    snapshots: list[Path] = []
+    from .review_bridge import ReviewBridgeError
+
+    snapshots: list[tuple[Path, os.stat_result]] = []
     unbound_retained = 0
-    for candidate in snapshots_dir.glob("continuum_catalog_*.sqlite3"):
-        candidate_uri = lexical_continuum_uri(root, candidate)
-        if candidate_uri not in catalog_snapshot_uris:
-            unbound_retained += 1
-            continue
-        if not _plain_snapshot_publication_output(candidate):
-            raise ValueError(
-                f"catalog-bound snapshot retention candidate is link-like or unsupported: {candidate}"
-            )
-        snapshots.append(candidate)
-    snapshots.sort(
-        key=lambda item: os.lstat(item).st_mtime,
-        reverse=True,
-    )
     deleted = 0
     paired_review_jobs_deleted = 0
     paired_card_sidecar_receipts_deleted = 0
     protected = 0
     retired_snapshot_uris: list[str] = []
     retired_snapshot_ids: list[str] = []
-    for old_snapshot in snapshots[keep:]:
-        old_snapshot_uri = lexical_continuum_uri(root, old_snapshot)
-        if old_snapshot_uri in protected_snapshot_uris:
-            protected += 1
-            continue
-        retired_snapshot_uris.append(old_snapshot_uri)
-        if snapshot_id := snapshot_id_from_catalog_path(old_snapshot):
-            retired_snapshot_ids.append(snapshot_id)
-        sidecars = snapshot_sidecars_path(old_snapshot)
-        review_jobs = snapshot_review_bridge_jobs_path(old_snapshot)
-        sidecar_receipts = snapshot_card_sidecar_receipts_path(old_snapshot)
-        manifest = snapshot_manifest_path(old_snapshot)
-        alias_key = snapshot_alias_key_path(old_snapshot)
-        for path in (old_snapshot, manifest, alias_key):
+    refused_snapshot_uris: set[str] = set()
+    with _open_snapshot_retention_directory(snapshots_dir) as storage:
+        for name in storage.names():
+            candidate = snapshots_dir / name
+            if not candidate.match("continuum_catalog_*.sqlite3"):
+                continue
+            candidate_uri = lexical_continuum_uri(root, candidate)
+            if candidate_uri not in catalog_snapshot_uris:
+                unbound_retained += 1
+                continue
+            metadata = storage.stat(name)
+            if (
+                metadata is None
+                or not stat.S_ISREG(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise ValueError(
+                    f"catalog-bound snapshot retention candidate is link-like or unsupported: {candidate}"
+                )
+            snapshots.append((candidate, metadata))
+        snapshots.sort(key=lambda item: item[1].st_mtime, reverse=True)
+        for old_snapshot, metadata in snapshots[keep:]:
+            old_snapshot_uri = lexical_continuum_uri(root, old_snapshot)
+            if old_snapshot_uri in protected_snapshot_uris:
+                protected += 1
+                continue
+            snapshot_id = snapshot_id_from_catalog_path(old_snapshot)
+            pair_id = snapshot_id or old_snapshot.stem
+            legacy_name = f"continuum_review_bridge_jobs_{pair_id}"
+            review_name = f"continuum_rj_{pair_id}"
+            legacy = storage.stat(legacy_name)
+            review = storage.stat(review_name)
+            if legacy is not None and review is not None:
+                raise ValueError(f"snapshot has ambiguous Review Relay job trees: {old_snapshot}")
+            if legacy is not None:
+                review_name, review = legacy_name, legacy
+            receipt_name = snapshot_card_sidecar_receipts_path(old_snapshot).name
+            manifest_name = snapshot_manifest_path(old_snapshot).name
+            alias_name = snapshot_alias_key_path(old_snapshot).name
+            selected = [
+                (manifest_name, storage.stat(manifest_name), False),
+                (alias_name, storage.stat(alias_name), False),
+                (review_name, review, True),
+                (receipt_name, storage.stat(receipt_name), True),
+            ]
+            if snapshot_id:
+                sidecar_name = f"continuum_cards_{snapshot_id}"
+                selected.append((sidecar_name, storage.stat(sidecar_name), True))
             try:
-                path.unlink(missing_ok=True)
+                storage.remove(old_snapshot.name, metadata)
+                if storage.stat(old_snapshot.name) is not None:
+                    raise OSError("snapshot retention could not confirm primary removal")
+            except (OSError, ReviewBridgeError):
+                refused_snapshot_uris.add(old_snapshot_uri)
+                continue
+            deleted += 1
+            retired_snapshot_uris.append(old_snapshot_uri)
+            if snapshot_id:
+                retired_snapshot_ids.append(snapshot_id)
+            for name, info, tree in selected:
+                if info is None:
+                    continue
+                try:
+                    storage.remove(name, info, tree=tree)
+                    if storage.stat(name) is not None:
+                        continue
+                except (OSError, ReviewBridgeError, RecursionError):
+                    continue
+                if name == review_name:
+                    paired_review_jobs_deleted += 1
+                elif name == receipt_name:
+                    paired_card_sidecar_receipts_deleted += 1
+                elif tree:
+                    # Keep the historical deletion count for card sidecar trees.
+                    continue
                 deleted += 1
-            except OSError:
-                pass
-        if sidecars is not None and os.path.lexists(sidecars):
-            try:
-                reason = _snapshot_link_like_reason(sidecars)
-                if reason in {"junction", "reparse_point"}:
-                    os.rmdir(sidecars)
-                elif reason:
-                    sidecars.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(sidecars)
-            except OSError:
-                pass
-        if review_jobs.exists() or review_jobs.is_symlink():
-            try:
-                reason = _snapshot_link_like_reason(review_jobs)
-                if reason in {"junction", "reparse_point"}:
-                    os.rmdir(review_jobs)
-                elif reason:
-                    review_jobs.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(review_jobs)
-                deleted += 1
-                paired_review_jobs_deleted += 1
-            except OSError:
-                pass
-        if sidecar_receipts.exists() or sidecar_receipts.is_symlink():
-            try:
-                reason = _snapshot_link_like_reason(sidecar_receipts)
-                if reason in {"junction", "reparse_point"}:
-                    os.rmdir(sidecar_receipts)
-                elif reason:
-                    sidecar_receipts.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(sidecar_receipts)
-                deleted += 1
-                paired_card_sidecar_receipts_deleted += 1
-            except OSError:
-                pass
-    catalog_rows_retired = _retire_missing_snapshot_catalog_rows(root)
+        catalog_rows_retired = _retire_missing_snapshot_catalog_rows(
+            root, preserve_uris=refused_snapshot_uris, snapshot_storage=storage
+        )
     if retired_snapshot_uris and is_initialized(root):
         conn = connect(root)
         try:

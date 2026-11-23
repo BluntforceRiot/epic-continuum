@@ -3110,12 +3110,14 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
             self.assertIsNone(store_module._INGEST_SOURCE_FD.get())
 
     def test_mcp_experiment_accepts_an_exact_new_allowed_leaf(self) -> None:
+        from continuum.core.permissions import audit_private_permissions, posix_permissions_supported
         from continuum.core.project_knowledge import record_project_knowledge
 
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
             root = base / "memory"
             destination = base / "approved-experiment"
+            incomplete = base / "incomplete-experiment"
             row = record_project_knowledge(
                 root, project_id="fixture-project", session_id="fixture-session", kind="note",
                 title="Project fixture", summary="One synthetic project observation.",
@@ -3127,23 +3129,43 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                             "workspace_id": "fixture-workspace", "destination": str(destination)},
             }
 
+            copy_helper = (
+                "_copy_private_tree_windows" if os.name == "nt" else "_copy_private_tree_posix"
+            )
+            failed_args = {
+                **args,
+                "request": {**args["request"], "destination": str(incomplete)},
+            }
+            with (
+                patch.dict(os.environ, {
+                    "CONTINUUM_ROOT": str(root),
+                    "CONTINUUM_ALLOWED_ROOTS": str(incomplete),
+                    "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
+                }),
+                patch("continuum.core.permissions." + copy_helper, side_effect=OSError("fixture copy refused")),
+            ):
+                refused = call_tool_raw("continuum_knowledge_write", failed_args)
+            self.assertTrue(refused["isError"])
+            self.assertTrue(incomplete.is_dir())
+            self.assertFalse((incomplete / ".experiment").exists())
+            self.assertEqual({path.name for path in base.iterdir()}, {"memory", "incomplete-experiment"})
+
             with patch.dict(os.environ, {
                 "CONTINUUM_ROOT": str(root),
                 "CONTINUUM_ALLOWED_ROOTS": str(destination),
                 "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
             }):
-                with patch(
-                    "continuum.core.permissions._publish_owned_experiment_stage",
-                    side_effect=OSError("fixture publication refused"),
-                ):
-                    refused = call_tool_raw("continuum_knowledge_write", args)
-                self.assertTrue(refused["isError"])
-                self.assertEqual({path.name for path in base.iterdir()}, {"memory"})
                 result = call_tool("continuum_knowledge_write", args)
 
             self.assertEqual(Path(result["experiment_root"]), destination)
-            self.assertEqual({path.name for path in base.iterdir()}, {"memory", "approved-experiment"})
+            self.assertEqual(
+                {path.name for path in base.iterdir()},
+                {"memory", "incomplete-experiment", "approved-experiment"},
+            )
             self.assertTrue((destination / ".experiment" / "manifest.json").is_file())
+            self.assertFalse(any(path.name.startswith(".continuum-experiment-stage-") for path in destination.iterdir()))
+            if os.name == "posix" and posix_permissions_supported(destination):
+                self.assertTrue(audit_private_permissions(destination)["ok"])
 
     def test_mcp_verify_proof_pack_rejects_entries_outside_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:

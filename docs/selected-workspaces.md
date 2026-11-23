@@ -63,6 +63,12 @@ hash-bound source mapping, and returns `manifest_sha256`. The source root remain
 read-only. No existing destination is reused or overwritten. A failed creation
 may leave its newly created incomplete directory for inspection; it is not a
 completed experiment until a valid manifest exists.
+If MCP allows only the exact new destination, it reserves and fills just that
+directory and publishes `.experiment` last. It does not write a sibling or
+require the destination to be on the same volume as the process's temporary
+directory. If copying is interrupted before that publish step, the incomplete
+directory is left for inspection; use a different approved new destination to
+retry without overwriting it.
 The manifest separately binds the source's canonical `source_project` and the
 isolated seed's `project_id`; a persisted alias from the source is not interpreted
 as a local alias in the new root. Original citation mappings always retain the

@@ -18,6 +18,7 @@ from typing import Any
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+_EXPERIMENT_EVIDENCE_DIR = ".experiment"
 
 
 @dataclass(frozen=True)
@@ -398,10 +399,12 @@ def _copy_regular_file_to_fd(source: Path, destination_fd: int) -> None:
         os.close(source_fd)
 
 
-def _copy_private_tree_posix(source: Path, destination_fd: int) -> None:
+def _copy_private_tree_posix(source: Path, destination_fd: int, *, omit: str | None = None) -> None:
     with os.scandir(source) as scanned:
         entries = sorted(scanned, key=lambda item: item.name)
     for entry in entries:
+        if entry.name == omit:
+            continue
         source_path = Path(entry.path)
         metadata = os.lstat(source_path)
         if _link_like_metadata(source_path, metadata):
@@ -439,12 +442,16 @@ def _copy_private_tree_posix(source: Path, destination_fd: int) -> None:
     os.fsync(destination_fd)
 
 
-def _copy_private_tree_windows(source: Path, native: Any, destination_handle: int) -> None:
+def _copy_private_tree_windows(
+    source: Path, native: Any, destination_handle: int, *, omit: str | None = None,
+) -> None:
     import msvcrt
 
     with os.scandir(source) as scanned:
         entries = sorted(scanned, key=lambda item: item.name)
     for entry in entries:
+        if entry.name == omit:
+            continue
         source_path = Path(entry.path)
         metadata = os.lstat(source_path)
         if _link_like_metadata(source_path, metadata):
@@ -476,7 +483,7 @@ def _copy_private_tree_windows(source: Path, native: Any, destination_handle: in
             raise ValueError(f"private tree source contains an unsupported entry: {source_path}")
 
 
-def _rename_posix_directory_noclobber(source_parent: int, source: str, target_parent: int, target: str) -> None:
+def _rename_posix_directory_noclobber(parent: int, source: str, target: str) -> None:
     """Rename within the admitted directory without ever replacing a sibling."""
 
     libc = ctypes.CDLL(None, use_errno=True)
@@ -493,54 +500,41 @@ def _rename_posix_directory_noclobber(source_parent: int, source: str, target_pa
         raise OSError(errno.ENOTSUP, "descriptor-relative no-clobber directory rename unavailable", target)
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(source_parent, os.fsencode(source), target_parent, os.fsencode(target), no_replace) != 0:
+    if rename(parent, os.fsencode(source), parent, os.fsencode(target), no_replace) != 0:
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code), target)
 
 
-def _publish_owned_experiment_stage(
-    source: Path, expected: os.stat_result, destination_parent: PinnedDirectory, name: str,
-) -> None:
-    """Only the destination leaf is approved; move the process-owned complete stage."""
+def _reserve_private_posix_directory(parent: int, name: str) -> int:
+    """Bind a fresh private directory, without reopening through the process cwd."""
 
-    if int(expected.st_dev) != destination_parent.identity[0]:
-        raise OSError(errno.EXDEV, "an exact destination leaf requires a same-volume private staging location")
-    identity = _pinned_identity(expected)
-    if os.name == "nt":
-        from .review_bridge import _open_windows_plain_directory
-
-        with (
-            _open_windows_plain_directory(source.parent) as (native, source_parent),
-            _open_windows_plain_directory(destination_parent.path) as (_, target_parent),
-        ):
-            if _pinned_identity(native.fstat(target_parent)) != destination_parent.identity:
-                raise ValueError("experiment destination parent changed before publication")
-            stage_handle = native.open_relative(
-                source_parent, source.name, directory=True,
-                desired_access=native._DELETE | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE,
-                share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
-            )
-            try:
-                if _pinned_identity(native.fstat(stage_handle)) != identity:
-                    raise ValueError("private experiment staging directory changed before publication")
-                native.rename_relative(stage_handle, target_parent, name, replace=False)
-            finally:
-                native.close(stage_handle)
-        return
-    if os.name != "posix" or destination_parent.fd is None:
-        raise OSError(errno.ENOTSUP, "descriptor-relative private tree publication is unavailable")
-    source_parent_fd = _open_posix_directory_fd(
-        source.parent, approved=(source.parent, _pinned_identity(source.parent.lstat())),
+    os.mkdir(name, PRIVATE_DIR_MODE, dir_fd=parent)
+    expected = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0)),
+        dir_fd=parent,
     )
     try:
-        if _pinned_identity(os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)) != identity:
-            raise ValueError("private experiment staging directory changed before publication")
-        _rename_posix_directory_noclobber(source_parent_fd, source.name, destination_parent.fd, name)
-        if _pinned_identity(os.stat(name, dir_fd=destination_parent.fd, follow_symlinks=False)) != identity:
-            raise ValueError("published experiment identity differs")
-    finally:
-        os.close(source_parent_fd)
-    os.fsync(destination_parent.fd)
+        opened = os.fstat(descriptor)
+        if (
+            not os.path.samestat(expected, opened)
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != os.fstat(parent).st_dev
+            or opened.st_uid != getattr(os, "geteuid", lambda: -1)()
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or os.listdir(descriptor)
+        ):
+            raise ValueError("private experiment directory changed before copying")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _assert_posix_directory_binding(parent: int, name: str, opened: int) -> None:
+    if not os.path.samestat(os.fstat(opened), os.stat(name, dir_fd=parent, follow_symlinks=False)):
+        raise ValueError("experiment directory identity differs from its opened object")
 
 
 def publish_private_tree(
@@ -550,7 +544,12 @@ def publish_private_tree(
     *,
     leaf_only: bool = False,
 ) -> Path:
-    """Publish a complete new tree through the admitted directory only."""
+    """Publish a new experiment through the admitted directory only.
+
+    With approval for just the new leaf, copy into that exclusive reservation and
+    publish the evidence directory last. No operation requires a sibling or a
+    rename between volumes. An interrupted reservation is not a completed experiment.
+    """
 
     if not name or Path(name).name != name or name in {".", ".."}:
         raise ValueError("private tree destination must be one path component")
@@ -560,14 +559,15 @@ def publish_private_tree(
     if not pinned_directory_is_current(destination_parent):
         raise ValueError("experiment destination parent changed before publication")
     destination = destination_parent.path / name
+    staged_evidence = source / _EXPERIMENT_EVIDENCE_DIR
     if leaf_only:
-        _publish_owned_experiment_stage(source, source_metadata, destination_parent, name)
-        if not pinned_directory_is_current(destination_parent):
-            raise ValueError("experiment destination parent changed during publication")
-        return destination
-    staging = ".continuum-experiment-stage-" + secrets.token_hex(16)
-    # The destination is never the working directory. If copying is refused,
-    # retain the private stage rather than path-delete an uncertain object.
+        evidence_metadata = staged_evidence.lstat()
+        if _link_like_metadata(staged_evidence, evidence_metadata) or not stat.S_ISDIR(evidence_metadata.st_mode):
+            raise ValueError("the private experiment stage must contain its plain evidence directory")
+    private_name = ".continuum-experiment-stage-" + secrets.token_hex(16)
+    staging = name if leaf_only else private_name
+    # On failure, leave the private stage/reservation instead of deleting a path
+    # that may no longer name our object. The evidence directory is the commit.
     if os.name == "nt":
         from .review_bridge import _open_windows_plain_directory
 
@@ -584,10 +584,28 @@ def publish_private_tree(
                 share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
             )
             try:
-                _copy_private_tree_windows(source, native, stage_handle)
-                if not pinned_directory_is_current(destination_parent):
-                    raise ValueError("experiment destination parent changed before publication")
-                native.rename_relative(stage_handle, parent, name, replace=False)
+                if leaf_only:
+                    _copy_private_tree_windows(source, native, stage_handle, omit=_EXPERIMENT_EVIDENCE_DIR)
+                    evidence_handle = native.open_relative(
+                        stage_handle, private_name, directory=True, disposition=native._FILE_CREATE,
+                        desired_access=(
+                            native._DELETE | native._FILE_LIST_DIRECTORY | native._FILE_TRAVERSE
+                            | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE
+                        ),
+                        share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+                    )
+                    try:
+                        _copy_private_tree_windows(staged_evidence, native, evidence_handle)
+                        if not pinned_directory_is_current(destination_parent):
+                            raise ValueError("experiment destination parent changed before publication")
+                        native.rename_relative(evidence_handle, stage_handle, _EXPERIMENT_EVIDENCE_DIR, replace=False)
+                    finally:
+                        native.close(evidence_handle)
+                else:
+                    _copy_private_tree_windows(source, native, stage_handle)
+                    if not pinned_directory_is_current(destination_parent):
+                        raise ValueError("experiment destination parent changed before publication")
+                    native.rename_relative(stage_handle, parent, name, replace=False)
             except OSError as exc:
                 # The directory context translates its own open errors.
                 # Keep ordinary copy/publication failures distinct.
@@ -598,31 +616,29 @@ def publish_private_tree(
             raise copy_error
     elif os.name == "posix" and destination_parent.fd is not None:
         parent_fd = destination_parent.fd
-        os.mkdir(staging, PRIVATE_DIR_MODE, dir_fd=parent_fd)
-        expected = os.stat(staging, dir_fd=parent_fd, follow_symlinks=False)
-        stage_fd = os.open(
-            staging,
-            os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0)),
-            dir_fd=parent_fd,
-        )
+        stage_fd = _reserve_private_posix_directory(parent_fd, staging)
         try:
-            opened = os.fstat(stage_fd)
-            if (
-                not os.path.samestat(expected, opened)
-                or not stat.S_ISDIR(opened.st_mode)
-                or opened.st_uid != getattr(os, "geteuid", lambda: -1)()
-                or stat.S_IMODE(opened.st_mode) & 0o077
-            ):
-                raise ValueError("private experiment staging directory changed before copying")
-            _copy_private_tree_posix(source, stage_fd)
-            if (
-                not pinned_directory_is_current(destination_parent)
-                or not os.path.samestat(opened, os.stat(staging, dir_fd=parent_fd, follow_symlinks=False))
-            ):
-                raise ValueError("experiment destination parent or stage changed before publication")
-            _rename_posix_directory_noclobber(parent_fd, staging, parent_fd, name)
-            if not os.path.samestat(opened, os.stat(name, dir_fd=parent_fd, follow_symlinks=False)):
-                raise ValueError("published experiment identity differs")
+            if leaf_only:
+                _copy_private_tree_posix(source, stage_fd, omit=_EXPERIMENT_EVIDENCE_DIR)
+                evidence_fd = _reserve_private_posix_directory(stage_fd, private_name)
+                try:
+                    _copy_private_tree_posix(staged_evidence, evidence_fd)
+                    if not pinned_directory_is_current(destination_parent):
+                        raise ValueError("experiment destination parent changed before publication")
+                    _assert_posix_directory_binding(parent_fd, name, stage_fd)
+                    _assert_posix_directory_binding(stage_fd, private_name, evidence_fd)
+                    _rename_posix_directory_noclobber(stage_fd, private_name, _EXPERIMENT_EVIDENCE_DIR)
+                    _assert_posix_directory_binding(stage_fd, _EXPERIMENT_EVIDENCE_DIR, evidence_fd)
+                    os.fsync(stage_fd)
+                finally:
+                    os.close(evidence_fd)
+            else:
+                _copy_private_tree_posix(source, stage_fd)
+                if not pinned_directory_is_current(destination_parent):
+                    raise ValueError("experiment destination parent changed before publication")
+                _assert_posix_directory_binding(parent_fd, staging, stage_fd)
+                _rename_posix_directory_noclobber(parent_fd, staging, name)
+            _assert_posix_directory_binding(parent_fd, name, stage_fd)
         finally:
             os.close(stage_fd)
         os.fsync(parent_fd)

@@ -27438,17 +27438,15 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                 deleted += 1
             except OSError:
                 pass
-        if sidecars is not None and sidecars.exists():
-            for child in sorted(sidecars.rglob("*"), reverse=True):
-                try:
-                    if child.is_dir():
-                        child.rmdir()
-                    else:
-                        child.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        if sidecars is not None and os.path.lexists(sidecars):
             try:
-                sidecars.rmdir()
+                reason = _snapshot_link_like_reason(sidecars)
+                if reason in {"junction", "reparse_point"}:
+                    os.rmdir(sidecars)
+                elif reason:
+                    sidecars.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(sidecars)
             except OSError:
                 pass
         if review_jobs.exists() or review_jobs.is_symlink():

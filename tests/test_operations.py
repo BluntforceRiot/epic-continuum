@@ -4964,6 +4964,101 @@ class OperationLedgerTest(unittest.TestCase):
             for row in rows:
                 self.assertTrue((root / row["snapshot_uri"]).exists())
 
+    def test_snapshot_retention_does_not_traverse_replaced_card_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            snapshots_dir = root / "snapshots"
+            snapshots: list[Path] = []
+            snapshot_ids: list[str] = []
+            conn = connect(root)
+            try:
+                for index in range(22):
+                    snapshot_id = (
+                        f"snapshot_20260101T0000{index:02d}Z_{index:016x}"
+                    )
+                    snapshot_ids.append(snapshot_id)
+                    snapshot_path = (
+                        snapshots_dir
+                        / f"continuum_catalog_{snapshot_id}.sqlite3"
+                    )
+                    snapshot_path.write_text(
+                        f"snapshot-{index}",
+                        encoding="utf-8",
+                    )
+                    timestamp = 1_700_000_000 + index
+                    os.utime(snapshot_path, (timestamp, timestamp))
+                    snapshots.append(snapshot_path)
+                    conn.execute(
+                        """
+                        INSERT INTO snapshots(
+                            id, snapshot_uri, reason, source_db_uri, created_at
+                        )
+                        VALUES(?, ?, 'retention link defense',
+                               'catalog/catalog.sqlite3', ?)
+                        """,
+                        (
+                            snapshot_id,
+                            f"snapshots/{snapshot_path.name}",
+                            f"2026-01-01T00:00:{index:02d}+00:00",
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            replaced_sidecars = (
+                snapshots_dir / f"continuum_cards_{snapshot_ids[0]}"
+            )
+            replaced_sidecars.mkdir()
+            (replaced_sidecars / "before-replacement.md").write_text(
+                "replace me",
+                encoding="utf-8",
+            )
+            plain_sidecars = snapshots_dir / f"continuum_cards_{snapshot_ids[1]}"
+            plain_sidecars.mkdir()
+            (plain_sidecars / "ordinary.md").write_text(
+                "ordinary sidecar",
+                encoding="utf-8",
+            )
+            outside = Path(tmp) / "outside"
+            outside_marker = outside / "must-survive.md"
+            outside.mkdir()
+            outside_marker.write_text("external data", encoding="utf-8")
+
+            real_sidecars_path = store_module.snapshot_sidecars_path
+            substituted = False
+
+            def substitute_selected_sidecars(snapshot_path: Path) -> Path | None:
+                nonlocal substituted
+                selected = real_sidecars_path(snapshot_path)
+                if snapshot_path == snapshots[0] and not substituted:
+                    self.assertEqual(selected, replaced_sidecars)
+                    shutil.rmtree(replaced_sidecars)
+                    make_link_like_dir(self, replaced_sidecars, outside)
+                    substituted = True
+                return selected
+
+            with patch.object(
+                store_module,
+                "snapshot_sidecars_path",
+                side_effect=substitute_selected_sidecars,
+            ):
+                enforce_snapshot_retention(root)
+
+            self.assertTrue(substituted)
+            self.assertTrue(outside_marker.is_file())
+            self.assertEqual(
+                outside_marker.read_text(encoding="utf-8"),
+                "external data",
+            )
+            self.assertFalse(os.path.lexists(replaced_sidecars))
+            self.assertFalse(plain_sidecars.exists())
+            self.assertEqual(
+                len(list(snapshots_dir.glob("continuum_catalog_*.sqlite3"))),
+                20,
+            )
+
     def test_snapshot_retention_preserves_immutable_proof_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"

@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
 import time
 import uuid
 from collections.abc import Iterable, Iterator
@@ -24,6 +25,8 @@ from urllib.parse import urlencode
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
 from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
 from .permissions import (
+    PinnedInternalDirectory,
+    PinnedInternalFile,
     flush_directory_strict,
     flush_file_strict,
     flush_tree_strict,
@@ -3137,6 +3140,65 @@ class _PinnedCatalogConnection(sqlite3.Connection):
             pass
 
 
+class _VerifiedDarwinCatalogUri:
+    """Resolve a pinned catalog through its normal WAL-capable path on macOS."""
+
+    def __init__(
+        self,
+        directory: PinnedInternalDirectory,
+        file: PinnedInternalFile,
+    ) -> None:
+        if directory.descriptor is None or file.descriptor is None:
+            raise OSError("pinned catalog descriptors are unavailable")
+        self.directory = directory
+        self.file = file
+        self.path = directory.path / "catalog.sqlite3"
+
+    def verify(self) -> None:
+        """Refuse a relocated or replaced name before SQLite uses that name."""
+        assert self.directory.descriptor is not None
+        assert self.file.descriptor is not None
+        try:
+            pinned_dir = os.fstat(self.directory.descriptor)
+            named_dir = os.lstat(self.directory.path)
+            pinned_file = os.fstat(self.file.descriptor)
+            named_file = os.lstat(self.path)
+        except OSError as exc:
+            raise ValueError("catalog namespace changed before SQLite could open it") from exc
+        if (
+            not stat.S_ISDIR(named_dir.st_mode)
+            or not stat.S_ISREG(named_file.st_mode)
+            or (named_dir.st_dev, named_dir.st_ino)
+            != (pinned_dir.st_dev, pinned_dir.st_ino)
+            or (named_file.st_dev, named_file.st_ino)
+            != (pinned_file.st_dev, pinned_file.st_ino)
+        ):
+            raise ValueError("catalog namespace changed before SQLite could open it")
+
+    def __fspath__(self) -> str:
+        # Python calls this inside sqlite3.connect. In particular, a caller
+        # that swaps catalog just before SQLite opens it cannot redirect the
+        # connection to its replacement. mode=rw also prevents new files from
+        # being created at a substituted name.
+        self.verify()
+        return f"{self.path.as_uri()}?mode=rw"
+
+
+def _darwin_open_catalog_fd_count(identity: tuple[int, int]) -> int:
+    """Count this process's live descriptors for the pinned catalog inode."""
+    count = 0
+    for name in os.listdir("/dev/fd"):
+        if not name.isdecimal():
+            continue
+        try:
+            observed = os.fstat(int(name))
+        except OSError:
+            continue
+        if (observed.st_dev, observed.st_ino) == identity:
+            count += 1
+    return count
+
+
 def connect(root: Path) -> sqlite3.Connection:
     # This is the single live-catalog write connection factory. Keep the claim
     # check here so direct library callers cannot bypass the runtime boundary.
@@ -3150,13 +3212,37 @@ def connect(root: Path) -> sqlite3.Connection:
                 secure_existing=True,
             )
         )
-        db_path = catalog_guard.enter_context(
+        pinned_file = catalog_guard.enter_context(
             pin_secure_file_beneath(catalog_dir, "catalog.sqlite3")
         )
         # Closing another descriptor for a SQLite file drops this process's
         # POSIX advisory locks, so secure existing sidecars before SQLite opens.
         secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
-        conn = sqlite3.connect(str(db_path), factory=_PinnedCatalogConnection)
+        if sys.platform == "darwin":
+            # macOS cannot create SQLite's WAL sidecars beside /dev/fd/<file>.
+            # Use the checked catalog name and verify SQLite opened the same
+            # inode before issuing a pragma that could write a sidecar.
+            darwin_uri = _VerifiedDarwinCatalogUri(catalog_dir, pinned_file)
+            assert pinned_file.descriptor is not None
+            pinned_stat = os.fstat(pinned_file.descriptor)
+            identity = pinned_stat.st_dev, pinned_stat.st_ino
+            open_fds_before = _darwin_open_catalog_fd_count(identity)
+            conn = sqlite3.connect(
+                darwin_uri,
+                uri=True,
+                factory=_PinnedCatalogConnection,
+            )
+            try:
+                darwin_uri.verify()
+                if _darwin_open_catalog_fd_count(identity) <= open_fds_before:
+                    raise ValueError("SQLite opened a different catalog file")
+            except BaseException:
+                conn.close()
+                raise
+        else:
+            conn = sqlite3.connect(
+                str(pinned_file.path), factory=_PinnedCatalogConnection
+            )
         conn.retain_catalog_guard(catalog_guard.pop_all())
         try:
             conn.row_factory = sqlite3.Row

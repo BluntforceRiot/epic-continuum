@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -274,11 +275,19 @@ class WriterClaimTests(unittest.TestCase):
                     side_effect=substitute_catalog,
                 ),
             ):
-                connection = connect(root)
-                try:
-                    self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
-                finally:
-                    connection.close()
+                if sys.platform == "darwin":
+                    # Darwin's WAL needs a normal pathname. Its checked URI
+                    # must fail closed when the catalog is moved before open.
+                    with self.assertRaisesRegex(
+                        ValueError, "catalog namespace changed"
+                    ):
+                        connect(root)
+                else:
+                    connection = connect(root)
+                    try:
+                        self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+                    finally:
+                        connection.close()
 
             self.assertTrue((displaced / "catalog.sqlite3").is_file())
             self.assertEqual(list(outside.iterdir()), [])

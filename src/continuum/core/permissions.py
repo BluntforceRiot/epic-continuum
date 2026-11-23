@@ -1191,6 +1191,14 @@ class PinnedInternalDirectory:
         self.descriptor = descriptor
 
 
+class PinnedInternalFile:
+    """A validated regular file kept open while a catalog connection starts."""
+
+    def __init__(self, path: Path, *, descriptor: int | None = None) -> None:
+        self.path = path
+        self.descriptor = descriptor
+
+
 @contextmanager
 def _pin_secure_directory_beneath_posix(
     root: Path,
@@ -1397,7 +1405,7 @@ def pin_secure_directory_beneath(
 def pin_secure_file_beneath(
     directory: PinnedInternalDirectory,
     filename: str,
-) -> Iterator[Path]:
+) -> Iterator[PinnedInternalFile]:
     """Create and pin one regular file beneath a pinned directory."""
 
     if Path(filename).name != filename or filename in {"", ".", ".."}:
@@ -1435,7 +1443,10 @@ def pin_secure_file_beneath(
                     "descriptor-backed SQLite paths are unavailable",
                     str(descriptor_root),
                 )
-            yield descriptor_root / str(descriptor)
+            yield PinnedInternalFile(
+                descriptor_root / str(descriptor),
+                descriptor=descriptor,
+            )
         finally:
             os.close(descriptor)
         return
@@ -1512,7 +1523,7 @@ def pin_secure_file_beneath(
             raise ValueError(
                 f"refusing unsafe internal layout file: {lexical_path}"
             )
-        yield lexical_path
+        yield PinnedInternalFile(lexical_path)
     finally:
         kernel32.CloseHandle(wintypes.HANDLE(handle_value))
 

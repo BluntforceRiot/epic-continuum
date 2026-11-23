@@ -4964,6 +4964,136 @@ class OperationLedgerTest(unittest.TestCase):
             for row in rows:
                 self.assertTrue((root / row["snapshot_uri"]).exists())
 
+
+    def test_snapshot_retention_removes_plain_pairs_only_after_catalog_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "epic-continuum"
+            init_db(root)
+            candidates: list[tuple[Path, list[Path]]] = []
+            snapshots_dir = root / "snapshots"
+            conn = connect(root)
+            try:
+                for index in range(22):
+                    ident = f"snapshot_20260101T0000{index:02d}Z_{index:032x}"
+                    primary = snapshots_dir / f"continuum_catalog_{ident}.sqlite3"
+                    primary.write_bytes(b"retention fixture")
+                    timestamp = 1_700_000_000 + index
+                    os.utime(primary, (timestamp, timestamp))
+                    conn.execute(
+                        """
+                        INSERT INTO snapshots(id, snapshot_uri, reason, source_db_uri, created_at)
+                        VALUES (?, ?, 'retention', 'catalog/catalog.sqlite3', '2026-01-01T00:00:00+00:00')
+                        """,
+                        (ident, primary.relative_to(root).as_posix()),
+                    )
+                    pairs: list[Path] = []
+                    if index < 2:
+                        for prefix in ("continuum_cards_", "continuum_rj_", "continuum_card_sidecar_receipts_"):
+                            pair = snapshots_dir / (prefix + ident)
+                            pair.mkdir()
+                            (pair / "fixture.txt").write_text("ordinary retained data", encoding="utf-8")
+                            pairs.append(pair)
+                    candidates.append((primary, pairs))
+                conn.commit()
+            finally:
+                conn.close()
+
+            refused, refused_pairs = candidates[0]
+            removed, removed_pairs = candidates[1]
+            real_remove = store_module._SnapshotRetentionDirectory.remove
+
+            def remove_with_refusal(storage, name, expected, *, tree=False):
+                if name == refused.name:
+                    raise PermissionError("fixture deletion refusal")
+                return real_remove(storage, name, expected, tree=tree)
+
+            with patch.object(store_module._SnapshotRetentionDirectory, "remove", remove_with_refusal):
+                result = enforce_snapshot_retention(root)
+
+            self.assertEqual(result["paired_review_jobs_deleted"], 1)
+            self.assertEqual(result["paired_card_sidecar_receipts_deleted"], 1)
+            self.assertTrue(refused.is_file())
+            self.assertTrue(all(pair.is_dir() for pair in refused_pairs))
+            self.assertFalse(removed.exists())
+            self.assertTrue(all(not pair.exists() for pair in removed_pairs))
+            conn = connect_existing(root)
+            try:
+                retained = {row["snapshot_uri"] for row in conn.execute("SELECT snapshot_uri FROM snapshots")}
+            finally:
+                conn.close()
+            self.assertEqual(len(retained), 21)
+            self.assertIn(refused.relative_to(root).as_posix(), retained)
+            self.assertNotIn(removed.relative_to(root).as_posix(), retained)
+
+            with patch.object(store_module, "_retire_missing_snapshot_catalog_rows", return_value=0) as sweep:
+                second = enforce_snapshot_retention(root)
+            sweep.assert_called()
+            self.assertEqual(second["catalog_rows_retired"], 0)
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(conn.execute(
+                    "SELECT id FROM snapshots WHERE snapshot_uri = ?", (refused.relative_to(root).as_posix(),),
+                ).fetchone())
+            finally:
+                conn.close()
+
+    def test_snapshot_retention_refuses_unmatched_plain_entry_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            for path in (first, second):
+                path.mkdir()
+                (path / "fixture.txt").write_text("keep", encoding="utf-8")
+            with store_module._open_snapshot_retention_directory(root) as storage:
+                other = storage.stat(second.name)
+                self.assertIsNotNone(other)
+                with self.assertRaisesRegex(OSError, "identity changed"):
+                    storage.remove(first.name, other, tree=True)
+            self.assertTrue((first / "fixture.txt").is_file())
+            self.assertTrue((second / "fixture.txt").is_file())
+
+    def test_snapshot_retention_refuses_other_reparse_metadata_without_traversal(self) -> None:
+        from types import SimpleNamespace
+
+        path = Path("synthetic-entry")
+        metadata = SimpleNamespace(
+            st_ino=7, st_dev=1, st_mode=stat.S_IFDIR,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=0,
+        )
+        storage = store_module._SnapshotRetentionDirectory(path.parent)
+        with (
+            patch.object(store_module.os, "lstat", return_value=metadata),
+            patch.object(store_module.os, "listdir") as listdir,
+        ):
+            with self.assertRaisesRegex(OSError, "reparse point"):
+                storage._remove_native(0, path, metadata, tree=True)
+            listdir.assert_not_called()
+
+    def test_snapshot_retention_preserves_known_link_metadata(self) -> None:
+        from types import SimpleNamespace
+
+        path = Path("synthetic-entry")
+        storage = store_module._SnapshotRetentionDirectory(path.parent)
+        for mode, tag, operation in (
+            (stat.S_IFLNK, 0xA000000C, "unlink"),  # Windows IO_REPARSE_TAG_SYMLINK
+            (stat.S_IFDIR, 0xA0000003, "rmdir"),   # Windows IO_REPARSE_TAG_MOUNT_POINT
+        ):
+            metadata = SimpleNamespace(
+                st_ino=7, st_dev=1, st_mode=mode,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=tag,
+            )
+            with (
+                self.subTest(operation=operation),
+                patch.object(store_module.os, "lstat", return_value=metadata),
+                patch.object(store_module.os, "listdir") as listdir,
+                patch.object(Path, operation) as remove,
+            ):
+                with self.assertRaisesRegex(OSError, "link or reparse point"):
+                    storage._remove_native(0, path, metadata, tree=True)
+                remove.assert_not_called()
+                listdir.assert_not_called()
+
     def test_snapshot_retention_preserves_immutable_proof_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "epic-continuum"

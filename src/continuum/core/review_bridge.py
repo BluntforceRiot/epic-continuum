@@ -38,7 +38,7 @@ from .permissions import (
     secure_mkdir,
     secure_write_text,
 )
-from .safety import DEFAULT_IGNORE_PATTERNS, ignored_by_pattern, load_ignore_patterns, redact_text_secrets, scan_text_for_secrets
+from .safety import DEFAULT_IGNORE_PATTERNS, ignored_by_pattern, load_ignore_patterns, redact_error_message_paths, redact_text_secrets, scan_text_for_secrets
 from .store import (
     connect,
     connect_existing,
@@ -847,11 +847,17 @@ def _bounded_diagnostic_text(value: str | bytes, *, max_bytes: int = 1_200) -> s
 
 
 def _bounded_persisted_review_error(value: BaseException | str) -> str:
-    """Bound durable failure diagnostics independently of reviewer input size."""
+    """Remove secrets and local paths before bounding durable diagnostics."""
     encoded = str(value).encode("utf-8", errors="replace")
-    if len(encoded) <= REVIEW_PERSISTED_ERROR_MAX_BYTES:
-        return encoded.decode("utf-8")
     suffix = b"\n[diagnostic truncated]"
+    if len(encoded) > REVIEW_PERSISTED_ERROR_MAX_BYTES:
+        # Do not slice untrusted text before redaction: a partial secret at the
+        # cut could evade the scanner. A digest still correlates repeat errors.
+        return f"diagnostic sha256={hashlib.sha256(encoded).hexdigest()}" + suffix.decode("ascii")
+    safe = redact_error_message_paths(encoded.decode("utf-8"))
+    encoded = safe.encode("utf-8")
+    if len(encoded) <= REVIEW_PERSISTED_ERROR_MAX_BYTES:
+        return safe
     prefix_limit = max(0, REVIEW_PERSISTED_ERROR_MAX_BYTES - len(suffix))
     prefix = encoded[:prefix_limit].decode("utf-8", errors="ignore")
     return prefix + suffix.decode("ascii")
@@ -19971,19 +19977,8 @@ def _openai_chat_completion(
             diagnostic = {}
         if completed.returncode == 22 and isinstance(diagnostic, dict):
             code = diagnostic.get("code", "unknown")
-            body = _bounded_diagnostic_text(
-                str(diagnostic.get("body") or ""),
-                max_bytes=1_000,
-            )
-            raise ReviewBridgeError(f"review endpoint HTTP {code}: {body}")
-        detail = (
-            str(diagnostic.get("detail") or "")
-            if isinstance(diagnostic, dict)
-            else ""
-        )
-        if not detail:
-            detail = _bounded_diagnostic_text(completed.stderr)
-        raise ReviewBridgeError(f"review endpoint unavailable: {detail}")
+            raise ReviewBridgeError(f"review endpoint HTTP {code}")
+        raise ReviewBridgeError("review endpoint unavailable")
     response_text = _validated_review_response_text(
         completed.stdout,
         label="review endpoint response",
@@ -20098,12 +20093,8 @@ def _run_hermes_oneshot(
             f"{REVIEW_INTEGRITY_MAX_RECORD_BYTES}-byte limit"
         )
     if completed.returncode != 0:
-        diagnostic = _bounded_diagnostic_text(completed.stderr)
-        if not diagnostic:
-            diagnostic = _bounded_diagnostic_text(completed.stdout)
         raise ReviewBridgeError(
-            "Hermes review transport failed "
-            f"(exit {completed.returncode}): {diagnostic}"
+            f"Hermes review transport failed (exit {completed.returncode})"
         )
     content = _validated_review_response_text(
         completed.stdout,

@@ -11721,6 +11721,62 @@ class ReviewBridgeTest(unittest.TestCase):
             self.assertIn("endpoint refused", status["error"])
             self.assertTrue(Path(status["last_attempt_uri"]).exists())
 
+    def test_transport_failure_redacts_secret_and_local_path_in_job_and_attempt(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            subject = base / "subject"
+            subject.mkdir()
+            (subject / "README.md").write_text("# Subject\n", encoding="utf-8")
+            job = create_review_job(root, subject_path=subject, prompt="Review hard.", transport="direct-openai")
+            secret = "ghp_" + "A" * 36
+            private_path = "/home/operator/private-review/credentials.txt"
+            failure = review_bridge_module.ReviewBridgeError(
+                f"endpoint refused GITHUB_TOKEN={secret} at {private_path}"
+            )
+            with patch.object(review_bridge_module, "_openai_chat_completion", side_effect=failure):
+                with self.assertRaises(review_bridge_module.ReviewBridgeError):
+                    review_bridge_module.run_review_job(root, job_id=job["job_id"], transport="direct-openai")
+
+            status = review_job_status(root, job_id=job["job_id"])
+            attempt = json.loads(Path(status["last_attempt_uri"]).read_text(encoding="utf-8"))
+            for error in (status["error"], attempt["error"]):
+                self.assertIn("endpoint refused", error)
+                self.assertNotIn(secret, error)
+                self.assertNotIn(private_path, error)
+
+    def test_provider_failure_messages_exclude_raw_diagnostics(self) -> None:
+        secret = "ghp_" + "A" * 36
+        private_path = "/home/operator/private-review/credentials.txt"
+        diagnostic = f"GITHUB_TOKEN={secret} at {private_path}"
+        endpoint_failure = bounded_process_result(
+            stderr=json.dumps({"kind": "http", "code": 403, "body": diagnostic}),
+            returncode=22,
+        )
+        with patch.object(review_bridge_module, "_run_bounded_process", return_value=endpoint_failure):
+            with self.assertRaisesRegex(review_bridge_module.ReviewBridgeError, "HTTP 403") as raised:
+                review_bridge_module._openai_chat_completion(
+                    base_url="http://127.0.0.1:8020/v1", model="test-model",
+                    system_prompt="Review.", user_prompt="Check.", untrusted_user_data="data",
+                    timeout_seconds=1, max_tokens=1,
+                )
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn(private_path, str(raised.exception))
+
+        hermes_failure = bounded_process_result(stderr=diagnostic, returncode=7)
+        job = {
+            "job_id": "test", "packet_sha256": "a" * 64, "sentinel": "test",
+            "request_uri": "request.json", "prompt_uri": "prompt.txt",
+            "schema_uri": "schema.json", "packet_uri": "packet.txt",
+        }
+        with patch.dict(os.environ, {"CONTINUUM_HERMES_EXE": "hermes"}), patch.object(
+            review_bridge_module, "_run_bounded_process", return_value=hermes_failure,
+        ):
+            with self.assertRaisesRegex(review_bridge_module.ReviewBridgeError, "exit 7") as raised:
+                review_bridge_module._run_hermes_oneshot(job=job, model="", timeout_seconds=1)
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn(private_path, str(raised.exception))
+
     def test_direct_transport_failure_receipt_catalog_error_rolls_back_attempt(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)

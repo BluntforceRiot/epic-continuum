@@ -471,7 +471,9 @@ def _copy_private_tree_windows(
                 desired_access=native._FILE_WRITE_DATA | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE,
             )
             try:
-                descriptor = msvcrt.open_osfhandle(child, os.O_WRONLY | int(getattr(os, "O_BINARY", 0)))
+                descriptor = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+                    child, os.O_WRONLY | int(getattr(os, "O_BINARY", 0)),
+                )
             except BaseException:
                 native.close(child)
                 raise

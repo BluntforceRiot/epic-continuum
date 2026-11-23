@@ -5217,8 +5217,9 @@ class OperationLedgerTest(unittest.TestCase):
             rendered = json.dumps(payload, ensure_ascii=True)
             self.assertEqual(code, 1)
             self.assertFalse(payload["ok"])
-            self.assertIn("<redacted-path:", payload["error"])
-            self.assertNotIn(str(missing), rendered)
+            self.assertRegex(payload["error"], r"<redacted-path(?::[^/\\<>\r\n]+)?>")
+            self.assertNotIn(str(missing), payload["error"])
+            self.assertNotIn(json.dumps(str(missing.parent), ensure_ascii=True)[1:-1], rendered)
             self.assertNotIn("supersecretvalue123", rendered)
 
     def test_directory_proof_manifests_redact_secret_bearing_child_names(self) -> None:

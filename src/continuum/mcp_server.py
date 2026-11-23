@@ -36,6 +36,7 @@ from .core.capability_api import (
 from .core.hardware import PROFILES
 from .core.mempalace_import import default_mempalace_path, import_mempalace
 from .core.local_model import local_model_health
+from .core.permissions import open_directory_beneath, open_regular_file_beneath
 from .core.project_state import (
     MAX_PROJECT_STATE_CHANGED_FILES,
     MAX_PROJECT_STATE_DECISIONS,
@@ -109,6 +110,7 @@ from .core.review_bridge import (
 )
 from .core.store import (
     MAX_RECENT_EVENT_LIMIT,
+    _use_ingest_source_fd,
     append_scroll_event,
     audit,
     audit_search_index,
@@ -689,27 +691,30 @@ def tool_ingest_file(args: JSON) -> Any:
     source_path = file_arg(args, "path", purpose="ingest source")
     title = optional_str(args, "title")
     storage_tier = optional_str(args, "storage_tier") or "hot"
-    source_ref = source_file_reference(root, source_path)
+    source_roots = None if env_truthy("CONTINUUM_MCP_ALLOW_ANY_PATH") else allowed_roots()
+    with open_regular_file_beneath(source_path, roots=source_roots) as source_fd:
+        source_ref = source_file_reference(root, source_path)
 
-    def action(operation: OperationGuard) -> JSON:
-        operation.cursor({"phase": "before_ingest", "source": source_ref, "storage_tier": storage_tier})
-        result = ingest_file(root, path=source_path, title=title, storage_tier=storage_tier)
-        operation.cursor({"phase": "file_ingested", "book_id": result["book_id"], "card_id": result["card_id"]})
-        return result
+        def action(operation: OperationGuard) -> JSON:
+            operation.cursor({"phase": "before_ingest", "source": source_ref, "storage_tier": storage_tier})
+            result = ingest_file(root, path=source_path, title=title, storage_tier=storage_tier)
+            operation.cursor({"phase": "file_ingested", "book_id": result["book_id"], "card_id": result["card_id"]})
+            return result
 
-    return guarded_tool(
-        root,
-        operation_type="mcp_ingest_file",
-        title=f"Ingest file {source_ref['name']}",
-        intent={"source": source_ref, "title": title, "storage_tier": storage_tier},
-        snapshot_policy="auto",
-        snapshot_reason="file ingest mutates Library/catalog",
-        touched_paths=[root / "catalog" / "catalog.sqlite3"],
-        result_touched_paths=lambda result: [
-            path for path in [result.get("card_uri"), result.get("original_uri"), result.get("reader_uri")] if path
-        ],
-        action=action,
-    )
+        with _use_ingest_source_fd(source_fd):
+            return guarded_tool(
+                root,
+                operation_type="mcp_ingest_file",
+                title=f"Ingest file {source_ref['name']}",
+                intent={"source": source_ref, "title": title, "storage_tier": storage_tier},
+                snapshot_policy="auto",
+                snapshot_reason="file ingest mutates Library/catalog",
+                touched_paths=[root / "catalog" / "catalog.sqlite3"],
+                result_touched_paths=lambda result: [
+                    path for path in [result.get("card_uri"), result.get("original_uri"), result.get("reader_uri")] if path
+                ],
+                action=action,
+            )
 
 
 def tool_compile_context(args: JSON) -> Any:
@@ -1055,9 +1060,21 @@ def _tool_knowledge(args: JSON, *, write: bool) -> Any:
         require_str(args, "action"), _normalize_json_value(args.get("request")), write=write,
         path_validator=lambda path, name: validate_allowed_path(path, purpose=name),
     )
+
+    def dispatch_prepared() -> JSON:
+        if prepared.action != "create_memory_experiment":
+            return dispatch_capability(root, prepared)
+        destination = prepared.request["destination"]
+        destination_roots = None if env_truthy("CONTINUUM_MCP_ALLOW_ANY_PATH") else allowed_roots()
+        with open_directory_beneath(destination.parent, roots=destination_roots) as pinned_parent:
+            from .core.workspaces import _use_pinned_experiment_destination
+
+            with _use_pinned_experiment_destination(pinned_parent):
+                return dispatch_capability(root, prepared)
+
     operation_root = prepared.operation_root(root)
     if operation_root is None:
-        return dispatch_capability(root, prepared)
+        return dispatch_prepared()
     intent: JSON = {"action": prepared.action}
     for key in ("project_id", "session_id"):
         if key in prepared.request:
@@ -1067,7 +1084,7 @@ def _tool_knowledge(args: JSON, *, write: bool) -> Any:
         title="Record scoped knowledge", intent=intent,
         snapshot_policy="none", snapshot_reason="append-only scoped knowledge",
         proof=False, touched_paths=[operation_root / "catalog" / "catalog.sqlite3"],
-        action=lambda operation: dispatch_capability(root, prepared),
+        action=lambda operation: dispatch_prepared(),
     )
 
 

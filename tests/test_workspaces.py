@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import socket
 import tempfile
 import unittest
@@ -391,6 +392,35 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_memory_experiment(self.root, project_id="project-a", record_ids=[row["id"]], workspace_id="experiment", destination=link / "child")
         self.assertFalse((actual / "child").exists())
+
+    @unittest.skipUnless(os.name == "posix", "directory replacement while pinned is POSIX-specific")
+    def test_experiment_parent_substitution_cannot_redirect_publication(self) -> None:
+        row = self.record()
+        parent = self.directory / "experiment-parent"
+        moved_parent = self.directory / "experiment-parent-retained"
+        redirected_parent = self.directory / "experiment-parent-redirected"
+        parent.mkdir()
+        redirected_parent.mkdir()
+        actual_export = export_workspace
+
+        def export_after_parent_swap(*args, **kwargs):
+            capsule = actual_export(*args, **kwargs)
+            parent.rename(moved_parent)
+            parent.symlink_to(redirected_parent, target_is_directory=True)
+            return capsule
+
+        with patch("continuum.core.workspaces.export_workspace", side_effect=export_after_parent_swap):
+            with self.assertRaisesRegex(ValueError, "destination parent changed"):
+                create_memory_experiment(
+                    self.root,
+                    project_id="project-a",
+                    record_ids=[row["id"]],
+                    workspace_id="experiment",
+                    destination=parent / "child",
+                )
+
+        self.assertFalse((redirected_parent / "child").exists())
+        self.assertFalse((moved_parent / "child").exists())
 
     def test_replay_rejects_changed_manifest_and_frozen_snapshot(self) -> None:
         experiment = self.experiment()

@@ -13,12 +13,14 @@ import re
 import sqlite3
 import stat
 import tempfile
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from .config import config_path, default_config, write_config
 from .knowledge_records import KINDS, SCHEMA, append_record, read_records, require_text, require_timestamp
+from .permissions import PinnedDirectory, open_directory_beneath, publish_private_tree
 from .recall import recall_memory
 from .safety import scan_text_for_secrets, scan_value_for_secrets
 from .store import canonical_partition_identifier, connect_existing, init_db, validate_partition_identifier
@@ -32,6 +34,19 @@ _MAX_SNAPSHOT = 64 * 1024 * 1024
 _MAX_PROJECT_RECORDS = 10000
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+_PINNED_EXPERIMENT_DESTINATION: ContextVar[PinnedDirectory | None] = ContextVar(
+    "continuum_pinned_experiment_destination",
+    default=None,
+)
+
+
+@contextmanager
+def _use_pinned_experiment_destination(directory: PinnedDirectory):
+    token = _PINNED_EXPERIMENT_DESTINATION.set(directory)
+    try:
+        yield
+    finally:
+        _PINNED_EXPERIMENT_DESTINATION.reset(token)
 
 
 def _identifier(value: Any, field: str) -> str:
@@ -439,54 +454,82 @@ def create_memory_experiment(
     if not isinstance(destination, (Path, str)) or not Path(destination).is_absolute():
         raise ValueError("destination must be an explicit absolute new directory")
     requested = Path(destination)
-    parent = _directory(requested.parent)
-    target = parent / requested.name
-    if target.exists() or target.is_symlink() or target.is_relative_to(source) or source.is_relative_to(target):
-        raise ValueError("experiment destination must be new and disjoint from its source")
-    capsule = export_workspace(source, project_id=project_id, record_ids=record_ids, workspace_id=workspace_id)
-    # Internal aliases are valid only in their owning catalog. Select a stable,
-    # ordinary destination partition without copying the source alias table/key
-    # or persisting the caller's possibly credential-bearing external spelling.
-    seed_project = capsule["source_project"]
-    try:
-        validate_partition_identifier("project_id", seed_project)
-    except ValueError:
-        seed_project = "workspace-" + hashlib.sha256(seed_project.encode("utf-8")).hexdigest()[:24]
-    plan_workspace_import(target, project_id=seed_project, capsule=capsule, expected_snapshot_hash=capsule["snapshot_hash"])
-    target.mkdir(exist_ok=False)
-    config = default_config()
-    config["capture"]["mode"] = "manual"
-    config["capture"]["dedup_window_seconds"] = 0
-    config["local_inference"]["enabled"] = False
-    write_config(target, config)
-    init_db(target)
-    imported = import_workspace(target, project_id=seed_project, session_id="workspace-seed", capsule=capsule,
-                                expected_snapshot_hash=capsule["snapshot_hash"])
-    evidence = target / ".experiment"
-    evidence.mkdir(exist_ok=False)
-    snapshot = evidence / "snapshot.sqlite3"
-    with closing(connect_existing(target)) as src, closing(sqlite3.connect(snapshot)) as dst:
-        src.backup(dst)
-    raw = _read_file(snapshot, _MAX_SNAPSHOT)
-    config_raw = _read_file(config_path(target), _MAX_CAPSULE)
-    mapping = []
-    sources = {item["id"]: item for item in capsule["records"]}
-    for item in imported["results"]:
-        original = sources[item["origin"]["record_id"]]
-        mapping.append({"id": item["id"], "content_hash": item["content_hash"],
-                        "source": {"project_id": capsule["source_project"], "kind": "scroll_event",
-                                   "id": original["id"], "content_hash": original["content_hash"]}})
-    manifest = {"schema": _EXPERIMENT, "workspace_id": workspace_id, "project_id": imported["project_id"],
-                "source_project": capsule["source_project"],
-                "capsule_hash": capsule["snapshot_hash"], "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
-                "snapshot_bytes": len(raw), "config_sha256": hashlib.sha256(config_raw).hexdigest(), "mapping": mapping}
-    for name, content in (("capsule.json", _json(capsule)), ("config.json", config_raw), ("manifest.json", _json(manifest))):
-        with (evidence / name).open("xb") as stream:
-            stream.write(content)
-    return {"schema_version": 1, "experiment_root": str(target), "manifest_sha256": _digest(manifest),
-            "project_id": imported["project_id"], "source_project": capsule["source_project"],
-            "snapshot_sha256": manifest["snapshot_sha256"], "capsule_hash": capsule["snapshot_hash"],
-            "seeded": len(mapping), "mapping": mapping, "provider_used": False, "source_mutated": False}
+    requested_parent = Path(os.path.abspath(requested.parent))
+    _pinned_destination = _PINNED_EXPERIMENT_DESTINATION.get()
+    if _pinned_destination is not None:
+        if (
+            not isinstance(_pinned_destination, PinnedDirectory)
+            or _pinned_destination.requested_path != requested_parent
+        ):
+            raise ValueError("pinned destination does not match the requested parent")
+        parent_context = nullcontext(_pinned_destination)
+    else:
+        parent = _directory(requested.parent)
+        parent_context = open_directory_beneath(parent, roots=[parent])
+
+    with parent_context as pinned_parent:
+        target = pinned_parent.path / requested.name
+        if target.exists() or target.is_symlink() or target.is_relative_to(source) or source.is_relative_to(target):
+            raise ValueError("experiment destination must be new and disjoint from its source")
+        capsule = export_workspace(source, project_id=project_id, record_ids=record_ids, workspace_id=workspace_id)
+        # Internal aliases are valid only in their owning catalog. Select a stable,
+        # ordinary destination partition without copying the source alias table/key
+        # or persisting the caller's possibly credential-bearing external spelling.
+        seed_project = capsule["source_project"]
+        try:
+            validate_partition_identifier("project_id", seed_project)
+        except ValueError:
+            seed_project = "workspace-" + hashlib.sha256(seed_project.encode("utf-8")).hexdigest()[:24]
+
+        with tempfile.TemporaryDirectory(prefix="continuum-memory-experiment-") as staging_directory:
+            staged = Path(staging_directory) / "experiment"
+            plan_workspace_import(
+                staged,
+                project_id=seed_project,
+                capsule=capsule,
+                expected_snapshot_hash=capsule["snapshot_hash"],
+            )
+            staged.mkdir(exist_ok=False)
+            config = default_config()
+            config["capture"]["mode"] = "manual"
+            config["capture"]["dedup_window_seconds"] = 0
+            config["local_inference"]["enabled"] = False
+            write_config(staged, config)
+            init_db(staged)
+            imported = import_workspace(
+                staged,
+                project_id=seed_project,
+                session_id="workspace-seed",
+                capsule=capsule,
+                expected_snapshot_hash=capsule["snapshot_hash"],
+            )
+            evidence = staged / ".experiment"
+            evidence.mkdir(exist_ok=False)
+            snapshot = evidence / "snapshot.sqlite3"
+            with closing(connect_existing(staged)) as src, closing(sqlite3.connect(snapshot)) as dst:
+                src.backup(dst)
+            raw = _read_file(snapshot, _MAX_SNAPSHOT)
+            config_raw = _read_file(config_path(staged), _MAX_CAPSULE)
+            mapping = []
+            sources = {item["id"]: item for item in capsule["records"]}
+            for item in imported["results"]:
+                original = sources[item["origin"]["record_id"]]
+                mapping.append({"id": item["id"], "content_hash": item["content_hash"],
+                                "source": {"project_id": capsule["source_project"], "kind": "scroll_event",
+                                           "id": original["id"], "content_hash": original["content_hash"]}})
+            manifest = {"schema": _EXPERIMENT, "workspace_id": workspace_id, "project_id": imported["project_id"],
+                        "source_project": capsule["source_project"],
+                        "capsule_hash": capsule["snapshot_hash"], "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
+                        "snapshot_bytes": len(raw), "config_sha256": hashlib.sha256(config_raw).hexdigest(), "mapping": mapping}
+            for name, content in (("capsule.json", _json(capsule)), ("config.json", config_raw), ("manifest.json", _json(manifest))):
+                with (evidence / name).open("xb") as stream:
+                    stream.write(content)
+            published = publish_private_tree(staged, pinned_parent, requested.name)
+
+        return {"schema_version": 1, "experiment_root": str(published), "manifest_sha256": _digest(manifest),
+                "project_id": imported["project_id"], "source_project": capsule["source_project"],
+                "snapshot_sha256": manifest["snapshot_sha256"], "capsule_hash": capsule["snapshot_hash"],
+                "seeded": len(mapping), "mapping": mapping, "provider_used": False, "source_mutated": False}
 
 
 def _experiment(experiment_root: Path | str, expected_manifest_hash: str) -> tuple[dict, dict, bytes, bytes]:

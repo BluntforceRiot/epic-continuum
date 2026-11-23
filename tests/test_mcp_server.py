@@ -3084,6 +3084,36 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 payload = json.loads(response["result"]["content"][0]["text"])
                 self.assertIn("verification root path is outside", payload["error"])
 
+    @unittest.skipUnless(os.name == "posix", "final-component symlink substitution is POSIX-specific")
+    def test_mcp_ingest_keeps_the_allowed_file_open_across_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:
+            allowed_root = Path(allowed) / "continuum"
+            source = Path(allowed) / "source.txt"
+            retained = Path(allowed) / "source-retained.txt"
+            denied_source = Path(denied) / "private.txt"
+            authorized = "Authorized project memory only.\n"
+            denied_marker = "OUTSIDE_ALLOWED_ROOT_PRIVATE_MARKER"
+            source.write_text(authorized, encoding="utf-8")
+            denied_source.write_text(denied_marker, encoding="utf-8")
+            actual_ingest = mcp_server_module.ingest_file
+
+            def ingest_after_source_swap(*args, **kwargs):
+                source.rename(retained)
+                source.symlink_to(denied_source)
+                return actual_ingest(*args, **kwargs)
+
+            with (
+                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}),
+                patch.object(mcp_server_module, "ingest_file", side_effect=ingest_after_source_swap),
+            ):
+                result = call_tool(
+                    "continuum_ingest_file",
+                    {"root": str(allowed_root), "path": str(source)},
+                )
+
+            self.assertEqual(Path(result["original_uri"]).read_text(encoding="utf-8"), authorized)
+            self.assertNotIn(denied_marker, Path(result["reader_uri"]).read_text(encoding="utf-8"))
+
     def test_mcp_verify_proof_pack_rejects_entries_outside_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:
             root = str(Path(allowed) / "continuum")

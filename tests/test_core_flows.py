@@ -6487,6 +6487,28 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             with self.assertRaisesRegex(ValueError, "file too large for ingest_file"):
                 ingest_file(root, path=source)
 
+    def test_ingest_file_scans_and_archives_the_supplied_descriptor_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            source = Path(tmp) / "authorized.txt"
+            retained = Path(tmp) / "authorized-retained.txt"
+            authorized = b"Descriptor-bound ordinary project notes.\n"
+            source.write_bytes(authorized)
+            source_fd = os.open(source, os.O_RDONLY)
+            try:
+                source.rename(retained)
+                source.write_text(
+                    "OPENAI_API_KEY=sk-testvalue12345678901234567890\n",
+                    encoding="utf-8",
+                )
+                with store_module._use_ingest_source_fd(source_fd):
+                    result = ingest_file(root, path=source)
+            finally:
+                os.close(source_fd)
+
+            self.assertEqual(Path(result["original_uri"]).read_bytes(), authorized)
+            self.assertEqual(Path(result["reader_uri"]).read_bytes(), authorized)
+
     def test_ingest_file_blocks_ignored_secret_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

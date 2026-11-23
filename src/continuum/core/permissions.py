@@ -9,6 +9,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from functools import lru_cache
 from typing import Any
@@ -16,6 +17,486 @@ from typing import Any
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+
+
+@dataclass(frozen=True)
+class PinnedDirectory:
+    """An absolute directory kept open across a security-sensitive operation."""
+
+    requested_path: Path
+    path: Path
+    identity: tuple[int, int]
+    fd: int | None = None
+
+
+def _link_like_metadata(path: Path, metadata: os.stat_result) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    try:
+        junction = bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return (
+        stat.S_ISLNK(metadata.st_mode)
+        or junction
+        or bool(int(getattr(metadata, "st_file_attributes", 0)) & reparse_flag)
+    )
+
+
+def _resolved_path_beneath(
+    path: Path,
+    roots: list[Path] | None,
+) -> tuple[Path, Path]:
+    requested = Path(path)
+    if not requested.is_absolute():
+        raise ValueError("a pinned filesystem path must be absolute")
+    try:
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"pinned filesystem path is unavailable: {requested}") from exc
+    candidates = list(roots) if roots is not None else [Path(resolved.anchor)]
+    contained_by: list[Path] = []
+    for root in candidates:
+        try:
+            resolved_root = Path(root).resolve(strict=True)
+            if not stat.S_ISDIR(os.lstat(resolved_root).st_mode):
+                continue
+            resolved.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        contained_by.append(resolved_root)
+    if not contained_by:
+        raise ValueError(f"pinned filesystem path is outside its allowed roots: {requested}")
+    return resolved, max(contained_by, key=lambda item: len(item.parts))
+
+
+def _open_posix_directory_fd(path: Path) -> int:
+    nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+    directory = int(getattr(os, "O_DIRECTORY", 0))
+    if not nofollow or not directory:
+        raise OSError(
+            errno.ENOTSUP,
+            "descriptor-relative no-follow traversal is unavailable",
+            str(path),
+        )
+    flags = os.O_RDONLY | nofollow | directory
+    current_fd = -1
+    try:
+        current_fd = os.open(path.anchor, flags)
+        for component in path.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        metadata = os.fstat(current_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(errno.ENOTDIR, "pinned path is not a directory", str(path))
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+@contextmanager
+def _open_windows_path_handles(
+    path: Path,
+    *,
+    final_directory: bool,
+) -> Iterator[tuple[int, tuple[int, int], Any, Any, list[int]]]:
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    file_read_attributes = 0x00000080
+    generic_read = 0x80000000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    handles: list[int] = []
+    final_handle = 0
+    final_identity = (0, 0)
+    current = Path(path.anchor)
+    try:
+        for index, component in enumerate(path.parts):
+            if index:
+                current = current / component
+            is_final = index == len(path.parts) - 1
+            is_directory = not is_final or final_directory
+            handle = kernel32.CreateFileW(
+                str(current),
+                file_read_attributes if is_directory else generic_read,
+                (share_read | share_write) if is_directory else share_read,
+                None,
+                open_existing,
+                (backup_semantics if is_directory else file_attribute_normal)
+                | open_reparse_point,
+                None,
+            )
+            handle_value = int(getattr(handle, "value", handle) or 0)
+            if handle_value in {0, invalid_handle}:
+                raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+            handles.append(handle_value)
+            information = _ByHandleFileInformation()
+            if not kernel32.GetFileInformationByHandle(
+                wintypes.HANDLE(handle_value),
+                ctypes.byref(information),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+            attributes = int(information.file_attributes)
+            file_index = (
+                int(information.file_index_high) << 32
+            ) | int(information.file_index_low)
+            metadata = os.lstat(current)
+            if (
+                bool(attributes & 0x10) != is_directory
+                or bool(attributes & 0x400)
+                or _link_like_metadata(current, metadata)
+                or stat.S_ISDIR(metadata.st_mode) != is_directory
+                or int(metadata.st_ino) != file_index
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    "pinned Windows path changed while opening",
+                    str(current),
+                )
+            if is_final:
+                final_handle = handle_value
+                final_identity = (int(metadata.st_dev), int(metadata.st_ino))
+        yield final_handle, final_identity, kernel32, wintypes, handles
+    finally:
+        for handle_value in reversed(handles):
+            kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+
+
+@contextmanager
+def open_directory_beneath(
+    path: Path,
+    *,
+    roots: list[Path] | None,
+) -> Iterator[PinnedDirectory]:
+    """Pin an existing directory reached beneath one of the approved roots."""
+
+    requested = Path(os.path.abspath(path))
+    resolved, _root = _resolved_path_beneath(requested, roots)
+    if os.name == "nt":
+        with _open_windows_path_handles(
+            resolved,
+            final_directory=True,
+        ) as (_handle, identity, _kernel32, _wintypes, _handles):
+            yield PinnedDirectory(requested, resolved, identity)
+        return
+    if os.name != "posix":
+        raise OSError(errno.ENOTSUP, "directory pinning is unsupported", str(path))
+    fd = _open_posix_directory_fd(resolved)
+    try:
+        metadata = os.fstat(fd)
+        yield PinnedDirectory(
+            requested,
+            resolved,
+            (int(metadata.st_dev), int(metadata.st_ino)),
+            fd,
+        )
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def open_regular_file_beneath(
+    path: Path,
+    *,
+    roots: list[Path] | None,
+) -> Iterator[int]:
+    """Open one approved regular file without reopening its pathname."""
+
+    requested = Path(os.path.abspath(path))
+    resolved, root = _resolved_path_beneath(requested, roots)
+    relative = resolved.relative_to(root)
+    if not relative.parts:
+        raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
+    if os.name == "nt":
+        import msvcrt
+
+        with _open_windows_path_handles(
+            resolved,
+            final_directory=False,
+        ) as (handle, _identity, _kernel32, _wintypes, handles):
+            fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+                handle,
+                os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
+            )
+            handles.remove(handle)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
+                yield fd
+            finally:
+                os.close(fd)
+        return
+    if os.name != "posix":
+        raise OSError(errno.ENOTSUP, "regular-file pinning is unsupported", str(path))
+    directory_fd = _open_posix_directory_fd(root)
+    file_fd = -1
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | int(getattr(os, "O_DIRECTORY", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0))
+        )
+        for component in relative.parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_flags = (
+            os.O_RDONLY
+            | int(getattr(os, "O_BINARY", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0))
+            | int(getattr(os, "O_NONBLOCK", 0))
+        )
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
+        yield file_fd
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def pinned_directory_is_current(directory: PinnedDirectory) -> bool:
+    """Return whether the pinned object still occupies its approved pathname."""
+
+    try:
+        metadata = os.lstat(directory.path)
+        if (
+            _link_like_metadata(directory.path, metadata)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (int(metadata.st_dev), int(metadata.st_ino)) != directory.identity
+        ):
+            return False
+        if directory.fd is not None:
+            opened = os.fstat(directory.fd)
+            return (int(opened.st_dev), int(opened.st_ino)) == directory.identity
+        return True
+    except OSError:
+        return False
+
+
+def _copy_regular_file_to_fd(source: Path, destination_fd: int) -> None:
+    source_flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_BINARY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_NONBLOCK", 0))
+    )
+    source_fd = os.open(source, source_flags)
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"private tree source is not a regular file: {source}")
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(destination_fd, remaining)
+                if written <= 0:
+                    raise OSError("private tree copy made no forward progress")
+                remaining = remaining[written:]
+            copied += len(chunk)
+        after = os.fstat(source_fd)
+        before_identity = (
+            int(before.st_dev),
+            int(before.st_ino),
+            int(before.st_size),
+            int(before.st_mtime_ns),
+            int(before.st_ctime_ns),
+        )
+        after_identity = (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+            int(after.st_ctime_ns),
+        )
+        if before_identity != after_identity or copied != int(after.st_size):
+            raise ValueError(f"private tree source changed while copying: {source}")
+        os.fsync(destination_fd)
+    finally:
+        os.close(source_fd)
+
+
+def _copy_private_tree_posix(source: Path, destination_fd: int) -> None:
+    with os.scandir(source) as scanned:
+        entries = sorted(scanned, key=lambda item: item.name)
+    for entry in entries:
+        source_path = Path(entry.path)
+        metadata = os.lstat(source_path)
+        if _link_like_metadata(source_path, metadata):
+            raise ValueError(f"private tree source contains a link-like entry: {source_path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            os.mkdir(entry.name, PRIVATE_DIR_MODE, dir_fd=destination_fd)
+            child_fd = os.open(
+                entry.name,
+                os.O_RDONLY
+                | int(getattr(os, "O_DIRECTORY", 0))
+                | int(getattr(os, "O_NOFOLLOW", 0)),
+                dir_fd=destination_fd,
+            )
+            try:
+                _copy_private_tree_posix(source_path, child_fd)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            child_fd = os.open(
+                entry.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | int(getattr(os, "O_BINARY", 0))
+                | int(getattr(os, "O_NOFOLLOW", 0)),
+                PRIVATE_FILE_MODE,
+                dir_fd=destination_fd,
+            )
+            try:
+                _copy_regular_file_to_fd(source_path, child_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            raise ValueError(f"private tree source contains an unsupported entry: {source_path}")
+    os.fsync(destination_fd)
+
+
+def _copy_private_tree_windows(
+    source: Path,
+    destination: Path,
+    *,
+    confinement_root: Path,
+) -> None:
+    with os.scandir(source) as scanned:
+        entries = sorted(scanned, key=lambda item: item.name)
+    for entry in entries:
+        source_path = Path(entry.path)
+        destination_path = destination / entry.name
+        metadata = os.lstat(source_path)
+        if _link_like_metadata(source_path, metadata):
+            raise ValueError(f"private tree source contains a link-like entry: {source_path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            os.mkdir(destination_path, PRIVATE_DIR_MODE)
+            with open_directory_beneath(
+                destination_path,
+                roots=[confinement_root],
+            ) as child:
+                _copy_private_tree_windows(
+                    source_path,
+                    child.path,
+                    confinement_root=confinement_root,
+                )
+        elif stat.S_ISREG(metadata.st_mode):
+            destination_fd = os.open(
+                destination_path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | int(getattr(os, "O_BINARY", 0)),
+                PRIVATE_FILE_MODE,
+            )
+            try:
+                _copy_regular_file_to_fd(source_path, destination_fd)
+            finally:
+                os.close(destination_fd)
+        else:
+            raise ValueError(f"private tree source contains an unsupported entry: {source_path}")
+
+
+def publish_private_tree(
+    source: Path,
+    destination_parent: PinnedDirectory,
+    name: str,
+) -> Path:
+    """Copy a private tree beneath a pinned parent without pathname reopening."""
+
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise ValueError("private tree destination must be one path component")
+    source_metadata = os.lstat(source)
+    if _link_like_metadata(source, source_metadata) or not stat.S_ISDIR(source_metadata.st_mode):
+        raise ValueError("private tree source must be a plain directory")
+    if not pinned_directory_is_current(destination_parent):
+        raise ValueError("experiment destination parent changed before publication")
+    destination = destination_parent.path / name
+    if os.name == "nt":
+        os.mkdir(destination, PRIVATE_DIR_MODE)
+        with open_directory_beneath(
+            destination,
+            roots=[destination_parent.path],
+        ) as pinned_destination:
+            _copy_private_tree_windows(
+                source,
+                pinned_destination.path,
+                confinement_root=pinned_destination.path,
+            )
+    elif os.name == "posix" and destination_parent.fd is not None:
+        os.mkdir(name, PRIVATE_DIR_MODE, dir_fd=destination_parent.fd)
+        destination_fd = os.open(
+            name,
+            os.O_RDONLY
+            | int(getattr(os, "O_DIRECTORY", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0)),
+            dir_fd=destination_parent.fd,
+        )
+        try:
+            _copy_private_tree_posix(source, destination_fd)
+        finally:
+            os.close(destination_fd)
+        os.fsync(destination_parent.fd)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "descriptor-relative private tree publication is unavailable",
+            str(destination),
+        )
+    if not pinned_directory_is_current(destination_parent):
+        raise ValueError("experiment destination parent changed during publication")
+    return destination
 
 
 def _flush_windows_handle_strict(
@@ -835,6 +1316,29 @@ def replace_durable(source: Path, destination: Path) -> None:
     flush_directory_strict(destination_parent)
     if source_parent != destination_parent:
         flush_directory_strict(source_parent)
+
+
+def secure_write_bytes(path: Path, data: bytes) -> None:
+    secure_mkdir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        if posix_permissions_supported(tmp_path):
+            os.fchmod(fd, PRIVATE_FILE_MODE)  # type: ignore[attr-defined]  # POSIX-only API
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        _chmod(path, PRIVATE_FILE_MODE)
+        fsync_parent(path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def secure_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:

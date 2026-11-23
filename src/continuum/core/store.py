@@ -33,6 +33,7 @@ from .permissions import (
     secure_copytree,
     secure_mkdir,
     secure_sqlite_files,
+    secure_write_bytes,
     secure_write_text,
     secure_write_text_exclusive,
     set_windows_delete_disposition,
@@ -85,6 +86,10 @@ PARTITION_INTERNAL_PREFIXES = (
     "redacted_agent_",
 )
 _INIT_DB_CACHE: set[str] = set()
+_INGEST_SOURCE_FD: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "continuum_ingest_source_fd",
+    default=None,
+)
 SCROLL_EVENT_SCOPE_BACKFILL_META_KEY = (
     "migration.scroll_event_scope_columns_backfill.v1"
 )
@@ -14374,13 +14379,73 @@ def roll_scroll_segment(
         conn.close()
 
 
+def _read_ingest_source_fd(
+    fd: int,
+    *,
+    path: Path,
+    max_bytes: int,
+) -> tuple[bytes, int]:
+    """Read one stable regular-file object without reopening its pathname."""
+
+    before = os.fstat(fd)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or bool(int(getattr(before, "st_file_attributes", 0)) & reparse_flag)
+    ):
+        raise FileNotFoundError(str(path))
+    source_size = int(before.st_size)
+    if source_size > max_bytes:
+        raise ValueError(
+            f"file too large for ingest_file: {format_size(source_size)} exceeds "
+            f"storage.max_ingest_bytes={format_size(max_bytes)}"
+        )
+    fingerprint = (
+        int(before.st_dev),
+        int(before.st_ino),
+        source_size,
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    os.lseek(fd, 0, os.SEEK_SET)
+    captured = bytearray()
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(captured)))
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if len(captured) > max_bytes:
+            raise ValueError(
+                f"file too large for ingest_file: more than {format_size(max_bytes)} exceeds "
+                f"storage.max_ingest_bytes={format_size(max_bytes)}"
+            )
+    after = os.fstat(fd)
+    final_fingerprint = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    if final_fingerprint != fingerprint or len(captured) != source_size:
+        raise ValueError(f"ingest source changed while reading: {path}")
+    return bytes(captured), source_size
+
+
+@contextmanager
+def _use_ingest_source_fd(fd: int) -> Iterator[None]:
+    token = _INGEST_SOURCE_FD.set(fd)
+    try:
+        yield
+    finally:
+        _INGEST_SOURCE_FD.reset(token)
+
+
 def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tier: str = "hot") -> dict[str, Any]:
     init_db(root)
     config = load_config(root)
     if storage_tier not in {"hot", "warm", "cold", "vault"}:
         raise ValueError("storage_tier must be hot, warm, cold, or vault")
-    if not path.exists() or not path.is_file():
-        raise FileNotFoundError(str(path))
     security_config = config.get("security", {})
     ignored, ignore_pattern = is_ignored_path(
         root,
@@ -14390,13 +14455,25 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     if ignored:
         raise ValueError(f"path matches Continuum ignore rule {ignore_pattern!r}: {path}")
     max_ingest_bytes = parse_size(config.get("storage", {}).get("max_ingest_bytes", "50MB"))
-    source_size = path.stat().st_size
-    if source_size > max_ingest_bytes:
-        raise ValueError(
-            f"file too large for ingest_file: {format_size(source_size)} exceeds "
-            f"storage.max_ingest_bytes={format_size(max_ingest_bytes)}"
+    owned_fd = -1
+    ingest_fd = _INGEST_SOURCE_FD.get()
+    try:
+        if ingest_fd is None:
+            owned_fd = os.open(
+                path,
+                os.O_RDONLY
+                | int(getattr(os, "O_BINARY", 0))
+                | int(getattr(os, "O_NONBLOCK", 0)),
+            )
+            ingest_fd = owned_fd
+        raw_bytes, source_size = _read_ingest_source_fd(
+            ingest_fd,
+            path=path,
+            max_bytes=max_ingest_bytes,
         )
-    raw_bytes = path.read_bytes()
+    finally:
+        if owned_fd >= 0:
+            os.close(owned_fd)
     digest = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8", errors="replace")
     source_ref = source_file_reference(root, path, digest=digest, size_bytes=source_size)
@@ -14431,7 +14508,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     secure_mkdir(original_dir)
     original_path = original_dir / safe_name
     if not original_path.exists():
-        secure_copy_file(path, original_path)
+        secure_write_bytes(original_path, raw_bytes)
     reader_dir = root / "archive" / "reader_editions" / ("cold" if storage_tier == "vault" else storage_tier)
     secure_mkdir(reader_dir)
     reader_path = reader_dir / f"{safe_name}.txt"

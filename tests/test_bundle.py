@@ -21,6 +21,8 @@ from continuum.core.bundle import (
     BUNDLE_MANIFEST_NAME,
     BUNDLE_ROOT_NAME,
     _claim_disposable_bundle_root,
+    _copy_confined_root_file,
+    _copy_root_to_stage,
     _is_transient,
     _manifest_hash,
     _write_zip_member,
@@ -604,6 +606,66 @@ class RootBundleTest(unittest.TestCase):
                     profile="shareable",
                     run_restore_drill=False,
                 )
+
+    def test_confined_stage_preserves_preexisting_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            root.mkdir()
+            relative = Path("ordinary.txt")
+            (root / relative).write_text("selected source", encoding="utf-8")
+            existing = base / "stage.txt"
+            existing.write_text("existing stage bytes", encoding="utf-8")
+
+            with self.assertRaises((FileExistsError, ValueError)):
+                _copy_confined_root_file(root, relative, existing)
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), "existing stage bytes")
+
+    def test_confined_stage_requires_inspected_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            root.mkdir()
+            relative = Path("ordinary.txt")
+            expected = root / "distinct.txt"
+            (root / relative).write_text("selected source", encoding="utf-8")
+            expected.write_text("distinct ordinary fixture", encoding="utf-8")
+            destination = base / "stage.txt"
+
+            with self.assertRaisesRegex(ValueError, "source identity changed"):
+                _copy_confined_root_file(root, relative, destination, inspected=expected.stat())
+            self.assertFalse(destination.exists())
+
+            size = _copy_confined_root_file(root, relative, destination, inspected=(root / relative).stat())
+            self.assertEqual(size, len(b"selected source"))
+            self.assertEqual(destination.read_bytes(), b"selected source")
+
+    def test_stage_skips_entry_classified_as_link_without_importing_it(self) -> None:
+        from continuum.core import bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "memory"
+            init_db(root)
+            selected = root / "not-a-stage-member.txt"
+            selected.write_text("ordinary metadata-classification fixture", encoding="utf-8")
+            stage = base / "stage"
+            original_predicate = bundle._is_link_like
+
+            with patch.object(bundle, "_is_link_like", side_effect=lambda path: path == selected or original_predicate(path)):
+                result = _copy_root_to_stage(root, stage, symlink_policy="skip")
+
+            self.assertFalse((stage / selected.name).exists())
+            self.assertTrue((stage / "catalog" / "catalog.sqlite3").is_file())
+            self.assertTrue(any(entry["reason"] == "symlink_skipped" for entry in result["skipped"]))
+
+            with (
+                patch.object(bundle, "_symlink_inventory", return_value=[]),
+                patch.object(bundle, "_is_link_like", side_effect=lambda path: path == selected or original_predicate(path)),
+                self.assertRaisesRegex(ValueError, "symlink policy is 'fail'"),
+            ):
+                _copy_root_to_stage(root, base / "fail-stage", symlink_policy="fail")
 
     def test_portable_skip_never_follows_symlinked_catalog_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

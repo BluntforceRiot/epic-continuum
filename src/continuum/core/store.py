@@ -27420,8 +27420,9 @@ class _SnapshotRetentionDirectory:
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_snapshot_retention_entry(expected, current):
             raise OSError("snapshot retention entry identity changed")
-        if stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
-            # unlinkat acts on the entry itself; it never follows a link.
+        if stat.S_ISLNK(current.st_mode):
+            raise OSError("snapshot retention will not remove a link-like entry")
+        if stat.S_ISREG(current.st_mode):
             os.unlink(name, dir_fd=parent_fd)
             return
         if not tree or not stat.S_ISDIR(current.st_mode):
@@ -27451,15 +27452,8 @@ class _SnapshotRetentionDirectory:
         if not _same_snapshot_retention_entry(expected, current):
             raise OSError("snapshot retention entry identity changed")
         attributes = getattr(current, "st_file_attributes", 0)
-        if stat.S_ISLNK(current.st_mode):
-            path.unlink()
-            return
-        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            # A known junction can be detached as an entry, never enumerated.
-            if tree and getattr(current, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT:
-                path.rmdir()
-                return
-            raise OSError("snapshot retention will not traverse a reparse point")
+        if stat.S_ISLNK(current.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("snapshot retention will not remove a link or reparse point")
         native = self.native
         directory = stat.S_ISDIR(current.st_mode)
         if (directory and not tree) or (not directory and not stat.S_ISREG(current.st_mode)):
@@ -27587,8 +27581,6 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     paired_review_jobs_deleted = 0
     paired_card_sidecar_receipts_deleted = 0
     protected = 0
-    retired_snapshot_uris: list[str] = []
-    retired_snapshot_ids: list[str] = []
     refused_snapshot_uris: set[str] = set()
     with _open_snapshot_retention_directory(snapshots_dir) as storage:
         for name in storage.names():
@@ -27645,9 +27637,6 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                 refused_snapshot_uris.add(old_snapshot_uri)
                 continue
             deleted += 1
-            retired_snapshot_uris.append(old_snapshot_uri)
-            if snapshot_id:
-                retired_snapshot_ids.append(snapshot_id)
             for name, info, tree in selected:
                 if info is None:
                     continue
@@ -27668,20 +27657,6 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
         catalog_rows_retired = _retire_missing_snapshot_catalog_rows(
             root, preserve_uris=refused_snapshot_uris, snapshot_storage=storage
         )
-    if retired_snapshot_uris and is_initialized(root):
-        conn = connect(root)
-        try:
-            for uri in retired_snapshot_uris:
-                before = conn.total_changes
-                conn.execute("DELETE FROM snapshots WHERE snapshot_uri = ?", (uri,))
-                catalog_rows_retired += max(0, conn.total_changes - before)
-            for snapshot_id in retired_snapshot_ids:
-                before = conn.total_changes
-                conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
-                catalog_rows_retired += max(0, conn.total_changes - before)
-            conn.commit()
-        finally:
-            conn.close()
     return {
         "policy": policy,
         "deleted": deleted,

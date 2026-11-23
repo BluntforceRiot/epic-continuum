@@ -5025,6 +5025,18 @@ class OperationLedgerTest(unittest.TestCase):
             self.assertIn(refused.relative_to(root).as_posix(), retained)
             self.assertNotIn(removed.relative_to(root).as_posix(), retained)
 
+            with patch.object(store_module, "_retire_missing_snapshot_catalog_rows", return_value=0) as sweep:
+                second = enforce_snapshot_retention(root)
+            sweep.assert_called()
+            self.assertEqual(second["catalog_rows_retired"], 0)
+            conn = connect_existing(root)
+            try:
+                self.assertIsNotNone(conn.execute(
+                    "SELECT id FROM snapshots WHERE snapshot_uri = ?", (refused.relative_to(root).as_posix(),),
+                ).fetchone())
+            finally:
+                conn.close()
+
     def test_snapshot_retention_refuses_unmatched_plain_entry_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5058,7 +5070,7 @@ class OperationLedgerTest(unittest.TestCase):
                 storage._remove_native(0, path, metadata, tree=True)
             listdir.assert_not_called()
 
-    def test_snapshot_retention_uses_nonrecursive_removal_for_known_link_metadata(self) -> None:
+    def test_snapshot_retention_preserves_known_link_metadata(self) -> None:
         from types import SimpleNamespace
 
         path = Path("synthetic-entry")
@@ -5077,8 +5089,9 @@ class OperationLedgerTest(unittest.TestCase):
                 patch.object(store_module.os, "listdir") as listdir,
                 patch.object(Path, operation) as remove,
             ):
-                storage._remove_native(0, path, metadata, tree=True)
-                remove.assert_called_once_with()
+                with self.assertRaisesRegex(OSError, "link or reparse point"):
+                    storage._remove_native(0, path, metadata, tree=True)
+                remove.assert_not_called()
                 listdir.assert_not_called()
 
     def test_snapshot_retention_preserves_immutable_proof_inputs(self) -> None:

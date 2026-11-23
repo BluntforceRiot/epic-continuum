@@ -3084,35 +3084,57 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 payload = json.loads(response["result"]["content"][0]["text"])
                 self.assertIn("verification root path is outside", payload["error"])
 
-    @unittest.skipUnless(os.name == "posix", "final-component symlink substitution is POSIX-specific")
     def test_mcp_ingest_keeps_the_allowed_file_open_across_dispatch(self) -> None:
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:
-            allowed_root = Path(allowed) / "continuum"
-            source = Path(allowed) / "source.txt"
-            retained = Path(allowed) / "source-retained.txt"
-            denied_source = Path(denied) / "private.txt"
-            authorized = "Authorized project memory only.\n"
-            denied_marker = "OUTSIDE_ALLOWED_ROOT_PRIVATE_MARKER"
-            source.write_text(authorized, encoding="utf-8")
-            denied_source.write_text(denied_marker, encoding="utf-8")
-            actual_ingest = mcp_server_module.ingest_file
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "memory"
+            root.mkdir()
+            source = root / "plain.txt"
+            source.write_text("ordinary protocol fixture", encoding="utf-8")
+            observations = []
 
-            def ingest_after_source_swap(*args, **kwargs):
-                source.rename(retained)
-                source.symlink_to(denied_source)
-                return actual_ingest(*args, **kwargs)
+            def observe(opened_root: Path, **args: Any) -> dict:
+                fd = store_module._INGEST_SOURCE_FD.get()
+                self.assertIsNotNone(fd)
+                assert fd is not None
+                observations.append(os.path.samestat(source.stat(), os.fstat(fd)))
+                return ingest_file(opened_root, **args)
 
             with (
-                patch.dict("os.environ", {"CONTINUUM_ALLOWED_ROOTS": allowed}),
-                patch.object(mcp_server_module, "ingest_file", side_effect=ingest_after_source_swap),
+                patch.dict(os.environ, {"CONTINUUM_ROOT": str(root), "CONTINUUM_MCP_ALLOW_ANY_PATH": "0"}),
+                patch.object(mcp_server_module, "ingest_file", side_effect=observe),
             ):
-                result = call_tool(
-                    "continuum_ingest_file",
-                    {"root": str(allowed_root), "path": str(source)},
-                )
+                result = call_tool("continuum_ingest_file", {"root": str(root), "path": str(source)})
 
-            self.assertEqual(Path(result["original_uri"]).read_text(encoding="utf-8"), authorized)
-            self.assertNotIn(denied_marker, Path(result["reader_uri"]).read_text(encoding="utf-8"))
+            self.assertEqual(observations, [True])
+            self.assertEqual(store_module.resolve_stored_uri(root, result["original_uri"]).read_bytes(), source.read_bytes())
+            self.assertIsNone(store_module._INGEST_SOURCE_FD.get())
+
+    def test_mcp_experiment_accepts_an_exact_new_allowed_leaf(self) -> None:
+        from continuum.core.project_knowledge import record_project_knowledge
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "memory"
+            destination = base / "approved-experiment"
+            row = record_project_knowledge(
+                root, project_id="fixture-project", session_id="fixture-session", kind="note",
+                title="Project fixture", summary="One synthetic project observation.",
+            )
+
+            with patch.dict(os.environ, {
+                "CONTINUUM_ROOT": str(root),
+                "CONTINUUM_ALLOWED_ROOTS": str(destination),
+                "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
+            }):
+                result = call_tool("continuum_knowledge_write", {
+                    "root": str(root),
+                    "action": "create_memory_experiment",
+                    "request": {"project_id": "fixture-project", "record_ids": [row["id"]],
+                                "workspace_id": "fixture-workspace", "destination": str(destination)},
+                })
+
+            self.assertEqual(Path(result["experiment_root"]), destination)
+            self.assertTrue((destination / ".experiment" / "manifest.json").is_file())
 
     def test_mcp_verify_proof_pack_rejects_entries_outside_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:

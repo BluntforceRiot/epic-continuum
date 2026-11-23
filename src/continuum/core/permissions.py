@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import secrets
 import shutil
 import stat
 import sys
@@ -43,34 +44,47 @@ def _link_like_metadata(path: Path, metadata: os.stat_result) -> bool:
     )
 
 
+def _pinned_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
 def _resolved_path_beneath(
     path: Path,
     roots: list[Path] | None,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, tuple[int, int], tuple[int, int]]:
     requested = Path(path)
     if not requested.is_absolute():
         raise ValueError("a pinned filesystem path must be absolute")
     try:
         resolved = requested.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise ValueError(f"pinned filesystem path is unavailable: {requested}") from exc
     candidates = list(roots) if roots is not None else [Path(resolved.anchor)]
-    contained_by: list[Path] = []
+    contained_by: list[tuple[Path, tuple[int, int]]] = []
     for root in candidates:
         try:
             resolved_root = Path(root).resolve(strict=True)
-            if not stat.S_ISDIR(os.lstat(resolved_root).st_mode):
+            root_stat = resolved_root.lstat()
+            if not stat.S_ISDIR(root_stat.st_mode) or _link_like_metadata(resolved_root, root_stat):
                 continue
             resolved.relative_to(resolved_root)
         except (OSError, RuntimeError, ValueError):
             continue
-        contained_by.append(resolved_root)
+        contained_by.append((resolved_root, _pinned_identity(root_stat)))
     if not contained_by:
         raise ValueError(f"pinned filesystem path is outside its allowed roots: {requested}")
-    return resolved, max(contained_by, key=lambda item: len(item.parts))
+    root, root_identity = max(contained_by, key=lambda item: len(item[0].parts))
+    observed = resolved.lstat()
+    if _link_like_metadata(resolved, observed):
+        raise ValueError(f"pinned filesystem path changed while resolving: {requested}")
+    return resolved, root, root_identity, _pinned_identity(observed)
 
 
-def _open_posix_directory_fd(path: Path) -> int:
+def _open_posix_directory_fd(
+    path: Path,
+    *,
+    approved: tuple[Path, tuple[int, int]],
+) -> int:
     nofollow = int(getattr(os, "O_NOFOLLOW", 0))
     directory = int(getattr(os, "O_DIRECTORY", 0))
     if not nofollow or not directory:
@@ -82,11 +96,17 @@ def _open_posix_directory_fd(path: Path) -> int:
     flags = os.O_RDONLY | nofollow | directory
     current_fd = -1
     try:
+        current = Path(path.anchor)
         current_fd = os.open(path.anchor, flags)
+        if current == approved[0] and _pinned_identity(os.fstat(current_fd)) != approved[1]:
+            raise ValueError("approved directory changed before opening")
         for component in path.parts[1:]:
             next_fd = os.open(component, flags, dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd
+            current = current / component
+            if current == approved[0] and _pinned_identity(os.fstat(current_fd)) != approved[1]:
+                raise ValueError("approved directory changed before opening")
         metadata = os.fstat(current_fd)
         if not stat.S_ISDIR(metadata.st_mode):
             raise OSError(errno.ENOTDIR, "pinned path is not a directory", str(path))
@@ -103,6 +123,7 @@ def _open_windows_path_handles(
     path: Path,
     *,
     final_directory: bool,
+    approved: tuple[Path, tuple[int, int]],
 ) -> Iterator[tuple[int, tuple[int, int], Any, Any, list[int]]]:
     from ctypes import wintypes
 
@@ -189,6 +210,7 @@ def _open_windows_path_handles(
                 or _link_like_metadata(current, metadata)
                 or stat.S_ISDIR(metadata.st_mode) != is_directory
                 or int(metadata.st_ino) != file_index
+                or (current == approved[0] and _pinned_identity(metadata) != approved[1])
             ):
                 raise OSError(
                     errno.ESTALE,
@@ -212,20 +234,26 @@ def open_directory_beneath(
 ) -> Iterator[PinnedDirectory]:
     """Pin an existing directory reached beneath one of the approved roots."""
 
-    requested = Path(os.path.abspath(path))
-    resolved, _root = _resolved_path_beneath(requested, roots)
+    requested = path.absolute()
+    resolved, root, root_identity, expected = _resolved_path_beneath(requested, roots)
+    approved = (root, root_identity)
     if os.name == "nt":
         with _open_windows_path_handles(
             resolved,
             final_directory=True,
+            approved=approved,
         ) as (_handle, identity, _kernel32, _wintypes, _handles):
+            if identity != expected:
+                raise ValueError("approved directory changed before opening")
             yield PinnedDirectory(requested, resolved, identity)
         return
     if os.name != "posix":
         raise OSError(errno.ENOTSUP, "directory pinning is unsupported", str(path))
-    fd = _open_posix_directory_fd(resolved)
+    fd = _open_posix_directory_fd(resolved, approved=approved)
     try:
         metadata = os.fstat(fd)
+        if _pinned_identity(metadata) != expected:
+            raise ValueError("approved directory changed before opening")
         yield PinnedDirectory(
             requested,
             resolved,
@@ -244,8 +272,8 @@ def open_regular_file_beneath(
 ) -> Iterator[int]:
     """Open one approved regular file without reopening its pathname."""
 
-    requested = Path(os.path.abspath(path))
-    resolved, root = _resolved_path_beneath(requested, roots)
+    requested = path.absolute()
+    resolved, root, root_identity, expected = _resolved_path_beneath(requested, roots)
     relative = resolved.relative_to(root)
     if not relative.parts:
         raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
@@ -255,6 +283,7 @@ def open_regular_file_beneath(
         with _open_windows_path_handles(
             resolved,
             final_directory=False,
+            approved=(root, root_identity),
         ) as (handle, _identity, _kernel32, _wintypes, handles):
             fd = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
                 handle,
@@ -265,13 +294,15 @@ def open_regular_file_beneath(
                 metadata = os.fstat(fd)
                 if not stat.S_ISREG(metadata.st_mode):
                     raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
+                if _pinned_identity(metadata) != expected:
+                    raise ValueError("approved file changed before opening")
                 yield fd
             finally:
                 os.close(fd)
         return
     if os.name != "posix":
         raise OSError(errno.ENOTSUP, "regular-file pinning is unsupported", str(path))
-    directory_fd = _open_posix_directory_fd(root)
+    directory_fd = _open_posix_directory_fd(root, approved=(root, root_identity))
     file_fd = -1
     try:
         directory_flags = (
@@ -293,6 +324,8 @@ def open_regular_file_beneath(
         metadata = os.fstat(file_fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"pinned filesystem path is not a regular file: {requested}")
+        if _pinned_identity(metadata) != expected:
+            raise ValueError("approved file changed before opening")
         yield file_fd
     finally:
         if file_fd >= 0:
@@ -406,46 +439,63 @@ def _copy_private_tree_posix(source: Path, destination_fd: int) -> None:
     os.fsync(destination_fd)
 
 
-def _copy_private_tree_windows(
-    source: Path,
-    destination: Path,
-    *,
-    confinement_root: Path,
-) -> None:
+def _copy_private_tree_windows(source: Path, native: Any, destination_handle: int) -> None:
+    import msvcrt
+
     with os.scandir(source) as scanned:
         entries = sorted(scanned, key=lambda item: item.name)
     for entry in entries:
         source_path = Path(entry.path)
-        destination_path = destination / entry.name
         metadata = os.lstat(source_path)
         if _link_like_metadata(source_path, metadata):
             raise ValueError(f"private tree source contains a link-like entry: {source_path}")
         if stat.S_ISDIR(metadata.st_mode):
-            os.mkdir(destination_path, PRIVATE_DIR_MODE)
-            with open_directory_beneath(
-                destination_path,
-                roots=[confinement_root],
-            ) as child:
-                _copy_private_tree_windows(
-                    source_path,
-                    child.path,
-                    confinement_root=confinement_root,
-                )
-        elif stat.S_ISREG(metadata.st_mode):
-            destination_fd = os.open(
-                destination_path,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | int(getattr(os, "O_BINARY", 0)),
-                PRIVATE_FILE_MODE,
+            child = native.open_relative(
+                destination_handle, entry.name, directory=True, disposition=native._FILE_CREATE,
+                share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
             )
             try:
-                _copy_regular_file_to_fd(source_path, destination_fd)
+                _copy_private_tree_windows(source_path, native, child)
             finally:
-                os.close(destination_fd)
+                native.close(child)
+        elif stat.S_ISREG(metadata.st_mode):
+            child = native.open_relative(
+                destination_handle, entry.name, directory=False, disposition=native._FILE_CREATE,
+                desired_access=native._FILE_WRITE_DATA | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE,
+            )
+            try:
+                descriptor = msvcrt.open_osfhandle(child, os.O_WRONLY | int(getattr(os, "O_BINARY", 0)))
+            except BaseException:
+                native.close(child)
+                raise
+            try:
+                _copy_regular_file_to_fd(source_path, descriptor)
+            finally:
+                os.close(descriptor)
         else:
             raise ValueError(f"private tree source contains an unsupported entry: {source_path}")
+
+
+def _rename_posix_directory_noclobber(parent: int, source: str, target: str) -> None:
+    """Rename within the admitted directory without ever replacing a sibling."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        no_replace = 1
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        no_replace = 0x00000004
+    else:
+        rename = None
+        no_replace = 0
+    if rename is None:
+        raise OSError(errno.ENOTSUP, "descriptor-relative no-clobber directory rename unavailable", target)
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(parent, os.fsencode(source), parent, os.fsencode(target), no_replace) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), target)
 
 
 def publish_private_tree(
@@ -453,7 +503,7 @@ def publish_private_tree(
     destination_parent: PinnedDirectory,
     name: str,
 ) -> Path:
-    """Copy a private tree beneath a pinned parent without pathname reopening."""
+    """Publish a complete new tree through the admitted directory only."""
 
     if not name or Path(name).name != name or name in {".", ".."}:
         raise ValueError("private tree destination must be one path component")
@@ -463,31 +513,67 @@ def publish_private_tree(
     if not pinned_directory_is_current(destination_parent):
         raise ValueError("experiment destination parent changed before publication")
     destination = destination_parent.path / name
+    staging = ".continuum-experiment-stage-" + secrets.token_hex(16)
+    # The destination is never the working directory. If copying is refused,
+    # retain the private stage rather than path-delete an uncertain object.
     if os.name == "nt":
-        os.mkdir(destination, PRIVATE_DIR_MODE)
-        with open_directory_beneath(
-            destination,
-            roots=[destination_parent.path],
-        ) as pinned_destination:
-            _copy_private_tree_windows(
-                source,
-                pinned_destination.path,
-                confinement_root=pinned_destination.path,
+        from .review_bridge import _open_windows_plain_directory
+
+        copy_error: OSError | None = None
+        with _open_windows_plain_directory(destination_parent.path) as (native, parent):
+            if _pinned_identity(native.fstat(parent)) != destination_parent.identity:
+                raise ValueError("experiment destination parent changed before publication")
+            stage_handle = native.open_relative(
+                parent, staging, directory=True, disposition=native._FILE_CREATE,
+                desired_access=(
+                    native._DELETE | native._FILE_LIST_DIRECTORY | native._FILE_TRAVERSE
+                    | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE
+                ),
+                share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
             )
+            try:
+                _copy_private_tree_windows(source, native, stage_handle)
+                if not pinned_directory_is_current(destination_parent):
+                    raise ValueError("experiment destination parent changed before publication")
+                native.rename_relative(stage_handle, parent, name, replace=False)
+            except OSError as exc:
+                # The directory context translates its own open errors.
+                # Keep ordinary copy/publication failures distinct.
+                copy_error = exc
+            finally:
+                native.close(stage_handle)
+        if copy_error is not None:
+            raise copy_error
     elif os.name == "posix" and destination_parent.fd is not None:
-        os.mkdir(name, PRIVATE_DIR_MODE, dir_fd=destination_parent.fd)
-        destination_fd = os.open(
-            name,
-            os.O_RDONLY
-            | int(getattr(os, "O_DIRECTORY", 0))
-            | int(getattr(os, "O_NOFOLLOW", 0)),
-            dir_fd=destination_parent.fd,
+        parent_fd = destination_parent.fd
+        os.mkdir(staging, PRIVATE_DIR_MODE, dir_fd=parent_fd)
+        expected = os.stat(staging, dir_fd=parent_fd, follow_symlinks=False)
+        stage_fd = os.open(
+            staging,
+            os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0)),
+            dir_fd=parent_fd,
         )
         try:
-            _copy_private_tree_posix(source, destination_fd)
+            opened = os.fstat(stage_fd)
+            if (
+                not os.path.samestat(expected, opened)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != getattr(os, "geteuid", lambda: -1)()
+                or stat.S_IMODE(opened.st_mode) & 0o077
+            ):
+                raise ValueError("private experiment staging directory changed before copying")
+            _copy_private_tree_posix(source, stage_fd)
+            if (
+                not pinned_directory_is_current(destination_parent)
+                or not os.path.samestat(opened, os.stat(staging, dir_fd=parent_fd, follow_symlinks=False))
+            ):
+                raise ValueError("experiment destination parent or stage changed before publication")
+            _rename_posix_directory_noclobber(parent_fd, staging, name)
+            if not os.path.samestat(opened, os.stat(name, dir_fd=parent_fd, follow_symlinks=False)):
+                raise ValueError("published experiment identity differs")
         finally:
-            os.close(destination_fd)
-        os.fsync(destination_parent.fd)
+            os.close(stage_fd)
+        os.fsync(parent_fd)
     else:
         raise OSError(
             errno.ENOTSUP,

@@ -13,7 +13,7 @@ import re
 import sqlite3
 import stat
 import tempfile
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import AbstractContextManager, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -454,8 +454,9 @@ def create_memory_experiment(
     if not isinstance(destination, (Path, str)) or not Path(destination).is_absolute():
         raise ValueError("destination must be an explicit absolute new directory")
     requested = Path(destination)
-    requested_parent = Path(os.path.abspath(requested.parent))
+    requested_parent = requested.parent.absolute()
     _pinned_destination = _PINNED_EXPERIMENT_DESTINATION.get()
+    parent_context: AbstractContextManager[PinnedDirectory]
     if _pinned_destination is not None:
         if (
             not isinstance(_pinned_destination, PinnedDirectory)
@@ -482,7 +483,7 @@ def create_memory_experiment(
             seed_project = "workspace-" + hashlib.sha256(seed_project.encode("utf-8")).hexdigest()[:24]
 
         with tempfile.TemporaryDirectory(prefix="continuum-memory-experiment-") as staging_directory:
-            staged = Path(staging_directory) / "experiment"
+            staged = Path(staging_directory).resolve(strict=True) / "experiment"
             plan_workspace_import(
                 staged,
                 project_id=seed_project,

@@ -393,34 +393,44 @@ class WorkspaceTests(unittest.TestCase):
             create_memory_experiment(self.root, project_id="project-a", record_ids=[row["id"]], workspace_id="experiment", destination=link / "child")
         self.assertFalse((actual / "child").exists())
 
-    @unittest.skipUnless(os.name == "posix", "directory replacement while pinned is POSIX-specific")
-    def test_experiment_parent_substitution_cannot_redirect_publication(self) -> None:
+    def test_experiment_refuses_publication_when_parent_identity_is_not_current(self) -> None:
         row = self.record()
-        parent = self.directory / "experiment-parent"
-        moved_parent = self.directory / "experiment-parent-retained"
-        redirected_parent = self.directory / "experiment-parent-redirected"
-        parent.mkdir()
-        redirected_parent.mkdir()
-        actual_export = export_workspace
+        destination = self.directory / "reserved-experiment"
+        before = self.snapshot()
+        with (
+            patch("continuum.core.permissions.pinned_directory_is_current", return_value=False),
+            self.assertRaisesRegex(ValueError, "parent changed"),
+        ):
+            create_memory_experiment(
+                self.root,
+                project_id="project-a",
+                record_ids=[row["id"]],
+                workspace_id="fixture-experiment",
+                destination=destination,
+            )
 
-        def export_after_parent_swap(*args, **kwargs):
-            capsule = actual_export(*args, **kwargs)
-            parent.rename(moved_parent)
-            parent.symlink_to(redirected_parent, target_is_directory=True)
-            return capsule
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.snapshot(), before)
 
-        with patch("continuum.core.workspaces.export_workspace", side_effect=export_after_parent_swap):
-            with self.assertRaisesRegex(ValueError, "destination parent changed"):
-                create_memory_experiment(
-                    self.root,
-                    project_id="project-a",
-                    record_ids=[row["id"]],
-                    workspace_id="experiment",
-                    destination=parent / "child",
-                )
+    def test_experiment_copy_error_leaves_final_destination_absent(self) -> None:
+        row = self.record()
+        target = self.directory / "not-yet-published"
+        before = self.snapshot()
+        implementation = "_copy_private_tree_windows" if os.name == "nt" else "_copy_private_tree_posix"
+        with (
+            patch(f"continuum.core.permissions.{implementation}", side_effect=OSError("fixture write failure")),
+            self.assertRaisesRegex(OSError, "fixture write failure"),
+        ):
+            create_memory_experiment(
+                self.root,
+                project_id="project-a",
+                record_ids=[row["id"]],
+                workspace_id="fixture-experiment",
+                destination=target,
+            )
 
-        self.assertFalse((redirected_parent / "child").exists())
-        self.assertFalse((moved_parent / "child").exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(self.snapshot(), before)
 
     def test_replay_rejects_changed_manifest_and_frozen_snapshot(self) -> None:
         experiment = self.experiment()

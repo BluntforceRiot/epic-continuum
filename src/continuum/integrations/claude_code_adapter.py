@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import traceback
@@ -10,6 +11,7 @@ from typing import Any
 from continuum.core.store import utc_now
 from continuum.integrations.common import (
     DEFAULT_TOKEN_BUDGET,
+    MAX_CAPTURE_TURN_UTF8_BYTES,
     adapter_metadata,
     append_adapter_log,
     as_text,
@@ -21,6 +23,52 @@ from continuum.integrations.common import (
 
 
 SOURCE = "claude_code"
+MAX_HOOK_STDIN_BYTES = 1024 * 1024
+MAX_HOOK_JSON_DEPTH = 32
+MAX_HOOK_JSON_NODES = 10_000
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate hook JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"non-finite hook JSON number: {value}")
+
+
+def _read_hook_payload() -> dict[str, Any]:
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    frame = stream.read(MAX_HOOK_STDIN_BYTES + 1)
+    if isinstance(frame, str):
+        frame = frame.encode("utf-8")
+    if len(frame) > MAX_HOOK_STDIN_BYTES:
+        raise ValueError("hook event exceeds byte limit")
+    payload = json.loads(
+        frame.decode("utf-8") or "{}",
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonfinite,
+    )
+    if not isinstance(payload, dict):
+        return {}
+    nodes = 0
+    pending: list[tuple[Any, int]] = [(payload, 1)]
+    while pending:
+        value, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_HOOK_JSON_NODES or depth > MAX_HOOK_JSON_DEPTH:
+            raise ValueError("hook event exceeds JSON structure limit")
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite hook JSON number")
+    return payload
 
 
 def _token_budget() -> int:
@@ -66,6 +114,8 @@ def handle_hook(payload: dict[str, Any]) -> dict[str, Any] | None:
 
     if event_name == "UserPromptSubmit":
         prompt = as_text(payload.get("prompt")).strip()
+        if len(prompt.encode("utf-8")) > MAX_CAPTURE_TURN_UTF8_BYTES:
+            return None
         record_turn(
             _root(),
             session_id=session_id,
@@ -110,8 +160,7 @@ def handle_hook(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 def main() -> int:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
-        result = handle_hook(payload if isinstance(payload, dict) else {})
+        result = handle_hook(_read_hook_payload())
         if result:
             print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0

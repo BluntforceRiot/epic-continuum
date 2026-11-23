@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
 import time
 import uuid
 from collections.abc import Iterable, Iterator
@@ -24,15 +25,22 @@ from urllib.parse import urlencode
 from .atomic import atomic_memory_card, load_atomic_yaml, write_atomic_yaml
 from .config import config_path, default_config, load_config, resolve_root_config_path, write_default_config
 from .permissions import (
+    PinnedInternalDirectory,
+    PinnedInternalFile,
     flush_directory_strict,
     flush_file_strict,
     flush_tree_strict,
     guard_windows_file_disposition,
+    pin_secure_directory_beneath,
+    pin_secure_file_beneath,
     replace_durable,
     secure_copy_file,
     secure_copytree,
     secure_mkdir,
+    secure_mkdir_beneath,
     secure_sqlite_files,
+    secure_sqlite_files_beneath,
+    secure_write_bytes,
     secure_write_text,
     secure_write_text_exclusive,
     set_windows_delete_disposition,
@@ -85,6 +93,10 @@ PARTITION_INTERNAL_PREFIXES = (
     "redacted_agent_",
 )
 _INIT_DB_CACHE: set[str] = set()
+_INGEST_SOURCE_FD: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "continuum_ingest_source_fd",
+    default=None,
+)
 SCROLL_EVENT_SCOPE_BACKFILL_META_KEY = (
     "migration.scroll_event_scope_columns_backfill.v1"
 )
@@ -3102,22 +3114,150 @@ def _install_live_catalog_schema_authorizer(
     conn.set_authorizer(authorize)
 
 
+class _PinnedCatalogConnection(sqlite3.Connection):
+    """A live connection that retains its exact catalog namespace guards."""
+
+    _catalog_guard: ExitStack | None = None
+
+    def retain_catalog_guard(self, guard: ExitStack) -> None:
+        if self._catalog_guard is not None:
+            raise RuntimeError("catalog namespace guard is already installed")
+        self._catalog_guard = guard
+
+    def close(self) -> None:
+        guard = self._catalog_guard
+        self._catalog_guard = None
+        try:
+            super().close()
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
+class _VerifiedDarwinCatalogUri:
+    """Resolve a pinned catalog through its normal WAL-capable path on macOS."""
+
+    def __init__(
+        self,
+        directory: PinnedInternalDirectory,
+        file: PinnedInternalFile,
+    ) -> None:
+        if directory.descriptor is None or file.descriptor is None:
+            raise OSError("pinned catalog descriptors are unavailable")
+        self.directory = directory
+        self.file = file
+        self.path = directory.path / "catalog.sqlite3"
+
+    def verify(self) -> None:
+        """Refuse a relocated or replaced name before SQLite uses that name."""
+        assert self.directory.descriptor is not None
+        assert self.file.descriptor is not None
+        try:
+            pinned_dir = os.fstat(self.directory.descriptor)
+            named_dir = os.lstat(self.directory.path)
+            pinned_file = os.fstat(self.file.descriptor)
+            named_file = os.lstat(self.path)
+        except OSError as exc:
+            raise ValueError("catalog namespace changed before SQLite could open it") from exc
+        if (
+            not stat.S_ISDIR(named_dir.st_mode)
+            or not stat.S_ISREG(named_file.st_mode)
+            or (named_dir.st_dev, named_dir.st_ino)
+            != (pinned_dir.st_dev, pinned_dir.st_ino)
+            or (named_file.st_dev, named_file.st_ino)
+            != (pinned_file.st_dev, pinned_file.st_ino)
+        ):
+            raise ValueError("catalog namespace changed before SQLite could open it")
+
+    def __fspath__(self) -> str:
+        # Python calls this inside sqlite3.connect. In particular, a caller
+        # that swaps catalog just before SQLite opens it cannot redirect the
+        # connection to its replacement. mode=rw also prevents new files from
+        # being created at a substituted name.
+        self.verify()
+        return f"{self.path.as_uri()}?mode=rw"
+
+
+def _darwin_open_catalog_fd_count(identity: tuple[int, int]) -> int:
+    """Count this process's live descriptors for the pinned catalog inode."""
+    count = 0
+    for name in os.listdir("/dev/fd"):
+        if not name.isdecimal():
+            continue
+        try:
+            observed = os.fstat(int(name))
+        except OSError:
+            continue
+        if (observed.st_dev, observed.st_ino) == identity:
+            count += 1
+    return count
+
+
 def connect(root: Path) -> sqlite3.Connection:
     # This is the single live-catalog write connection factory. Keep the claim
     # check here so direct library callers cannot bypass the runtime boundary.
     ensure_writer_claim(root)
-    db_path = root / "catalog" / "catalog.sqlite3"
     secure_mkdir(root, secure_existing=True)
-    secure_mkdir(db_path.parent, secure_existing=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    _install_live_catalog_schema_authorizer(root, conn)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    secure_sqlite_files(db_path)
-    return conn
+    with ExitStack() as catalog_guard:
+        catalog_dir = catalog_guard.enter_context(
+            pin_secure_directory_beneath(
+                root,
+                "catalog",
+                secure_existing=True,
+            )
+        )
+        pinned_file = catalog_guard.enter_context(
+            pin_secure_file_beneath(catalog_dir, "catalog.sqlite3")
+        )
+        # Closing another descriptor for a SQLite file drops this process's
+        # POSIX advisory locks, so secure existing sidecars before SQLite opens.
+        secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
+        if sys.platform == "darwin":
+            # macOS cannot create SQLite's WAL sidecars beside /dev/fd/<file>.
+            # Use the checked catalog name and verify SQLite opened the same
+            # inode before issuing a pragma that could write a sidecar.
+            darwin_uri = _VerifiedDarwinCatalogUri(catalog_dir, pinned_file)
+            assert pinned_file.descriptor is not None
+            pinned_stat = os.fstat(pinned_file.descriptor)
+            identity = pinned_stat.st_dev, pinned_stat.st_ino
+            conn = sqlite3.connect(
+                darwin_uri,
+                uri=True,
+                factory=_PinnedCatalogConnection,
+            )
+            try:
+                darwin_uri.verify()
+                # SQLite's Unix VFS may reuse a catalog descriptor retained
+                # for POSIX locks, so a valid connect need not add a new fd.
+                # Our pin accounts for one fd; require another live fd for
+                # the same inode before any pragma can write a sidecar.
+                if _darwin_open_catalog_fd_count(identity) <= 1:
+                    raise ValueError("SQLite opened a different catalog file")
+            except BaseException:
+                conn.close()
+                raise
+        else:
+            conn = sqlite3.connect(
+                str(pinned_file.path), factory=_PinnedCatalogConnection
+            )
+        conn.retain_catalog_guard(catalog_guard.pop_all())
+        try:
+            conn.row_factory = sqlite3.Row
+            _install_live_catalog_schema_authorizer(root, conn)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
 
 def _assert_live_wal_read_compatible(root: Path, db_path: Path, *, immutable: bool) -> None:
@@ -9231,7 +9371,7 @@ def init_layout(root: Path) -> None:
         "run",
     ]
     for rel in dirs:
-        secure_mkdir(root / rel, secure_existing=True)
+        secure_mkdir_beneath(root, rel, secure_existing=True)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -14374,13 +14514,73 @@ def roll_scroll_segment(
         conn.close()
 
 
+def _read_ingest_source_fd(
+    fd: int,
+    *,
+    path: Path,
+    max_bytes: int,
+) -> tuple[bytes, int]:
+    """Read one stable regular-file object without reopening its pathname."""
+
+    before = os.fstat(fd)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or bool(int(getattr(before, "st_file_attributes", 0)) & reparse_flag)
+    ):
+        raise FileNotFoundError(str(path))
+    source_size = int(before.st_size)
+    if source_size > max_bytes:
+        raise ValueError(
+            f"file too large for ingest_file: {format_size(source_size)} exceeds "
+            f"storage.max_ingest_bytes={format_size(max_bytes)}"
+        )
+    fingerprint = (
+        int(before.st_dev),
+        int(before.st_ino),
+        source_size,
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    os.lseek(fd, 0, os.SEEK_SET)
+    captured = bytearray()
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(captured)))
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if len(captured) > max_bytes:
+            raise ValueError(
+                f"file too large for ingest_file: more than {format_size(max_bytes)} exceeds "
+                f"storage.max_ingest_bytes={format_size(max_bytes)}"
+            )
+    after = os.fstat(fd)
+    final_fingerprint = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    if final_fingerprint != fingerprint or len(captured) != source_size:
+        raise ValueError(f"ingest source changed while reading: {path}")
+    return bytes(captured), source_size
+
+
+@contextmanager
+def _use_ingest_source_fd(fd: int) -> Iterator[None]:
+    token = _INGEST_SOURCE_FD.set(fd)
+    try:
+        yield
+    finally:
+        _INGEST_SOURCE_FD.reset(token)
+
+
 def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tier: str = "hot") -> dict[str, Any]:
     init_db(root)
     config = load_config(root)
     if storage_tier not in {"hot", "warm", "cold", "vault"}:
         raise ValueError("storage_tier must be hot, warm, cold, or vault")
-    if not path.exists() or not path.is_file():
-        raise FileNotFoundError(str(path))
     security_config = config.get("security", {})
     ignored, ignore_pattern = is_ignored_path(
         root,
@@ -14390,13 +14590,25 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     if ignored:
         raise ValueError(f"path matches Continuum ignore rule {ignore_pattern!r}: {path}")
     max_ingest_bytes = parse_size(config.get("storage", {}).get("max_ingest_bytes", "50MB"))
-    source_size = path.stat().st_size
-    if source_size > max_ingest_bytes:
-        raise ValueError(
-            f"file too large for ingest_file: {format_size(source_size)} exceeds "
-            f"storage.max_ingest_bytes={format_size(max_ingest_bytes)}"
+    owned_fd = -1
+    ingest_fd = _INGEST_SOURCE_FD.get()
+    try:
+        if ingest_fd is None:
+            owned_fd = os.open(
+                path,
+                os.O_RDONLY
+                | int(getattr(os, "O_BINARY", 0))
+                | int(getattr(os, "O_NONBLOCK", 0)),
+            )
+            ingest_fd = owned_fd
+        raw_bytes, source_size = _read_ingest_source_fd(
+            ingest_fd,
+            path=path,
+            max_bytes=max_ingest_bytes,
         )
-    raw_bytes = path.read_bytes()
+    finally:
+        if owned_fd >= 0:
+            os.close(owned_fd)
     digest = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8", errors="replace")
     source_ref = source_file_reference(root, path, digest=digest, size_bytes=source_size)
@@ -14431,7 +14643,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     secure_mkdir(original_dir)
     original_path = original_dir / safe_name
     if not original_path.exists():
-        secure_copy_file(path, original_path)
+        secure_write_bytes(original_path, raw_bytes)
     reader_dir = root / "archive" / "reader_editions" / ("cold" if storage_tier == "vault" else storage_tier)
     secure_mkdir(reader_dir)
     reader_path = reader_dir / f"{safe_name}.txt"

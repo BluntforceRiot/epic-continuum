@@ -6487,6 +6487,26 @@ permissions.secure_write_text(destination, '{"unpublished":true}\n')
             with self.assertRaisesRegex(ValueError, "file too large for ingest_file"):
                 ingest_file(root, path=source)
 
+    def test_ingest_file_scans_and_archives_the_supplied_descriptor_bytes(self) -> None:
+        from continuum.core import store
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "memory"
+            source = base / "selected.txt"
+            selected = "ordinary fixture text captured from the selected file"
+            source.write_text(selected, encoding="utf-8")
+
+            with (
+                source.open("rb") as stream,
+                store._use_ingest_source_fd(stream.fileno()),
+                patch.object(store, "scan_text_for_secrets", wraps=store.scan_text_for_secrets) as scanner,
+            ):
+                result = store.ingest_file(root, path=source)
+
+            self.assertEqual(store.resolve_stored_uri(root, result["original_uri"]).read_bytes(), selected.encode())
+            self.assertTrue(any(call.args and call.args[0] == selected for call in scanner.call_args_list))
+
     def test_ingest_file_blocks_ignored_secret_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "continuum"

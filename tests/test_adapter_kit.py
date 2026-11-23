@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,10 +9,14 @@ from unittest.mock import patch
 
 from continuum.core.store import compile_context, connect
 from continuum.integrations.adapter_manifest import adapter_index
-from continuum.integrations.claude_code_adapter import handle_hook
+from continuum.integrations.claude_code_adapter import (
+    MAX_HOOK_STDIN_BYTES,
+    _read_hook_payload,
+    handle_hook,
+)
 from continuum.integrations.openai_context_adapter import prepare_chat_request, record_chat_response
 from continuum.integrations.openclaw_adapter import build_openclaw_mission_card
-from continuum.integrations.common import record_turn
+from continuum.integrations.common import MAX_CAPTURE_TURN_UTF8_BYTES, adapter_metadata, record_turn
 from continuum.mcp_server import TOOLS
 
 
@@ -236,6 +241,49 @@ class AdapterKitTest(unittest.TestCase):
             self.assertEqual(hook_output["hookEventName"], "UserPromptSubmit")
             self.assertIn("Epic Continuum Looking Glass", hook_output["additionalContext"])
             self.assertIn("recover this Claude Code thread", hook_output["additionalContext"])
+
+    def test_claude_code_hook_rejects_oversized_and_malformed_frames(self) -> None:
+        def parse(frame: bytes) -> dict[str, object]:
+            with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(frame), encoding="utf-8")):
+                return _read_hook_payload()
+
+        with patch("continuum.integrations.claude_code_adapter.json.loads") as decode:
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                parse(b" " * (MAX_HOOK_STDIN_BYTES + 1))
+            decode.assert_not_called()
+        for frame, message in (
+            (b'{"prompt":"one","prompt":"two"}', "duplicate"),
+            (b'{"prompt":NaN}', "non-finite"),
+            (b'{"prompt":1e999}', "non-finite"),
+            (b'{"prompt":' + b"[" * 33 + b"0" + b"]" * 33 + b"}", "structure limit"),
+            (b'{"prompt":[' + b"0," * 10_000 + b"0]}", "structure limit"),
+        ):
+            with self.subTest(message=message, frame=frame[:30]):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse(frame)
+
+    def test_oversized_turn_is_not_captured_or_used_as_a_hook_query(self) -> None:
+        oversized = "é" * (MAX_CAPTURE_TURN_UTF8_BYTES // 2 + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "continuum"
+            self.assertIsNone(
+                record_turn(root, session_id="large", role="user", content=oversized,
+                            source="adapter-test", explicit=True)
+            )
+            with patch.dict("os.environ", {"CONTINUUM_ROOT": str(root)}):
+                self.assertIsNone(handle_hook({"hook_event_name": "UserPromptSubmit", "prompt": oversized}))
+            self.assertFalse(root.exists())
+
+    def test_large_hook_metadata_is_not_captured(self) -> None:
+        metadata = adapter_metadata("claude_code", {"cwd": "x" * 2048, "model": "small"})
+        self.assertNotIn("cwd", metadata)
+        self.assertEqual(metadata["model"], "small")
+        nested = adapter_metadata("claude_code", {"model": {"name": "small"}})
+        self.assertEqual(nested["model"], {"name": "small"})
+        oversized = adapter_metadata("claude_code", {"model": {"name": "x" * 2048}})
+        self.assertNotIn("model", oversized)
+        malformed = adapter_metadata("claude_code", {"model": "\ud800"})
+        self.assertNotIn("model", malformed)
 
 
 if __name__ == "__main__":

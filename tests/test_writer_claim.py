@@ -4,6 +4,8 @@ import io
 import hashlib
 import json
 import os
+import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -147,6 +149,223 @@ class WriterClaimTests(unittest.TestCase):
             self.assertTrue(claim["claimed"])
             self.assertTrue(claim["compatible"])
             self.assertFalse(claim["root_has_existing_state"])
+
+    def test_new_root_refuses_linked_catalog_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            try:
+                (root / "catalog").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=WINDOWS,
+                ),
+                self.assertRaisesRegex(
+                    WriterClaimError,
+                    "existing Continuum root has no writer claim",
+                ),
+            ):
+                init_db(root)
+
+            self.assertFalse(writer_claim_path(root).exists())
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
+
+    def test_claimed_root_refuses_linked_nested_layout_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            claim_writer(root, identity=WINDOWS)
+            (root / "archive").mkdir()
+            try:
+                (root / "archive" / "originals").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=WINDOWS,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "unsafe internal layout directory",
+                ),
+            ):
+                init_db(root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
+
+    def test_claimed_root_connect_refuses_linked_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            claim_writer(root, identity=WINDOWS)
+            try:
+                (root / "catalog").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=WINDOWS,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "unsafe internal layout directory",
+                ),
+            ):
+                connect(root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor race test is POSIX-only")
+    def test_connect_pins_catalog_across_sqlite_open_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            displaced = root / "catalog-before-race"
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            claim_writer(root, identity=LINUX)
+            real_connect = sqlite3.connect
+
+            def substitute_catalog(database, *args, **kwargs):
+                (root / "catalog").rename(displaced)
+                (root / "catalog").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+                return real_connect(database, *args, **kwargs)
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=LINUX,
+                ),
+                patch(
+                    "continuum.core.store.sqlite3.connect",
+                    side_effect=substitute_catalog,
+                ),
+            ):
+                if sys.platform == "darwin":
+                    # Darwin's WAL needs a normal pathname. Its checked URI
+                    # must fail closed when the catalog is moved before open.
+                    with self.assertRaisesRegex(
+                        ValueError, "catalog namespace changed"
+                    ):
+                        connect(root)
+                else:
+                    connection = connect(root)
+                    try:
+                        self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+                    finally:
+                        connection.close()
+
+            self.assertTrue((displaced / "catalog.sqlite3").is_file())
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle race test is Windows-only")
+    def test_windows_connect_holds_catalog_against_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            displaced = root / "catalog-before-race"
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            claim_writer(root, identity=WINDOWS)
+            real_connect = sqlite3.connect
+
+            def attempt_catalog_substitution(database, *args, **kwargs):
+                with self.assertRaises(OSError):
+                    (root / "catalog").rename(displaced)
+                return real_connect(database, *args, **kwargs)
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=WINDOWS,
+                ),
+                patch(
+                    "continuum.core.store.sqlite3.connect",
+                    side_effect=attempt_catalog_substitution,
+                ),
+            ):
+                connection = connect(root)
+                try:
+                    self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+                finally:
+                    connection.close()
+
+            self.assertTrue((root / "catalog" / "catalog.sqlite3").is_file())
+            self.assertFalse(displaced.exists())
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
+
+    @unittest.skipUnless(os.name == "nt", "Windows reparse test is Windows-only")
+    def test_windows_connect_rejects_catalog_reparse_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            outside = base / "outside"
+            outside.mkdir()
+            outside_mode = outside.stat().st_mode
+            claim_writer(root, identity=WINDOWS)
+            try:
+                (root / "catalog").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory reparse points unavailable: {exc}")
+            attributes = int(
+                getattr((root / "catalog").lstat(), "st_file_attributes", 0)
+            )
+            self.assertNotEqual(attributes & 0x400, 0)
+
+            with (
+                patch(
+                    "continuum.core.writer_claim.detect_runtime_identity",
+                    return_value=WINDOWS,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "unsafe internal layout directory",
+                ),
+            ):
+                connect(root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode, outside_mode)
 
     def test_explicit_wal_aware_read_only_connection_observes_committed_wal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

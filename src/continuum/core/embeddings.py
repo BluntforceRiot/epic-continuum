@@ -9,6 +9,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import math
 import socket
 import threading
 import time
@@ -94,14 +95,17 @@ def embedding_text_blocked(text: str) -> bool:
         return True
 
 
-def embed_texts(*, endpoint: str, model: str, texts: list[str]) -> list[tuple[float, ...]]:
+def embed_texts(
+    *, endpoint: str, model: str, texts: list[str], deadline: float | None = None,
+) -> list[tuple[float, ...]]:
     """Embed exact safe UTF-8 strings, returning detached unit-length vectors.
 
     Inputs are never truncated. Batches contain 1..16 texts, each <=64 KiB and
     together <=256 KiB UTF-8. Response vectors are finite, nonzero, consistently
     dimensioned (1..2048), indexed exactly once, and bound to the requested model.
-    Both response bytes and total request lifetime are bounded. Any failure has
-    a fixed error message without provider body, model alias or input content.
+    Both response bytes and total request lifetime are bounded. An optional
+    caller deadline can shorten, but never extend, that lifetime. Any failure
+    has a fixed error message without provider body, model alias or input content.
     """
     endpoint, model = embedding_identity(endpoint, model)
     if type(texts) is not list or not 1 <= len(texts) <= MAX_BATCH_SIZE:
@@ -127,11 +131,18 @@ def embed_texts(*, endpoint: str, model: str, texts: list[str]) -> list[tuple[fl
     # caps above imply a finite payload; keep a separate explicit wire ceiling.
     if len(payload) > 2 * 1024 * 1024:
         raise ValueError("embedding serialized request exceeds 2 MiB")
+    if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError("embedding deadline must be a finite monotonic timestamp")
+    request_deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    if deadline is not None:
+        request_deadline = min(request_deadline, float(deadline))
+    remaining = request_deadline - time.monotonic()
+    if remaining <= 0:
+        raise EmbeddingError("embedding provider request failed")
     parsed = urlsplit(endpoint)
     connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    connection = connection_type(parsed.hostname or "", parsed.port, timeout=HTTP_TIMEOUT_SECONDS)
+    connection = connection_type(parsed.hostname or "", parsed.port, timeout=min(HTTP_TIMEOUT_SECONDS, remaining))
     timer: threading.Timer | None = None
-    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
     try:
         connection.connect()
         transport = connection.sock
@@ -147,7 +158,7 @@ def embed_texts(*, endpoint: str, model: str, texts: list[str]) -> list[tuple[fl
                 pass
             transport.close()
 
-        remaining = deadline - time.monotonic()
+        remaining = request_deadline - time.monotonic()
         if remaining <= 0:
             raise EmbeddingError("embedding provider request failed")
         timer = threading.Timer(remaining, expire)
@@ -162,7 +173,7 @@ def embed_texts(*, endpoint: str, model: str, texts: list[str]) -> list[tuple[fl
         if length is not None and (not length.isdecimal() or int(length) > MAX_RESPONSE_BYTES):
             raise EmbeddingError("embedding provider response is invalid")
         raw = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(raw) > MAX_RESPONSE_BYTES or time.monotonic() >= deadline:
+        if len(raw) > MAX_RESPONSE_BYTES or time.monotonic() >= request_deadline:
             raise EmbeddingError("embedding provider response is invalid")
         data = json.loads(raw, object_pairs_hook=_json_object, parse_constant=_invalid_constant)
         if type(data) is not dict or data.get("model") != model:
@@ -183,6 +194,8 @@ def embed_texts(*, endpoint: str, model: str, texts: list[str]) -> list[tuple[fl
                 raise ValueError("inconsistent response dimensions")
             dimensions = len(vector)
             indexed[index] = vector
+        if time.monotonic() >= request_deadline:
+            raise EmbeddingError("embedding provider request failed")
         return [indexed[index] for index in range(len(texts))]
     except EmbeddingError:
         raise

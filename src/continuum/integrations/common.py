@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ DEFAULT_TOKEN_BUDGET = 1800
 DEFAULT_CONTEXT_HEADER = "Epic Continuum Looking Glass"
 MAX_CAPTURE_TURN_UTF8_BYTES = 64 * 1024
 MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES = 1024
+MAX_CAPTURE_METADATA_NODES = 64
+MAX_CAPTURE_METADATA_DEPTH = 4
 
 
 def append_adapter_log(path: Path, payload: dict[str, Any]) -> None:
@@ -51,6 +54,58 @@ def session_id_from_payload(payload: dict[str, Any], *, default: str) -> str:
     return default
 
 
+def _bounded_capture_metadata_value(value: Any) -> bool:
+    """Allow small JSON values while bounding traversal before serialization."""
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    remaining = MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES
+    seen = 0
+    while pending:
+        item, depth = pending.pop()
+        seen += 1
+        if seen > MAX_CAPTURE_METADATA_NODES:
+            return False
+        if type(item) is str:
+            if len(item) > remaining:
+                return False
+            try:
+                remaining -= len(item.encode("utf-8"))
+            except UnicodeError:
+                return False
+        elif item is None:
+            remaining -= 4
+        elif type(item) is bool:
+            remaining -= 5
+        elif type(item) is int:
+            if item.bit_length() > 3400:
+                return False
+            remaining -= len(str(item))
+        elif type(item) is float:
+            if not math.isfinite(item):
+                return False
+            remaining -= len(str(item))
+        elif type(item) in (list, tuple):
+            if depth >= MAX_CAPTURE_METADATA_DEPTH or len(item) > MAX_CAPTURE_METADATA_NODES:
+                return False
+            pending.extend((nested, depth + 1) for nested in item)
+        elif type(item) is dict:
+            if depth >= MAX_CAPTURE_METADATA_DEPTH or len(item) > MAX_CAPTURE_METADATA_NODES:
+                return False
+            for key, nested in item.items():
+                if type(key) is not str:
+                    return False
+                pending.append((key, depth + 1))
+                pending.append((nested, depth + 1))
+        else:
+            return False
+        if remaining < 0:
+            return False
+    try:
+        encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return len(encoded.encode("utf-8")) <= MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES
+
+
 def adapter_metadata(source: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "source": source,
@@ -71,7 +126,7 @@ def adapter_metadata(source: str, payload: dict[str, Any] | None = None) -> dict
         "hook_event_name",
     ):
         value = payload.get(key)
-        if isinstance(value, (str, int, float, bool)) and len(str(value).encode("utf-8")) <= MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES:
+        if value is not None and _bounded_capture_metadata_value(value):
             metadata[key] = value
     return metadata
 

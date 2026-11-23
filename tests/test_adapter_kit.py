@@ -278,6 +278,12 @@ class AdapterKitTest(unittest.TestCase):
         metadata = adapter_metadata("claude_code", {"cwd": "x" * 2048, "model": "small"})
         self.assertNotIn("cwd", metadata)
         self.assertEqual(metadata["model"], "small")
+        nested = adapter_metadata("claude_code", {"model": {"name": "small"}})
+        self.assertEqual(nested["model"], {"name": "small"})
+        oversized = adapter_metadata("claude_code", {"model": {"name": "x" * 2048}})
+        self.assertNotIn("model", oversized)
+        malformed = adapter_metadata("claude_code", {"model": "\ud800"})
+        self.assertNotIn("model", malformed)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,16 @@ from .core.capability_api import (
     READ_ACTIONS, WRITE_ACTIONS, dispatch_capability, explicit_path, prepare_capability,
 )
 from .core.hardware import PROFILES
-from .core.mempalace_import import default_mempalace_path, import_mempalace
+from .core.mempalace_import import (
+    MEMPALACE_DEFAULT_MAX_COPIED_BYTES,
+    MEMPALACE_DEFAULT_MAX_FIELD_BYTES,
+    MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES,
+    MEMPALACE_DEFAULT_MAX_ROWS,
+    MEMPALACE_DEFAULT_MAX_SOURCE_BYTES,
+    MEMPALACE_DEFAULT_TIMEOUT_SECONDS,
+    default_mempalace_path,
+    import_mempalace,
+)
 from .core.local_model import local_model_health
 from .core.project_state import (
     MAX_PROJECT_STATE_CHANGED_FILES,
@@ -1652,6 +1661,32 @@ def tool_import_mempalace(args: JSON) -> Any:
         include_closets=optional_bool(args, "include_closets", True),
         include_kg=optional_bool(args, "include_kg", True),
         allow_stop=allow_stop,
+        max_source_bytes=optional_int(
+            args,
+            "max_source_bytes",
+            MEMPALACE_DEFAULT_MAX_SOURCE_BYTES,
+        ),
+        max_copied_bytes=optional_int(
+            args,
+            "max_copied_bytes",
+            MEMPALACE_DEFAULT_MAX_COPIED_BYTES,
+        ),
+        max_rows=optional_int(args, "max_rows", MEMPALACE_DEFAULT_MAX_ROWS),
+        max_field_bytes=optional_int(
+            args,
+            "max_field_bytes",
+            MEMPALACE_DEFAULT_MAX_FIELD_BYTES,
+        ),
+        max_imported_bytes=optional_int(
+            args,
+            "max_imported_bytes",
+            MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES,
+        ),
+        timeout_seconds=optional_int(
+            args,
+            "timeout_seconds",
+            MEMPALACE_DEFAULT_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -2749,6 +2784,36 @@ TOOLS: dict[str, tuple[str, JSON, ToolHandler]] = {
                 "palace_path": {"type": "string"},
                 "include_closets": {"type": "boolean"},
                 "include_kg": {"type": "boolean"},
+                "max_source_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_MAX_SOURCE_BYTES,
+                },
+                "max_copied_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_MAX_COPIED_BYTES,
+                },
+                "max_rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_MAX_ROWS,
+                },
+                "max_field_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_MAX_FIELD_BYTES,
+                },
+                "max_imported_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES,
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MEMPALACE_DEFAULT_TIMEOUT_SECONDS,
+                },
                 "allow_stop": {
                     "type": "boolean",
                     "description": "Stop mempalace-readonly-mcp if the live Chroma DB is locked.",

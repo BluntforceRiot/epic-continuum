@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from continuum.core.config import load_config, write_config
-from continuum.core.mempalace_import import import_mempalace, sqlite_backup, stop_mempalace_processes
+from continuum.core.mempalace_import import MempalaceLimitError, import_mempalace, sqlite_backup, stop_mempalace_processes
 from continuum.core.operations import doctor, verify_proof_pack
 from continuum.core.store import audit_search_index, init_db, rebuild_search_index, resolve_stored_uri, search_memory
 
@@ -647,6 +647,89 @@ class MemPalaceImportTest(unittest.TestCase):
             for result in results:
                 verification = verify_proof_pack(Path(result["proof_pack_uri"]))
                 self.assertTrue(verification["ok"], verification["errors"])
+
+    def test_source_byte_limit_rejects_before_snapshot_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            palace = tmp_path / "palace"
+            palace.mkdir()
+            chroma = palace / "chroma.sqlite3"
+            create_fake_chroma(chroma)
+            root = tmp_path / "continuum"
+
+            with self.assertRaisesRegex(MempalaceLimitError, "source byte budget exceeded"):
+                import_mempalace(
+                    root,
+                    palace_path=palace,
+                    include_closets=False,
+                    include_kg=False,
+                    max_source_bytes=chroma.stat().st_size - 1,
+                )
+
+            self.assertFalse((root / "run" / "mempalace_import_snapshots").exists())
+
+    def test_copied_byte_limit_stops_backup_without_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            palace = tmp_path / "palace"
+            palace.mkdir()
+            create_fake_chroma(palace / "chroma.sqlite3")
+            root = tmp_path / "continuum"
+
+            with self.assertRaisesRegex(MempalaceLimitError, "copied byte budget exceeded"):
+                import_mempalace(
+                    root,
+                    palace_path=palace,
+                    include_closets=False,
+                    include_kg=False,
+                    max_copied_bytes=1,
+                )
+
+            self.assertFalse((root / "run" / "mempalace_import_snapshots").exists())
+
+    def test_row_limit_rejects_before_import_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            palace = tmp_path / "palace"
+            palace.mkdir()
+            create_fake_chroma(palace / "chroma.sqlite3")
+            root = tmp_path / "continuum"
+
+            with self.assertRaisesRegex(MempalaceLimitError, "row budget exceeded"):
+                import_mempalace(
+                    root,
+                    palace_path=palace,
+                    include_closets=False,
+                    include_kg=False,
+                    max_rows=3,
+                )
+
+            self.assertFalse((root / "archive" / "originals" / "hot" / "mempalace" / "by-import").exists())
+            self.assertFalse((root / "run" / "mempalace_import_snapshots").exists())
+
+    def test_oversized_field_removes_partial_import_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            palace = tmp_path / "palace"
+            palace.mkdir()
+            create_fake_chroma(
+                palace / "chroma.sqlite3",
+                drawer_content="x" * 2048,
+            )
+            root = tmp_path / "continuum"
+
+            with self.assertRaisesRegex(MempalaceLimitError, "field byte budget exceeded"):
+                import_mempalace(
+                    root,
+                    palace_path=palace,
+                    include_closets=False,
+                    include_kg=False,
+                    max_field_bytes=1024,
+                    max_imported_bytes=8192,
+                )
+
+            self.assertFalse((root / "archive" / "originals" / "hot" / "mempalace" / "by-import").exists())
+            self.assertFalse((root / "run" / "mempalace_import_snapshots").exists())
 
 
 if __name__ == "__main__":

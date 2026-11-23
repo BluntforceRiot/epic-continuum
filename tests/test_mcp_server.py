@@ -1529,6 +1529,17 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("continuum_import_mempalace", names)
         self.assertIn("continuum_restore_drill", names)
         tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+        mempalace_properties = tools["continuum_import_mempalace"]["inputSchema"]["properties"]
+        for field, maximum in (
+            ("max_source_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_SOURCE_BYTES),
+            ("max_copied_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_COPIED_BYTES),
+            ("max_rows", mcp_server_module.MEMPALACE_DEFAULT_MAX_ROWS),
+            ("max_field_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_FIELD_BYTES),
+            ("max_imported_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES),
+            ("timeout_seconds", mcp_server_module.MEMPALACE_DEFAULT_TIMEOUT_SECONDS),
+        ):
+            self.assertEqual(mempalace_properties[field]["minimum"], 1)
+            self.assertEqual(mempalace_properties[field]["maximum"], maximum)
         self.assertTrue(tools["continuum_status"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["continuum_compile_context"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["continuum_audit_search_index"]["annotations"]["readOnlyHint"])

@@ -27,7 +27,14 @@ from .operations import (
     start_operation,
     update_operation_cursor,
 )
-from .permissions import secure_copy_file, secure_copytree, secure_mkdir, secure_sqlite_files
+from .permissions import (
+    fsync_parent,
+    secure_copy_file,
+    secure_copytree,
+    secure_file,
+    secure_mkdir,
+    secure_sqlite_files,
+)
 from .safety import redact_text_secrets, redact_value_secrets, scan_text_for_secrets
 from .store import (
     add_graph_edge,
@@ -58,6 +65,252 @@ from .store import (
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+MEMPALACE_DEFAULT_MAX_SOURCE_BYTES = 4 * 1024**3
+MEMPALACE_ABSOLUTE_MAX_SOURCE_BYTES = 16 * 1024**3
+MEMPALACE_DEFAULT_MAX_COPIED_BYTES = 12 * 1024**3
+MEMPALACE_ABSOLUTE_MAX_COPIED_BYTES = 48 * 1024**3
+MEMPALACE_DEFAULT_MAX_ROWS = 1_000_000
+MEMPALACE_ABSOLUTE_MAX_ROWS = 4_000_000
+MEMPALACE_DEFAULT_MAX_FIELD_BYTES = 4 * 1024**2
+MEMPALACE_ABSOLUTE_MAX_FIELD_BYTES = 16 * 1024**2
+MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES = 1024**3
+MEMPALACE_ABSOLUTE_MAX_IMPORTED_BYTES = 4 * 1024**3
+MEMPALACE_DEFAULT_TIMEOUT_SECONDS = 600
+MEMPALACE_MAX_TIMEOUT_SECONDS = 3600
+MEMPALACE_FREE_SPACE_RESERVE_BYTES = 256 * 1024**2
+MEMPALACE_SQLITE_BATCH_ROWS = 16
+MEMPALACE_SQLITE_BACKUP_PAGES = 256
+MEMPALACE_COPY_CHUNK_BYTES = 1024**2
+MEMPALACE_MAX_METADATA_FIELDS_PER_ITEM = 256
+MEMPALACE_ROOT_EXPANSION_FACTOR = 8
+
+
+class MempalaceLimitError(RuntimeError):
+    """Raised when an import exceeds a configured resource boundary."""
+
+
+def _bounded_import_limit(name: str, value: int | None, default: int, maximum: int) -> int:
+    requested = default if value is None else value
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        raise ValueError(f"{name} must be an integer")
+    if requested < 1 or requested > maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return requested
+
+
+def _utf8_size(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    return len(str(value).encode("utf-8", errors="replace"))
+
+
+class MempalaceImportBudget:
+    def __init__(
+        self,
+        *,
+        max_source_bytes: int | None = None,
+        max_copied_bytes: int | None = None,
+        max_rows: int | None = None,
+        max_field_bytes: int | None = None,
+        max_imported_bytes: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        self.max_source_bytes = _bounded_import_limit(
+            "max_source_bytes",
+            max_source_bytes,
+            MEMPALACE_DEFAULT_MAX_SOURCE_BYTES,
+            MEMPALACE_ABSOLUTE_MAX_SOURCE_BYTES,
+        )
+        self.max_copied_bytes = _bounded_import_limit(
+            "max_copied_bytes",
+            max_copied_bytes,
+            MEMPALACE_DEFAULT_MAX_COPIED_BYTES,
+            MEMPALACE_ABSOLUTE_MAX_COPIED_BYTES,
+        )
+        self.max_rows = _bounded_import_limit(
+            "max_rows",
+            max_rows,
+            MEMPALACE_DEFAULT_MAX_ROWS,
+            MEMPALACE_ABSOLUTE_MAX_ROWS,
+        )
+        self.max_field_bytes = _bounded_import_limit(
+            "max_field_bytes",
+            max_field_bytes,
+            MEMPALACE_DEFAULT_MAX_FIELD_BYTES,
+            MEMPALACE_ABSOLUTE_MAX_FIELD_BYTES,
+        )
+        self.max_imported_bytes = _bounded_import_limit(
+            "max_imported_bytes",
+            max_imported_bytes,
+            MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES,
+            MEMPALACE_ABSOLUTE_MAX_IMPORTED_BYTES,
+        )
+        self.timeout_seconds = _bounded_import_limit(
+            "timeout_seconds",
+            timeout_seconds,
+            MEMPALACE_DEFAULT_TIMEOUT_SECONDS,
+            MEMPALACE_MAX_TIMEOUT_SECONDS,
+        )
+        self.deadline = time.monotonic() + self.timeout_seconds
+        self.source_bytes = 0
+        self.copied_bytes = 0
+        self.rows = 0
+        self.imported_bytes = 0
+        self.deadline_exceeded = False
+        self._source_sizes: dict[str, int] = {}
+
+    def limits(self) -> dict[str, int]:
+        return {
+            "max_source_bytes": self.max_source_bytes,
+            "max_copied_bytes": self.max_copied_bytes,
+            "max_rows": self.max_rows,
+            "max_field_bytes": self.max_field_bytes,
+            "max_imported_bytes": self.max_imported_bytes,
+            "timeout_seconds": self.timeout_seconds,
+            "free_space_reserve_bytes": MEMPALACE_FREE_SPACE_RESERVE_BYTES,
+        }
+
+    def check_deadline(self, phase: str) -> None:
+        if time.monotonic() <= self.deadline:
+            return
+        self.deadline_exceeded = True
+        raise MempalaceLimitError(f"MemPalace import exceeded its deadline while {phase}")
+
+    def remaining_seconds(self) -> float:
+        return max(0.001, self.deadline - time.monotonic())
+
+    def account_source(self, source: Path, size: int, phase: str) -> None:
+        self.check_deadline(phase)
+        key = str(source.resolve(strict=False))
+        bounded_size = max(0, int(size))
+        previous = self._source_sizes.get(key, 0)
+        if bounded_size <= previous:
+            return
+        next_total = self.source_bytes + bounded_size - previous
+        if next_total > self.max_source_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace source byte budget exceeded while {phase}: "
+                f"{next_total} > {self.max_source_bytes}"
+            )
+        self._source_sizes[key] = bounded_size
+        self.source_bytes = next_total
+
+    def require_row_capacity(self, count: int, phase: str) -> None:
+        self.check_deadline(phase)
+        if self.rows + max(0, int(count)) > self.max_rows:
+            raise MempalaceLimitError(
+                f"MemPalace row budget exceeded while {phase}: "
+                f"more than {self.max_rows} rows would be processed"
+            )
+
+    def consume_row(self, phase: str) -> None:
+        self.check_deadline(phase)
+        if self.rows >= self.max_rows:
+            raise MempalaceLimitError(
+                f"MemPalace row budget exceeded while {phase}: {self.max_rows} rows processed"
+            )
+        self.rows += 1
+
+    def consume_field(self, value: Any, phase: str) -> int:
+        self.check_deadline(phase)
+        size = _utf8_size(value)
+        if size > self.max_field_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace field byte budget exceeded while {phase}: "
+                f"{size} > {self.max_field_bytes}"
+            )
+        next_total = self.imported_bytes + size
+        if next_total > self.max_imported_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace imported byte budget exceeded while {phase}: "
+                f"{next_total} > {self.max_imported_bytes}"
+            )
+        self.imported_bytes = next_total
+        return size
+
+    def check_item_bytes(self, count: int, phase: str) -> None:
+        maximum = min(self.max_imported_bytes, self.max_field_bytes * 4)
+        if count > maximum:
+            raise MempalaceLimitError(
+                f"MemPalace item byte budget exceeded while {phase}: {count} > {maximum}"
+            )
+
+    def require_free_space(self, destination: Path, phase: str, *, additional_bytes: int = 0) -> None:
+        self.check_deadline(phase)
+        try:
+            free_bytes = int(shutil.disk_usage(destination).free)
+        except OSError as exc:
+            raise MempalaceLimitError(
+                f"MemPalace free-space probe failed while {phase}: {type(exc).__name__}"
+            ) from exc
+        required = MEMPALACE_FREE_SPACE_RESERVE_BYTES + max(0, int(additional_bytes))
+        if free_bytes < required:
+            raise MempalaceLimitError(
+                f"MemPalace free-space reserve would be exhausted while {phase}"
+            )
+
+    def prepare_copy(self, expected_bytes: int, destination: Path, phase: str) -> int:
+        self.check_deadline(phase)
+        size = max(0, int(expected_bytes))
+        if self.copied_bytes + size > self.max_copied_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace copied byte budget exceeded while {phase}: "
+                f"{self.copied_bytes + size} > {self.max_copied_bytes}"
+            )
+        self.require_free_space(destination, phase, additional_bytes=size)
+        return self.copied_bytes
+
+    def check_copy_progress(self, baseline: int, copied: int, destination: Path, phase: str) -> None:
+        self.check_deadline(phase)
+        if baseline + max(0, int(copied)) > self.max_copied_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace copied byte budget exceeded while {phase}: "
+                f"more than {self.max_copied_bytes} bytes"
+            )
+        self.require_free_space(destination, phase)
+
+    def commit_copy(self, copied: int, phase: str) -> None:
+        self.check_deadline(phase)
+        next_total = self.copied_bytes + max(0, int(copied))
+        if next_total > self.max_copied_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace copied byte budget exceeded while {phase}: "
+                f"{next_total} > {self.max_copied_bytes}"
+            )
+        self.copied_bytes = next_total
+
+    def configure_source_connection(self, conn: sqlite3.Connection, phase: str) -> None:
+        self.check_deadline(phase)
+        length_category = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+        set_limit = getattr(conn, "setlimit", None)
+        get_limit = getattr(conn, "getlimit", None)
+        if not isinstance(length_category, int) or not callable(set_limit) or not callable(get_limit):
+            raise MempalaceLimitError("SQLite length limits are unavailable for MemPalace import")
+        row_limit = min(self.max_imported_bytes, self.max_field_bytes * 4)
+        set_limit(length_category, row_limit)
+        if int(get_limit(length_category)) > row_limit:
+            raise MempalaceLimitError("SQLite length limit could not be lowered for MemPalace import")
+
+        def cancel_after_deadline() -> int:
+            if time.monotonic() <= self.deadline:
+                return 0
+            self.deadline_exceeded = True
+            return 1
+
+        conn.set_progress_handler(cancel_after_deadline, 100)
+
+    def translate_sqlite_error(self, exc: sqlite3.Error, phase: str) -> None:
+        if self.deadline_exceeded or time.monotonic() > self.deadline:
+            self.deadline_exceeded = True
+            raise MempalaceLimitError(f"MemPalace import exceeded its deadline while {phase}") from exc
+        if isinstance(exc, sqlite3.DataError):
+            raise MempalaceLimitError(
+                f"MemPalace SQLite row exceeded the bounded field allocation while {phase}"
+            ) from exc
 
 
 @contextmanager
@@ -292,24 +545,165 @@ def emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) ->
         callback(payload)
 
 
-def sqlite_backup(source: Path, dest: Path) -> None:
-    secure_mkdir(dest.parent)
-    src = sqlite3.connect(sqlite_readonly_uri(source, immutable=False), uri=True, timeout=2)
-    try:
-        dst = sqlite3.connect(str(dest))
+def sqlite_source_footprint(source: Path) -> int:
+    total = 0
+    for candidate in (source, Path(f"{source}-wal"), Path(f"{source}-shm")):
         try:
-            src.backup(dst)
+            if candidate.exists():
+                total += int(candidate.stat().st_size)
+        except OSError as exc:
+            raise MempalaceLimitError(
+                f"could not measure MemPalace source database {source.name}: {type(exc).__name__}"
+            ) from exc
+    return total
+
+
+def sqlite_backup(
+    source: Path,
+    dest: Path,
+    *,
+    budget: MempalaceImportBudget | None = None,
+    phase: str = "backing up SQLite database",
+) -> None:
+    secure_mkdir(dest.parent)
+    if budget is None:
+        src = sqlite3.connect(sqlite_readonly_uri(source, immutable=False), uri=True, timeout=2)
+        try:
+            plain_dst = sqlite3.connect(str(dest))
+            try:
+                src.backup(plain_dst)
+            finally:
+                plain_dst.close()
         finally:
+            src.close()
+        secure_sqlite_files(dest)
+        return
+
+    physical_bytes = sqlite_source_footprint(source)
+    budget.account_source(source, physical_bytes, phase)
+    src = sqlite3.connect(sqlite_readonly_uri(source, immutable=False), uri=True, timeout=2)
+    dst: sqlite3.Connection | None = None
+    try:
+        budget.configure_source_connection(src, phase)
+        page_size = int(src.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(src.execute("PRAGMA page_count").fetchone()[0])
+        expected_bytes = max(physical_bytes, page_size * page_count)
+        budget.account_source(source, expected_bytes, phase)
+        baseline = budget.prepare_copy(expected_bytes, dest.parent, phase)
+
+        def backup_progress(_status: int, remaining: int, total: int) -> None:
+            logical_bytes = max(0, int(total)) * page_size
+            budget.account_source(source, max(physical_bytes, logical_bytes), phase)
+            copied_pages = max(0, int(total) - int(remaining))
+            budget.check_copy_progress(baseline, copied_pages * page_size, dest.parent, phase)
+
+        dst = sqlite3.connect(str(dest))
+        src.backup(
+            dst,
+            pages=MEMPALACE_SQLITE_BACKUP_PAGES,
+            progress=backup_progress,
+            sleep=0.05,
+        )
+        dst.close()
+        dst = None
+        copied_bytes = int(dest.stat().st_size)
+        budget.check_copy_progress(baseline, copied_bytes, dest.parent, phase)
+        budget.commit_copy(copied_bytes, phase)
+    except sqlite3.Error as exc:
+        if dst is not None:
             dst.close()
+            dst = None
+        for candidate in (dest, Path(f"{dest}-wal"), Path(f"{dest}-shm")):
+            candidate.unlink(missing_ok=True)
+        budget.translate_sqlite_error(exc, phase)
+        raise
+    except Exception:
+        if dst is not None:
+            dst.close()
+            dst = None
+        for candidate in (dest, Path(f"{dest}-wal"), Path(f"{dest}-shm")):
+            candidate.unlink(missing_ok=True)
+        raise
     finally:
+        if dst is not None:
+            dst.close()
         src.close()
     secure_sqlite_files(dest)
 
 
-def stop_mempalace_processes() -> dict[str, Any]:
+def _copy_file_with_budget(
+    source: Path,
+    destination: Path,
+    *,
+    budget: MempalaceImportBudget,
+    phase: str,
+) -> None:
+    secure_mkdir(destination.parent)
+    expected_bytes = int(source.stat().st_size)
+    baseline = budget.prepare_copy(expected_bytes, destination.parent, phase)
+    copied = 0
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_BINARY", 0))
+    fd = os.open(str(destination), flags, 0o600)
+    try:
+        with source.open("rb") as input_handle, os.fdopen(fd, "wb") as output_handle:
+            fd = -1
+            while True:
+                budget.check_deadline(phase)
+                chunk = input_handle.read(MEMPALACE_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                budget.check_copy_progress(baseline, copied, destination.parent, phase)
+                output_handle.write(chunk)
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        if copied != expected_bytes:
+            raise MempalaceLimitError(
+                f"MemPalace source changed size while {phase}: {copied} != {expected_bytes}"
+            )
+        budget.commit_copy(copied, phase)
+        secure_file(destination)
+        fsync_parent(destination)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _iter_sqlite_rows(
+    cursor: sqlite3.Cursor,
+    *,
+    budget: MempalaceImportBudget,
+    phase: str,
+) -> Iterator[sqlite3.Row]:
+    while True:
+        budget.check_deadline(phase)
+        try:
+            rows = cursor.fetchmany(MEMPALACE_SQLITE_BATCH_ROWS)
+        except sqlite3.Error as exc:
+            budget.translate_sqlite_error(exc, phase)
+            raise
+        if not rows:
+            return
+        for row in rows:
+            budget.consume_row(phase)
+            yield row
+
+
+def stop_mempalace_processes(*, deadline: float | None = None) -> dict[str, Any]:
     stopped: list[dict[str, Any]] = []
     errors: list[str] = []
     system = platform.system().lower()
+
+    def command_timeout() -> float:
+        if deadline is None:
+            return 10.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MemPalace process-stop deadline exceeded")
+        return min(10.0, remaining)
+
     if system == "windows":
         command = (
             "Get-CimInstance Win32_Process | "
@@ -322,7 +716,7 @@ def stop_mempalace_processes() -> dict[str, Any]:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=command_timeout(),
             )
             for line in proc.stdout.splitlines():
                 if not line.strip():
@@ -337,7 +731,7 @@ def stop_mempalace_processes() -> dict[str, Any]:
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=10,
+                    timeout=command_timeout(),
                 )
                 stopped.append(
                     {
@@ -358,7 +752,7 @@ def stop_mempalace_processes() -> dict[str, Any]:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=command_timeout(),
             )
             current_pid = os.getpid()
             for line in proc.stdout.splitlines():
@@ -378,7 +772,9 @@ def stop_mempalace_processes() -> dict[str, Any]:
                     continue
                 except Exception as exc:
                     errors.append(f"{pid}: {exc}")
-            time.sleep(0.8)
+            delay = 0.8 if deadline is None else min(0.8, max(0.0, deadline - time.monotonic()))
+            if delay > 0:
+                time.sleep(delay)
         except FileNotFoundError:
             errors.append("pgrep is not available")
         except Exception as exc:
@@ -392,6 +788,7 @@ def snapshot_mempalace(
     palace_path: Path,
     import_id: str,
     allow_stop: bool,
+    budget: MempalaceImportBudget | None = None,
     snapshot_dir: Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -400,11 +797,28 @@ def snapshot_mempalace(
     source_kg = palace_path / "knowledge_graph.sqlite3"
     if not source_chroma.exists():
         raise FileNotFoundError(str(source_chroma))
+    if budget is not None:
+        budget.account_source(
+            source_chroma,
+            sqlite_source_footprint(source_chroma),
+            "preflighting MemPalace source databases",
+        )
+        if source_kg.exists():
+            budget.account_source(
+                source_kg,
+                sqlite_source_footprint(source_kg),
+                "preflighting MemPalace source databases",
+            )
 
     stopped: dict[str, Any] | None = None
     emit_progress(progress, {"phase": "snapshot", "message": "snapshotting chroma.sqlite3"})
     try:
-        sqlite_backup(source_chroma, snapshot_dir / "chroma.sqlite3")
+        sqlite_backup(
+            source_chroma,
+            snapshot_dir / "chroma.sqlite3",
+            budget=budget,
+            phase="snapshotting chroma.sqlite3",
+        )
     except sqlite3.OperationalError as exc:
         if not allow_stop:
             raise RuntimeError(
@@ -412,15 +826,38 @@ def snapshot_mempalace(
                 "mempalace-readonly-mcp before snapshotting."
             ) from exc
         emit_progress(progress, {"phase": "stop", "message": "stopping MemPalace MCP processes"})
-        stopped = stop_mempalace_processes()
-        sqlite_backup(source_chroma, snapshot_dir / "chroma.sqlite3")
+        stopped = stop_mempalace_processes(deadline=budget.deadline if budget is not None else None)
+        sqlite_backup(
+            source_chroma,
+            snapshot_dir / "chroma.sqlite3",
+            budget=budget,
+            phase="snapshotting chroma.sqlite3 after stopping MemPalace",
+        )
 
     if source_kg.exists():
         emit_progress(progress, {"phase": "snapshot", "message": "snapshotting knowledge_graph.sqlite3"})
         try:
-            sqlite_backup(source_kg, snapshot_dir / "knowledge_graph.sqlite3")
+            sqlite_backup(
+                source_kg,
+                snapshot_dir / "knowledge_graph.sqlite3",
+                budget=budget,
+                phase="snapshotting knowledge_graph.sqlite3",
+            )
         except sqlite3.OperationalError:
-            secure_copy_file(source_kg, snapshot_dir / "knowledge_graph.sqlite3")
+            if budget is None:
+                secure_copy_file(source_kg, snapshot_dir / "knowledge_graph.sqlite3")
+            else:
+                budget.account_source(
+                    source_kg,
+                    sqlite_source_footprint(source_kg),
+                    "copying knowledge_graph.sqlite3 fallback",
+                )
+                _copy_file_with_budget(
+                    source_kg,
+                    snapshot_dir / "knowledge_graph.sqlite3",
+                    budget=budget,
+                    phase="copying knowledge_graph.sqlite3 fallback",
+                )
             secure_sqlite_files(snapshot_dir / "knowledge_graph.sqlite3")
 
     return {
@@ -439,12 +876,37 @@ def quarantine_snapshot_reference(snapshot: dict[str, Any], *, policy: str = "qu
     }
 
 
-def promote_mempalace_snapshot(root: Path, import_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+def promote_mempalace_snapshot(
+    root: Path,
+    import_id: str,
+    snapshot: dict[str, Any],
+    *,
+    budget: MempalaceImportBudget | None = None,
+) -> dict[str, Any]:
     source_dir = Path(str(snapshot["snapshot_dir"]))
     target_dir = root / "run" / "mempalace_import_snapshots" / safe_filename(import_id)
     if target_dir.exists():
         shutil.rmtree(target_dir)
-    secure_copytree(source_dir, target_dir)
+    if budget is None:
+        secure_copytree(source_dir, target_dir)
+    else:
+        secure_mkdir(target_dir)
+        try:
+            for source_path in sorted(source_dir.rglob("*")):
+                if source_path.is_dir():
+                    secure_mkdir(target_dir / source_path.relative_to(source_dir))
+                    continue
+                if source_path.is_symlink() or not source_path.is_file():
+                    raise MempalaceLimitError(f"unsupported MemPalace snapshot entry: {source_path.name}")
+                _copy_file_with_budget(
+                    source_path,
+                    target_dir / source_path.relative_to(source_dir),
+                    budget=budget,
+                    phase=f"promoting MemPalace snapshot {source_path.name}",
+                )
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
     promoted = dict(snapshot)
     promoted.update(
         {
@@ -624,35 +1086,66 @@ def kg_source_file_reference(root: Path, value: Any) -> dict[str, Any] | None:
     return source_path_reference(root, Path(text))
 
 
-def load_metadata(conn: sqlite3.Connection, embedding_row_id: int) -> dict[str, Any]:
+def load_metadata(
+    conn: sqlite3.Connection,
+    embedding_row_id: int,
+    *,
+    budget: MempalaceImportBudget,
+) -> tuple[dict[str, Any], int]:
     metadata: dict[str, Any] = {}
-    rows = conn.execute(
+    item_bytes = 0
+    cursor = conn.execute(
         """
         SELECT key, string_value, int_value, float_value, bool_value
         FROM embedding_metadata
         WHERE id = ?
+        ORDER BY key
         """,
         (embedding_row_id,),
-    ).fetchall()
-    for row in rows:
-        metadata[row["key"]] = metadata_value(row)
-    return metadata
+    )
+    for row in _iter_sqlite_rows(cursor, budget=budget, phase="reading embedding metadata"):
+        if len(metadata) >= MEMPALACE_MAX_METADATA_FIELDS_PER_ITEM:
+            raise MempalaceLimitError(
+                "MemPalace metadata field-count budget exceeded while reading an embedding"
+            )
+        key = row["key"]
+        value = metadata_value(row)
+        item_bytes += budget.consume_field(key, "reading an embedding metadata key")
+        item_bytes += budget.consume_field(value, "reading an embedding metadata value")
+        budget.check_item_bytes(item_bytes, "reading embedding metadata")
+        metadata[key] = value
+    return metadata, item_bytes
 
 
-def load_document(conn: sqlite3.Connection, embedding_row_id: int, metadata: dict[str, Any]) -> str:
+def load_document(
+    conn: sqlite3.Connection,
+    embedding_row_id: int,
+    metadata: dict[str, Any],
+    *,
+    budget: MempalaceImportBudget,
+    item_bytes: int,
+) -> tuple[str, int]:
     document = metadata.get("chroma:document")
     if isinstance(document, str):
-        return document
+        return document, item_bytes
     try:
         row = conn.execute(
             "SELECT string_value FROM embedding_fulltext_search WHERE rowid = ?",
             (embedding_row_id,),
         ).fetchone()
-    except sqlite3.OperationalError:
-        row = None
+    except sqlite3.Error as exc:
+        if isinstance(exc, sqlite3.OperationalError) and not budget.deadline_exceeded:
+            row = None
+        else:
+            budget.translate_sqlite_error(exc, "reading embedding full-text content")
+            raise
     if row and row["string_value"]:
-        return str(row["string_value"])
-    return ""
+        budget.consume_row("reading embedding full-text content")
+        content = str(row["string_value"])
+        item_bytes += budget.consume_field(content, "reading embedding full-text content")
+        budget.check_item_bytes(item_bytes, "reading an embedding")
+        return content, item_bytes
+    return "", item_bytes
 
 
 def classify_embedding(embedding_id: str) -> str:
@@ -672,6 +1165,7 @@ def write_import_text(
     digest: str,
     metadata: dict[str, Any],
     kind: str,
+    created_sink: list[Path] | None = None,
 ) -> dict[str, Path]:
     wing = str(metadata.get("wing") or "unknown_wing")
     room = str(metadata.get("room") or "unknown_room")
@@ -700,6 +1194,8 @@ def write_import_text(
     }
     text = "---continuum-import-json\n" + json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n---\n\n" + content
     atomic_write_text(original_path, text)
+    if created_sink is not None:
+        created_sink.append(original_path)
 
     reader_dir = (
         root
@@ -715,10 +1211,14 @@ def write_import_text(
     )
     reader_path = reader_dir / f"{safe_digest}.txt"
     atomic_write_text(reader_path, content)
+    if created_sink is not None:
+        created_sink.append(reader_path)
 
     hash_path = root / "archive" / "originals" / "hot" / "mempalace" / "by-hash" / digest[:2] / f"{digest}.txt"
     if not hash_path.exists():
         atomic_write_text(hash_path, content)
+        if created_sink is not None:
+            created_sink.append(hash_path)
     return {"original_path": original_path, "reader_path": reader_path, "content_hash_path": hash_path}
 
 
@@ -746,6 +1246,7 @@ def import_embedding(
     operation_id: str,
     secret_findings: list[dict[str, Any]] | None = None,
     artifact_sink: list[Path] | None = None,
+    created_artifact_sink: list[Path] | None = None,
 ) -> dict[str, Any]:
     raw_embedding_id = str(embedding["embedding_id"])
     embedding_id = safe_public_identifier(raw_embedding_id, prefix="embedding", limit=120)
@@ -764,6 +1265,7 @@ def import_embedding(
         digest=digest,
         metadata=metadata,
         kind=kind,
+        created_sink=created_artifact_sink,
     )
     original_path = artifact_paths["original_path"]
     reader_path = artifact_paths["reader_path"]
@@ -997,15 +1499,46 @@ def import_embedding(
     }
 
 
-def import_kg(root: Path, target_conn: sqlite3.Connection, kg_db: Path, import_id: str) -> dict[str, int]:
+def _table_row_count(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    budget: MempalaceImportBudget,
+    phase: str,
+) -> int:
+    budget.check_deadline(phase)
+    try:
+        row = conn.execute(f'SELECT count(*) FROM "{table}"').fetchone()
+    except sqlite3.Error as exc:
+        budget.translate_sqlite_error(exc, phase)
+        raise
+    budget.check_deadline(phase)
+    return int(row[0]) if row is not None else 0
+
+
+def import_kg(
+    root: Path,
+    target_conn: sqlite3.Connection,
+    kg_db: Path,
+    import_id: str,
+    *,
+    budget: MempalaceImportBudget,
+) -> dict[str, int]:
     if not kg_db.exists():
         return {"entities": 0, "triples": 0}
-    source = sqlite3.connect(str(kg_db))
+    source = sqlite3.connect(sqlite_readonly_uri(kg_db, immutable=True), uri=True, timeout=2)
     source.row_factory = sqlite3.Row
     try:
-        entity_rows = source.execute("SELECT * FROM entities").fetchall()
+        budget.configure_source_connection(source, "opening the knowledge graph")
         entity_nodes: dict[str, str] = {}
-        for row in entity_rows:
+        entity_count = 0
+        entity_cursor = source.execute("SELECT id, name, type, properties FROM entities ORDER BY rowid")
+        for row in _iter_sqlite_rows(entity_cursor, budget=budget, phase="importing knowledge graph entities"):
+            row_bytes = sum(
+                budget.consume_field(row[key], f"reading knowledge graph entity {key}")
+                for key in ("id", "name", "type", "properties")
+            )
+            budget.check_item_bytes(row_bytes, "reading a knowledge graph entity")
             properties = sanitize_kg_value(root, "properties", json_loads(row["properties"], {}))
             entity_type = redact_text_secrets(str(row["type"] or "unknown"))
             entity_label = redact_text_secrets(str(row["name"]))
@@ -1023,11 +1556,33 @@ def import_kg(root: Path, target_conn: sqlite3.Connection, kg_db: Path, import_i
                 },
             )
             entity_nodes[row["id"]] = node_id
-        triple_rows = source.execute("SELECT * FROM triples").fetchall()
-        for row in triple_rows:
+            entity_count += 1
+        triple_count = 0
+        triple_cursor = source.execute(
+            """
+            SELECT id, subject, predicate, object, confidence, source_file, source_drawer_id
+            FROM triples
+            ORDER BY rowid
+            """
+        )
+        for row in _iter_sqlite_rows(triple_cursor, budget=budget, phase="importing knowledge graph triples"):
+            row_bytes = sum(
+                budget.consume_field(row[key], f"reading knowledge graph triple {key}")
+                for key in (
+                    "id",
+                    "subject",
+                    "predicate",
+                    "object",
+                    "confidence",
+                    "source_file",
+                    "source_drawer_id",
+                )
+            )
+            budget.check_item_bytes(row_bytes, "reading a knowledge graph triple")
             source_node = entity_nodes.get(row["subject"])
             target_node = entity_nodes.get(row["object"])
             if not source_node or not target_node:
+                triple_count += 1
                 continue
             source_file_ref = kg_source_file_reference(root, row["source_file"])
             predicate = redact_text_secrets(str(row["predicate"]))
@@ -1052,24 +1607,45 @@ def import_kg(root: Path, target_conn: sqlite3.Connection, kg_db: Path, import_i
                     }
                 ],
             )
-        return {"entities": len(entity_rows), "triples": len(triple_rows)}
+            triple_count += 1
+        return {"entities": entity_count, "triples": triple_count}
+    except sqlite3.Error as exc:
+        budget.translate_sqlite_error(exc, "importing the knowledge graph")
+        raise
     finally:
+        source.set_progress_handler(None, 0)
         source.close()
 
 
-def scan_kg_for_secrets(kg_db: Path) -> list[dict[str, Any]]:
+def scan_kg_for_secrets(
+    kg_db: Path,
+    *,
+    budget: MempalaceImportBudget,
+) -> list[dict[str, Any]]:
     if not kg_db.exists():
         return []
     findings: list[dict[str, Any]] = []
-    source = sqlite3.connect(str(kg_db))
+    source = sqlite3.connect(sqlite_readonly_uri(kg_db, immutable=True), uri=True, timeout=2)
     source.row_factory = sqlite3.Row
     try:
+        budget.configure_source_connection(source, "opening the knowledge graph secret scan")
         try:
-            entity_rows = source.execute("SELECT id, name, type, properties FROM entities").fetchall()
-            triple_rows = source.execute("SELECT id, predicate, source_file, source_drawer_id FROM triples").fetchall()
-        except sqlite3.OperationalError:
+            entity_cursor = source.execute(
+                "SELECT id, name, type, properties FROM entities ORDER BY rowid"
+            )
+            triple_cursor = source.execute(
+                "SELECT id, predicate, source_file, source_drawer_id FROM triples ORDER BY rowid"
+            )
+        except sqlite3.OperationalError as exc:
+            if budget.deadline_exceeded:
+                budget.translate_sqlite_error(exc, "starting the knowledge graph secret scan")
             return []
-        for row in entity_rows:
+        for row in _iter_sqlite_rows(entity_cursor, budget=budget, phase="scanning knowledge graph entities"):
+            row_bytes = sum(
+                budget.consume_field(row[key], f"scanning knowledge graph entity {key}")
+                for key in ("id", "name", "type", "properties")
+            )
+            budget.check_item_bytes(row_bytes, "scanning a knowledge graph entity")
             properties = json_loads(row["properties"], {})
             payload = {
                 "entity_id": row["id"],
@@ -1091,7 +1667,12 @@ def scan_kg_for_secrets(kg_db: Path) -> list[dict[str, Any]]:
                 findings.append(scoped)
                 if len(findings) >= 20:
                     return findings
-        for row in triple_rows:
+        for row in _iter_sqlite_rows(triple_cursor, budget=budget, phase="scanning knowledge graph triples"):
+            row_bytes = sum(
+                budget.consume_field(row[key], f"scanning knowledge graph triple {key}")
+                for key in ("id", "predicate", "source_file", "source_drawer_id")
+            )
+            budget.check_item_bytes(row_bytes, "scanning a knowledge graph triple")
             payload = {
                 "triple_id": row["id"],
                 "predicate": row["predicate"],
@@ -1107,8 +1688,34 @@ def scan_kg_for_secrets(kg_db: Path) -> list[dict[str, Any]]:
                 if len(findings) >= 20:
                     return findings
         return findings
+    except sqlite3.Error as exc:
+        budget.translate_sqlite_error(exc, "scanning the knowledge graph")
+        raise
     finally:
+        source.set_progress_handler(None, 0)
         source.close()
+
+
+def cleanup_budget_failure_artifacts(
+    root: Path,
+    import_id: str,
+    created_paths: list[Path],
+) -> None:
+    resolved_root = root.resolve(strict=False)
+    for path in sorted(set(created_paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.resolve(strict=False).relative_to(resolved_root)
+        except (OSError, ValueError):
+            continue
+        if path.is_file() or path.is_symlink():
+            path.unlink(missing_ok=True)
+    safe_import = safe_filename(import_id)
+    for directory in (
+        root / "archive" / "originals" / "hot" / "mempalace" / "by-import" / safe_import,
+        root / "archive" / "reader_editions" / "hot" / "mempalace" / "by-import" / safe_import,
+        root / "run" / "mempalace_import_snapshots" / safe_import,
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def import_mempalace(
@@ -1119,10 +1726,29 @@ def import_mempalace(
     include_kg: bool = True,
     allow_stop: bool = False,
     progress: ProgressCallback | None = None,
+    max_source_bytes: int | None = None,
+    max_copied_bytes: int | None = None,
+    max_rows: int | None = None,
+    max_field_bytes: int | None = None,
+    max_imported_bytes: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     palace = palace_path or default_mempalace_path()
     import_id = unique_id("import")
-    with mempalace_import_lock(root, import_id):
+    budget = MempalaceImportBudget(
+        max_source_bytes=max_source_bytes,
+        max_copied_bytes=max_copied_bytes,
+        max_rows=max_rows,
+        max_field_bytes=max_field_bytes,
+        max_imported_bytes=max_imported_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+    with mempalace_import_lock(
+        root,
+        import_id,
+        timeout_seconds=min(60.0, budget.remaining_seconds()),
+    ):
+        budget.check_deadline("waiting for the import lock")
         return _import_mempalace_locked(
             root,
             palace=palace,
@@ -1131,6 +1757,7 @@ def import_mempalace(
             include_kg=include_kg,
             allow_stop=allow_stop,
             progress=progress,
+            budget=budget,
         )
 
 
@@ -1143,8 +1770,11 @@ def _import_mempalace_locked(
     include_kg: bool,
     allow_stop: bool,
     progress: ProgressCallback | None,
+    budget: MempalaceImportBudget,
 ) -> dict[str, Any]:
+    budget.check_deadline("initializing the import")
     init_db(root)
+    budget.check_deadline("initializing the import")
     palace_source = source_path_reference(root, palace)
     operation = start_operation(
         root,
@@ -1157,6 +1787,7 @@ def _import_mempalace_locked(
             "include_closets": include_closets,
             "include_kg": include_kg,
             "allow_stop": allow_stop,
+            "resource_limits": budget.limits(),
             "preflight_snapshot_policy": "auto",
             "preflight_snapshot_reason": "MemPalace import mutates Library/catalog",
         },
@@ -1197,6 +1828,7 @@ def _import_mempalace_locked(
     errors: list[dict[str, Any]] = []
     imported_items: list[dict[str, Any]] = []
     imported_artifact_paths: list[Path] = []
+    created_artifact_paths: list[Path] = []
     resume_state = write_import_state(
         root,
         import_id=import_id,
@@ -1207,6 +1839,7 @@ def _import_mempalace_locked(
         errors=errors,
     )
     try:
+        budget.check_deadline("starting the preflight snapshot")
         try:
             catalog_snapshot = create_preflight_snapshot(
                 root,
@@ -1228,11 +1861,13 @@ def _import_mempalace_locked(
                 message=f"catalog snapshot skipped: {exc}",
                 detail={"error_type": type(exc).__name__},
             )
+        budget.check_deadline("finishing the preflight snapshot")
         working_snapshot = snapshot_mempalace(
             root=root,
             palace_path=palace,
             import_id=import_id,
             allow_stop=allow_stop,
+            budget=budget,
             snapshot_dir=Path(quarantine_tmp.name) / safe_filename(import_id),
             progress=import_progress,
         )
@@ -1259,31 +1894,81 @@ def _import_mempalace_locked(
         )
         chroma_db = Path(working_snapshot["chroma_db"])
         kg_db = Path(working_snapshot["kg_db"]) if working_snapshot.get("kg_db") else None
-        source = sqlite3.connect(str(chroma_db))
+        source = sqlite3.connect(sqlite_readonly_uri(chroma_db, immutable=True), uri=True, timeout=2)
         source.row_factory = sqlite3.Row
-        target = connect(root)
+        budget.configure_source_connection(source, "opening the Chroma snapshot")
         security_config = load_config(root).get("security", {})
         secret_scan_enabled = bool(security_config.get("secret_scan_enabled", True))
         secret_action = str(security_config.get("secret_scan_action") or "warn")
-        rows = source.execute(
+        total = _table_row_count(
+            source,
+            "embeddings",
+            budget=budget,
+            phase="counting Chroma embeddings",
+        )
+        metadata_total = _table_row_count(
+            source,
+            "embedding_metadata",
+            budget=budget,
+            phase="counting Chroma metadata",
+        )
+        required_rows = total * 2 + metadata_total
+        if include_kg and kg_db is not None:
+            kg_source = sqlite3.connect(sqlite_readonly_uri(kg_db, immutable=True), uri=True, timeout=2)
+            try:
+                budget.configure_source_connection(kg_source, "counting knowledge graph rows")
+                kg_entities = _table_row_count(
+                    kg_source,
+                    "entities",
+                    budget=budget,
+                    phase="counting knowledge graph entities",
+                )
+                kg_triples = _table_row_count(
+                    kg_source,
+                    "triples",
+                    budget=budget,
+                    phase="counting knowledge graph triples",
+                )
+            finally:
+                kg_source.set_progress_handler(None, 0)
+                kg_source.close()
+            kg_passes = 2 if secret_scan_enabled and secret_action != "off" else 1
+            required_rows += (kg_entities + kg_triples) * kg_passes
+        budget.require_row_capacity(required_rows, "preflighting aggregate source rows")
+        target = connect(root)
+        embedding_cursor = source.execute(
             """
             SELECT id, embedding_id, created_at
             FROM embeddings
             ORDER BY id
             """
-        ).fetchall()
-        total = len(rows)
+        )
         import_progress({"phase": "import", "current": 0, "total": total, "message": "starting embeddings"})
-        for index, row in enumerate(rows, start=1):
+        for index, row in enumerate(
+            _iter_sqlite_rows(embedding_cursor, budget=budget, phase="reading Chroma embeddings"),
+            start=1,
+        ):
             embedding_id = str(row["embedding_id"])
+            item_bytes = budget.consume_field(row["id"], "reading a Chroma embedding row identifier")
+            item_bytes += budget.consume_field(embedding_id, "reading a Chroma embedding identifier")
+            item_bytes += budget.consume_field(row["created_at"], "reading a Chroma embedding timestamp")
+            budget.check_item_bytes(item_bytes, "reading a Chroma embedding")
             display_embedding_id = safe_public_identifier(embedding_id, prefix="embedding", limit=120)
             kind = classify_embedding(embedding_id)
             counts["embeddings_seen"] += 1
             if kind == "closet" and not include_closets:
                 counts["skipped"] += 1
                 continue
-            metadata = load_metadata(source, int(row["id"]))
-            content = load_document(source, int(row["id"]), metadata)
+            metadata, metadata_bytes = load_metadata(source, int(row["id"]), budget=budget)
+            item_bytes += metadata_bytes
+            budget.check_item_bytes(item_bytes, "reading a Chroma embedding")
+            content, item_bytes = load_document(
+                source,
+                int(row["id"]),
+                metadata,
+                budget=budget,
+                item_bytes=item_bytes,
+            )
             if not content.strip():
                 counts["skipped"] += 1
                 continue
@@ -1307,6 +1992,11 @@ def _import_mempalace_locked(
                     )
                     continue
             sanitized_metadata = sanitize_mempalace_metadata(root, metadata)
+            budget.require_free_space(
+                root,
+                "writing imported embedding artifacts",
+                additional_bytes=item_bytes * MEMPALACE_ROOT_EXPANSION_FACTOR,
+            )
             try:
                 result = import_embedding(
                     root=root,
@@ -1318,6 +2008,7 @@ def _import_mempalace_locked(
                     operation_id=operation_id,
                     secret_findings=secret_findings,
                     artifact_sink=imported_artifact_paths,
+                    created_artifact_sink=created_artifact_paths,
                 )
                 imported_items.append(result)
                 for key in ("original_uri", "reader_uri", "content_hash_uri"):
@@ -1333,6 +2024,9 @@ def _import_mempalace_locked(
                 counts["cards"] += 1
                 counts["chunks"] += len(chunk_text(content))
                 counts["secret_findings"] += len(result.get("secret_findings") or [])
+                budget.require_free_space(root, "finishing imported embedding artifacts")
+            except MempalaceLimitError:
+                raise
             except Exception as exc:
                 errors.append(
                     {
@@ -1391,7 +2085,7 @@ def _import_mempalace_locked(
             import_progress({"phase": "kg", "message": "importing knowledge graph"})
             kg_secret_findings: list[dict[str, Any]] = []
             if secret_scan_enabled and secret_action != "off":
-                kg_secret_findings = scan_kg_for_secrets(kg_db)
+                kg_secret_findings = scan_kg_for_secrets(kg_db, budget=budget)
             if kg_secret_findings and secret_action == "block":
                 counts["secret_findings"] += len(kg_secret_findings)
                 counts["skipped"] += 1
@@ -1407,7 +2101,7 @@ def _import_mempalace_locked(
                     }
                 )
             else:
-                kg_counts = import_kg(root, target, kg_db, import_id)
+                kg_counts = import_kg(root, target, kg_db, import_id, budget=budget)
                 counts["kg_entities"] = kg_counts["entities"]
                 counts["kg_triples"] = kg_counts["triples"]
             resume_state = write_import_state(
@@ -1431,8 +2125,14 @@ def _import_mempalace_locked(
                 errors=errors,
             )
             imported_artifact_paths.append(blocked_snapshot_manifest_path)
+            created_artifact_paths.append(blocked_snapshot_manifest_path)
         else:
-            snapshot = promote_mempalace_snapshot(root, import_id, working_snapshot)
+            snapshot = promote_mempalace_snapshot(
+                root,
+                import_id,
+                working_snapshot,
+                budget=budget,
+            )
         resume_state = write_import_state(
             root,
             import_id=import_id,
@@ -1467,6 +2167,8 @@ def _import_mempalace_locked(
                 "errors": errors[:25],
             },
         )
+        budget.check_deadline("committing the bounded MemPalace import")
+        budget.require_free_space(root, "committing the bounded MemPalace import")
         target.commit()
         sync_card_sidecars_after_commit(
             root,
@@ -1659,11 +2361,18 @@ def _import_mempalace_locked(
                 pass
             target.close()
             target = None
+        budget_failure = isinstance(exc, MempalaceLimitError)
+        if budget_failure:
+            cleanup_budget_failure_artifacts(root, import_id, created_artifact_paths)
+            snapshot = quarantine_snapshot_reference(
+                working_snapshot,
+                policy="discarded_after_resource_limit",
+            )
         failure_dir = root / "exports" / "imports" / safe_filename(import_id)
         failure_receipt_path = failure_dir / "receipt.failed.json"
         failure_catalog_backup_path = failure_dir / "catalog.failure.sqlite3"
         touched_paths: list[Path] = []
-        if (root / "catalog" / "catalog.sqlite3").exists():
+        if not budget_failure and (root / "catalog" / "catalog.sqlite3").exists():
             try:
                 sqlite_backup(root / "catalog" / "catalog.sqlite3", failure_catalog_backup_path)
                 touched_paths.append(failure_catalog_backup_path)

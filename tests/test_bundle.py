@@ -21,6 +21,8 @@ from continuum.core.bundle import (
     BUNDLE_MANIFEST_NAME,
     BUNDLE_ROOT_NAME,
     _claim_disposable_bundle_root,
+    _copy_confined_root_file,
+    _copy_root_to_stage,
     _is_transient,
     _manifest_hash,
     _write_zip_member,
@@ -604,6 +606,87 @@ class RootBundleTest(unittest.TestCase):
                     profile="shareable",
                     run_restore_drill=False,
                 )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink race regression")
+    def test_stage_copy_rejects_leaf_link_substituted_after_type_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            stage = base / "stage"
+            external = base / "external-private.txt"
+            external.write_text("outside-root-private-bytes", encoding="utf-8")
+            init_db(root)
+            source = root / "archive" / "race-leaf.txt"
+            secure_write_text(source, "audited in-root bytes")
+            relative = source.relative_to(root)
+            substituted = False
+
+            def substitute_after_checks(
+                active_root: Path,
+                rel: Path,
+                destination: Path,
+            ) -> int:
+                nonlocal substituted
+                if rel == relative and not substituted:
+                    source.unlink()
+                    source.symlink_to(external)
+                    substituted = True
+                return _copy_confined_root_file(active_root, rel, destination)
+
+            with (
+                patch(
+                    "continuum.core.bundle._copy_confined_root_file",
+                    side_effect=substitute_after_checks,
+                ),
+                self.assertRaisesRegex(ValueError, "changed|opened safely"),
+            ):
+                _copy_root_to_stage(root, stage, symlink_policy="fail")
+
+            self.assertTrue(substituted)
+            self.assertFalse((stage / relative).exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink race regression")
+    def test_stage_copy_rejects_ancestor_link_substituted_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "continuum"
+            stage = base / "stage"
+            external_dir = base / "external-private"
+            external_dir.mkdir()
+            external = external_dir / "payload.txt"
+            external.write_text("outside-root-private-bytes", encoding="utf-8")
+            init_db(root)
+            source_dir = root / "archive" / "race-parent"
+            source_dir.mkdir(parents=True)
+            source = source_dir / "payload.txt"
+            secure_write_text(source, "audited in-root bytes")
+            relative = source.relative_to(root)
+            original_dir = source_dir.with_name("race-parent-original")
+            substituted = False
+
+            def substitute_after_checks(
+                active_root: Path,
+                rel: Path,
+                destination: Path,
+            ) -> int:
+                nonlocal substituted
+                if rel == relative and not substituted:
+                    source_dir.rename(original_dir)
+                    source_dir.symlink_to(external_dir, target_is_directory=True)
+                    substituted = True
+                return _copy_confined_root_file(active_root, rel, destination)
+
+            with (
+                patch(
+                    "continuum.core.bundle._copy_confined_root_file",
+                    side_effect=substitute_after_checks,
+                ),
+                self.assertRaisesRegex(ValueError, "changed|opened safely"),
+            ):
+                _copy_root_to_stage(root, stage, symlink_policy="fail")
+
+            self.assertTrue(substituted)
+            self.assertFalse((stage / relative).exists())
 
     def test_portable_skip_never_follows_symlinked_catalog_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

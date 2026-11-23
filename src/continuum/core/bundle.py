@@ -24,7 +24,13 @@ from typing import Any, Iterable, TypeVar
 
 from .config import load_config
 from .operations import _verify_artifact_ledger, _verify_recent_proof_packs, verify_root
-from .permissions import secure_copy_file, secure_mkdir, secure_sqlite_files
+from .permissions import (
+    flush_file_strict,
+    fsync_parent,
+    secure_file,
+    secure_mkdir,
+    secure_sqlite_files,
+)
 from .safety import redact_text_secrets, redact_value_secrets, scan_text_for_secrets, scan_value_for_secrets
 from .store import (
     atomic_write_text_file,
@@ -1822,6 +1828,96 @@ def _symlink_inventory(root: Path) -> list[dict[str, Any]]:
     return inventory
 
 
+def _stable_bundle_source_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _copy_confined_root_file(root: Path, rel: Path, destination: Path) -> int:
+    """Copy one exact regular root file without following substituted components."""
+    if os.name != "nt" and (
+        not int(getattr(os, "O_NOFOLLOW", 0))
+        or not int(getattr(os, "O_DIRECTORY", 0))
+    ):
+        raise ValueError(
+            "bundle staging requires handle-relative no-follow filesystem access"
+        )
+    # Review subject snapshotting already provides the repository's portable
+    # handle-relative traversal: O_NOFOLLOW directory descriptors on POSIX and
+    # native relative handles that reject reparse points on Windows. Import it
+    # lazily so ordinary bundle imports do not load the review subsystem.
+    from .review_bridge import ReviewBridgeError, _open_confined_regular_file
+
+    secure_mkdir(destination.parent)
+    destination_fd = -1
+    copied_bytes = 0
+    try:
+        with _open_confined_regular_file(root, rel) as (source_handle, initial_source):
+            initial_identity = _stable_bundle_source_identity(initial_source)
+            initial_size = int(initial_source.st_size)
+            destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            destination_flags |= int(getattr(os, "O_BINARY", 0))
+            destination_flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            destination_fd = os.open(str(destination), destination_flags, 0o600)
+            with os.fdopen(destination_fd, "wb", closefd=True) as destination_handle:
+                destination_fd = -1
+                initial_destination = os.fstat(destination_handle.fileno())
+                if not stat.S_ISREG(initial_destination.st_mode):
+                    raise ValueError("bundle stage destination is not a regular file")
+                while True:
+                    chunk = source_handle.read(_BUNDLE_IO_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > initial_size:
+                        raise ValueError(
+                            f"bundle source changed while staging: {rel.as_posix()}"
+                        )
+                    written = destination_handle.write(chunk)
+                    if written != len(chunk):
+                        raise OSError("short write while staging bundle source")
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+                final_destination = os.fstat(destination_handle.fileno())
+                if (
+                    not stat.S_ISREG(final_destination.st_mode)
+                    or not os.path.samestat(initial_destination, final_destination)
+                    or int(final_destination.st_size) != copied_bytes
+                ):
+                    raise ValueError("bundle stage destination changed while copying")
+
+            final_source = os.fstat(source_handle.fileno())
+            if (
+                _stable_bundle_source_identity(final_source) != initial_identity
+                or copied_bytes != initial_size
+            ):
+                raise ValueError(
+                    f"bundle source changed while staging: {rel.as_posix()}"
+                )
+    except ReviewBridgeError as exc:
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            f"bundle source path changed or could not be opened safely: {rel.as_posix()}"
+        ) from exc
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+    secure_file(destination)
+    flush_file_strict(destination)
+    fsync_parent(destination)
+    return copied_bytes
+
+
 def _copy_root_to_stage(
     root: Path,
     stage_root: Path,
@@ -1856,9 +1952,8 @@ def _copy_root_to_stage(
         if rel.as_posix() == "catalog/catalog.sqlite3":
             continue
         target = stage_root / rel
-        secure_copy_file(path, target)
+        copied_bytes += _copy_confined_root_file(root, rel, target)
         copied_files += 1
-        copied_bytes += target.stat().st_size
 
     staged_db = stage_root / "catalog" / "catalog.sqlite3"
     _sqlite_backup(source_db, staged_db)

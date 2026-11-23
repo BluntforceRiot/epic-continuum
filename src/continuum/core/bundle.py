@@ -1839,7 +1839,13 @@ def _stable_bundle_source_identity(metadata: os.stat_result) -> tuple[int, int, 
     )
 
 
-def _copy_confined_root_file(root: Path, rel: Path, destination: Path) -> int:
+def _copy_confined_root_file(
+    root: Path,
+    rel: Path,
+    destination: Path,
+    *,
+    inspected: os.stat_result | None = None,
+) -> int:
     """Copy one exact regular root file without following substituted components."""
     if os.name != "nt" and (
         not int(getattr(os, "O_NOFOLLOW", 0))
@@ -1859,6 +1865,11 @@ def _copy_confined_root_file(root: Path, rel: Path, destination: Path) -> int:
     copied_bytes = 0
     try:
         with _open_confined_regular_file(root, rel) as (source_handle, initial_source):
+            if inspected is not None and (
+                not stat.S_ISREG(inspected.st_mode)
+                or not os.path.samestat(inspected, initial_source)
+            ):
+                raise ValueError(f"bundle source identity changed before staging: {rel.as_posix()}")
             initial_identity = _stable_bundle_source_identity(initial_source)
             initial_size = int(initial_source.st_size)
             destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1901,17 +1912,16 @@ def _copy_confined_root_file(root: Path, rel: Path, destination: Path) -> int:
                     f"bundle source changed while staging: {rel.as_posix()}"
                 )
     except ReviewBridgeError as exc:
-        destination.unlink(missing_ok=True)
         raise ValueError(
             f"bundle source path changed or could not be opened safely: {rel.as_posix()}"
         ) from exc
-    except Exception:
-        destination.unlink(missing_ok=True)
-        raise
     finally:
         if destination_fd >= 0:
             os.close(destination_fd)
 
+    # The caller owns the enclosing disposable stage and cleans it on error.
+    # Never remove a destination pathname here: an exclusive create may have
+    # refused it, or the name may no longer identify the file we opened.
     secure_file(destination)
     flush_file_strict(destination)
     fsync_parent(destination)
@@ -1944,15 +1954,16 @@ def _copy_root_to_stage(
         if _is_link_like(path):
             skipped.append({**_safe_rel_text(rel), "reason": "symlink_skipped"})
             continue
-        if path.is_dir():
+        inspected = path.lstat()
+        if stat.S_ISDIR(inspected.st_mode):
             continue
-        if not path.is_file():
+        if not stat.S_ISREG(inspected.st_mode):
             skipped.append({**_safe_rel_text(rel), "reason": "unsupported_file_type"})
             continue
         if rel.as_posix() == "catalog/catalog.sqlite3":
             continue
         target = stage_root / rel
-        copied_bytes += _copy_confined_root_file(root, rel, target)
+        copied_bytes += _copy_confined_root_file(root, rel, target, inspected=inspected)
         copied_files += 1
 
     staged_db = stage_root / "catalog" / "catalog.sqlite3"

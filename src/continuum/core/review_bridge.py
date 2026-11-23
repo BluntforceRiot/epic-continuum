@@ -8406,7 +8406,7 @@ def _open_confined_regular_file(
                     )
             file_fd = os.open(
                 parts[-1],
-                os.O_RDONLY | nofollow_flag | getattr(os, "O_BINARY", 0),
+                os.O_RDONLY | nofollow_flag | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=directory_fds[-1],
             )
             opened_stat = os.fstat(file_fd)

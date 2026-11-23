@@ -607,86 +607,58 @@ class RootBundleTest(unittest.TestCase):
                     run_restore_drill=False,
                 )
 
-    @unittest.skipUnless(os.name == "posix", "POSIX symlink race regression")
-    def test_stage_copy_rejects_leaf_link_substituted_after_type_check(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            root = base / "continuum"
-            stage = base / "stage"
-            external = base / "external-private.txt"
-            external.write_text("outside-root-private-bytes", encoding="utf-8")
+    def test_confined_stage_preserves_preexisting_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            root.mkdir()
+            relative = Path("ordinary.txt")
+            (root / relative).write_text("selected source", encoding="utf-8")
+            existing = base / "stage.txt"
+            existing.write_text("existing stage bytes", encoding="utf-8")
+
+            with self.assertRaises((FileExistsError, ValueError)):
+                _copy_confined_root_file(root, relative, existing)
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), "existing stage bytes")
+
+    def test_confined_stage_requires_inspected_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            root.mkdir()
+            relative = Path("ordinary.txt")
+            expected = root / "distinct.txt"
+            (root / relative).write_text("selected source", encoding="utf-8")
+            expected.write_text("distinct ordinary fixture", encoding="utf-8")
+            destination = base / "stage.txt"
+
+            with self.assertRaisesRegex(ValueError, "source identity changed"):
+                _copy_confined_root_file(root, relative, destination, inspected=expected.stat())
+            self.assertFalse(destination.exists())
+
+            size = _copy_confined_root_file(root, relative, destination, inspected=(root / relative).stat())
+            self.assertEqual(size, len(b"selected source"))
+            self.assertEqual(destination.read_bytes(), b"selected source")
+
+    def test_stage_skips_entry_classified_as_link_without_importing_it(self) -> None:
+        from continuum.core import bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "memory"
             init_db(root)
-            source = root / "archive" / "race-leaf.txt"
-            secure_write_text(source, "audited in-root bytes")
-            relative = source.relative_to(root)
-            substituted = False
-
-            def substitute_after_checks(
-                active_root: Path,
-                rel: Path,
-                destination: Path,
-            ) -> int:
-                nonlocal substituted
-                if rel == relative and not substituted:
-                    source.unlink()
-                    source.symlink_to(external)
-                    substituted = True
-                return _copy_confined_root_file(active_root, rel, destination)
-
-            with (
-                patch(
-                    "continuum.core.bundle._copy_confined_root_file",
-                    side_effect=substitute_after_checks,
-                ),
-                self.assertRaisesRegex(ValueError, "changed|opened safely"),
-            ):
-                _copy_root_to_stage(root, stage, symlink_policy="fail")
-
-            self.assertTrue(substituted)
-            self.assertFalse((stage / relative).exists())
-
-    @unittest.skipUnless(os.name == "posix", "POSIX symlink race regression")
-    def test_stage_copy_rejects_ancestor_link_substituted_before_open(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            root = base / "continuum"
+            selected = root / "not-a-stage-member.txt"
+            selected.write_text("ordinary metadata-classification fixture", encoding="utf-8")
             stage = base / "stage"
-            external_dir = base / "external-private"
-            external_dir.mkdir()
-            external = external_dir / "payload.txt"
-            external.write_text("outside-root-private-bytes", encoding="utf-8")
-            init_db(root)
-            source_dir = root / "archive" / "race-parent"
-            source_dir.mkdir(parents=True)
-            source = source_dir / "payload.txt"
-            secure_write_text(source, "audited in-root bytes")
-            relative = source.relative_to(root)
-            original_dir = source_dir.with_name("race-parent-original")
-            substituted = False
+            original_predicate = bundle._is_link_like
 
-            def substitute_after_checks(
-                active_root: Path,
-                rel: Path,
-                destination: Path,
-            ) -> int:
-                nonlocal substituted
-                if rel == relative and not substituted:
-                    source_dir.rename(original_dir)
-                    source_dir.symlink_to(external_dir, target_is_directory=True)
-                    substituted = True
-                return _copy_confined_root_file(active_root, rel, destination)
+            with patch.object(bundle, "_is_link_like", side_effect=lambda path: path == selected or original_predicate(path)):
+                result = _copy_root_to_stage(root, stage, symlink_policy="skip")
 
-            with (
-                patch(
-                    "continuum.core.bundle._copy_confined_root_file",
-                    side_effect=substitute_after_checks,
-                ),
-                self.assertRaisesRegex(ValueError, "changed|opened safely"),
-            ):
-                _copy_root_to_stage(root, stage, symlink_policy="fail")
-
-            self.assertTrue(substituted)
-            self.assertFalse((stage / relative).exists())
+            self.assertFalse((stage / selected.name).exists())
+            self.assertTrue((stage / "catalog" / "catalog.sqlite3").is_file())
+            self.assertTrue(any(entry["reason"] == "symlink_skipped" for entry in result["skipped"]))
 
     def test_portable_skip_never_follows_symlinked_catalog_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

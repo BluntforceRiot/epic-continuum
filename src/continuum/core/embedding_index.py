@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ from .store import _visible_card_clause, _visible_scroll_clause, is_initialized
 MAX_SOURCES = 5000
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_CACHE_BYTES = 64 * 1024 * 1024
+MAX_REFRESH_PROVIDER_BATCHES = 512
+REFRESH_TIMEOUT_SECONDS = 30.0
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -211,10 +214,12 @@ def refresh_embedding_index(
     Max 5000 eligible sources, 32 MiB admitted UTF-8, 64 KiB/source, 2048 vector
     dimensions and 64 MiB cache. Oversize/credential/invalid sources are counted,
     never truncated. A provider/limit failure leaves the previous cache intact.
-    Concurrent passes may last-writer-win; every query revalidates live authority.
+    At most 512 provider batches share one 30-second deadline. Concurrent passes
+    may last-writer-win; every query revalidates live authority.
     """
     _integer(max_sources, "max_sources", 1, MAX_SOURCES)
     _integer(batch_size, "batch_size", 1, MAX_BATCH_SIZE)
+    deadline = time.monotonic() + REFRESH_TIMEOUT_SECONDS
     endpoint, model, session_id, project_id, identity = _identity(root, endpoint, model, session_id, project_id)
     if not is_initialized(root):
         raise ValueError("embedding refresh requires an initialized explicit memory root")
@@ -233,7 +238,7 @@ def refresh_embedding_index(
         else:
             pending.append(source)
     dimensions = previous["dimensions"] if reused and previous else 0
-    batches = 0
+    provider_batches: list[list[_Source]] = []
     position = 0
     while position < len(pending):
         batch: list[_Source] = []
@@ -246,16 +251,30 @@ def refresh_embedding_index(
             batch.append(source)
             size += next_size
             position += 1
-        vectors = embed_texts(endpoint=endpoint, model=model, texts=[source.content for source in batch])
+        provider_batches.append(batch)
+        if len(provider_batches) > MAX_REFRESH_PROVIDER_BATCHES:
+            raise ValueError(
+                "embedding refresh exceeds the provider batch limit; increase batch_size or narrow max_sources; "
+                "previous index was preserved"
+            )
+    for batch in provider_batches:
+        if time.monotonic() >= deadline:
+            raise EmbeddingError("embedding refresh exceeded its total deadline; previous index was preserved")
+        vectors = embed_texts(
+            endpoint=endpoint, model=model, texts=[source.content for source in batch], deadline=deadline,
+        )
         if dimensions and len(vectors[0]) != dimensions:
             raise EmbeddingError("embedding dimensions changed; previous index was preserved")
         dimensions = len(vectors[0])
         entries.extend({"kind": source.kind, "id": source.source_id, "content_hash": source.content_hash,
                         "vector": list(vector)} for source, vector in zip(batch, vectors))
-        batches += 1
+    if time.monotonic() >= deadline:
+        raise EmbeddingError("embedding refresh exceeded its total deadline; previous index was preserved")
     entries.sort(key=lambda entry: (entry["kind"], entry["id"]))
     payload = {"schema_version": 1, "identity_sha256": identity, "dimensions": dimensions, "entries": entries}
     text = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n"
+    if time.monotonic() >= deadline:
+        raise EmbeddingError("embedding refresh exceeded its total deadline; previous index was preserved")
     if len(text) > MAX_CACHE_BYTES:
         raise ValueError("embedding cache exceeds 64 MiB; previous index was preserved")
     # Recheck the path after provider I/O before the existing private atomic write.
@@ -265,7 +284,7 @@ def refresh_embedding_index(
     return {"schema_version": 1, "status": "refreshed", "identity_sha256": identity,
             "indexed_sources": len(entries), "embedded_sources": len(pending), "reused_sources": reused,
             "removed_sources": len(set(old_entries) - {(source.kind, source.source_id) for source in sources}),
-            "provider_batches": batches, "dimensions": dimensions, "previous_index": previous_status,
+            "provider_batches": len(provider_batches), "dimensions": dimensions, "previous_index": previous_status,
             "cache_sha256": _digest(text), **counters, "instruction_authority": "none"}
 
 

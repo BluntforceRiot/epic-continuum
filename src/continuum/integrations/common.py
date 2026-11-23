@@ -14,6 +14,8 @@ from continuum.core.workers import maybe_maintain_after_capture
 
 DEFAULT_TOKEN_BUDGET = 1800
 DEFAULT_CONTEXT_HEADER = "Epic Continuum Looking Glass"
+MAX_CAPTURE_TURN_UTF8_BYTES = 64 * 1024
+MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES = 1024
 
 
 def append_adapter_log(path: Path, payload: dict[str, Any]) -> None:
@@ -69,7 +71,7 @@ def adapter_metadata(source: str, payload: dict[str, Any] | None = None) -> dict
         "hook_event_name",
     ):
         value = payload.get(key)
-        if value is not None:
+        if isinstance(value, (str, int, float, bool)) and len(str(value).encode("utf-8")) <= MAX_CAPTURE_METADATA_VALUE_UTF8_BYTES:
             metadata[key] = value
     return metadata
 
@@ -138,6 +140,10 @@ def record_turn(
 ) -> dict[str, Any] | None:
     text = as_text(content).strip()
     if not text:
+        return None
+    # Automatic adapters must not let a single event consume unbounded scan
+    # time or durable storage. Check before secret scanning and persistence.
+    if len(text.encode("utf-8")) > MAX_CAPTURE_TURN_UTF8_BYTES:
         return None
     resolved_root = Path(root) if root else default_continuum_root()
     kind = "assistant_turn" if role == "assistant" else "user_turn"

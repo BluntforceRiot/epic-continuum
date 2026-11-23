@@ -1529,6 +1529,17 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
         self.assertIn("continuum_import_mempalace", names)
         self.assertIn("continuum_restore_drill", names)
         tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+        mempalace_properties = tools["continuum_import_mempalace"]["inputSchema"]["properties"]
+        for field, maximum in (
+            ("max_source_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_SOURCE_BYTES),
+            ("max_copied_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_COPIED_BYTES),
+            ("max_rows", mcp_server_module.MEMPALACE_DEFAULT_MAX_ROWS),
+            ("max_field_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_FIELD_BYTES),
+            ("max_imported_bytes", mcp_server_module.MEMPALACE_DEFAULT_MAX_IMPORTED_BYTES),
+            ("timeout_seconds", mcp_server_module.MEMPALACE_DEFAULT_TIMEOUT_SECONDS),
+        ):
+            self.assertEqual(mempalace_properties[field]["minimum"], 1)
+            self.assertEqual(mempalace_properties[field]["maximum"], maximum)
         self.assertTrue(tools["continuum_status"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["continuum_compile_context"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["continuum_audit_search_index"]["annotations"]["readOnlyHint"])
@@ -3083,6 +3094,89 @@ class EpicContinuumMcpServerTest(unittest.TestCase):
                 self.assertTrue(response["result"]["isError"])
                 payload = json.loads(response["result"]["content"][0]["text"])
                 self.assertIn("verification root path is outside", payload["error"])
+
+    def test_mcp_ingest_keeps_the_allowed_file_open_across_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "memory"
+            root.mkdir()
+            source = root / "plain.txt"
+            source.write_text("ordinary protocol fixture", encoding="utf-8")
+            observations = []
+
+            def observe(opened_root: Path, **args: Any) -> dict:
+                fd = store_module._INGEST_SOURCE_FD.get()
+                self.assertIsNotNone(fd)
+                assert fd is not None
+                observations.append(os.path.samestat(source.stat(), os.fstat(fd)))
+                return ingest_file(opened_root, **args)
+
+            with (
+                patch.dict(os.environ, {"CONTINUUM_ROOT": str(root), "CONTINUUM_MCP_ALLOW_ANY_PATH": "0"}),
+                patch.object(mcp_server_module, "ingest_file", side_effect=observe),
+            ):
+                result = call_tool("continuum_ingest_file", {"root": str(root), "path": str(source)})
+
+            self.assertEqual(observations, [True])
+            self.assertEqual(store_module.resolve_stored_uri(root, result["original_uri"]).read_bytes(), source.read_bytes())
+            self.assertIsNone(store_module._INGEST_SOURCE_FD.get())
+
+    def test_mcp_experiment_accepts_an_exact_new_allowed_leaf(self) -> None:
+        from continuum.core.permissions import audit_private_permissions, posix_permissions_supported
+        from continuum.core.project_knowledge import record_project_knowledge
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "memory"
+            destination = base / "approved-experiment"
+            incomplete = base / "incomplete-experiment"
+            row = record_project_knowledge(
+                root, project_id="fixture-project", session_id="fixture-session", kind="note",
+                title="Project fixture", summary="One synthetic project observation.",
+            )
+            args = {
+                "root": str(root),
+                "action": "create_memory_experiment",
+                "request": {"project_id": "fixture-project", "record_ids": [row["id"]],
+                            "workspace_id": "fixture-workspace", "destination": str(destination)},
+            }
+
+            copy_helper = (
+                "_copy_private_tree_windows" if os.name == "nt" else "_copy_private_tree_posix"
+            )
+            failed_args = {
+                **args,
+                "request": {**args["request"], "destination": str(incomplete)},
+            }
+            with (
+                patch.dict(os.environ, {
+                    "CONTINUUM_ROOT": str(root),
+                    "CONTINUUM_ALLOWED_ROOTS": str(incomplete),
+                    "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
+                }),
+                patch("continuum.core.permissions." + copy_helper, side_effect=OSError("fixture copy refused")),
+            ):
+                refused = call_tool_raw("continuum_knowledge_write", failed_args)
+            self.assertTrue(refused["isError"])
+            self.assertTrue(incomplete.is_dir())
+            self.assertFalse((incomplete / ".experiment").exists())
+            self.assertEqual({path.name for path in base.iterdir()}, {"memory", "incomplete-experiment"})
+
+            with patch.dict(os.environ, {
+                "CONTINUUM_ROOT": str(root),
+                "CONTINUUM_ALLOWED_ROOTS": str(destination),
+                "CONTINUUM_MCP_ALLOW_ANY_PATH": "0",
+            }):
+                result = call_tool("continuum_knowledge_write", args)
+
+            self.assertEqual(Path(result["experiment_root"]), destination)
+            self.assertEqual(
+                {path.name for path in base.iterdir()},
+                {"memory", "incomplete-experiment", "approved-experiment"},
+            )
+            self.assertTrue((destination / ".experiment" / "manifest.json").is_file())
+            self.assertFalse(any(path.name.startswith(".continuum-experiment-stage-") for path in destination.iterdir()))
+            if os.name == "posix" and posix_permissions_supported(destination):
+                self.assertTrue(audit_private_permissions(destination)["ok"])
 
     def test_mcp_verify_proof_pack_rejects_entries_outside_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as denied:

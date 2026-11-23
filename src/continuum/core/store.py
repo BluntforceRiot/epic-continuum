@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -28,11 +28,16 @@ from .permissions import (
     flush_file_strict,
     flush_tree_strict,
     guard_windows_file_disposition,
+    pin_secure_directory_beneath,
+    pin_secure_file_beneath,
     replace_durable,
     secure_copy_file,
     secure_copytree,
     secure_mkdir,
+    secure_mkdir_beneath,
     secure_sqlite_files,
+    secure_sqlite_files_beneath,
+    secure_write_bytes,
     secure_write_text,
     secure_write_text_exclusive,
     set_windows_delete_disposition,
@@ -85,6 +90,10 @@ PARTITION_INTERNAL_PREFIXES = (
     "redacted_agent_",
 )
 _INIT_DB_CACHE: set[str] = set()
+_INGEST_SOURCE_FD: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "continuum_ingest_source_fd",
+    default=None,
+)
 SCROLL_EVENT_SCOPE_BACKFILL_META_KEY = (
     "migration.scroll_event_scope_columns_backfill.v1"
 )
@@ -3102,22 +3111,62 @@ def _install_live_catalog_schema_authorizer(
     conn.set_authorizer(authorize)
 
 
+class _PinnedCatalogConnection(sqlite3.Connection):
+    """A live connection that retains its exact catalog namespace guards."""
+
+    _catalog_guard: ExitStack | None = None
+
+    def retain_catalog_guard(self, guard: ExitStack) -> None:
+        if self._catalog_guard is not None:
+            raise RuntimeError("catalog namespace guard is already installed")
+        self._catalog_guard = guard
+
+    def close(self) -> None:
+        guard = self._catalog_guard
+        self._catalog_guard = None
+        try:
+            super().close()
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
 def connect(root: Path) -> sqlite3.Connection:
     # This is the single live-catalog write connection factory. Keep the claim
     # check here so direct library callers cannot bypass the runtime boundary.
     ensure_writer_claim(root)
-    db_path = root / "catalog" / "catalog.sqlite3"
     secure_mkdir(root, secure_existing=True)
-    secure_mkdir(db_path.parent, secure_existing=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    _install_live_catalog_schema_authorizer(root, conn)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    secure_sqlite_files(db_path)
-    return conn
+    with ExitStack() as catalog_guard:
+        catalog_dir = catalog_guard.enter_context(
+            pin_secure_directory_beneath(
+                root,
+                "catalog",
+                secure_existing=True,
+            )
+        )
+        db_path = catalog_guard.enter_context(
+            pin_secure_file_beneath(catalog_dir, "catalog.sqlite3")
+        )
+        conn = sqlite3.connect(str(db_path), factory=_PinnedCatalogConnection)
+        conn.retain_catalog_guard(catalog_guard.pop_all())
+        try:
+            conn.row_factory = sqlite3.Row
+            _install_live_catalog_schema_authorizer(root, conn)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
 
 def _assert_live_wal_read_compatible(root: Path, db_path: Path, *, immutable: bool) -> None:
@@ -9231,7 +9280,7 @@ def init_layout(root: Path) -> None:
         "run",
     ]
     for rel in dirs:
-        secure_mkdir(root / rel, secure_existing=True)
+        secure_mkdir_beneath(root, rel, secure_existing=True)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -14374,13 +14423,73 @@ def roll_scroll_segment(
         conn.close()
 
 
+def _read_ingest_source_fd(
+    fd: int,
+    *,
+    path: Path,
+    max_bytes: int,
+) -> tuple[bytes, int]:
+    """Read one stable regular-file object without reopening its pathname."""
+
+    before = os.fstat(fd)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or bool(int(getattr(before, "st_file_attributes", 0)) & reparse_flag)
+    ):
+        raise FileNotFoundError(str(path))
+    source_size = int(before.st_size)
+    if source_size > max_bytes:
+        raise ValueError(
+            f"file too large for ingest_file: {format_size(source_size)} exceeds "
+            f"storage.max_ingest_bytes={format_size(max_bytes)}"
+        )
+    fingerprint = (
+        int(before.st_dev),
+        int(before.st_ino),
+        source_size,
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    os.lseek(fd, 0, os.SEEK_SET)
+    captured = bytearray()
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(captured)))
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if len(captured) > max_bytes:
+            raise ValueError(
+                f"file too large for ingest_file: more than {format_size(max_bytes)} exceeds "
+                f"storage.max_ingest_bytes={format_size(max_bytes)}"
+            )
+    after = os.fstat(fd)
+    final_fingerprint = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    if final_fingerprint != fingerprint or len(captured) != source_size:
+        raise ValueError(f"ingest source changed while reading: {path}")
+    return bytes(captured), source_size
+
+
+@contextmanager
+def _use_ingest_source_fd(fd: int) -> Iterator[None]:
+    token = _INGEST_SOURCE_FD.set(fd)
+    try:
+        yield
+    finally:
+        _INGEST_SOURCE_FD.reset(token)
+
+
 def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tier: str = "hot") -> dict[str, Any]:
     init_db(root)
     config = load_config(root)
     if storage_tier not in {"hot", "warm", "cold", "vault"}:
         raise ValueError("storage_tier must be hot, warm, cold, or vault")
-    if not path.exists() or not path.is_file():
-        raise FileNotFoundError(str(path))
     security_config = config.get("security", {})
     ignored, ignore_pattern = is_ignored_path(
         root,
@@ -14390,13 +14499,25 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     if ignored:
         raise ValueError(f"path matches Continuum ignore rule {ignore_pattern!r}: {path}")
     max_ingest_bytes = parse_size(config.get("storage", {}).get("max_ingest_bytes", "50MB"))
-    source_size = path.stat().st_size
-    if source_size > max_ingest_bytes:
-        raise ValueError(
-            f"file too large for ingest_file: {format_size(source_size)} exceeds "
-            f"storage.max_ingest_bytes={format_size(max_ingest_bytes)}"
+    owned_fd = -1
+    ingest_fd = _INGEST_SOURCE_FD.get()
+    try:
+        if ingest_fd is None:
+            owned_fd = os.open(
+                path,
+                os.O_RDONLY
+                | int(getattr(os, "O_BINARY", 0))
+                | int(getattr(os, "O_NONBLOCK", 0)),
+            )
+            ingest_fd = owned_fd
+        raw_bytes, source_size = _read_ingest_source_fd(
+            ingest_fd,
+            path=path,
+            max_bytes=max_ingest_bytes,
         )
-    raw_bytes = path.read_bytes()
+    finally:
+        if owned_fd >= 0:
+            os.close(owned_fd)
     digest = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8", errors="replace")
     source_ref = source_file_reference(root, path, digest=digest, size_bytes=source_size)
@@ -14431,7 +14552,7 @@ def ingest_file(root: Path, *, path: Path, title: str | None = None, storage_tie
     secure_mkdir(original_dir)
     original_path = original_dir / safe_name
     if not original_path.exists():
-        secure_copy_file(path, original_path)
+        secure_write_bytes(original_path, raw_bytes)
     reader_dir = root / "archive" / "reader_editions" / ("cold" if storage_tier == "vault" else storage_tier)
     secure_mkdir(reader_dir)
     reader_path = reader_dir / f"{safe_name}.txt"
@@ -26566,7 +26687,12 @@ def count_orphan_card_sidecars(root: Path, conn: sqlite3.Connection) -> int:
     return audit_card_sidecars(root, conn)["orphan_card_sidecars"]
 
 
-def _retire_missing_snapshot_catalog_rows(root: Path) -> int:
+def _retire_missing_snapshot_catalog_rows(
+    root: Path,
+    *,
+    preserve_uris: set[str] | None = None,
+    snapshot_storage: _SnapshotRetentionDirectory | None = None,
+) -> int:
     if not is_initialized(root):
         return 0
     conn = connect(root)
@@ -26577,7 +26703,20 @@ def _retire_missing_snapshot_catalog_rows(root: Path) -> int:
         rows = conn.execute("SELECT id, snapshot_uri FROM snapshots").fetchall()
         for row in rows:
             snapshot_path = resolve_stored_uri(root, str(row["snapshot_uri"] or ""))
-            if snapshot_path.exists():
+            if preserve_uris and lexical_continuum_uri(root, snapshot_path) in preserve_uris:
+                continue
+            try:
+                if (
+                    snapshot_storage is not None
+                    and snapshot_path.absolute().parent == (root / "snapshots").absolute()
+                ):
+                    present = snapshot_storage.stat(snapshot_path.name) is not None
+                else:
+                    present = snapshot_path.exists()
+            except OSError:
+                # An unreadable namespace cannot prove that recorded data is gone.
+                continue
+            if present:
                 continue
             before = conn.total_changes
             conn.execute("DELETE FROM snapshots WHERE id = ?", (row["id"],))
@@ -27344,6 +27483,164 @@ def _reconcile_interrupted_snapshot_publications(root: Path) -> dict[str, int]:
     return result
 
 
+def _same_snapshot_retention_entry(
+    left: os.stat_result, right: os.stat_result
+) -> bool:
+    return (
+        bool(left.st_ino)
+        and os.path.samestat(left, right)
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and getattr(left, "st_reparse_tag", 0) == getattr(right, "st_reparse_tag", 0)
+    )
+
+
+class _SnapshotRetentionDirectory:
+    """Retain a no-follow parent for selection and every cleanup operation."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        fd: int | None = None,
+        native: Any = None,
+        handle: int = 0,
+    ) -> None:
+        self.path = path
+        self.fd = fd
+        self.native = native
+        self.handle = handle
+
+    def names(self) -> list[str]:
+        return os.listdir(self.path if self.fd is None else self.fd)
+
+    def stat(self, name: str) -> os.stat_result | None:
+        self._require_entry_name(name)
+        try:
+            if self.fd is not None:
+                return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            return os.lstat(self.path / name)
+        except FileNotFoundError:
+            return None
+
+    def remove(self, name: str, expected: os.stat_result, *, tree: bool = False) -> None:
+        self._require_entry_name(name)
+        if self.fd is not None:
+            self._remove_relative(self.fd, name, expected, tree=tree)
+        else:
+            self._remove_native(self.handle, self.path / name, expected, tree=tree)
+
+    @staticmethod
+    def _require_entry_name(name: str) -> None:
+        if name in {"", ".", ".."} or Path(name).name != name or "\x00" in name:
+            raise OSError("snapshot retention requires a single entry name")
+
+    @classmethod
+    def _remove_relative(
+        cls, parent_fd: int, name: str, expected: os.stat_result, *, tree: bool
+    ) -> None:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_snapshot_retention_entry(expected, current):
+            raise OSError("snapshot retention entry identity changed")
+        if stat.S_ISLNK(current.st_mode):
+            raise OSError("snapshot retention will not remove a link-like entry")
+        if stat.S_ISREG(current.st_mode):
+            os.unlink(name, dir_fd=parent_fd)
+            return
+        if not tree or not stat.S_ISDIR(current.st_mode):
+            raise OSError("snapshot retention entry is not an eligible file or directory")
+        if current.st_dev != os.fstat(parent_fd).st_dev:
+            raise OSError("snapshot retention will not cross filesystems")
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            if not _same_snapshot_retention_entry(expected, os.fstat(fd)):
+                raise OSError("snapshot retention directory identity changed at open")
+            for child in os.listdir(fd):
+                child_stat = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                cls._remove_relative(fd, child, child_stat, tree=True)
+            if not _same_snapshot_retention_entry(
+                expected, os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            ):
+                raise OSError("snapshot retention directory identity changed during cleanup")
+            os.rmdir(name, dir_fd=parent_fd)
+        finally:
+            os.close(fd)
+
+    def _remove_native(
+        self, parent_handle: int, path: Path, expected: os.stat_result, *, tree: bool
+    ) -> None:
+        current = os.lstat(path)
+        if not _same_snapshot_retention_entry(expected, current):
+            raise OSError("snapshot retention entry identity changed")
+        attributes = getattr(current, "st_file_attributes", 0)
+        if stat.S_ISLNK(current.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("snapshot retention will not remove a link or reparse point")
+        native = self.native
+        directory = stat.S_ISDIR(current.st_mode)
+        if (directory and not tree) or (not directory and not stat.S_ISREG(current.st_mode)):
+            raise OSError("snapshot retention entry is not an eligible file or directory")
+        access = native._DELETE | native._FILE_READ_ATTRIBUTES | native._SYNCHRONIZE
+        if directory:
+            access |= native._FILE_LIST_DIRECTORY | native._FILE_TRAVERSE
+        handle = native.open_relative(
+            parent_handle,
+            path.name,
+            directory=directory,
+            desired_access=access,
+            share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+        )
+        try:
+            if not _same_snapshot_retention_entry(expected, native.fstat(handle)):
+                raise OSError("snapshot retention entry identity changed at open")
+            if directory:
+                # All ancestors and this directory are pinned without a
+                # delete share while the pathname is used for enumeration.
+                for child_name in os.listdir(path):
+                    child = path / child_name
+                    self._remove_native(handle, child, os.lstat(child), tree=True)
+            native.mark_delete(handle)
+        finally:
+            native.close(handle)
+
+
+@contextmanager
+def _open_snapshot_retention_directory(path: Path) -> Iterator[_SnapshotRetentionDirectory]:
+    from .review_bridge import _open_plain_directory_fd, _windows_native_confinement
+
+    if os.name == "nt":
+        from .operations import _restore_io_path
+
+        native = _windows_native_confinement()
+        absolute = Path(os.path.abspath(path))
+        with ExitStack() as stack:
+            handle = native.open_anchor(absolute.anchor)
+            stack.callback(native.close, handle)
+            for part in absolute.parts[1:]:
+                handle = native.open_relative(
+                    handle,
+                    part,
+                    directory=True,
+                    share_access=native._FILE_SHARE_READ | native._FILE_SHARE_WRITE,
+                )
+                stack.callback(native.close, handle)
+            yield _SnapshotRetentionDirectory(
+                _restore_io_path(absolute), native=native, handle=handle
+            )
+        return
+    if (
+        not getattr(os, "O_DIRECTORY", 0)
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or os.listdir not in os.supports_fd
+        or os.stat not in os.supports_follow_symlinks
+        or not {os.open, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd
+    ):
+        raise OSError("snapshot retention requires directory-relative no-follow cleanup")
+    with _open_plain_directory_fd(path) as fd:
+        if fd is None:
+            raise OSError("snapshot retention directory could not be pinned")
+        yield _SnapshotRetentionDirectory(path, fd=fd)
+
+
 def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
     reconciliation = _reconcile_interrupted_snapshot_publications(root)
     policy = str(load_config(root).get("retention", {}).get("snapshot_retention", "last_20"))
@@ -27397,101 +27694,90 @@ def enforce_snapshot_retention(root: Path) -> dict[str, Any]:
                         )
         finally:
             conn.close()
-    snapshots: list[Path] = []
+    from .review_bridge import ReviewBridgeError
+
+    snapshots: list[tuple[Path, os.stat_result]] = []
     unbound_retained = 0
-    for candidate in snapshots_dir.glob("continuum_catalog_*.sqlite3"):
-        candidate_uri = lexical_continuum_uri(root, candidate)
-        if candidate_uri not in catalog_snapshot_uris:
-            unbound_retained += 1
-            continue
-        if not _plain_snapshot_publication_output(candidate):
-            raise ValueError(
-                f"catalog-bound snapshot retention candidate is link-like or unsupported: {candidate}"
-            )
-        snapshots.append(candidate)
-    snapshots.sort(
-        key=lambda item: os.lstat(item).st_mtime,
-        reverse=True,
-    )
     deleted = 0
     paired_review_jobs_deleted = 0
     paired_card_sidecar_receipts_deleted = 0
     protected = 0
-    retired_snapshot_uris: list[str] = []
-    retired_snapshot_ids: list[str] = []
-    for old_snapshot in snapshots[keep:]:
-        old_snapshot_uri = lexical_continuum_uri(root, old_snapshot)
-        if old_snapshot_uri in protected_snapshot_uris:
-            protected += 1
-            continue
-        retired_snapshot_uris.append(old_snapshot_uri)
-        if snapshot_id := snapshot_id_from_catalog_path(old_snapshot):
-            retired_snapshot_ids.append(snapshot_id)
-        sidecars = snapshot_sidecars_path(old_snapshot)
-        review_jobs = snapshot_review_bridge_jobs_path(old_snapshot)
-        sidecar_receipts = snapshot_card_sidecar_receipts_path(old_snapshot)
-        manifest = snapshot_manifest_path(old_snapshot)
-        alias_key = snapshot_alias_key_path(old_snapshot)
-        for path in (old_snapshot, manifest, alias_key):
+    refused_snapshot_uris: set[str] = set()
+    with _open_snapshot_retention_directory(snapshots_dir) as storage:
+        for name in storage.names():
+            candidate = snapshots_dir / name
+            if not candidate.match("continuum_catalog_*.sqlite3"):
+                continue
+            candidate_uri = lexical_continuum_uri(root, candidate)
+            if candidate_uri not in catalog_snapshot_uris:
+                unbound_retained += 1
+                continue
+            metadata = storage.stat(name)
+            if (
+                metadata is None
+                or not stat.S_ISREG(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise ValueError(
+                    f"catalog-bound snapshot retention candidate is link-like or unsupported: {candidate}"
+                )
+            snapshots.append((candidate, metadata))
+        snapshots.sort(key=lambda item: item[1].st_mtime, reverse=True)
+        for old_snapshot, metadata in snapshots[keep:]:
+            old_snapshot_uri = lexical_continuum_uri(root, old_snapshot)
+            if old_snapshot_uri in protected_snapshot_uris:
+                protected += 1
+                continue
+            snapshot_id = snapshot_id_from_catalog_path(old_snapshot)
+            pair_id = snapshot_id or old_snapshot.stem
+            legacy_name = f"continuum_review_bridge_jobs_{pair_id}"
+            review_name = f"continuum_rj_{pair_id}"
+            legacy = storage.stat(legacy_name)
+            review = storage.stat(review_name)
+            if legacy is not None and review is not None:
+                raise ValueError(f"snapshot has ambiguous Review Relay job trees: {old_snapshot}")
+            if legacy is not None:
+                review_name, review = legacy_name, legacy
+            receipt_name = snapshot_card_sidecar_receipts_path(old_snapshot).name
+            manifest_name = snapshot_manifest_path(old_snapshot).name
+            alias_name = snapshot_alias_key_path(old_snapshot).name
+            selected = [
+                (manifest_name, storage.stat(manifest_name), False),
+                (alias_name, storage.stat(alias_name), False),
+                (review_name, review, True),
+                (receipt_name, storage.stat(receipt_name), True),
+            ]
+            if snapshot_id:
+                sidecar_name = f"continuum_cards_{snapshot_id}"
+                selected.append((sidecar_name, storage.stat(sidecar_name), True))
             try:
-                path.unlink(missing_ok=True)
-                deleted += 1
-            except OSError:
-                pass
-        if sidecars is not None and sidecars.exists():
-            for child in sorted(sidecars.rglob("*"), reverse=True):
+                storage.remove(old_snapshot.name, metadata)
+                if storage.stat(old_snapshot.name) is not None:
+                    raise OSError("snapshot retention could not confirm primary removal")
+            except (OSError, ReviewBridgeError):
+                refused_snapshot_uris.add(old_snapshot_uri)
+                continue
+            deleted += 1
+            for name, info, tree in selected:
+                if info is None:
+                    continue
                 try:
-                    if child.is_dir():
-                        child.rmdir()
-                    else:
-                        child.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            try:
-                sidecars.rmdir()
-            except OSError:
-                pass
-        if review_jobs.exists() or review_jobs.is_symlink():
-            try:
-                reason = _snapshot_link_like_reason(review_jobs)
-                if reason in {"junction", "reparse_point"}:
-                    os.rmdir(review_jobs)
-                elif reason:
-                    review_jobs.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(review_jobs)
+                    storage.remove(name, info, tree=tree)
+                    if storage.stat(name) is not None:
+                        continue
+                except (OSError, ReviewBridgeError, RecursionError):
+                    continue
+                if name == review_name:
+                    paired_review_jobs_deleted += 1
+                elif name == receipt_name:
+                    paired_card_sidecar_receipts_deleted += 1
+                elif tree:
+                    # Keep the historical deletion count for card sidecar trees.
+                    continue
                 deleted += 1
-                paired_review_jobs_deleted += 1
-            except OSError:
-                pass
-        if sidecar_receipts.exists() or sidecar_receipts.is_symlink():
-            try:
-                reason = _snapshot_link_like_reason(sidecar_receipts)
-                if reason in {"junction", "reparse_point"}:
-                    os.rmdir(sidecar_receipts)
-                elif reason:
-                    sidecar_receipts.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(sidecar_receipts)
-                deleted += 1
-                paired_card_sidecar_receipts_deleted += 1
-            except OSError:
-                pass
-    catalog_rows_retired = _retire_missing_snapshot_catalog_rows(root)
-    if retired_snapshot_uris and is_initialized(root):
-        conn = connect(root)
-        try:
-            for uri in retired_snapshot_uris:
-                before = conn.total_changes
-                conn.execute("DELETE FROM snapshots WHERE snapshot_uri = ?", (uri,))
-                catalog_rows_retired += max(0, conn.total_changes - before)
-            for snapshot_id in retired_snapshot_ids:
-                before = conn.total_changes
-                conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
-                catalog_rows_retired += max(0, conn.total_changes - before)
-            conn.commit()
-        finally:
-            conn.close()
+        catalog_rows_retired = _retire_missing_snapshot_catalog_rows(
+            root, preserve_uris=refused_snapshot_uris, snapshot_storage=storage
+        )
     return {
         "policy": policy,
         "deleted": deleted,

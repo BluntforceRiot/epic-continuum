@@ -241,6 +241,28 @@ def _root_has_existing_state(root: Path) -> bool:
         return False
     if not canonical.is_dir():
         return True
+    # Bootstrap config and lock directories remain valid on a fresh root, but
+    # no fixed internal component may redirect initialization outside it.
+    layout_components = (
+        "catalog",
+        "archive",
+        "scroll",
+        "graph",
+        "queues",
+        "snapshots",
+        "exports",
+        "config",
+        "run",
+    )
+    try:
+        for name in layout_components:
+            component = canonical / name
+            if _is_link_like(component):
+                return True
+            if component.exists() and not component.is_dir():
+                return True
+    except OSError:
+        return True
     # "Existing" means an existing Continuum state tree, not merely a caller
     # placing an import file, configuration, or a bootstrap lock below the
     # directory before first initialization. Config and run/lock paths do not

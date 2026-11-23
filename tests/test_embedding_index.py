@@ -217,6 +217,12 @@ class EmbeddingProtocolTests(unittest.TestCase):
             self.embed()
         self.assertLess(time.monotonic() - before, 2)
 
+    def test_expired_caller_deadline_never_opens_socket(self):
+        with patch.object(socket, "create_connection", side_effect=AssertionError("unexpected socket")):
+            with self.assertRaises(EmbeddingError):
+                self.embed(deadline=time.monotonic() - 1)
+        self.assertEqual(self.provider.requests, [])
+
 
 class EmbeddingIndexTests(unittest.TestCase):
     def setUp(self):
@@ -534,6 +540,35 @@ class EmbeddingIndexTests(unittest.TestCase):
             self.refresh(batch_size=1)
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(len(list(path.parent.iterdir())), 1)
+
+    def test_refresh_shares_one_deadline_across_provider_batches(self):
+        self.event("pending one")
+        self.event("pending two")
+        deadlines = []
+
+        def embedding_fixture(*, endpoint, model, texts, deadline=None):
+            deadlines.append(deadline)
+            return [(1.0, 0.0, 0.0) for _ in texts]
+
+        with patch("continuum.core.embedding_index.time.monotonic", return_value=100.0), \
+                patch("continuum.core.embedding_index.embed_texts", side_effect=embedding_fixture):
+            result = self.refresh(batch_size=1)
+        self.assertEqual(result["provider_batches"], 2)
+        self.assertEqual(deadlines, [130.0, 130.0])
+
+    def test_excessive_provider_plan_preserves_cache_without_requests(self):
+        self.event("initial")
+        self.refresh()
+        path = self.cache()[0]
+        before = path.read_bytes()
+        self.event("pending one")
+        self.event("pending two")
+        self.provider.requests.clear()
+        with patch("continuum.core.embedding_index.MAX_REFRESH_PROVIDER_BATCHES", 1):
+            with self.assertRaisesRegex(ValueError, "provider batch limit"):
+                self.refresh(batch_size=1)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.provider.requests, [])
 
     def test_new_dimensions_with_reused_entries_preserve_cache(self):
         self.event("initial")

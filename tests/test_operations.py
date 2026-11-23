@@ -5076,8 +5076,8 @@ class OperationLedgerTest(unittest.TestCase):
         path = Path("synthetic-entry")
         storage = store_module._SnapshotRetentionDirectory(path.parent)
         for mode, tag, operation in (
-            (stat.S_IFLNK, stat.IO_REPARSE_TAG_SYMLINK, "unlink"),
-            (stat.S_IFDIR, stat.IO_REPARSE_TAG_MOUNT_POINT, "rmdir"),
+            (stat.S_IFLNK, 0xA000000C, "unlink"),  # Windows IO_REPARSE_TAG_SYMLINK
+            (stat.S_IFDIR, 0xA0000003, "rmdir"),   # Windows IO_REPARSE_TAG_MOUNT_POINT
         ):
             metadata = SimpleNamespace(
                 st_ino=7, st_dev=1, st_mode=mode,

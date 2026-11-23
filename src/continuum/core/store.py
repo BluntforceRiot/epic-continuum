@@ -3153,6 +3153,9 @@ def connect(root: Path) -> sqlite3.Connection:
         db_path = catalog_guard.enter_context(
             pin_secure_file_beneath(catalog_dir, "catalog.sqlite3")
         )
+        # Closing another descriptor for a SQLite file drops this process's
+        # POSIX advisory locks, so secure existing sidecars before SQLite opens.
+        secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
         conn = sqlite3.connect(str(db_path), factory=_PinnedCatalogConnection)
         conn.retain_catalog_guard(catalog_guard.pop_all())
         try:
@@ -3162,7 +3165,6 @@ def connect(root: Path) -> sqlite3.Connection:
             conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            secure_sqlite_files_beneath(catalog_dir, "catalog.sqlite3")
         except BaseException:
             conn.close()
             raise
